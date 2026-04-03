@@ -141,10 +141,11 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
   sampler_ = std::make_unique<Sampler>();
 
 #if !defined(USE_NPU)
-  // Startup validation: ATB block-copy kernel is NPU-only. We should fail fast
-  // if CUDA deployment accidentally enables it.
-  CHECK(!FLAGS_enable_block_copy_kernel)
-      << "enable_block_copy_kernel must be false on CUDA builds.";
+  if (FLAGS_enable_block_copy_kernel) {
+    LOG(WARNING) << "enable_block_copy_kernel is only supported on NPU; "
+                    "forcing enable_block_copy_kernel=false.";
+    FLAGS_enable_block_copy_kernel = false;
+  }
 #endif
 
 #if defined(USE_NPU)
