@@ -29,6 +29,7 @@ limitations under the License.
 #include "rec_completion_service_impl.h"
 #include "rerank_service_impl.h"
 #include "sample_service_impl.h"
+#include "speech_service_impl.h"
 #include "xllm_service.pb.h"
 
 namespace xllm {
@@ -79,6 +80,16 @@ class APIService : public proto::XllmAPIService {
                       const proto::HttpRequest* request,
                       proto::HttpResponse* response,
                       ::google::protobuf::Closure* done) override;
+
+  void Speech(::google::protobuf::RpcController* controller,
+              const proto::SpeechRequest* request,
+              proto::SpeechResponse* response,
+              ::google::protobuf::Closure* done) override;
+
+  void SpeechHttp(::google::protobuf::RpcController* controller,
+                  const proto::HttpRequest* request,
+                  proto::HttpResponse* response,
+                  ::google::protobuf::Closure* done) override;
 
   void ImageGeneration(::google::protobuf::RpcController* controller,
                        const proto::ImageGenerationRequest* request,
@@ -188,6 +199,7 @@ class APIService : public proto::XllmAPIService {
   std::unique_ptr<MMChatServiceImpl> mm_chat_service_impl_;
   std::unique_ptr<EmbeddingServiceImpl> embedding_service_impl_;
   std::unique_ptr<MMEmbeddingServiceImpl> mm_embedding_service_impl_;
+  std::unique_ptr<SpeechServiceImpl> speech_service_impl_;
   std::unique_ptr<ModelsServiceImpl> models_service_impl_;
   std::unique_ptr<ImageGenerationServiceImpl> image_generation_service_impl_;
   std::unique_ptr<RerankServiceImpl> rerank_service_impl_;

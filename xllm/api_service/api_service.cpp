@@ -58,6 +58,11 @@ std::string build_sample_backend_error_message() {
   return "Current backend '" + FLAGS_backend +
          "' does not support /v1/sample; only llm is supported";
 }
+
+std::string build_speech_backend_error_message() {
+  return "Current backend '" + FLAGS_backend +
+         "' does not support /v1/audio/speech; only vlm is supported";
+}
 }  // namespace
 
 APIService::APIService(Master* master,
@@ -99,6 +104,8 @@ APIService::APIService(Master* master,
         std::make_unique<MMChatServiceImpl>(vlm_master, model_names);
     mm_embedding_service_impl_ =
         std::make_unique<MMEmbeddingServiceImpl>(vlm_master, model_names);
+    speech_service_impl_ =
+        std::make_unique<SpeechServiceImpl>(vlm_master, model_names);
   } else if (FLAGS_backend == "dit") {
     image_generation_service_impl_ =
         std::make_unique<ImageGenerationServiceImpl>(
@@ -569,6 +576,77 @@ void APIService::EmbeddingsHttp(::google::protobuf::RpcController* controller,
     handle_embedding_request<MMEmbeddingCall, MMEmbeddingServiceImpl>(
         mm_embedding_service_impl_, controller, request, response, done);
   }
+}
+
+void APIService::Speech(::google::protobuf::RpcController* controller,
+                        const proto::SpeechRequest* request,
+                        proto::SpeechResponse* response,
+                        ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      std::bind(request_in_metric, nullptr),
+      std::bind(request_out_metric, (void*)controller));
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | respose | controller is null.";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  if (FLAGS_backend != "vlm") {
+    ctrl->SetFailed(build_speech_backend_error_message());
+    return;
+  }
+  CHECK(speech_service_impl_) << "speech service is invalid.";
+
+  auto call =
+      std::make_shared<SpeechCall>(ctrl,
+                                   done_guard.release(),
+                                   const_cast<proto::SpeechRequest*>(request),
+                                   response,
+                                   true);
+  speech_service_impl_->process_async(call);
+}
+
+void APIService::SpeechHttp(::google::protobuf::RpcController* controller,
+                            const proto::HttpRequest* request,
+                            proto::HttpResponse* response,
+                            ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      std::bind(request_in_metric, nullptr),
+      std::bind(request_out_metric, (void*)controller));
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | respose | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  if (FLAGS_backend != "vlm") {
+    ctrl->SetFailed(build_speech_backend_error_message());
+    return;
+  }
+  CHECK(speech_service_impl_) << "speech service is invalid.";
+
+  auto arena = GetArenaWithCheck<SpeechCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<proto::SpeechRequest>(arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::SpeechResponse>(arena);
+
+  std::string error;
+  json2pb::Json2PbOptions options;
+  butil::IOBuf& buf = ctrl->request_attachment();
+  butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
+  auto st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
+  if (!st) {
+    ctrl->SetFailed(error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+
+  auto call = std::make_shared<SpeechCall>(
+      ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+  speech_service_impl_->process_async(call);
 }
 
 void APIService::ImageGeneration(::google::protobuf::RpcController* controller,
@@ -1101,7 +1179,7 @@ void APIService::WakeupHttp(::google::protobuf::RpcController* controller,
         std::vector<WeightSegment> segments;
         segments.reserve(seg_list.segments_size());
         for (const auto& proto_seg : seg_list.segments()) {
-          segments.emplace_back(proto_seg.offset(), proto_seg.size());
+          segments.push_back({proto_seg.offset(), proto_seg.size()});
         }
         wakeup_options.src_weight_segments.push_back(std::move(segments));
       }
