@@ -39,8 +39,16 @@ std::unique_ptr<Tokenizer> TokenizerFactory::create_tokenizer(
     LOG(INFO) << "Create rec tokenizer.";
     tokenizer =
         std::make_unique<RecTokenizer>(model_weights_path, tokenizer_args);
+  } else if (tokenizer_args.tokenizer_type() == "qwen_bpe" ||
+             tokenizer_args.tokenizer_type() == "qwen2_bpe") {
+    // 4. Qwen-family byte-level BPE tokenizer from vocab.json + merges.txt.
+    // Keep "qwen2_bpe" as backward-compatible alias.
+    LOG(INFO) << "Create Qwen BPE tokenizer (type="
+              << tokenizer_args.tokenizer_type() << ").";
+    tokenizer =
+        std::make_unique<Qwen2BPETokenizer>(model_weights_path, tokenizer_args);
   } else {
-    // 4. create sentencepiece tokenizer
+    // 5. create sentencepiece tokenizer
     LOG(INFO) << "Create SentencePiece tokenizer.";
     tokenizer = std::make_unique<SentencePieceTokenizer>(model_weights_path,
                                                          tokenizer_args);

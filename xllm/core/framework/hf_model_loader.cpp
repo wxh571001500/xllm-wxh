@@ -28,10 +28,12 @@ limitations under the License.
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <cctype>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "core/common/rec_model_utils.h"
@@ -829,6 +831,7 @@ bool HFModelLoader::load_tokenizer_args(const std::string& model_weights_path) {
   JsonReader tokenizer_reader;
   const std::string tokenizer_args_file_path =
       model_weights_path_ + "/tokenizer_config.json";
+  std::vector<SpecialToken> parsed_special_tokens;
 
   // check if tokenizer.json exists, if exists, set the tokenizer type to fast
   const std::string tokenizer_json_path =
@@ -839,6 +842,18 @@ bool HFModelLoader::load_tokenizer_args(const std::string& model_weights_path) {
   }
 
   if (tokenizer_reader.parse(tokenizer_args_file_path)) {
+    std::unordered_set<std::string> seen_tokens;
+    std::unordered_set<int32_t> seen_ids;
+    auto add_special_token = [&](const std::string& token, int32_t id) {
+      if (token.empty()) {
+        return;
+      }
+      if (!seen_tokens.insert(token).second || !seen_ids.insert(id).second) {
+        return;
+      }
+      parsed_special_tokens.emplace_back(token, id);
+    };
+
     // read chat template if exists
     if (auto v = load_chat_template_file(model_weights_path_)) {
       tokenizer_args_.chat_template() = v.value();
@@ -853,6 +868,9 @@ bool HFModelLoader::load_tokenizer_args(const std::string& model_weights_path) {
     }
     if (auto v = tokenizer_reader.value<std::string>("tokenizer_class")) {
       tokenizer_args_.tokenizer_class() = v.value();
+    }
+    if (auto v = tokenizer_reader.value<bool>("add_prefix_space")) {
+      tokenizer_args_.add_prefix_space() = v.value();
     }
     // read bos_token
     if (auto v = tokenizer_reader.value<std::string>("bos_token.content")) {
@@ -872,6 +890,42 @@ bool HFModelLoader::load_tokenizer_args(const std::string& model_weights_path) {
     } else if (auto v = tokenizer_reader.value<std::string>("pad_token")) {
       tokenizer_args_.pad_token() = v.value();
     }
+
+    const auto& tokenizer_json = tokenizer_reader.data();
+    auto added_tokens_it = tokenizer_json.find("added_tokens_decoder");
+    if (added_tokens_it != tokenizer_json.end() &&
+        added_tokens_it->is_object()) {
+      for (const auto& [id_str, token_json] : added_tokens_it->items()) {
+        int32_t token_id = -1;
+        try {
+          token_id = std::stoi(id_str);
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "Skip invalid added token id " << id_str << ": "
+                       << e.what();
+          continue;
+        }
+
+        if (token_json.is_string()) {
+          add_special_token(token_json.get<std::string>(), token_id);
+          continue;
+        }
+
+        if (!token_json.is_object()) {
+          continue;
+        }
+
+        const bool is_special = token_json.value("special", false);
+        if (!is_special) {
+          continue;
+        }
+
+        auto content_it = token_json.find("content");
+        if (content_it == token_json.end() || !content_it->is_string()) {
+          continue;
+        }
+        add_special_token(content_it->get<std::string>(), token_id);
+      }
+    }
   }
 
   auto tokenizer_args_loader =
@@ -882,6 +936,23 @@ bool HFModelLoader::load_tokenizer_args(const std::string& model_weights_path) {
                  << tokenizer_args_file_path;
       return false;
     }
+  }
+
+  if (!parsed_special_tokens.empty()) {
+    auto special_tokens = tokenizer_args_.special_tokens();
+    std::unordered_set<std::string> seen_tokens;
+    std::unordered_set<int32_t> seen_ids;
+    for (const auto& [token, id] : special_tokens) {
+      seen_tokens.insert(token);
+      seen_ids.insert(id);
+    }
+    for (const auto& [token, id] : parsed_special_tokens) {
+      if (!seen_tokens.insert(token).second || !seen_ids.insert(id).second) {
+        continue;
+      }
+      special_tokens.emplace_back(token, id);
+    }
+    tokenizer_args_.special_tokens() = std::move(special_tokens);
   }
 
   return true;

@@ -30,12 +30,15 @@ namespace xllm {
 using SpecialToken = std::pair<std::string, int32_t>;
 
 struct TokenizerArgs {
-  // Type of tokenizer to use. valid values are "fast", "sentencepiece" and
-  // "tiktoken".
+  // Type of tokenizer to use. valid values are "fast", "sentencepiece",
+  // "tiktoken", "rec", "qwen_bpe" ("qwen2_bpe" is kept as alias).
   PROPERTY(std::string, tokenizer_type) = "sentencepiece";
 
   // Vocab file name.
   PROPERTY(std::string, vocab_file) = "tokenizer.model";
+
+  // Merge file name. Used by qwen_bpe tokenizer.
+  PROPERTY(std::string, merges_file);
 
   // Special tokens to add to the vocabulary.
   PROPERTY(std::vector<SpecialToken>, special_tokens);
@@ -66,11 +69,17 @@ struct TokenizerArgs {
 
   // tokenizer_class
   PROPERTY(std::string, tokenizer_class);
+
+  // add_prefix_space, used by byte-level BPE tokenizers such as Qwen2.
+  PROPERTY(bool, add_prefix_space) = false;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const TokenizerArgs& args) {
   os << "TokenizerArgs: [";
   os << "tokenizer_type: " << args.tokenizer_type();
+  if (!args.merges_file().empty()) {
+    os << ", merges_file: " << args.merges_file();
+  }
   //  os << ", chat_template: " << args.chat_template();
   os << ", add_bos_token: " << args.add_bos_token();
   os << ", add_eos_token: " << args.add_eos_token();
@@ -78,6 +87,7 @@ inline std::ostream& operator<<(std::ostream& os, const TokenizerArgs& args) {
   os << ", eos_token: " << args.eos_token();
   os << ", pad_token: " << args.pad_token();
   os << ", tokenizer_class: " << args.tokenizer_class();
+  os << ", add_prefix_space: " << args.add_prefix_space();
   if (!args.special_tokens().empty()) {
     os << ", special_tokens: [";
     for (const auto& [token, id] : args.special_tokens()) {

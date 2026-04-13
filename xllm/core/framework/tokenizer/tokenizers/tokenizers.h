@@ -19,6 +19,10 @@ typedef struct {
 
 TokenizerHandle tokenizers_new_from_path(const char* path);
 
+TokenizerHandle tokenizers_new_qwen2_from_files(const char* vocab_path,
+                                                const char* merges_path,
+                                                int add_prefix_space);
+
 void tokenizers_encode(TokenizerHandle handle,
                        const char* data,
                        size_t len,

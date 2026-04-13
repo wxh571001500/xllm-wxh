@@ -10,6 +10,7 @@ cc_library(
     tokenizer_args.h
     tokenizer.h
     tokenizer_factory.h
+    qwen2_bpe_tokenizer.h
     tiktoken_tokenizer.h
     sentencepiece_tokenizer.h
     fast_tokenizer.h
@@ -17,6 +18,7 @@ cc_library(
     rec_tokenizer.h
   SRCS
     tokenizer_factory.cpp
+    qwen2_bpe_tokenizer.cpp
     tiktoken_tokenizer.cpp
     sentencepiece_tokenizer.cpp
     fast_tokenizer.cpp
@@ -43,3 +45,4 @@ cc_test(
     glog::glog
     GTest::gtest_main
 )
+

@@ -6,6 +6,14 @@ use std::fs;
 use std::ffi::{c_char, CStr};
 use std::io;
 use tokenizers::tokenizer::Tokenizer;
+use tokenizers::models::bpe::BPE;
+use tokenizers::normalizers::unicode::NFC;
+use tokenizers::pre_tokenizers::{
+    byte_level::ByteLevel,
+    sequence::Sequence,
+    split::{Split, SplitPattern},
+};
+use tokenizers::tokenizer::{SplitDelimiterBehavior, TokenizerBuilder};
 
 pub struct TokenizerWrapper {
     tokenizer: Tokenizer,
@@ -73,6 +81,54 @@ impl TokenizerWrapper {
     }
 }
 
+impl TokenizerWrapper {
+    pub fn qwen2_from_files(
+        vocab_path: &str,
+        merges_path: &str,
+        add_prefix_space: bool,
+    ) -> TokenizerWrapper {
+        const PRETOKENIZE_REGEX: &str =
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+        let model = BPE::from_file(vocab_path, merges_path)
+            .continuing_subword_prefix(String::new())
+            .end_of_word_suffix(String::new())
+            .fuse_unk(false)
+            .byte_fallback(false)
+            .build()
+            .unwrap();
+
+        let split = Split::new(
+            SplitPattern::Regex(PRETOKENIZE_REGEX.to_string()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .unwrap();
+        let pre_tokenizer = Sequence::new(vec![
+            split.into(),
+            ByteLevel::new(add_prefix_space, true, false).into(),
+        ]);
+
+        let tokenizer = TokenizerBuilder::new()
+            .with_model(model)
+            .with_normalizer(Some(NFC))
+            .with_pre_tokenizer(Some(pre_tokenizer))
+            .with_post_processor(Some(ByteLevel::default()))
+            .with_decoder(Some(ByteLevel::default()))
+            .build()
+            .unwrap();
+
+        let mut tokenizer: Tokenizer = tokenizer.into();
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).unwrap();
+        TokenizerWrapper {
+            tokenizer,
+            decode_str: String::new(),
+            id_to_token_result: String::new(),
+        }
+    }
+}
+
 #[no_mangle]
 extern "C" fn tokenizers_new_from_str(input_cstr: *const u8, len: usize) -> *mut TokenizerWrapper {
     unsafe {
@@ -97,6 +153,29 @@ extern "C" fn tokenizers_new_from_path(path: *const c_char) -> *mut TokenizerWra
             panic!("Failed to read tokenizer file.");
         }
     }
+}
+
+#[no_mangle]
+extern "C" fn tokenizers_new_qwen2_from_files(
+    vocab_path: *const c_char,
+    merges_path: *const c_char,
+    add_prefix_space: i32,
+) -> *mut TokenizerWrapper {
+    let vocab_path_cstr = unsafe { CStr::from_ptr(vocab_path) };
+    let vocab_path_str = match vocab_path_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => panic!("Failed to convert C vocab path string to Rust string"),
+    };
+    let merges_path_cstr = unsafe { CStr::from_ptr(merges_path) };
+    let merges_path_str = match merges_path_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => panic!("Failed to convert C merges path string to Rust string"),
+    };
+    Box::into_raw(Box::new(TokenizerWrapper::qwen2_from_files(
+        vocab_path_str,
+        merges_path_str,
+        add_prefix_space != 0,
+    )))
 }
 
 #[no_mangle]
@@ -222,3 +301,4 @@ extern "C" fn tokenizers_token_to_id(
         };
     }
 }
+
