@@ -20,6 +20,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "framework/kv_cache_transfer/spec_kv_cache_transfer.h"
 #endif
+#include "runtime/llm_worker_impl.h"
 #include "runtime/speculative_worker_impl.h"
 
 namespace xllm {
@@ -35,7 +36,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
  public:
   MTPWorkerImpl(const ParallelArgs& parallel_args,
                 const torch::Device& device,
-                const runtime::Options& options);
+                const runtime::Options& options,
+                WorkerType worker_type);
 
   ~MTPWorkerImpl() override = default;
 
@@ -49,6 +51,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                 const runtime::Options& options,
                 const runtime::Options& target_options,
                 const runtime::Options& draft_options,
+                WorkerType worker_type,
                 bool enable_opt_validate_probs = false);
 
  public:
@@ -91,6 +94,12 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Default MTP behavior always compresses probs for cache storage.
   virtual void process_draft_sample_output(SampleOutput& sample_output);
 
+  virtual void check_draft_input_embedding(const torch::Tensor& embedding,
+                                           const std::string& phase) const {
+    (void)embedding;
+    (void)phase;
+  }
+
   SampleOutput validate(const SamplingParameters& sampling_params,
                         const torch::Tensor& draft_token_ids,
                         const torch::Tensor& draft_probs,
@@ -104,6 +113,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   void prepare_prefill_inputs(const ForwardInput& inputs,
                               ForwardInput& prefill_inputs);
   bool use_qwen3_5_spec_verify_path() const;
+  bool use_mimo_spec_verify_path() const;
+  // Returns true when validation must use chunked-prefill to avoid the
+  // FlashInfer batch-decode read-before-write race on the bonus token.
+  bool use_chunked_prefill_spec_verify_path() const;
 
   // Prepare target validate input from cached target context.
   void prepare_validate_inputs(const ForwardInput& inputs,

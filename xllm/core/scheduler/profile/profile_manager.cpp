@@ -95,6 +95,15 @@ MlaGraphWarmupShape get_mla_graph_warmup_shape(
                              per_seq_kv_budget};
 }
 
+int64_t graph_warmup_bootstrap_hidden_size(const ModelArgs& model_args) {
+  const int64_t hidden_size = model_args.hidden_size();
+  if (::xllm::SpeculativeConfig::get_instance().speculative_algorithm() ==
+      "Eagle3") {
+    return 3 * hidden_size;
+  }
+  return hidden_size;
+}
+
 }  // namespace
 
 ProfileManager::ProfileManager(Engine* engine, const Options& options)
@@ -754,8 +763,10 @@ std::shared_ptr<Request> ProfileManager::generate_single_decode_request(
   // per-token decode state. Inject a placeholder bootstrap embedding so the
   // synthetic warmup/profile request takes the same bootstrap path as a real
   // disagg PD decode request instead of reading stale recycled decode state.
-  prepare_warmup_decode_sequence(
-      sequence, model_args.hidden_size(), num_speculative_tokens);
+  // Eagle3 uses three concatenated target hidden states for this embedding.
+  prepare_warmup_decode_sequence(sequence,
+                                 graph_warmup_bootstrap_hidden_size(model_args),
+                                 num_speculative_tokens);
 
   CHECK(sequence->stage() == SequenceStage::DECODE)
       << "Decode profiling request is not in DECODE stage. total_length: "
