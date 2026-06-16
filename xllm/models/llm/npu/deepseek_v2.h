@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v2_decoder_layer_impl.h"
 #include "llm_model_base.h"
+#include "models/spec_feature_dump.h"
 
 // DeepSeek v2 compatible with huggingface weights
 // ref to:
@@ -234,6 +235,12 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     const int64_t hidden_size = h.size(-1);
     int64_t capture_idx = 0;
     RollingLayerGuard rolling_guard(rolling_mgr_);
+    spec_feature_dump::FeatureMetadata model_input_metadata;
+    model_input_metadata.model = "target";
+    model_input_metadata.point = "model_input_hidden";
+    model_input_metadata.rank = rank_;
+    model_input_metadata.layer = -1;
+    spec_feature_dump::dump_hidden(model_input_metadata, h, input_params);
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event = nullptr;
       std::atomic<bool>* event_flag = nullptr;
@@ -248,6 +255,24 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
       auto& layer = layers_[i];
       const int32_t layer_index = static_cast<int32_t>(i);
+      const bool dump_layer =
+          spec_feature_dump::should_dump_layer("target", layer_index);
+      if (dump_layer) {
+        spec_feature_dump::FeatureMetadata layer_input_metadata;
+        layer_input_metadata.model = "target";
+        layer_input_metadata.point = "layer_input_hidden";
+        layer_input_metadata.rank = rank_;
+        layer_input_metadata.layer = layer_index;
+        spec_feature_dump::dump_hidden(layer_input_metadata, h, input_params);
+
+        spec_feature_dump::FeatureMetadata kv_input_metadata;
+        kv_input_metadata.model = "target";
+        kv_input_metadata.point = "layer_kv_before";
+        kv_input_metadata.rank = rank_;
+        kv_input_metadata.layer = layer_index;
+        spec_feature_dump::dump_kv(
+            kv_input_metadata, kv_caches[i], input_params);
+      }
       if (capture_aux_hidden_states_ &&
           layers_to_capture_set_.count(layer_index) != 0) {
         aux_output_buffer_.slice(0, 0, num_tokens)
@@ -267,8 +292,31 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
             event,
             event_flag);
       rolling_guard.after_layer(layer_index);
+      if (dump_layer) {
+        spec_feature_dump::FeatureMetadata layer_output_metadata;
+        layer_output_metadata.model = "target";
+        layer_output_metadata.point = "layer_output_hidden";
+        layer_output_metadata.rank = rank_;
+        layer_output_metadata.layer = layer_index;
+        spec_feature_dump::dump_hidden(layer_output_metadata, h, input_params);
+
+        spec_feature_dump::FeatureMetadata kv_metadata;
+        kv_metadata.model = "target";
+        kv_metadata.point = "layer_kv_after";
+        kv_metadata.rank = rank_;
+        kv_metadata.layer = layer_index;
+        spec_feature_dump::dump_kv(
+            kv_metadata, kv_caches[i], input_params);
+      }
     }
     auto hidden_states = norm_(h, 0);
+    spec_feature_dump::FeatureMetadata model_output_metadata;
+    model_output_metadata.model = "target";
+    model_output_metadata.point = "model_output_hidden";
+    model_output_metadata.rank = rank_;
+    model_output_metadata.layer = -1;
+    spec_feature_dump::dump_hidden(
+        model_output_metadata, hidden_states, input_params);
     if (capture_aux_hidden_states_) {
       CHECK_EQ(capture_idx, static_cast<int64_t>(layers_to_capture_set_.size()))
           << "captured Eagle3 layer count mismatch";

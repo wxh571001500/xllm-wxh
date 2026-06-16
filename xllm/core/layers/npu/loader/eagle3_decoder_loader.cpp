@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "eagle3_decoder_loader.h"
 
+#include <glog/logging.h>
+
 #include <set>
 
 #include "eagle3_loader_constants.h"
@@ -46,11 +48,24 @@ Eagle3DecoderLoader::Eagle3DecoderLoader(uint64_t weight_count,
 
 void Eagle3DecoderLoader::load_state_dict(const StateDict& state_dict) {
   const bool to_host = load_to_host();
+  CHECK_GT(dp_local_tp_size_, 0)
+      << "Eagle3 decoder local tp size must be positive";
+  CHECK_GE(dp_local_tp_rank_, 0)
+      << "Eagle3 decoder local tp rank must be non-negative";
+  CHECK_LT(dp_local_tp_rank_, dp_local_tp_size_)
+      << "Eagle3 decoder local tp rank must be smaller than local tp size";
+
   auto& w = working_tensors();
   if (quantize_type_ == "w8a8") {
     for (const auto& [index, name] : WEIGHT_MAPPING_W8A8) {
       if (WEIGHT_SHARD_W8A8.find(index) != WEIGHT_SHARD_W8A8.end()) {
-        set_weight(state_dict, name, index, WEIGHT_SHARD_W8A8[index], to_host);
+        set_weight(state_dict,
+                   name,
+                   index,
+                   WEIGHT_SHARD_W8A8[index],
+                   dp_local_tp_rank_,
+                   dp_local_tp_size_,
+                   to_host);
       } else {
         set_weight(state_dict, name, index, to_host);
       }
@@ -66,7 +81,13 @@ void Eagle3DecoderLoader::load_state_dict(const StateDict& state_dict) {
 
   for (const auto& [index, name] : WEIGHT_MAPPING) {
     if (WEIGHT_SHARD.find(index) != WEIGHT_SHARD.end()) {
-      set_weight(state_dict, name, index, WEIGHT_SHARD[index], to_host);
+      set_weight(state_dict,
+                 name,
+                 index,
+                 WEIGHT_SHARD[index],
+                 dp_local_tp_rank_,
+                 dp_local_tp_size_,
+                 to_host);
     } else {
       set_weight(state_dict, name, index, to_host);
     }
@@ -133,6 +154,21 @@ void Eagle3DecoderLoader::merge_host_at_weights() {
   }
 
   w[IN_MLP_W1_WEIGHT] = zero_like_working(IN_MLP_W1_WEIGHT);
+
+  LOG_FIRST_N(INFO, 8) << "Eagle3 decoder loaded weight shapes"
+                       << ", global_rank=" << parallel_args_.rank()
+                       << ", global_world_size=" << parallel_args_.world_size()
+                       << ", dp_size=" << dp_size_
+                       << ", cp_size=" << cp_size_
+                       << ", local_tp_rank=" << dp_local_tp_rank_
+                       << ", local_tp_size=" << dp_local_tp_size_
+                       << ", qkv_weight=" << w[IN_Q_WEIGHT].sizes()
+                       << ", attn_out_weight="
+                       << w[IN_ATTENTION_OUT_WEIGHT].sizes()
+                       << ", mlp_gate_up_weight="
+                       << w[IN_MLP_W2_WEIGHT].sizes()
+                       << ", mlp_down_weight="
+                       << w[IN_MLP_CPROJ_WEIGHT].sizes();
 }
 
 TransposeType Eagle3DecoderLoader::check_transpose(at::Tensor& tensor) {

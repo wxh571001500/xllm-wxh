@@ -79,6 +79,30 @@ torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
                            .pinned_memory(true));
 }
 
+bool mtp_speculative_algorithm_is_eagle3() {
+  return ::xllm::SpeculativeConfig::get_instance().speculative_algorithm() ==
+         "Eagle3";
+}
+
+bool is_kimi_k25_eagle3_draft(const std::string& target_model_type,
+                              const std::string& draft_model_type) {
+  return mtp_speculative_algorithm_is_eagle3() &&
+         target_model_type == "kimi_k25" &&
+         draft_model_type == "kimi_k25_eagle3";
+}
+
+int64_t local_tp_size_from_parallel_args(const ParallelArgs& parallel_args) {
+  const int64_t world_size = std::max<int64_t>(parallel_args.world_size(), 1);
+  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
+  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
+  const int64_t divisor = dp_size * cp_size;
+  CHECK_EQ(world_size % divisor, 0)
+      << "world_size must be divisible by dp_size * cp_size"
+      << ", world_size=" << world_size << ", dp_size=" << dp_size
+      << ", cp_size=" << cp_size;
+  return std::max<int64_t>(1, world_size / divisor);
+}
+
 bool mtp_decode_kv_debug_enabled() {
   static const bool enabled =
       util::get_bool_env("XLLM_MTP_DECODE_KV_DEBUG", false);
@@ -106,6 +130,12 @@ bool mtp_target_only_on_multi_request_enabled() {
 bool mtp_isolate_multi_request_validate_enabled() {
   static const bool enabled =
       util::get_bool_env("XLLM_MTP_ISOLATE_MULTI_REQUEST_VALIDATE", false);
+  return enabled;
+}
+
+bool mtp_kimi_k25_eagle3_replica_draft_enabled() {
+  static const bool enabled =
+      util::get_bool_env("XLLM_KIMI_K25_EAGLE3_REPLICA_DRAFT", false);
   return enabled;
 }
 
@@ -1638,11 +1668,21 @@ std::unique_ptr<LLMWorkerImpl> MTPWorkerImpl::create_draft_worker(
   const std::string& draft_model_type = model_loader->model_args().model_type();
   const std::string& target_model_type =
       target_impl_->context_.get_model_args().model_type();
+  const bool is_kimi_k25_eagle3 =
+      is_kimi_k25_eagle3_draft(target_model_type, draft_model_type);
   const bool use_replica_draft =
-      ::xllm::SpeculativeConfig::get_instance().speculative_algorithm() ==
-          "Eagle3" &&
-      target_model_type == "kimi_k25" && draft_model_type == "kimi_k25_eagle3";
+      mtp_kimi_k25_eagle3_replica_draft_enabled() && is_kimi_k25_eagle3;
   if (!use_replica_draft) {
+    if (is_kimi_k25_eagle3) {
+      LOG(INFO) << "Creating TP Eagle3 draft worker for kimi_k25"
+                << ", target_model_type=" << target_model_type
+                << ", draft_model_type=" << draft_model_type
+                << ", target_rank=" << parallel_args_.rank()
+                << ", target_world_size=" << parallel_args_.world_size()
+                << ", target_dp_size=" << parallel_args_.dp_size()
+                << ", target_cp_size=" << parallel_args_.cp_size()
+                << ", target_ep_size=" << parallel_args_.ep_size();
+    }
     return std::make_unique<LLMWorkerImpl>(
         parallel_args_, device(), draft_options_);
   }
@@ -1670,11 +1710,9 @@ bool MTPWorkerImpl::should_use_separate_draft_kv_cache_shape() const {
   if (target_impl_ == nullptr || draft_impl_ == nullptr) {
     return false;
   }
-  return ::xllm::SpeculativeConfig::get_instance().speculative_algorithm() ==
-             "Eagle3" &&
-         target_impl_->context_.get_model_args().model_type() == "kimi_k25" &&
-         draft_impl_->context_.get_model_args().model_type() ==
-             "kimi_k25_eagle3";
+  return is_kimi_k25_eagle3_draft(
+      target_impl_->context_.get_model_args().model_type(),
+      draft_impl_->context_.get_model_args().model_type());
 }
 
 KVCacheShape MTPWorkerImpl::get_draft_kv_cache_shape(
@@ -1688,8 +1726,10 @@ KVCacheShape MTPWorkerImpl::get_draft_kv_cache_shape(
   CHECK_GT(num_blocks, 0) << "draft KV cache num_blocks must be positive";
 
   const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
-  const int64_t draft_tp_size = std::max<int64_t>(
-      1, draft_impl_->context_.get_parallel_args().world_size());
+  const ParallelArgs& draft_parallel_args =
+      draft_impl_->context_.get_parallel_args();
+  const int64_t draft_tp_size =
+      local_tp_size_from_parallel_args(draft_parallel_args);
 
   KVCacheCapacity draft_kv_cache_cap;
   draft_kv_cache_cap.n_blocks(num_blocks)
@@ -1719,6 +1759,11 @@ KVCacheShape MTPWorkerImpl::get_draft_kv_cache_shape(
   LOG(INFO) << "Using separate Eagle3 draft KV cache shape for kimi_k25"
             << ", num_blocks=" << num_blocks
             << ", draft_tp_size=" << draft_tp_size
+            << ", replica_draft="
+            << mtp_kimi_k25_eagle3_replica_draft_enabled()
+            << ", draft_world_size=" << draft_parallel_args.world_size()
+            << ", draft_dp_size=" << draft_parallel_args.dp_size()
+            << ", draft_cp_size=" << draft_parallel_args.cp_size()
             << ", local_kv_heads=" << local_kv_heads
             << ", slot_size=" << draft_kv_cache_cap.slot_size()
             << ", index_slot_size=" << draft_kv_cache_cap.index_slot_size()
@@ -1810,8 +1855,8 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   const auto draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
     if (should_use_separate_draft_kv_cache_shape()) {
-      LOG(FATAL) << "kimi_k25 Eagle3 separate draft KV cache shape is not "
-                    "supported with KV cache transfer yet.";
+      draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
+          kv_cache_transfer_, get_draft_kv_cache_shape(kv_cache_shape));
     } else {
       draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
           kv_cache_transfer_, kv_cache_shape);

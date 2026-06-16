@@ -40,6 +40,7 @@ limitations under the License.
 #include "core/layers/npu/npu_rms_norm_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
 #include "models/model_registry.h"
+#include "models/spec_feature_dump.h"
 
 namespace xllm::npu::model {
 
@@ -110,6 +111,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     dp_size_ = parallel_args.dp_size();
     dp_local_tp_size_ = parallel_args.world_size() / dp_size_;
     dp_rank_ = parallel_args.rank() / dp_local_tp_size_;
+    rank_ = parallel_args.rank();
 
     // Word embedding
     embed_tokens_ =
@@ -273,6 +275,32 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
       return ModelOutput();
     }
 
+    spec_feature_dump::FeatureMetadata model_input_metadata;
+    model_input_metadata.model = "draft";
+    model_input_metadata.point = "model_input_hidden";
+    model_input_metadata.rank = rank_;
+    model_input_metadata.layer = -1;
+    spec_feature_dump::dump_hidden(
+        model_input_metadata, hidden_states, input_params);
+
+    const bool dump_layer = spec_feature_dump::should_dump_layer("draft", 0);
+    if (dump_layer) {
+      spec_feature_dump::FeatureMetadata layer_input_metadata;
+      layer_input_metadata.model = "draft";
+      layer_input_metadata.point = "layer_input_hidden";
+      layer_input_metadata.rank = rank_;
+      layer_input_metadata.layer = 0;
+      spec_feature_dump::dump_hidden(
+          layer_input_metadata, hidden_states, input_params);
+
+      spec_feature_dump::FeatureMetadata kv_input_metadata;
+      kv_input_metadata.model = "draft";
+      kv_input_metadata.point = "layer_kv_before";
+      kv_input_metadata.rank = rank_;
+      kv_input_metadata.layer = 0;
+      spec_feature_dump::dump_kv(kv_input_metadata, kv_caches[0], input_params);
+    }
+
     decoder_(hidden_states,
              hidden_states_extra,
              cos_pos,
@@ -282,8 +310,31 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
              input_params_new,
              event,
              event_flag);
+    if (dump_layer) {
+      spec_feature_dump::FeatureMetadata layer_output_metadata;
+      layer_output_metadata.model = "draft";
+      layer_output_metadata.point = "layer_output_hidden";
+      layer_output_metadata.rank = rank_;
+      layer_output_metadata.layer = 0;
+      spec_feature_dump::dump_hidden(
+          layer_output_metadata, hidden_states, input_params);
+
+      spec_feature_dump::FeatureMetadata kv_metadata;
+      kv_metadata.model = "draft";
+      kv_metadata.point = "layer_kv_after";
+      kv_metadata.rank = rank_;
+      kv_metadata.layer = 0;
+      spec_feature_dump::dump_kv(kv_metadata, kv_caches[0], input_params);
+    }
     auto aux_hidden_states = hidden_states.clone();
     hidden_states = norm_(hidden_states, 0);
+    spec_feature_dump::FeatureMetadata model_output_metadata;
+    model_output_metadata.model = "draft";
+    model_output_metadata.point = "model_output_hidden";
+    model_output_metadata.rank = rank_;
+    model_output_metadata.layer = -1;
+    spec_feature_dump::dump_hidden(
+        model_output_metadata, hidden_states, input_params);
 
     // For draft decode, we capture the hidden state before norm as
     // aux_hidden_states This is used for speculative decoding to pass hidden
@@ -336,6 +387,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
   torch::TensorOptions options_;
 
   int32_t dp_rank_ = 0;
+  int32_t rank_ = 0;
   int32_t dp_size_ = 1;
   int32_t dp_local_tp_size_ = 1;
   std::vector<int64_t> mrope_section_;

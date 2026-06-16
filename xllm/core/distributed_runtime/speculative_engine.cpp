@@ -23,10 +23,21 @@ limitations under the License.
 #include <type_traits>
 
 #include "llm_engine.h"
+#include "util/env_var.h"
 #include "util/utils.h"
 #include "vlm_engine.h"
 
 namespace xllm {
+
+namespace {
+
+bool kimi_k25_eagle3_replica_draft_enabled() {
+  static const bool enabled =
+      util::get_bool_env("XLLM_KIMI_K25_EAGLE3_REPLICA_DRAFT", false);
+  return enabled;
+}
+
+}  // namespace
 
 template <typename TargetEngine>
 SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
@@ -170,7 +181,8 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
 
   KVCacheCapacity draft_kv_cache_cap =
       draft_engine_->estimate_kv_cache_capacity();
-  if (should_skip_external_draft_kv_cache()) {
+  if (should_skip_external_draft_kv_cache() &&
+      kimi_k25_eagle3_replica_draft_enabled()) {
     draft_kv_cache_cap =
         get_internal_draft_kv_cache_capacity(draft_kv_cache_cap);
   }
@@ -196,9 +208,12 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
   draft_kv_cache_cap.n_blocks() = n_blocks;
   draft_kv_cache_cap.cache_size_in_bytes() = kv_cache_size;
   if (should_skip_external_draft_kv_cache()) {
-    LOG(INFO) << "Allocating target KV cache only for kimi_k25 Eagle3. "
-              << "The internal MTP draft worker allocates its own draft KV "
-                 "cache with the same block count.";
+    LOG(INFO) << "Allocating target KV cache only for kimi_k25 Eagle3"
+              << ", n_blocks=" << n_blocks
+              << ", target_slot_size=" << target_kv_cache_cap.slot_size()
+              << ", draft_slot_size=" << draft_kv_cache_cap.slot_size()
+              << ". The worker-side Eagle3 draft model allocates its own "
+                 "draft KV cache.";
     return engine_->allocate_kv_cache(target_kv_cache_cap);
   }
   return engine_->allocate_kv_cache(target_kv_cache_cap) &&
