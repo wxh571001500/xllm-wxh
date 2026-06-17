@@ -1039,17 +1039,13 @@ void log_mtp_decode_input_debug(const char* stage,
             << int_vector_debug_string(params.attention.host.new_cache_slots)
             << " input_embedding_shape="
             << tensor_shape_debug_string(params.embedding.input_embedding)
-            << " aux_input_embedding_shape="
-            << tensor_shape_debug_string(params.embedding.aux_input_embedding)
             << " selected_token_idxes="
             << tensor_int_values_debug_string(
                    input.sampling_params.selected_token_idxes)
             << " sample_idxes="
             << tensor_int_values_debug_string(input.sampling_params.sample_idxes)
             << " input_embedding_l2="
-            << tensor_l2_norm(params.embedding.input_embedding)
-            << " aux_input_embedding_l2="
-            << tensor_l2_norm(params.embedding.aux_input_embedding);
+            << tensor_l2_norm(params.embedding.input_embedding);
 }
 
 void log_mtp_decode_kv_slots_debug(const char* stage,
@@ -1134,12 +1130,6 @@ void log_mtp_decode_kv_slots_debug(const char* stage,
         request_idx,
         slots.size(),
         request_count);
-    const torch::Tensor aux_embedding_row = select_embedding_row_tensor(
-        params.embedding.aux_input_embedding,
-        row,
-        request_idx,
-        slots.size(),
-        request_count);
     LOG(INFO) << "[MTP_DECODE_KV_DEBUG]"
               << " stage=" << stage
               << " rank=" << rank
@@ -1161,8 +1151,6 @@ void log_mtp_decode_kv_slots_debug(const char* stage,
               << " block_table_prefix="
               << block_table_prefix_debug_string(cpu_block_tables, row)
               << " input_embedding_row_l2=" << tensor_l2_norm(embedding_row)
-              << " aux_input_embedding_row_l2="
-              << tensor_l2_norm(aux_embedding_row)
               << " top_logits="
               << logits_topk_debug_string(logits, logits_row)
               << " kv_l2="
@@ -1442,7 +1430,6 @@ ForwardInput make_fake_prefill_input_for_empty_shard(
   input_params.attention.rebuild_device_buffer(device);
 
   input_params.embedding.input_embedding = torch::Tensor();
-  input_params.embedding.aux_input_embedding = torch::Tensor();
   input_params.embedding.embedding_ids.clear();
   input_params.embedding.request_ids.clear();
   input_params.embedding.extra_token_ids = {1};
@@ -1542,7 +1529,6 @@ ForwardInput make_fake_decode_input_for_empty_shard(
   } else {
     input_params.embedding.input_embedding = torch::Tensor();
   }
-  input_params.embedding.aux_input_embedding = torch::Tensor();
   input_params.embedding.embedding_ids.clear();
   input_params.embedding.request_ids.clear();
   input_params.embedding.extra_token_ids.clear();

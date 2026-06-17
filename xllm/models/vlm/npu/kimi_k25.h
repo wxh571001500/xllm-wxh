@@ -34,6 +34,7 @@ limitations under the License.
 #include "models/model_registry.h"
 #include "processors/input_processor.h"
 #include "processors/kimi25_image_processor.h"
+#include "util/env_var.h"
 #include "xllm_atb_layers/core/include/atb_speed/log.h"
 
 namespace xllm {
@@ -1070,6 +1071,11 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       torch::Tensor pixel_values,
       torch::Tensor grid_thws,
       const ModelInputParams& input_params) {
+    if (util::get_bool_env("XLLM_KIMI_K25_DISABLE_VISION_GROUPING", false)) {
+      torch::Tensor output = visual_(pixel_values, grid_thws, input_params);
+      return {mm_projector_ ? mm_projector_(output) : output};
+    }
+
     int n = grid_thws.size(0);
     auto n_patches_each_media = grid_thws.prod(-1);
     int max_infer_batch = std::max(n_patches_each_media.max().item<int>(),

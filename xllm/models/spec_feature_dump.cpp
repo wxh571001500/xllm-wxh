@@ -16,25 +16,21 @@ limitations under the License.
 #include "models/spec_feature_dump.h"
 
 #include <glog/logging.h>
-#include <nlohmann/json.hpp>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
-#include <system_error>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -45,22 +41,29 @@ namespace xllm::spec_feature_dump {
 
 namespace {
 
-constexpr int32_t kSchemaVersion = 1;
 constexpr char kDefaultDumpRoot[] =
     "/export/home/weinan5/wangxiaohan/xllm-dump";
-constexpr char kTargetModel[] = "target";
 constexpr char kDraftModel[] = "draft";
+constexpr int32_t kDefaultMaxKvTokens = 2048;
 
 std::atomic<int64_t> g_event_index{0};
-std::mutex g_write_mutex;
 
 struct RequestView {
   std::string request_id;
   int32_t request_index = -1;
-  std::vector<int64_t> token_rows;
   int32_t q_seq_len = 0;
   int32_t kv_seq_len = 0;
-  std::vector<int32_t> slots;
+  std::vector<int64_t> token_rows;
+  std::vector<int32_t> token_slots;
+  std::vector<int32_t> token_ids;
+};
+
+struct EventDump {
+  int64_t event_index = -1;
+  std::filesystem::path dir;
+  std::string hidden_file;
+  std::string k_file;
+  std::string v_file;
 };
 
 const char* getenv_value(const char* name) {
@@ -79,6 +82,19 @@ bool env_bool(const char* name, bool default_value) {
   const std::string text(value);
   return text == "1" || text == "true" || text == "TRUE" || text == "on" ||
          text == "ON" || text == "yes" || text == "YES";
+}
+
+int32_t env_int32(const char* name, int32_t default_value) {
+  const char* value = getenv_value(name);
+  if (value == nullptr) {
+    return default_value;
+  }
+  try {
+    return std::stoi(value);
+  } catch (const std::exception&) {
+    LOG(WARNING) << "Invalid integer env " << name << "=" << value;
+    return default_value;
+  }
 }
 
 std::string env_string(const char* name, const std::string& default_value) {
@@ -108,6 +124,32 @@ std::vector<std::string> split_list(const std::string& text) {
   return values;
 }
 
+const std::unordered_set<std::string>& request_filter() {
+  static const std::unordered_set<std::string> filter = [] {
+    std::unordered_set<std::string> values;
+    const char* configured = getenv_value("XLLM_SPEC_FEATURE_DUMP_REQUEST_IDS");
+    if (configured == nullptr) {
+      configured = getenv_value("XLLM_SPEC_FEATURE_LOG_REQUEST_IDS");
+    }
+    if (configured == nullptr) {
+      return values;
+    }
+    for (const std::string& value : split_list(configured)) {
+      values.insert(value);
+    }
+    return values;
+  }();
+  return filter;
+}
+
+bool should_dump_request(const std::string& request_id) {
+  if (request_id.empty()) {
+    return false;
+  }
+  const std::unordered_set<std::string>& filter = request_filter();
+  return filter.empty() || filter.find(request_id) != filter.end();
+}
+
 std::filesystem::path dump_root_path() {
   return std::filesystem::path(
       env_string("XLLM_SPEC_FEATURE_DUMP_DIR", kDefaultDumpRoot));
@@ -130,220 +172,131 @@ std::optional<std::filesystem::path> available_dump_root() {
   return root;
 }
 
-const std::unordered_set<std::string>& request_filter() {
-  static const std::unordered_set<std::string> filter = [] {
-    std::unordered_set<std::string> values;
-    const char* configured = getenv_value("XLLM_SPEC_FEATURE_DUMP_REQUEST_IDS");
-    if (configured == nullptr) {
-      return values;
-    }
-    for (const std::string& value : split_list(configured)) {
-      values.insert(value);
-    }
-    return values;
-  }();
-  return filter;
-}
-
-bool should_dump_request(const std::string& request_id) {
-  if (request_id.empty()) {
-    return false;
-  }
-  const std::unordered_set<std::string>& filter = request_filter();
-  return filter.empty() || filter.find(request_id) != filter.end();
-}
-
-uint64_t fnv1a64(const std::string& value) {
-  uint64_t hash = 1469598103934665603ull;
-  for (unsigned char ch : value) {
-    hash ^= static_cast<uint64_t>(ch);
-    hash *= 1099511628211ull;
-  }
-  return hash;
-}
-
-std::string hex_u64(uint64_t value) {
-  std::ostringstream oss;
-  oss << std::hex << std::setw(16) << std::setfill('0') << value;
-  return oss.str();
-}
-
 std::string sanitize_path_component(const std::string& value) {
-  std::string safe;
-  safe.reserve(std::min<size_t>(value.size(), 128));
+  std::string result;
+  result.reserve(std::min<size_t>(value.size(), 128));
   for (char ch : value) {
     const bool keep = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
                       (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' ||
                       ch == '.';
-    safe.push_back(keep ? ch : '_');
-    if (safe.size() >= 128) {
+    result.push_back(keep ? ch : '_');
+    if (result.size() >= 128) {
       break;
     }
   }
-  if (safe.empty()) {
+  if (result.empty()) {
     return "empty";
   }
-  return safe;
+  return result;
 }
 
-std::string host_name() {
-  char buffer[256] = {};
-  if (gethostname(buffer, sizeof(buffer) - 1) != 0) {
-    return "unknown";
+std::string json_escape(const std::string& text) {
+  std::ostringstream oss;
+  for (char ch : text) {
+    switch (ch) {
+      case '\\':
+        oss << "\\\\";
+        break;
+      case '"':
+        oss << "\\\"";
+        break;
+      case '\n':
+        oss << "\\n";
+        break;
+      case '\r':
+        oss << "\\r";
+        break;
+      case '\t':
+        oss << "\\t";
+        break;
+      default:
+        oss << ch;
+        break;
+    }
   }
-  return sanitize_path_component(std::string(buffer));
+  return oss.str();
 }
 
-std::filesystem::path request_dir_path(const std::filesystem::path& root,
-                                       const std::string& request_id) {
-  return root / ("request-" + sanitize_path_component(request_id) + "-" +
-                 hex_u64(fnv1a64(request_id)));
+std::string json_string(const std::string& text) {
+  return "\"" + json_escape(text) + "\"";
 }
 
-bool ensure_directory(const std::filesystem::path& path) {
-  std::error_code error_code;
-  std::filesystem::create_directories(path, error_code);
-  if (error_code) {
-    LOG(WARNING) << "Failed to create spec feature dump directory: "
-                 << path.string() << ", error=" << error_code.message();
-    return false;
+template <typename T>
+std::string json_vector(const std::vector<T>& values) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << values[i];
   }
-  return true;
+  oss << "]";
+  return oss.str();
 }
 
-bool write_request_id_file(const std::filesystem::path& request_dir,
-                           const std::string& request_id) {
-  std::ofstream output(request_dir / "request_id.txt");
-  if (!output.good()) {
-    return false;
-  }
-  output << request_id << "\n";
-  return output.good();
-}
-
-bool append_json_line(const std::filesystem::path& path,
-                      const nlohmann::json& record) {
-  std::lock_guard<std::mutex> guard(g_write_mutex);
-  std::ofstream output(path, std::ios::app);
-  if (!output.good()) {
-    LOG(WARNING) << "Failed to open spec feature dump file: "
-                 << path.string();
-    return false;
-  }
-  output << record.dump(-1, ' ', false, nlohmann::json::error_handler_t::ignore)
-         << "\n";
-  if (!output.good()) {
-    LOG(WARNING) << "Failed to write spec feature dump file: "
-                 << path.string();
-    return false;
-  }
-  return true;
-}
-
-int64_t now_unix_us() {
-  const auto now = std::chrono::system_clock::now();
-  return std::chrono::duration_cast<std::chrono::microseconds>(
-             now.time_since_epoch())
-      .count();
-}
-
-nlohmann::json shape_json(const torch::Tensor& tensor) {
-  nlohmann::json shape = nlohmann::json::array();
+std::string shape_json(const torch::Tensor& tensor) {
   if (!tensor.defined()) {
-    return shape;
+    return "[]";
   }
-  for (int32_t dim = 0; dim < tensor.dim(); ++dim) {
-    shape.push_back(tensor.size(dim));
-  }
-  return shape;
-}
-
-std::string scalar_type_string(torch::ScalarType scalar_type) {
   std::ostringstream oss;
-  oss << scalar_type;
+  oss << "[";
+  for (int32_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << tensor.size(i);
+  }
+  oss << "]";
   return oss.str();
-}
-
-std::string device_string(const torch::Device& device) {
-  std::ostringstream oss;
-  oss << device;
-  return oss.str();
-}
-
-nlohmann::json finite_number(double value) {
-  if (!std::isfinite(value)) {
-    return nullptr;
-  }
-  return value;
-}
-
-nlohmann::json int_vector_json(const std::vector<int32_t>& values) {
-  nlohmann::json result = nlohmann::json::array();
-  for (int32_t value : values) {
-    result.push_back(value);
-  }
-  return result;
-}
-
-nlohmann::json int64_vector_json(const std::vector<int64_t>& values) {
-  nlohmann::json result = nlohmann::json::array();
-  for (int64_t value : values) {
-    result.push_back(value);
-  }
-  return result;
 }
 
 std::vector<int32_t> seq_lengths_from_layout(
     const std::vector<int32_t>& values,
-    int64_t row_count) {
-  if (row_count <= 0) {
+    int64_t sequence_count) {
+  if (sequence_count <= 0) {
     return {};
   }
-  if (values.size() == static_cast<size_t>(row_count + 1) &&
+  if (values.size() == static_cast<size_t>(sequence_count + 1) &&
       !values.empty() && values.front() == 0) {
     std::vector<int32_t> lengths;
-    lengths.reserve(static_cast<size_t>(row_count));
-    for (int64_t i = 0; i < row_count; ++i) {
+    lengths.reserve(static_cast<size_t>(sequence_count));
+    for (int64_t i = 0; i < sequence_count; ++i) {
       lengths.emplace_back(values[static_cast<size_t>(i + 1)] -
                            values[static_cast<size_t>(i)]);
     }
     return lengths;
   }
-  if (values.size() == static_cast<size_t>(row_count)) {
+  if (values.size() == static_cast<size_t>(sequence_count)) {
     return values;
   }
   return {};
 }
 
-std::vector<int64_t> equal_partition_rows(int64_t row_count,
-                                          int32_t request_index,
-                                          int64_t request_count) {
-  std::vector<int64_t> rows;
-  if (row_count <= 0 || request_count <= 0 || request_index < 0 ||
-      request_index >= request_count || row_count % request_count != 0) {
-    return rows;
+int32_t seq_len_for_request(const std::vector<int32_t>& values,
+                            int32_t request_index,
+                            int64_t sequence_count) {
+  const std::vector<int32_t> lengths =
+      seq_lengths_from_layout(values, sequence_count);
+  if (request_index < 0 ||
+      request_index >= static_cast<int32_t>(lengths.size())) {
+    return 0;
   }
-  const int64_t rows_per_request = row_count / request_count;
-  const int64_t start =
-      static_cast<int64_t>(request_index) * rows_per_request;
-  rows.reserve(static_cast<size_t>(rows_per_request));
-  for (int64_t i = 0; i < rows_per_request; ++i) {
-    rows.emplace_back(start + i);
-  }
-  return rows;
+  return lengths[static_cast<size_t>(request_index)];
 }
 
-std::vector<int64_t> token_rows_for_request_index(
+std::vector<int64_t> token_rows_for_request(
     const ModelInputParams& input_params,
     int32_t request_index,
     int64_t token_row_count,
     int64_t request_count) {
-  if (request_count <= 0 || request_index < 0 ||
-      request_index >= request_count || token_row_count <= 0) {
-    return {};
+  std::vector<int64_t> rows;
+  if (request_index < 0 || request_index >= request_count ||
+      token_row_count <= 0) {
+    return rows;
   }
 
-  std::vector<int32_t> q_lengths = seq_lengths_from_layout(
+  const std::vector<int32_t> q_lengths = seq_lengths_from_layout(
       input_params.attention.host.q_seq_lens, request_count);
   if (!q_lengths.empty()) {
     int64_t total_tokens = 0;
@@ -356,7 +309,6 @@ std::vector<int64_t> token_rows_for_request_index(
         start += q_lengths[static_cast<size_t>(i)];
       }
       const int32_t length = q_lengths[static_cast<size_t>(request_index)];
-      std::vector<int64_t> rows;
       rows.reserve(static_cast<size_t>(std::max(length, 0)));
       for (int32_t i = 0; i < length; ++i) {
         rows.emplace_back(start + i);
@@ -365,281 +317,189 @@ std::vector<int64_t> token_rows_for_request_index(
     }
   }
 
-  std::vector<int64_t> rows =
-      equal_partition_rows(token_row_count, request_index, request_count);
-  if (!rows.empty()) {
+  if (request_count > 0 && token_row_count % request_count == 0) {
+    const int64_t rows_per_request = token_row_count / request_count;
+    const int64_t start =
+        static_cast<int64_t>(request_index) * rows_per_request;
+    rows.reserve(static_cast<size_t>(rows_per_request));
+    for (int64_t i = 0; i < rows_per_request; ++i) {
+      rows.emplace_back(start + i);
+    }
     return rows;
   }
+
   if (request_index < token_row_count) {
-    return {request_index};
+    rows.emplace_back(request_index);
   }
-  return {};
+  return rows;
 }
 
-int32_t seq_len_for_request(const std::vector<int32_t>& values,
-                            int32_t request_index,
-                            int64_t request_count) {
-  std::vector<int32_t> lengths =
-      seq_lengths_from_layout(values, request_count);
-  if (request_index >= 0 &&
-      request_index < static_cast<int32_t>(lengths.size())) {
-    return lengths[static_cast<size_t>(request_index)];
-  }
-  return 0;
-}
-
-torch::Tensor to_cpu_tensor(const torch::Tensor& tensor,
-                            torch::ScalarType dtype) {
-  if (!tensor.defined()) {
-    return torch::Tensor();
+std::vector<int32_t> token_ids_for_request(const torch::Tensor& token_ids,
+                                           const std::vector<int64_t>& rows) {
+  std::vector<int32_t> result;
+  if (!token_ids.defined() || rows.empty() || token_ids.dim() < 1) {
+    return result;
   }
   try {
-    return safe_to(tensor,
-                   torch::TensorOptions().dtype(dtype).device(torch::kCPU),
-                   /*non_blocking=*/false)
-        .contiguous();
-  } catch (const std::exception& exception) {
-    LOG(WARNING) << "Failed to copy tensor for spec feature dump: "
-                 << exception.what();
-    return torch::Tensor();
-  }
-}
-
-std::vector<double> row_l2_values(const torch::Tensor& tensor) {
-  std::vector<double> values;
-  if (!tensor.defined() || tensor.dim() != 2) {
-    return values;
-  }
-  torch::Tensor cpu_tensor = to_cpu_tensor(tensor, torch::kFloat);
-  if (!cpu_tensor.defined()) {
-    return values;
-  }
-
-  const int64_t rows = cpu_tensor.size(0);
-  const int64_t cols = cpu_tensor.size(1);
-  const float* data = cpu_tensor.data_ptr<float>();
-  values.reserve(static_cast<size_t>(rows));
-  for (int64_t row = 0; row < rows; ++row) {
-    double square_sum = 0.0;
-    const int64_t row_offset = row * cols;
-    for (int64_t col = 0; col < cols; ++col) {
-      const double value = static_cast<double>(data[row_offset + col]);
-      square_sum += value * value;
+    torch::Tensor cpu_tensor =
+        token_ids.to(torch::TensorOptions().dtype(torch::kInt64).device(
+            torch::kCPU));
+    cpu_tensor = cpu_tensor.contiguous().view(-1);
+    const int64_t* data = cpu_tensor.data_ptr<int64_t>();
+    const int64_t size = cpu_tensor.size(0);
+    result.reserve(rows.size());
+    for (int64_t row : rows) {
+      if (row < 0 || row >= size) {
+        result.emplace_back(-1);
+        continue;
+      }
+      result.emplace_back(static_cast<int32_t>(data[row]));
     }
-    values.emplace_back(std::sqrt(square_sum));
-  }
-  return values;
-}
-
-torch::Tensor hidden_rows_2d(const torch::Tensor& hidden_states,
-                             const std::vector<int64_t>& rows) {
-  if (!hidden_states.defined() || hidden_states.dim() == 0 || rows.empty()) {
-    return torch::Tensor();
-  }
-  if (hidden_states.size(0) <= 0) {
-    return torch::Tensor();
-  }
-
-  std::vector<int64_t> valid_rows;
-  valid_rows.reserve(rows.size());
-  for (int64_t row : rows) {
-    if (row >= 0 && row < hidden_states.size(0)) {
-      valid_rows.emplace_back(row);
-    }
-  }
-  if (valid_rows.empty()) {
-    return torch::Tensor();
-  }
-
-  try {
-    torch::Tensor index = torch::tensor(
-        valid_rows,
-        torch::TensorOptions().dtype(torch::kLong).device(
-            hidden_states.device()));
-    torch::Tensor selected =
-        hidden_states.index_select(/*dim=*/0, index).contiguous();
-    return selected.reshape({selected.size(0), -1});
   } catch (const std::exception& exception) {
-    LOG(WARNING) << "Failed to select hidden rows for spec feature dump: "
+    LOG(WARNING) << "Failed to copy token ids for spec feature dump: "
                  << exception.what();
-    return torch::Tensor();
-  }
-}
-
-nlohmann::json double_vector_json(const std::vector<double>& values) {
-  nlohmann::json result = nlohmann::json::array();
-  for (double value : values) {
-    result.push_back(finite_number(value));
   }
   return result;
 }
 
-nlohmann::json optional_double_vector_json(
-    const std::vector<std::optional<double>>& values) {
-  nlohmann::json result = nlohmann::json::array();
-  for (const std::optional<double>& value : values) {
-    if (value.has_value()) {
-      result.push_back(finite_number(value.value()));
-    } else {
-      result.push_back(nullptr);
-    }
+std::string stage_name(const ModelInputParams& input_params) {
+  const BatchForwardType& batch_type = input_params.meta.batch_forward_type;
+  if (batch_type.is_decode()) {
+    return "decode";
   }
-  return result;
+  if (batch_type.no_decode()) {
+    return "prefill";
+  }
+  if (batch_type.is_mixed()) {
+    return "mixed";
+  }
+  return "empty";
 }
 
-torch::Tensor flatten_kv_cache_slots(const torch::Tensor& cache,
-                                     int32_t block_size) {
-  if (!cache.defined() || block_size <= 0 || cache.dim() < 2 ||
-      cache.size(0) <= 0) {
-    return torch::Tensor();
-  }
-  if (cache.size(1) == block_size) {
-    return cache.reshape({cache.size(0) * block_size, -1});
-  }
-  if (cache.dim() >= 3 && cache.size(2) == block_size) {
-    return cache.transpose(1, 2)
-        .contiguous()
-        .reshape({cache.size(0) * block_size, -1});
-  }
-  return torch::Tensor();
+int32_t max_kv_tokens_per_request() {
+  return env_int32("XLLM_SPEC_FEATURE_DUMP_MAX_KV_TOKENS",
+                   kDefaultMaxKvTokens);
 }
 
-std::vector<std::optional<double>> slot_l2_values(
-    const torch::Tensor& cache,
-    const std::vector<int32_t>& slots,
-    int32_t block_size) {
-  std::vector<std::optional<double>> values(slots.size());
-  torch::Tensor flat_cache = flatten_kv_cache_slots(cache, block_size);
-  if (!flat_cache.defined()) {
+bool dump_hidden_tensors() {
+  return env_bool("XLLM_SPEC_FEATURE_DUMP_HIDDEN_TENSORS", true);
+}
+
+bool dump_kv_tensors() {
+  return env_bool("XLLM_SPEC_FEATURE_DUMP_KV_TENSORS", true);
+}
+
+std::vector<std::vector<int32_t>> block_tables_to_vectors(
+    const torch::Tensor& block_tables) {
+  std::vector<std::vector<int32_t>> values;
+  if (!block_tables.defined() || block_tables.dim() != 2) {
     return values;
   }
-
-  std::vector<int64_t> valid_slots;
-  std::vector<size_t> valid_positions;
-  valid_slots.reserve(slots.size());
-  valid_positions.reserve(slots.size());
-  for (size_t i = 0; i < slots.size(); ++i) {
-    const int32_t slot = slots[i];
-    if (slot >= 0 && static_cast<int64_t>(slot) < flat_cache.size(0)) {
-      valid_slots.emplace_back(slot);
-      valid_positions.emplace_back(i);
-    }
-  }
-  if (valid_slots.empty()) {
-    return values;
-  }
-
   try {
-    torch::Tensor index =
-        torch::tensor(valid_slots,
-                      torch::TensorOptions().dtype(torch::kLong).device(
-                          flat_cache.device()));
-    torch::Tensor selected =
-        flat_cache.index_select(/*dim=*/0, index).contiguous();
-    const std::vector<double> selected_values =
-        row_l2_values(selected.reshape({selected.size(0), -1}));
-    for (size_t i = 0; i < selected_values.size(); ++i) {
-      values[valid_positions[i]] = selected_values[i];
+    torch::Tensor cpu_tensor =
+        block_tables.to(torch::TensorOptions().dtype(torch::kInt).device(
+            torch::kCPU));
+    cpu_tensor = cpu_tensor.contiguous();
+    const int64_t rows = cpu_tensor.size(0);
+    const int64_t cols = cpu_tensor.size(1);
+    const int32_t* data = cpu_tensor.data_ptr<int32_t>();
+    values.resize(static_cast<size_t>(rows));
+    for (int64_t row = 0; row < rows; ++row) {
+      std::vector<int32_t>& current = values[static_cast<size_t>(row)];
+      current.reserve(static_cast<size_t>(cols));
+      for (int64_t col = 0; col < cols; ++col) {
+        current.emplace_back(data[row * cols + col]);
+      }
     }
   } catch (const std::exception& exception) {
-    LOG(WARNING) << "Failed to compute KV slot L2 for spec feature dump: "
+    LOG(WARNING) << "Failed to copy block table for spec feature dump: "
                  << exception.what();
   }
   return values;
 }
 
-int32_t infer_block_size_from_cache(const torch::Tensor& cache) {
-  if (!cache.defined() || cache.dim() < 2) {
-    return 0;
+std::string block_tables_json(
+    const std::vector<std::vector<int32_t>>& block_tables) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < block_tables.size(); ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << json_vector(block_tables[i]);
   }
-  if (cache.dim() >= 4) {
-    return static_cast<int32_t>(cache.size(1));
-  }
-  return static_cast<int32_t>(cache.size(1));
+  oss << "]";
+  return oss.str();
 }
 
-torch::Tensor block_tables_cpu(const ModelInputParams& input_params) {
-  const torch::Tensor& block_tables = input_params.attention.host.block_tables;
-  if (!block_tables.defined()) {
-    return torch::Tensor();
-  }
-  return to_cpu_tensor(block_tables, torch::kLong);
-}
-
-int64_t block_table_row_for_request(const torch::Tensor& block_tables,
-                                    int32_t request_index,
-                                    int64_t request_count,
-                                    const std::vector<int64_t>& token_rows,
-                                    int64_t token_row_count) {
-  if (!block_tables.defined() || block_tables.dim() != 2 ||
-      request_index < 0) {
+int64_t block_table_row_for_request(
+    const std::vector<std::vector<int32_t>>& block_tables,
+    int32_t request_index,
+    int64_t request_count,
+    const std::vector<int64_t>& token_rows,
+    int64_t token_row_count) {
+  if (request_index < 0 || block_tables.empty()) {
     return -1;
   }
-  const int64_t row_count = block_tables.size(0);
-  if (row_count == request_count && request_index < row_count) {
+  const int64_t table_rows = static_cast<int64_t>(block_tables.size());
+  if (table_rows == request_count && request_index < table_rows) {
     return request_index;
   }
-  if (row_count == token_row_count && !token_rows.empty()) {
+  if (table_rows == token_row_count && !token_rows.empty()) {
     const int64_t row = token_rows.front();
-    if (row >= 0 && row < row_count) {
+    if (row >= 0 && row < table_rows) {
       return row;
     }
   }
-  if (request_count > 0 && row_count % request_count == 0) {
-    const int64_t rows_per_request = row_count / request_count;
-    return static_cast<int64_t>(request_index) * rows_per_request;
+  if (request_count > 0 && table_rows % request_count == 0) {
+    return static_cast<int64_t>(request_index) * (table_rows / request_count);
   }
-  if (request_index < row_count) {
+  if (request_index < table_rows) {
     return request_index;
   }
   return -1;
 }
 
-std::vector<int32_t> slots_from_block_table(const ModelInputParams& input_params,
-                                            const RequestView& view,
-                                            int64_t token_row_count,
-                                            int32_t block_size) {
-  if (block_size <= 0 || view.kv_seq_len <= 0) {
-    return {};
-  }
-
-  torch::Tensor block_tables = block_tables_cpu(input_params);
-  if (!block_tables.defined() || block_tables.dim() != 2) {
-    return {};
-  }
-
-  const int64_t request_count =
-      static_cast<int64_t>(input_params.embedding.request_ids.size());
-  const int64_t block_table_row = block_table_row_for_request(block_tables,
-                                                              view.request_index,
-                                                              request_count,
-                                                              view.token_rows,
-                                                              token_row_count);
-  if (block_table_row < 0 || block_table_row >= block_tables.size(0)) {
-    return {};
-  }
-
-  const int64_t table_width = block_tables.size(1);
-  const int64_t* block_data = block_tables.data_ptr<int64_t>();
+std::vector<int32_t> token_slots_for_request(
+    const std::vector<std::vector<int32_t>>& block_tables,
+    const RequestView& view,
+    int64_t request_count,
+    int64_t token_row_count,
+    int32_t block_size) {
   std::vector<int32_t> slots;
-  slots.reserve(static_cast<size_t>(view.kv_seq_len));
-  for (int32_t token_index = 0; token_index < view.kv_seq_len; ++token_index) {
+  if (block_size <= 0 || view.kv_seq_len <= 0 || block_tables.empty()) {
+    return slots;
+  }
+
+  const int64_t block_table_row =
+      block_table_row_for_request(block_tables,
+                                  view.request_index,
+                                  request_count,
+                                  view.token_rows,
+                                  token_row_count);
+  if (block_table_row < 0 ||
+      block_table_row >= static_cast<int64_t>(block_tables.size())) {
+    return slots;
+  }
+
+  const std::vector<int32_t>& table =
+      block_tables[static_cast<size_t>(block_table_row)];
+  const int32_t max_tokens = max_kv_tokens_per_request();
+  const int32_t token_count =
+      max_tokens >= 0 ? std::min(view.kv_seq_len, max_tokens)
+                      : view.kv_seq_len;
+  slots.reserve(static_cast<size_t>(std::max(token_count, 0)));
+  for (int32_t token_index = 0; token_index < token_count; ++token_index) {
     const int64_t block_col = token_index / block_size;
-    if (block_col < 0 || block_col >= table_width) {
+    if (block_col < 0 || block_col >= static_cast<int64_t>(table.size())) {
       slots.emplace_back(-1);
       continue;
     }
-    const int64_t physical_block =
-        block_data[block_table_row * table_width + block_col];
-    if (physical_block < 0 ||
-        physical_block >
-            static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
-      slots.emplace_back(-1);
-      continue;
-    }
+    const int64_t physical_block = table[static_cast<size_t>(block_col)];
     const int64_t slot =
         physical_block * block_size + token_index % block_size;
-    if (slot > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+    if (slot < 0 ||
+        slot > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
       slots.emplace_back(-1);
       continue;
     }
@@ -650,7 +510,9 @@ std::vector<int32_t> slots_from_block_table(const ModelInputParams& input_params
 
 std::vector<RequestView> build_request_views(
     const ModelInputParams& input_params,
-    int64_t token_row_count) {
+    int64_t token_row_count,
+    int32_t block_size,
+    const std::vector<std::vector<int32_t>>& block_tables) {
   std::vector<RequestView> views;
   const std::vector<std::string>& request_ids =
       input_params.embedding.request_ids;
@@ -671,99 +533,269 @@ std::vector<RequestView> build_request_views(
     RequestView view;
     view.request_id = request_id;
     view.request_index = request_index;
-    view.token_rows = token_rows_for_request_index(
-        input_params, request_index, token_row_count, request_count);
     view.q_seq_len = seq_len_for_request(
         input_params.attention.host.q_seq_lens, request_index, request_count);
     view.kv_seq_len = seq_len_for_request(
         input_params.attention.host.kv_seq_lens, request_index, request_count);
+    view.token_rows = token_rows_for_request(
+        input_params, request_index, token_row_count, request_count);
+    view.token_slots = token_slots_for_request(
+        block_tables, view, request_count, token_row_count, block_size);
     views.emplace_back(std::move(view));
   }
   return views;
 }
 
-std::string stage_name(const ModelInputParams& input_params) {
-  const BatchForwardType& batch_type = input_params.meta.batch_forward_type;
-  if (batch_type.is_decode()) {
-    return "decode";
+int32_t infer_block_size_from_cache(const torch::Tensor& cache) {
+  if (!cache.defined() || cache.dim() < 2) {
+    return 0;
   }
-  if (batch_type.no_decode()) {
-    return "prefill";
-  }
-  if (batch_type.is_mixed()) {
-    return "mixed";
-  }
-  return "empty";
+  return static_cast<int32_t>(cache.size(1));
 }
 
-nlohmann::json base_record(const FeatureMetadata& metadata,
-                           const ModelInputParams& input_params,
-                           const std::string& request_id,
-                           int32_t request_index) {
-  const int64_t event_index =
-      g_event_index.fetch_add(1, std::memory_order_relaxed);
-  nlohmann::json record;
-  record["schema_version"] = kSchemaVersion;
-  record["event_index"] = event_index;
-  record["event_time_unix_us"] = now_unix_us();
-  record["pid"] = static_cast<int64_t>(getpid());
-  record["host"] = host_name();
-  record["rank"] = metadata.rank;
-  record["model"] = metadata.model;
-  record["stage"] = stage_name(input_params);
-  record["point"] = metadata.point;
-  record["layer"] = metadata.layer;
-  record["request_id"] = request_id;
-  record["request_index"] = request_index;
-  record["batch_id"] = input_params.meta.batch_id;
-  record["batch_forward_type"] =
-      input_params.meta.batch_forward_type.to_string();
-  record["num_sequences"] = input_params.meta.num_sequences;
-  record["q_max_seq_len"] = input_params.meta.q_max_seq_len;
-  record["kv_max_seq_len"] = input_params.meta.kv_max_seq_len;
-  record["empty_dp_request"] = false;
-  return record;
-}
-
-nlohmann::json empty_dp_record(const FeatureMetadata& metadata,
-                               const ModelInputParams& input_params,
-                               const torch::Tensor& tensor) {
-  nlohmann::json record =
-      base_record(metadata, input_params, "__dp_empty__", -1);
-  record["empty_dp_request"] = true;
-  record["tensor_defined"] = tensor.defined();
-  record["tensor_shape"] = shape_json(tensor);
-  if (tensor.defined()) {
-    record["tensor_dtype"] = scalar_type_string(tensor.scalar_type());
-    record["tensor_device"] = device_string(tensor.device());
+std::vector<int32_t> selected_slots_from_views(
+    const std::vector<RequestView>& views) {
+  std::vector<int32_t> slots;
+  for (const RequestView& view : views) {
+    for (int32_t slot : view.token_slots) {
+      if (slot >= 0) {
+        slots.emplace_back(slot);
+      }
+    }
   }
-  return record;
+  std::sort(slots.begin(), slots.end());
+  slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+  return slots;
 }
 
-std::filesystem::path feature_file_path(const std::filesystem::path& request_dir,
-                                        int64_t rank) {
-  std::ostringstream file_name;
-  file_name << "features_rank" << rank << "_host" << host_name() << "_pid"
-            << static_cast<int64_t>(getpid()) << ".jsonl";
-  return request_dir / file_name.str();
+std::vector<int32_t> selected_blocks_from_slots(
+    const std::vector<int32_t>& slots,
+    int32_t block_size) {
+  std::vector<int32_t> blocks;
+  if (block_size <= 0) {
+    return blocks;
+  }
+  blocks.reserve(slots.size());
+  for (int32_t slot : slots) {
+    if (slot >= 0) {
+      blocks.emplace_back(slot / block_size);
+    }
+  }
+  std::sort(blocks.begin(), blocks.end());
+  blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+  return blocks;
 }
 
-void write_feature_record(const std::filesystem::path& root,
-                          const std::string& request_id,
-                          int64_t rank,
-                          const nlohmann::json& record) {
-  const std::filesystem::path request_dir = request_dir_path(root, request_id);
-  if (!ensure_directory(request_dir)) {
+bool save_tensor_cpu(const torch::Tensor& tensor,
+                     const std::filesystem::path& path,
+                     const std::string& label) {
+  if (!tensor.defined()) {
+    return false;
+  }
+  try {
+    torch::Tensor cpu_tensor = tensor.to(torch::kCPU).contiguous();
+    save_tensor_as_pickle(cpu_tensor, path.string());
+    return true;
+  } catch (const std::exception& exception) {
+    LOG(WARNING) << "Failed to save " << label
+                 << " for spec feature dump to " << path.string()
+                 << ": " << exception.what();
+    return false;
+  }
+}
+
+bool save_selected_kv_blocks(const torch::Tensor& cache,
+                             const std::vector<int32_t>& selected_blocks,
+                             const std::filesystem::path& path,
+                             const std::string& label) {
+  if (!cache.defined() || selected_blocks.empty() || cache.dim() < 1) {
+    return false;
+  }
+  try {
+    std::vector<torch::Tensor> cpu_blocks;
+    cpu_blocks.reserve(selected_blocks.size());
+    for (int32_t block : selected_blocks) {
+      if (block < 0 || static_cast<int64_t>(block) >= cache.size(0)) {
+        continue;
+      }
+      torch::Tensor block_tensor =
+          cache.narrow(/*dim=*/0, static_cast<int64_t>(block), /*length=*/1);
+      cpu_blocks.emplace_back(block_tensor.to(torch::kCPU).contiguous());
+    }
+    if (cpu_blocks.empty()) {
+      return false;
+    }
+    torch::Tensor selected = torch::cat(cpu_blocks, /*dim=*/0);
+    save_tensor_as_pickle(selected, path.string());
+    return true;
+  } catch (const std::exception& exception) {
+    LOG(WARNING) << "Failed to save selected " << label
+                 << " blocks for spec feature dump: " << exception.what();
+    return false;
+  }
+}
+
+EventDump create_event_dir(const std::filesystem::path& root,
+                           const FeatureMetadata& metadata,
+                           const ModelInputParams& input_params) {
+  EventDump event;
+  event.event_index = g_event_index.fetch_add(1, std::memory_order_relaxed);
+  std::ostringstream name;
+  name << "event-" << std::setw(10) << std::setfill('0') << event.event_index
+       << "_rank" << metadata.rank << "_pid" << static_cast<int64_t>(getpid())
+       << "_" << sanitize_path_component(metadata.model)
+       << "_" << sanitize_path_component(stage_name(input_params))
+       << "_" << sanitize_path_component(metadata.point)
+       << "_layer" << metadata.layer;
+  event.dir = root / name.str();
+  std::error_code error_code;
+  std::filesystem::create_directories(event.dir, error_code);
+  if (error_code) {
+    LOG(WARNING) << "Failed to create spec feature dump event dir: "
+                 << event.dir.string() << ", error=" << error_code.message();
+    event.dir.clear();
+  }
+  return event;
+}
+
+void write_common_json(std::ostream& output,
+                       const EventDump& event,
+                       const FeatureMetadata& metadata,
+                       const ModelInputParams& input_params,
+                        const std::vector<RequestView>& views,
+                       const std::vector<std::vector<int32_t>>& block_tables,
+                       int32_t block_size,
+                       const std::vector<int32_t>& selected_slots,
+                       const std::vector<int32_t>& selected_blocks,
+                       const std::string& tensor_kind) {
+  output << "{\n";
+  output << "  \"schema_version\": 2,\n";
+  output << "  \"event_index\": " << event.event_index << ",\n";
+  output << "  \"pid\": " << static_cast<int64_t>(getpid()) << ",\n";
+  output << "  \"rank\": " << metadata.rank << ",\n";
+  output << "  \"model\": " << json_string(metadata.model) << ",\n";
+  output << "  \"stage\": " << json_string(stage_name(input_params)) << ",\n";
+  output << "  \"point\": " << json_string(metadata.point) << ",\n";
+  output << "  \"layer\": " << metadata.layer << ",\n";
+  output << "  \"batch_id\": " << input_params.meta.batch_id << ",\n";
+  output << "  \"batch_forward_type\": "
+         << json_string(input_params.meta.batch_forward_type.to_string())
+         << ",\n";
+  output << "  \"num_sequences\": " << input_params.meta.num_sequences
+         << ",\n";
+  output << "  \"q_seq_lens\": "
+         << json_vector(input_params.attention.host.q_seq_lens) << ",\n";
+  output << "  \"kv_seq_lens\": "
+         << json_vector(input_params.attention.host.kv_seq_lens) << ",\n";
+  output << "  \"tensor_kind\": " << json_string(tensor_kind) << ",\n";
+  output << "  \"block_size\": " << block_size << ",\n";
+  output << "  \"block_tables\": " << block_tables_json(block_tables)
+         << ",\n";
+  output << "  \"selected_slots\": " << json_vector(selected_slots) << ",\n";
+  output << "  \"selected_blocks\": " << json_vector(selected_blocks)
+         << ",\n";
+  output << "  \"hidden_file\": " << json_string(event.hidden_file) << ",\n";
+  output << "  \"k_file\": " << json_string(event.k_file) << ",\n";
+  output << "  \"v_file\": " << json_string(event.v_file) << ",\n";
+  output << "  \"requests\": [\n";
+  for (size_t i = 0; i < views.size(); ++i) {
+    const RequestView& view = views[i];
+    output << "    {\n";
+    output << "      \"request_id\": " << json_string(view.request_id)
+           << ",\n";
+    output << "      \"request_index\": " << view.request_index << ",\n";
+    output << "      \"q_seq_len\": " << view.q_seq_len << ",\n";
+    output << "      \"kv_seq_len\": " << view.kv_seq_len << ",\n";
+    output << "      \"token_rows\": " << json_vector(view.token_rows)
+           << ",\n";
+    output << "      \"token_slots\": " << json_vector(view.token_slots)
+           << ",\n";
+    output << "      \"token_ids\": " << json_vector(view.token_ids)
+           << "\n";
+    output << "    }";
+    if (i + 1 < views.size()) {
+      output << ",";
+    }
+    output << "\n";
+  }
+  output << "  ]\n";
+  output << "}\n";
+}
+
+void write_meta_json(const EventDump& event,
+                     const FeatureMetadata& metadata,
+                     const ModelInputParams& input_params,
+                     const std::vector<RequestView>& views,
+                     const std::vector<std::vector<int32_t>>& block_tables,
+                     int32_t block_size,
+                     const std::vector<int32_t>& selected_slots,
+                     const std::vector<int32_t>& selected_blocks,
+                     const std::string& tensor_kind) {
+  if (event.dir.empty()) {
     return;
   }
-  write_request_id_file(request_dir, request_id);
-  append_json_line(feature_file_path(request_dir, rank), record);
+  const std::filesystem::path path = event.dir / "meta.json";
+  std::ofstream output(path);
+  if (!output.good()) {
+    LOG(WARNING) << "Failed to open spec feature dump meta file: "
+                 << path.string();
+    return;
+  }
+  write_common_json(output,
+                    event,
+                    metadata,
+                    input_params,
+                    views,
+                    block_tables,
+                    block_size,
+                    selected_slots,
+                    selected_blocks,
+                    tensor_kind);
+}
+
+void dump_empty_dp_event(const FeatureMetadata& metadata,
+                         const ModelInputParams& input_params,
+                         const torch::Tensor& tensor) {
+  if (!input_params.embedding.request_ids.empty()) {
+    return;
+  }
+  const std::optional<std::filesystem::path> root = available_dump_root();
+  if (!root.has_value()) {
+    return;
+  }
+  EventDump event = create_event_dir(root.value(), metadata, input_params);
+  if (event.dir.empty()) {
+    return;
+  }
+  std::ofstream output(event.dir / "meta.json");
+  output << "{\n";
+  output << "  \"schema_version\": 2,\n";
+  output << "  \"event_index\": " << event.event_index << ",\n";
+  output << "  \"pid\": " << static_cast<int64_t>(getpid()) << ",\n";
+  output << "  \"rank\": " << metadata.rank << ",\n";
+  output << "  \"model\": " << json_string(metadata.model) << ",\n";
+  output << "  \"stage\": " << json_string(stage_name(input_params)) << ",\n";
+  output << "  \"point\": " << json_string(metadata.point) << ",\n";
+  output << "  \"layer\": " << metadata.layer << ",\n";
+  output << "  \"empty_dp_request\": true,\n";
+  output << "  \"tensor_shape\": " << shape_json(tensor) << "\n";
+  output << "}\n";
+  LOG(INFO) << "SpecFeatureDump event_index=" << event.event_index
+            << " request_id=__dp_empty__"
+            << " rank=" << metadata.rank
+            << " model=" << metadata.model
+            << " stage=" << stage_name(input_params)
+            << " point=" << metadata.point
+            << " layer=" << metadata.layer
+            << " dir=" << event.dir.string();
 }
 
 const std::set<int32_t>& selected_layers_for_model(const std::string& model) {
   static const std::set<int32_t> target_layers = [] {
     const std::string configured =
-        env_string("XLLM_SPEC_FEATURE_DUMP_TARGET_LAYERS", "0,30,60");
+        env_string("XLLM_SPEC_FEATURE_DUMP_TARGET_LAYERS",
+                   env_string("XLLM_SPEC_FEATURE_LOG_TARGET_LAYERS",
+                              "0,30,60"));
     std::set<int32_t> layers;
     if (configured == "all" || configured == "ALL") {
       layers.insert(-1);
@@ -773,7 +805,7 @@ const std::set<int32_t>& selected_layers_for_model(const std::string& model) {
       try {
         layers.insert(std::stoi(item));
       } catch (const std::exception&) {
-        LOG(WARNING) << "Invalid XLLM_SPEC_FEATURE_DUMP_TARGET_LAYERS item: "
+        LOG(WARNING) << "Invalid target layer item for spec feature dump: "
                      << item;
       }
     }
@@ -782,7 +814,8 @@ const std::set<int32_t>& selected_layers_for_model(const std::string& model) {
 
   static const std::set<int32_t> draft_layers = [] {
     const std::string configured =
-        env_string("XLLM_SPEC_FEATURE_DUMP_DRAFT_LAYERS", "0");
+        env_string("XLLM_SPEC_FEATURE_DUMP_DRAFT_LAYERS",
+                   env_string("XLLM_SPEC_FEATURE_LOG_DRAFT_LAYERS", "0"));
     std::set<int32_t> layers;
     if (configured == "all" || configured == "ALL") {
       layers.insert(-1);
@@ -792,7 +825,7 @@ const std::set<int32_t>& selected_layers_for_model(const std::string& model) {
       try {
         layers.insert(std::stoi(item));
       } catch (const std::exception&) {
-        LOG(WARNING) << "Invalid XLLM_SPEC_FEATURE_DUMP_DRAFT_LAYERS item: "
+        LOG(WARNING) << "Invalid draft layer item for spec feature dump: "
                      << item;
       }
     }
@@ -805,26 +838,34 @@ const std::set<int32_t>& selected_layers_for_model(const std::string& model) {
   return target_layers;
 }
 
-void dump_empty_dp_if_needed(const FeatureMetadata& metadata,
-                             const ModelInputParams& input_params,
-                             const torch::Tensor& tensor) {
-  if (!input_params.embedding.request_ids.empty()) {
-    return;
+void log_event_summary(const EventDump& event,
+                       const FeatureMetadata& metadata,
+                       const ModelInputParams& input_params,
+                       const std::vector<RequestView>& views) {
+  std::ostringstream request_ids;
+  request_ids << "[";
+  for (size_t i = 0; i < views.size(); ++i) {
+    if (i > 0) {
+      request_ids << ",";
+    }
+    request_ids << views[i].request_id;
   }
-  const std::optional<std::filesystem::path> root = available_dump_root();
-  if (!root.has_value()) {
-    return;
-  }
-  write_feature_record(root.value(),
-                       "__dp_empty__",
-                       metadata.rank,
-                       empty_dp_record(metadata, input_params, tensor));
+  request_ids << "]";
+  LOG(INFO) << "SpecFeatureDump event_index=" << event.event_index
+            << " rank=" << metadata.rank
+            << " model=" << metadata.model
+            << " stage=" << stage_name(input_params)
+            << " point=" << metadata.point
+            << " layer=" << metadata.layer
+            << " request_ids=" << request_ids.str()
+            << " dir=" << event.dir.string();
 }
 
 }  // namespace
 
 bool enabled() {
-  return env_bool("XLLM_SPEC_FEATURE_DUMP", false);
+  return env_bool("XLLM_SPEC_FEATURE_DUMP",
+                  env_bool("XLLM_SPEC_FEATURE_LOG", false));
 }
 
 bool should_dump_layer(const std::string& model, int32_t layer) {
@@ -837,48 +878,78 @@ bool should_dump_layer(const std::string& model, int32_t layer) {
 
 void dump_hidden(const FeatureMetadata& metadata,
                  const torch::Tensor& hidden_states,
-                 const ModelInputParams& input_params) {
+                 const ModelInputParams& input_params,
+                 const torch::Tensor& token_ids) {
+  if (!enabled()) {
+    return;
+  }
+  if (input_params.embedding.request_ids.empty()) {
+    dump_empty_dp_event(metadata, input_params, hidden_states);
+    return;
+  }
   const std::optional<std::filesystem::path> root = available_dump_root();
   if (!root.has_value()) {
     return;
   }
-  dump_empty_dp_if_needed(metadata, input_params, hidden_states);
 
   const int64_t token_row_count =
       hidden_states.defined() && hidden_states.dim() > 0 ? hidden_states.size(0)
                                                          : 0;
+  const std::vector<std::vector<int32_t>> block_tables =
+      block_tables_to_vectors(input_params.attention.host.block_tables);
   const std::vector<RequestView> views =
-      build_request_views(input_params, token_row_count);
-  for (const RequestView& view : views) {
-    nlohmann::json record =
-        base_record(metadata, input_params, view.request_id, view.request_index);
-    record["q_seq_len"] = view.q_seq_len;
-    record["kv_seq_len"] = view.kv_seq_len;
-    record["token_rows"] = int64_vector_json(view.token_rows);
-    record["tensor_kind"] = "hidden";
-    record["hidden_shape"] = shape_json(hidden_states);
-    if (hidden_states.defined()) {
-      record["hidden_dtype"] = scalar_type_string(hidden_states.scalar_type());
-      record["hidden_device"] = device_string(hidden_states.device());
-    }
-
-    torch::Tensor rows = hidden_rows_2d(hidden_states, view.token_rows);
-    record["token_l2"] = double_vector_json(row_l2_values(rows));
-    write_feature_record(
-        root.value(), view.request_id, metadata.rank, record);
+      build_request_views(input_params,
+                          token_row_count,
+                          /*block_size=*/0,
+                          block_tables);
+  if (views.empty()) {
+    return;
   }
+
+  std::vector<RequestView> views_with_token_ids = views;
+  if (metadata.point == "model_input_hidden") {
+    for (RequestView& view : views_with_token_ids) {
+      view.token_ids = token_ids_for_request(token_ids, view.token_rows);
+    }
+  }
+
+  EventDump event = create_event_dir(root.value(), metadata, input_params);
+  if (event.dir.empty()) {
+    return;
+  }
+  if (dump_hidden_tensors() &&
+      save_tensor_cpu(hidden_states, event.dir / "hidden.pt", "hidden")) {
+    event.hidden_file = "hidden.pt";
+  }
+
+  write_meta_json(event,
+                  metadata,
+                  input_params,
+                  views_with_token_ids,
+                  block_tables,
+                  /*block_size=*/0,
+                  /*selected_slots=*/{},
+                  /*selected_blocks=*/{},
+                  "hidden");
+  log_event_summary(event, metadata, input_params, views_with_token_ids);
 }
 
 void dump_kv(const FeatureMetadata& metadata,
              const KVCache& kv_cache,
              const ModelInputParams& input_params) {
-  const std::optional<std::filesystem::path> root = available_dump_root();
-  if (!root.has_value()) {
+  if (!enabled()) {
     return;
   }
   const torch::Tensor k_cache = kv_cache.get_k_cache();
   const torch::Tensor v_cache = kv_cache.get_v_cache();
-  dump_empty_dp_if_needed(metadata, input_params, k_cache);
+  if (input_params.embedding.request_ids.empty()) {
+    dump_empty_dp_event(metadata, input_params, k_cache);
+    return;
+  }
+  const std::optional<std::filesystem::path> root = available_dump_root();
+  if (!root.has_value()) {
+    return;
+  }
 
   const int64_t request_count =
       static_cast<int64_t>(input_params.embedding.request_ids.size());
@@ -889,39 +960,44 @@ void dump_kv(const FeatureMetadata& metadata,
     token_row_count += static_cast<int64_t>(std::max(length, 0));
   }
 
-  const std::vector<RequestView> views =
-      build_request_views(input_params, token_row_count);
   const int32_t block_size =
       infer_block_size_from_cache(k_cache.defined() ? k_cache : v_cache);
-  for (const RequestView& view : views) {
-    const std::vector<int32_t> slots = slots_from_block_table(
-        input_params, view, token_row_count, block_size);
-    nlohmann::json record =
-        base_record(metadata, input_params, view.request_id, view.request_index);
-    record["block_size"] = block_size;
-    record["q_seq_len"] = view.q_seq_len;
-    record["kv_seq_len"] = view.kv_seq_len;
-    record["token_rows"] = int64_vector_json(view.token_rows);
-    record["tensor_kind"] = "kv";
-    record["kv_token_start"] = 0;
-    record["slots"] = int_vector_json(slots);
-    record["k_shape"] = shape_json(k_cache);
-    record["v_shape"] = shape_json(v_cache);
-    if (k_cache.defined()) {
-      record["k_dtype"] = scalar_type_string(k_cache.scalar_type());
-      record["k_device"] = device_string(k_cache.device());
-    }
-    if (v_cache.defined()) {
-      record["v_dtype"] = scalar_type_string(v_cache.scalar_type());
-      record["v_device"] = device_string(v_cache.device());
-    }
-    record["k_l2"] =
-        optional_double_vector_json(slot_l2_values(k_cache, slots, block_size));
-    record["v_l2"] =
-        optional_double_vector_json(slot_l2_values(v_cache, slots, block_size));
-    write_feature_record(
-        root.value(), view.request_id, metadata.rank, record);
+  const std::vector<std::vector<int32_t>> block_tables =
+      block_tables_to_vectors(input_params.attention.host.block_tables);
+  const std::vector<RequestView> views = build_request_views(
+      input_params, token_row_count, block_size, block_tables);
+  if (views.empty()) {
+    return;
   }
+  const std::vector<int32_t> selected_slots = selected_slots_from_views(views);
+  const std::vector<int32_t> selected_blocks =
+      selected_blocks_from_slots(selected_slots, block_size);
+
+  EventDump event = create_event_dir(root.value(), metadata, input_params);
+  if (event.dir.empty()) {
+    return;
+  }
+  if (dump_kv_tensors()) {
+    if (save_selected_kv_blocks(
+            k_cache, selected_blocks, event.dir / "k_blocks.pt", "k")) {
+      event.k_file = "k_blocks.pt";
+    }
+    if (save_selected_kv_blocks(
+            v_cache, selected_blocks, event.dir / "v_blocks.pt", "v")) {
+      event.v_file = "v_blocks.pt";
+    }
+  }
+
+  write_meta_json(event,
+                  metadata,
+                  input_params,
+                  views,
+                  block_tables,
+                  block_size,
+                  selected_slots,
+                  selected_blocks,
+                  "kv");
+  log_event_summary(event, metadata, input_params, views);
 }
 
 }  // namespace xllm::spec_feature_dump

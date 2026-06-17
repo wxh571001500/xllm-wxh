@@ -240,7 +240,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     model_input_metadata.point = "model_input_hidden";
     model_input_metadata.rank = rank_;
     model_input_metadata.layer = -1;
-    spec_feature_dump::dump_hidden(model_input_metadata, h, input_params);
+    spec_feature_dump::dump_hidden(model_input_metadata, h, input_params, tokens);
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event = nullptr;
       std::atomic<bool>* event_flag = nullptr;

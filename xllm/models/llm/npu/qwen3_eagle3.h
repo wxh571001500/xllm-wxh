@@ -163,19 +163,8 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
 
     torch::Tensor hidden_states = embed_tokens_(tokens, 0);
     // In EAGLE-3, hidden_states_extra comes from verifier layers
-    // (3 layers concatenated). Keep it separate from real input_embedding so
-    // VLM fused embeddings are not reused as verifier hidden states.
-    torch::Tensor hidden_states_extra =
-        input_params.embedding.aux_input_embedding;
-    if (!hidden_states_extra.defined() || hidden_states_extra.size(0) == 0) {
-      const bool has_multimodal_input =
-          input_params.multimodal.mm_data.valid() ||
-          input_params.multimodal.visual_pos_masks.defined() ||
-          !input_params.multimodal.deep_stacks.empty();
-      if (!has_multimodal_input) {
-        hidden_states_extra = input_params.embedding.input_embedding;
-      }
-    }
+    // (3 layers concatenated).
+    torch::Tensor hidden_states_extra = input_params.embedding.input_embedding;
     if (!hidden_states_extra.defined() || hidden_states_extra.size(0) == 0) {
       LOG(WARNING) << "hidden_states_extra use embedding from tokens.";
       hidden_states_extra = hidden_states;
@@ -281,7 +270,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     model_input_metadata.rank = rank_;
     model_input_metadata.layer = -1;
     spec_feature_dump::dump_hidden(
-        model_input_metadata, hidden_states, input_params);
+        model_input_metadata, hidden_states, input_params, tokens);
 
     const bool dump_layer = spec_feature_dump::should_dump_layer("draft", 0);
     if (dump_layer) {

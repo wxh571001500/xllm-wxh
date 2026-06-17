@@ -36,7 +36,8 @@ bool should_dump_layer(const std::string& model, int32_t layer);
 
 void dump_hidden(const FeatureMetadata& metadata,
                  const torch::Tensor& hidden_states,
-                 const ModelInputParams& input_params);
+                 const ModelInputParams& input_params,
+                 const torch::Tensor& token_ids = torch::Tensor());
 
 void dump_kv(const FeatureMetadata& metadata,
              const KVCache& kv_cache,

@@ -216,7 +216,6 @@ inline bool has_contiguous_input_buffer_exclusions(
 inline void clear_contiguous_input_buffer_tensor_targets(
     ModelInputParams& params) {
   params.embedding.input_embedding = torch::Tensor();
-  params.embedding.aux_input_embedding = torch::Tensor();
   params.embedding.linear_state_indices = torch::Tensor();
   params.block_copy.src_block_indices = torch::Tensor();
   params.block_copy.dst_block_indices = torch::Tensor();
@@ -261,8 +260,6 @@ inline bool add_model_tensors_to_plan(const ModelInputParams& source,
                                       ForwardInputBufferPlan& plan) {
   return plan.add(source.embedding.input_embedding,
                   &target.embedding.input_embedding) &&
-         plan.add(source.embedding.aux_input_embedding,
-                  &target.embedding.aux_input_embedding) &&
          plan.add(source.embedding.linear_state_indices,
                   &target.embedding.linear_state_indices) &&
          plan.add(source.block_copy.src_block_indices,
@@ -755,14 +752,6 @@ inline ForwardInput cp_partition_forward_input(const ForwardInput& input,
     output.input_params.embedding.input_embedding =
         detail::gather_tensor_by_indices_on_dim(
             input.input_params.embedding.input_embedding,
-            gather_indices,
-            /*dim=*/0);
-  }
-  if (input.input_params.embedding.aux_input_embedding.defined() &&
-      input.input_params.embedding.aux_input_embedding.size(0) == token_num) {
-    output.input_params.embedding.aux_input_embedding =
-        detail::gather_tensor_by_indices_on_dim(
-            input.input_params.embedding.aux_input_embedding,
             gather_indices,
             /*dim=*/0);
   }
