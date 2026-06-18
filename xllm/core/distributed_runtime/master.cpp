@@ -341,7 +341,12 @@ Master::Master(const Options& options, EngineType type)
     if (use_suffix_spec) {
       engine_ = std::make_unique<SuffixSpeculativeEngine>(spec_options);
     } else {
-      engine_ = std::make_unique<SpeculativeEngine>(spec_options);
+      if (options_.backend() == "vlm") {
+        engine_ =
+            std::make_unique<SpeculativeEngineBase<VLMEngine>>(spec_options);
+      } else {
+        engine_ = std::make_unique<SpeculativeEngine>(spec_options);
+      }
     }
   } else if (type == EngineType::LLM) {
     if (options_.task_type() == "embed" || options.task_type() == "mm_embed") {

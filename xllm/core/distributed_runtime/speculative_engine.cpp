@@ -15,25 +15,42 @@ limitations under the License.
 
 #include "speculative_engine.h"
 
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <torch/torch.h>
 
 #include <algorithm>
 #include <memory>
+#include <type_traits>
 
-#include "common/metrics.h"
 #include "llm_engine.h"
-#include "runtime/forward_params.h"
-#include "util/timer.h"
+#include "util/env_var.h"
 #include "util/utils.h"
+#include "vlm_engine.h"
 
 namespace xllm {
 
-SpeculativeEngine::SpeculativeEngine(const runtime::Options& options)
-    : SpeculativeEngine(options, /*use_draft_engine=*/true) {}
+namespace {
 
-SpeculativeEngine::SpeculativeEngine(const runtime::Options& options,
-                                     bool use_draft_engine)
+bool kimi_k25_eagle3_replica_draft_enabled() {
+  static const bool enabled =
+      util::get_bool_env("XLLM_KIMI_K25_EAGLE3_REPLICA_DRAFT", false);
+  return enabled;
+}
+
+}  // namespace
+
+template <typename TargetEngine>
+SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
+    const runtime::Options& options)
+    : SpeculativeEngineBase(options, /*use_draft_engine=*/true) {}
+
+template <typename TargetEngine>
+SpeculativeEngineBase<TargetEngine>::~SpeculativeEngineBase() = default;
+
+template <typename TargetEngine>
+SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
+    const runtime::Options& options,
+    bool use_draft_engine)
     : options_(options), use_draft_engine_(use_draft_engine) {
   CHECK_GT(options.num_speculative_tokens(), 0)
       << "speculative tokens should not be zero";
@@ -45,15 +62,17 @@ SpeculativeEngine::SpeculativeEngine(const runtime::Options& options,
 
   runtime::Options engine_options = options_;
   engine_options.num_decoding_tokens(options.num_speculative_tokens() + 1);
-  engine_ = std::make_unique<LLMEngine>(engine_options, dist_manager_);
+  engine_ = std::make_unique<TargetEngine>(engine_options, dist_manager_);
 
   if (use_draft_engine_) {
     // draft engine
-    engine_options.model_path(options_.draft_model_path().value_or(""))
+    runtime::Options draft_options = engine_options;
+    draft_options.model_path(options_.draft_model_path().value_or(""))
         .devices(options.draft_devices())
+        .backend("llm")
         .num_decoding_tokens(1)
         .is_draft_engine(true);
-    draft_engine_ = std::make_unique<LLMEngine>(engine_options, dist_manager_);
+    draft_engine_ = std::make_unique<LLMEngine>(draft_options, dist_manager_);
 
     // Currently target and draft engines must use the same device list.
     if (options.devices() != options.draft_devices()) {
@@ -64,12 +83,21 @@ SpeculativeEngine::SpeculativeEngine(const runtime::Options& options,
   }
 }
 
+SpeculativeEngine::SpeculativeEngine(const runtime::Options& options)
+    : SpeculativeEngineBase<LLMEngine>(options) {}
+
 SuffixSpeculativeEngine::SuffixSpeculativeEngine(
     const runtime::Options& options)
-    : SpeculativeEngine(options, /*use_draft_engine=*/false) {}
+    : SpeculativeEngineBase<LLMEngine>(options, /*use_draft_engine=*/false) {}
 
-bool SpeculativeEngine::init(MasterStatus master_status) {
-  if (!init_model()) {
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::init() {
+  return init(MasterStatus::WAKEUP);
+}
+
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::init(MasterStatus master_status) {
+  if (!init_model(master_status)) {
     return false;
   }
 
@@ -80,8 +108,17 @@ bool SpeculativeEngine::init(MasterStatus master_status) {
   return true;
 }
 
-bool SpeculativeEngine::init_model() {
-  if (!engine_->init_model()) {
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::init_model(
+    MasterStatus master_status) {
+  bool target_initialized = false;
+  if constexpr (std::is_same_v<TargetEngine, VLMEngine>) {
+    (void)master_status;
+    target_initialized = engine_->init_model();
+  } else {
+    target_initialized = engine_->init_model(master_status);
+  }
+  if (!target_initialized) {
     return false;
   }
 
@@ -134,7 +171,8 @@ bool SpeculativeEngine::init_model() {
   return true;
 }
 
-bool SpeculativeEngine::allocate_kv_cache() {
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
   KVCacheCapacity target_kv_cache_cap = engine_->estimate_kv_cache_capacity();
 
   if (!use_draft_engine_) {
@@ -143,6 +181,11 @@ bool SpeculativeEngine::allocate_kv_cache() {
 
   KVCacheCapacity draft_kv_cache_cap =
       draft_engine_->estimate_kv_cache_capacity();
+  if (should_skip_external_draft_kv_cache() &&
+      kimi_k25_eagle3_replica_draft_enabled()) {
+    draft_kv_cache_cap =
+        get_internal_draft_kv_cache_capacity(draft_kv_cache_cap);
+  }
   const int64_t kv_cache_size =
       std::min(target_kv_cache_cap.cache_size_in_bytes(),
                draft_kv_cache_cap.cache_size_in_bytes());
@@ -164,16 +207,81 @@ bool SpeculativeEngine::allocate_kv_cache() {
   target_kv_cache_cap.cache_size_in_bytes() = kv_cache_size;
   draft_kv_cache_cap.n_blocks() = n_blocks;
   draft_kv_cache_cap.cache_size_in_bytes() = kv_cache_size;
+  if (should_skip_external_draft_kv_cache()) {
+    LOG(INFO) << "Allocating target KV cache only for kimi_k25 Eagle3"
+              << ", n_blocks=" << n_blocks
+              << ", target_slot_size=" << target_kv_cache_cap.slot_size()
+              << ", draft_slot_size=" << draft_kv_cache_cap.slot_size()
+              << ". The worker-side Eagle3 draft model allocates its own "
+                 "draft KV cache.";
+    return engine_->allocate_kv_cache(target_kv_cache_cap);
+  }
   return engine_->allocate_kv_cache(target_kv_cache_cap) &&
          draft_engine_->allocate_kv_cache(draft_kv_cache_cap);
 }
 
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::should_skip_external_draft_kv_cache()
+    const {
+  if (!use_draft_engine_ || draft_engine_ == nullptr) {
+    return false;
+  }
+  return options_.speculative_algorithm() == "Eagle3" &&
+         model_args_.model_type() == "kimi_k25" &&
+         draft_engine_->model_args().model_type() == "kimi_k25_eagle3";
+}
+
+template <typename TargetEngine>
+KVCacheCapacity
+SpeculativeEngineBase<TargetEngine>::get_internal_draft_kv_cache_capacity(
+    const KVCacheCapacity& draft_kv_cache_cap) const {
+  CHECK(should_skip_external_draft_kv_cache())
+      << "internal draft KV cache capacity is only needed for kimi_k25 Eagle3";
+
+  const ModelArgs& draft_model_args = draft_engine_->model_args();
+  const torch::ScalarType draft_dtype =
+      util::parse_dtype(draft_model_args.dtype(), options_.devices()[0]);
+  const int64_t dtype_size =
+      static_cast<int64_t>(torch::elementSize(draft_dtype));
+  const int64_t total_kv_heads =
+      draft_model_args.n_kv_heads().value_or(draft_model_args.n_heads());
+  const int64_t cache_dtype_size =
+      options_.kv_cache_dtype() == "auto" ? dtype_size : 1;
+
+  KVCacheCapacity internal_draft_kv_cache_cap = draft_kv_cache_cap;
+  internal_draft_kv_cache_cap
+      .slot_size(2 * cache_dtype_size * draft_model_args.head_dim() *
+                 total_kv_heads)
+      .index_slot_size(draft_model_args.index_n_heads() > 0
+                           ? dtype_size * draft_model_args.index_head_dim()
+                           : 0)
+      .scale_slot_size(options_.kv_cache_dtype() == "auto"
+                           ? 0
+                           : 2 * sizeof(float) * total_kv_heads)
+      .n_layers(draft_model_args.num_nextn_predict_layers() > 0
+                    ? draft_model_args.num_nextn_predict_layers()
+                    : draft_model_args.n_layers());
+  LOG(INFO) << "Using internal replica draft KV cache capacity for kimi_k25 "
+               "Eagle3"
+            << ", total_kv_heads=" << total_kv_heads
+            << ", slot_size=" << internal_draft_kv_cache_cap.slot_size()
+            << ", index_slot_size="
+            << internal_draft_kv_cache_cap.index_slot_size()
+            << ", scale_slot_size="
+            << internal_draft_kv_cache_cap.scale_slot_size()
+            << ", n_layers=" << internal_draft_kv_cache_cap.n_layers();
+  return internal_draft_kv_cache_cap;
+}
+
 // TODO: support dp batches later
-ForwardOutput SpeculativeEngine::step(std::vector<Batch>& batches) {
+template <typename TargetEngine>
+ForwardOutput SpeculativeEngineBase<TargetEngine>::step(
+    std::vector<Batch>& batches) {
   return engine_->step(batches);
 }
 
-int64_t SpeculativeEngine::calculate_kv_cache(
+template <typename TargetEngine>
+int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
     const KVCacheCapacity& target_kv_cache_cap,
     const KVCacheCapacity& draft_kv_cache_cap) const {
   CHECK_GT(target_kv_cache_cap.cache_size_in_bytes(), 0)
@@ -203,17 +311,15 @@ int64_t SpeculativeEngine::calculate_kv_cache(
   const int64_t draft_full_attention_slot_size =
       draft_kv_cache_cap.slot_size() + draft_kv_cache_cap.index_slot_size() +
       draft_kv_cache_cap.scale_slot_size();
-  CHECK_LE(draft_full_attention_slot_size, target_full_attention_slot_size)
-      << "draft full-attention kv cache slot size must not exceed target slot "
-         "size because the current speculative worker allocates draft KV "
-         "tensors with the target KVCacheShape";
-  // The current speculative worker allocates draft KV tensors with the
-  // target KVCacheShape, so draft physical allocation uses target slot size.
-  const int64_t draft_allocated_full_attention_slot_size =
-      target_full_attention_slot_size;
+  LOG_IF(INFO, draft_full_attention_slot_size > target_full_attention_slot_size)
+      << "draft full-attention kv cache slot size is larger than target, "
+      << "draft_slot_size=" << draft_full_attention_slot_size
+      << ", target_slot_size=" << target_full_attention_slot_size
+      << ". The speculative worker may allocate draft KV cache with a "
+         "separate draft KVCacheShape when supported.";
   CHECK_GT(target_full_attention_slot_size, 0)
       << "target full-attention kv cache slot size must be greater than 0";
-  CHECK_GT(draft_allocated_full_attention_slot_size, 0)
+  CHECK_GT(draft_full_attention_slot_size, 0)
       << "draft full-attention kv cache slot size must be greater than 0";
 
   const int64_t target_full_attention_layers =
@@ -224,27 +330,32 @@ int64_t SpeculativeEngine::calculate_kv_cache(
       block_size * target_full_attention_layers *
       target_full_attention_slot_size;
   const int64_t draft_full_attention_block_size_in_bytes =
-      block_size * draft_full_attention_layers *
-      draft_allocated_full_attention_slot_size;
+      block_size * draft_full_attention_layers * draft_full_attention_slot_size;
   const int64_t full_attention_block_size_in_bytes =
       target_full_attention_block_size_in_bytes +
       draft_full_attention_block_size_in_bytes;
   CHECK_GT(full_attention_block_size_in_bytes, 0)
       << "speculative kv cache block size in bytes must be greater than 0";
 
-  return (cache_size_in_bytes - linear_cache_size_in_bytes) /
-         full_attention_block_size_in_bytes;
+  const int64_t n_blocks = (cache_size_in_bytes - linear_cache_size_in_bytes) /
+                           full_attention_block_size_in_bytes;
+  return n_blocks;
 }
 
-void SpeculativeEngine::update_last_step_result(std::vector<Batch>& batch) {
+template <typename TargetEngine>
+void SpeculativeEngineBase<TargetEngine>::update_last_step_result(
+    std::vector<Batch>& batch) {
   engine_->update_last_step_result(batch);
 }
 
-std::vector<int64_t> SpeculativeEngine::get_active_activation_memory() const {
+template <typename TargetEngine>
+std::vector<int64_t>
+SpeculativeEngineBase<TargetEngine>::get_active_activation_memory() const {
   return engine_->get_active_activation_memory();
 }
 
-bool SpeculativeEngine::pull_kv_blocks(
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::pull_kv_blocks(
     const int32_t src_dp_size,
     const int32_t src_dp_rank,
     const std::vector<uint64_t>& src_cluster_ids,
@@ -265,29 +376,36 @@ bool SpeculativeEngine::pull_kv_blocks(
                                  dst_blocks);
 };
 
-void SpeculativeEngine::get_device_info(std::vector<std::string>& device_ips,
-                                        std::vector<uint16_t>& ports) {
+template <typename TargetEngine>
+void SpeculativeEngineBase<TargetEngine>::get_device_info(
+    std::vector<std::string>& device_ips,
+    std::vector<uint16_t>& ports) {
   engine_->get_device_info(device_ips, ports);
 };
 
-void SpeculativeEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,
-                                       std::vector<std::string>& addrs,
-                                       std::vector<int64_t>& k_cache_ids,
-                                       std::vector<int64_t>& v_cache_ids) {
+template <typename TargetEngine>
+void SpeculativeEngineBase<TargetEngine>::get_cache_info(
+    std::vector<uint64_t>& cluster_ids,
+    std::vector<std::string>& addrs,
+    std::vector<int64_t>& k_cache_ids,
+    std::vector<int64_t>& v_cache_ids) {
   engine_->get_cache_info(cluster_ids, addrs, k_cache_ids, v_cache_ids);
 };
 
-bool SpeculativeEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
-                                     const std::vector<std::string>& addrs,
-                                     const std::vector<std::string>& device_ips,
-                                     const std::vector<uint16_t>& ports,
-                                     const int32_t src_dp_size,
-                                     const int32_t src_kv_split_size) {
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::link_cluster(
+    const std::vector<uint64_t>& cluster_ids,
+    const std::vector<std::string>& addrs,
+    const std::vector<std::string>& device_ips,
+    const std::vector<uint16_t>& ports,
+    const int32_t src_dp_size,
+    const int32_t src_kv_split_size) {
   return engine_->link_cluster(
       cluster_ids, addrs, device_ips, ports, src_dp_size, src_kv_split_size);
 };
 
-bool SpeculativeEngine::unlink_cluster(
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::unlink_cluster(
     const std::vector<uint64_t>& cluster_ids,
     const std::vector<std::string>& addrs,
     const std::vector<std::string>& device_ips,
@@ -297,4 +415,8 @@ bool SpeculativeEngine::unlink_cluster(
   return engine_->unlink_cluster(
       cluster_ids, addrs, device_ips, ports, src_dp_size, src_kv_split_size);
 };
+
+template class SpeculativeEngineBase<LLMEngine>;
+template class SpeculativeEngineBase<VLMEngine>;
+
 }  // namespace xllm

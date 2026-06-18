@@ -66,8 +66,12 @@ void NpuEagle3DecoderLayerImpl::param_from_args(
   param.kvQuant = false;
   param.quantGroupSize = 0;
   param.rmsNormEps = args.rms_norm_eps();
-  param.worldSize = parallel_args.world_size();
-  param.numAttentionHeadsPerRank = args.n_heads() / param.worldSize;
+  CHECK_GT(dp_local_tp_size_, 0) << "dp local tp size must be positive";
+  CHECK_GE(dp_local_tp_rank_, 0) << "dp local tp rank must be non-negative";
+  CHECK_LT(dp_local_tp_rank_, dp_local_tp_size_)
+      << "dp local tp rank must be smaller than dp local tp size";
+  param.worldSize = dp_local_tp_size_;
+  param.numAttentionHeadsPerRank = args.n_heads() / dp_local_tp_size_;
   // param.hiddenSizePerAttentionHead = args.hidden_size() / args.n_heads();
   param.hiddenSizePerAttentionHead = args.head_dim();
   param.enableIntraLayerAddNorm = false;
@@ -75,13 +79,23 @@ void NpuEagle3DecoderLayerImpl::param_from_args(
   // param.numKeyValueHeadsPerRank = args.n_kv_heads();
   std::optional<long int> optionalValue = args.n_kv_heads();
   param.numKeyValueHeadsPerRank =
-      static_cast<int>(optionalValue.value()) / param.worldSize;
-  ;
+      static_cast<int>(optionalValue.value()) / dp_local_tp_size_;
   // param.numKeyValueHeadsPerRank = static_cast<int>(args.n_kv_heads());
 
-  param.rank = parallel_args.rank();
+  param.rank = dp_local_tp_rank_;
   param.backend = "lccl";
+  const int32_t tp_group_id = parallel_args.rank() / dp_local_tp_size_;
+  param.commDomain = std::to_string(tp_group_id);
   param.enableLogN = false;
+  LOG(INFO) << "Eagle3 decoder layer parallel args"
+            << ", is_prefill=" << isPrefill
+            << ", global_rank=" << parallel_args.rank()
+            << ", global_world_size=" << parallel_args.world_size()
+            << ", dp_size=" << parallel_args.dp_size()
+            << ", cp_size=" << parallel_args.cp_size()
+            << ", atb_rank=" << param.rank
+            << ", atb_world_size=" << param.worldSize
+            << ", comm_domain=" << param.commDomain;
 }
 
 NpuEagle3DecoderLayerImpl::NpuEagle3DecoderLayerImpl(
@@ -233,6 +247,20 @@ torch::Tensor NpuEagle3DecoderLayerImpl::forward(
     std::atomic<bool>* event_flag,
     int node_id) {
   atb::Status st;
+  LOG_FIRST_N(INFO, 8) << "Eagle3 decoder forward shapes"
+                       << ", node_id=" << node_id
+                       << ", is_decode="
+                       << input_params.meta.batch_forward_type.is_decode()
+                       << ", hidden_states=" << hidden_states.sizes()
+                       << ", hidden_states_extra="
+                       << hidden_states_extra.sizes()
+                       << ", cos_pos=" << cos_pos.sizes()
+                       << ", sin_pos=" << sin_pos.sizes()
+                       << ", attn_mask=" << attn_mask.sizes()
+                       << ", k_cache=" << kv_cache.get_k_cache().sizes()
+                       << ", v_cache=" << kv_cache.get_v_cache().sizes()
+                       << ", local_tp_rank=" << dp_local_tp_rank_
+                       << ", local_tp_size=" << dp_local_tp_size_;
   if (!input_params.meta.batch_forward_type.is_decode()) {
     // mstxRangeId id = mstxRangeStartA("prefill build variant", nullptr);
     build_node_variant_pack(prefill_node_,

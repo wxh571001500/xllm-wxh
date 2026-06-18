@@ -626,6 +626,7 @@ AnthropicServiceImpl::AnthropicServiceImpl(
           master_->options().tool_call_parser().value_or("")),
       reasoning_parser_format_(
           master_->options().reasoning_parser().value_or("")) {
+  LOG(INFO) << "master inside service: " << master;
   CHECK(master_ != nullptr);
 }
 

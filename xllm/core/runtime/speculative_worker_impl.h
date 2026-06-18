@@ -19,8 +19,8 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "framework/sampling/rejection_sampler.h"
-#include "runtime/llm_worker_impl.h"
 #include "runtime/options.h"
+#include "runtime/worker_impl.h"
 
 namespace xllm {
 
@@ -34,12 +34,13 @@ class SpeculativeWorkerImpl : public WorkerImpl {
 
  protected:
   // `options` is passed to WorkerImpl (preserves enable_schedule_overlap etc.),
-  // `target_options` is used to create impl_ (target model worker).
+  // `target_options` is used to create target_impl_ (target model worker).
   // Each algorithm subclass decides its own target_options.
   SpeculativeWorkerImpl(const ParallelArgs& parallel_args,
                         const torch::Device& device,
                         const runtime::Options& options,
-                        const runtime::Options& target_options);
+                        const runtime::Options& target_options,
+                        WorkerType worker_type);
 
  public:
   // initialize model, cache manager. blocking call
@@ -53,25 +54,25 @@ class SpeculativeWorkerImpl : public WorkerImpl {
                   MasterStatus master_status) override;
 
   void get_device_info(std::string& device_ip, uint16_t& port) override {
-    impl_->get_device_info(device_ip, port);
+    target_impl_->get_device_info(device_ip, port);
   };
 
   bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                     const std::vector<std::string>& addrs,
                     const std::vector<std::string>& device_ips,
                     const std::vector<uint16_t>& ports) override {
-    return impl_->link_cluster(cluster_ids, addrs, device_ips, ports);
+    return target_impl_->link_cluster(cluster_ids, addrs, device_ips, ports);
   };
 
   bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                       const std::vector<std::string>& addrs,
                       const std::vector<std::string>& device_ips,
                       const std::vector<uint16_t>& ports) override {
-    return impl_->unlink_cluster(cluster_ids, addrs, device_ips, ports);
+    return target_impl_->unlink_cluster(cluster_ids, addrs, device_ips, ports);
   };
 
   std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override {
-    return impl_->estimate_kv_cache_capacity();
+    return target_impl_->estimate_kv_cache_capacity();
   };
 
   // allocate kv cache. blocking call
@@ -86,12 +87,12 @@ class SpeculativeWorkerImpl : public WorkerImpl {
                       std::string& addr,
                       int64_t& k_cache_id,
                       int64_t& v_cache_id) override {
-    impl_->get_cache_info(cluster_id, addr, k_cache_id, v_cache_id);
+    target_impl_->get_cache_info(cluster_id, addr, k_cache_id, v_cache_id);
   };
 
   // prepare input for execution
   ForwardInput prepare_inputs(Batch& batch) override {
-    return impl_->prepare_inputs(batch);
+    return target_impl_->prepare_inputs(batch);
   };
 
   // prepare work before model execution
@@ -110,12 +111,12 @@ class SpeculativeWorkerImpl : public WorkerImpl {
       const int64_t src_v_cache_id,
       const std::vector<uint64_t>& src_blocks,
       const std::vector<uint64_t>& dst_blocks) override {
-    return impl_->pull_kv_blocks_async(src_cluster_id,
-                                       src_addr,
-                                       src_k_cache_id,
-                                       src_v_cache_id,
-                                       src_blocks,
-                                       dst_blocks);
+    return target_impl_->pull_kv_blocks_async(src_cluster_id,
+                                              src_addr,
+                                              src_k_cache_id,
+                                              src_v_cache_id,
+                                              src_blocks,
+                                              dst_blocks);
   };
 
  protected:
@@ -138,8 +139,7 @@ class SpeculativeWorkerImpl : public WorkerImpl {
 
  protected:
   // Target model worker
-  std::unique_ptr<LLMWorkerImpl> impl_;
-
+  std::unique_ptr<WorkerImpl> target_impl_;
   bool enable_fused_kernel_ = false;
   int32_t embedding_size_ = 0;
 };

@@ -34,6 +34,7 @@ limitations under the License.
 
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -730,6 +731,17 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
           context_.get_parallel_args().ep_size() > 1 ||
           !context_.get_parallel_args().mapping_data().empty()));
     if (need_fake_input_for_empty_shard) {
+      int64_t fake_token_count = 1;
+      if (parallel_args_.dp_local_process_group_ != nullptr &&
+          input_params.parallel.dp_global_token_nums.size() > 1) {
+        const int64_t dp_rank = parallel_args_.dp_local_process_group_->rank();
+        CHECK_LT(dp_rank,
+                 static_cast<int64_t>(
+                     input_params.parallel.dp_global_token_nums.size()))
+            << "dp rank exceeds dp_global_token_nums size";
+        fake_token_count = std::max<int64_t>(
+            1, input_params.parallel.dp_global_token_nums[dp_rank]);
+      }
       auto token_options = processed_input.token_ids.defined()
                                ? processed_input.token_ids.options()
                                : torch::TensorOptions().dtype(torch::kInt32);
@@ -737,9 +749,9 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
                                   ? processed_input.positions.options()
                                   : torch::TensorOptions().dtype(torch::kInt32);
       processed_input.token_ids =
-          torch::ones({1}, token_options.device(device_));
+          torch::ones({fake_token_count}, token_options.device(device_));
       processed_input.positions =
-          torch::zeros({1}, position_options.device(device_));
+          torch::zeros({fake_token_count}, position_options.device(device_));
       empty_shard = false;
     }
     if (empty_shard) {
@@ -1165,9 +1177,24 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   }
 
 #if defined(USE_NPU)
-  if (options_.enable_speculative_decode() &&
-      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  const std::string& speculative_algorithm = options_.speculative_algorithm();
+  const bool is_eagle3 =
+      speculative_algorithm == "Eagle3" || speculative_algorithm == "eagle3";
+  const bool is_kimi_eagle3_target = !options_.is_draft_engine() && is_eagle3 &&
+                                     args.model_type() == "kimi_k25";
+  const bool needs_speculative_target_graph =
+      options_.enable_speculative_decode() && !options_.is_draft_engine() &&
+      (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
+       is_kimi_eagle3_target);
+  if (needs_speculative_target_graph) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
+    LOG(INFO)
+        << "[MTP_ONESHOT_VALIDATE] configure target speculative graph"
+        << " model_type=" << args.model_type()
+        << " speculative_algorithm=" << speculative_algorithm
+        << " dp_size=" << parallel_args_.dp_size() << " enable_atb_spec_kernel="
+        << ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()
+        << " num_speculative_tokens=" << args.num_speculative_tokens();
   } else if (options_.enable_speculative_decode() &&
              options_.num_speculative_tokens() == 0 &&
              args.num_nextn_predict_layers() != 0) {

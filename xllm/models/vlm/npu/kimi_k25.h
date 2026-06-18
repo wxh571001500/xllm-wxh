@@ -34,6 +34,7 @@ limitations under the License.
 #include "models/model_registry.h"
 #include "processors/input_processor.h"
 #include "processors/kimi25_image_processor.h"
+#include "util/env_var.h"
 #include "xllm_atb_layers/core/include/atb_speed/log.h"
 
 namespace xllm {
@@ -1070,6 +1071,11 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       torch::Tensor pixel_values,
       torch::Tensor grid_thws,
       const ModelInputParams& input_params) {
+    if (util::get_bool_env("XLLM_KIMI_K25_DISABLE_VISION_GROUPING", false)) {
+      torch::Tensor output = visual_(pixel_values, grid_thws, input_params);
+      return {mm_projector_ ? mm_projector_(output) : output};
+    }
+
     int n = grid_thws.size(0);
     auto n_patches_each_media = grid_thws.prod(-1);
     int max_infer_batch = std::max(n_patches_each_media.max().item<int>(),
@@ -1352,6 +1358,10 @@ REGISTER_MODEL_ARGS(kimi_k25, [&] {
       rope_scaling_attn_factor, "text_config.rope_scaling.attn_factor", 1.0f);
   LOAD_ARG_OR(
       num_nextn_predict_layers, "text_config.num_nextn_predict_layers", 1);
+  LOAD_ARG_OR(layers_to_capture, "layers_to_capture", std::vector<int32_t>{});
+  LOAD_ARG_OR(layers_to_capture,
+              "text_config.layers_to_capture",
+              args->layers_to_capture());
 
   LOAD_ARG_OR(bos_token_id, "text_config.bos_token_id", 163584);
   LOAD_ARG_OR(eos_token_id, "text_config.eos_token_id", 163585);

@@ -12,9 +12,11 @@ cc_library(
   HDRS
     model_registry.h
     models.h
+    spec_feature_dump.h
     dit/utils/lanczos_resample.h
   SRCS
     model_registry.cpp
+    spec_feature_dump.cpp
     dit/utils/lanczos_resample.cpp
   DEPS
     :model
@@ -22,5 +24,7 @@ cc_library(
     :dit_cache
     :model_loader
     :layers
+    :util
+    nlohmann_json::nlohmann_json
     $<$<BOOL:${USE_NPU}>:npu_layers>
 )

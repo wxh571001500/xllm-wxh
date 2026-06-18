@@ -20,6 +20,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,7 @@ limitations under the License.
 #include "core/layers/npu/npu_rms_norm_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
 #include "models/model_registry.h"
+#include "models/spec_feature_dump.h"
 
 namespace xllm::npu::model {
 
@@ -104,10 +106,12 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
       : model_type_(model_type), options_(context.get_tensor_options()) {
     auto model_args = context.get_model_args();
     auto parallel_args = context.get_parallel_args();
+    mrope_section_ = model_args.rope_scaling_mrope_section();
 
     dp_size_ = parallel_args.dp_size();
     dp_local_tp_size_ = parallel_args.world_size() / dp_size_;
     dp_rank_ = parallel_args.rank() / dp_local_tp_size_;
+    rank_ = parallel_args.rank();
 
     // Word embedding
     embed_tokens_ =
@@ -158,9 +162,8 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     }
 
     torch::Tensor hidden_states = embed_tokens_(tokens, 0);
-    // Get hidden_states_extra from input_params.embedding.input_embedding
     // In EAGLE-3, hidden_states_extra comes from verifier layers
-    // (3 layers concatenated)
+    // (3 layers concatenated).
     torch::Tensor hidden_states_extra = input_params.embedding.input_embedding;
     if (!hidden_states_extra.defined() || hidden_states_extra.size(0) == 0) {
       LOG(WARNING) << "hidden_states_extra use embedding from tokens.";
@@ -171,6 +174,17 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     // hidden_states_extra shape: [B*L, 3*target_hidden_size] or [B*L,
     // hidden_size]
     if (hidden_states_extra.size(-1) != hidden_states.size(-1)) {
+      if (fc_weight_k_ > 0 && hidden_states_extra.size(-1) != fc_weight_k_) {
+        LOG(FATAL) << "Eagle3 draft fusion input dim mismatch, model_type="
+                   << model_type_ << ", tokens_sizes=" << tokens.sizes()
+                   << ", positions_sizes=" << positions.sizes()
+                   << ", token_embedding_sizes=" << hidden_states.sizes()
+                   << ", input_embedding_sizes=" << hidden_states_extra.sizes()
+                   << ", fc_weight_sizes=" << fc_weight_sizes_str_
+                   << ", expected_input_k=" << fc_weight_k_
+                   << ". Check that the Eagle3 draft checkpoint was trained "
+                      "for the target hidden size and captured layer count.";
+      }
       hidden_states_extra = fc_(hidden_states_extra, 0);
     }
 
@@ -179,6 +193,38 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
     auto cos_pos = target_cos_sin_chunks[0].contiguous();
     auto sin_pos = target_cos_sin_chunks[1].contiguous();
+    if (positions.dim() == 2) {
+      CHECK_GE(mrope_section_.size(), 3)
+          << "QWen3Eagle3Model received mRoPE positions but "
+             "rope_scaling.mrope_section is missing or invalid.";
+      auto apply = [this](torch::Tensor x) {
+        torch::Tensor freqs_t = x[0].clone();
+        const int64_t mrope_length = freqs_t.size(-1) / 2;
+
+        for (int32_t dim_idx = 1; dim_idx <= 2; ++dim_idx) {
+          const int64_t offset = dim_idx;
+          const int64_t section_len = mrope_section_[dim_idx];
+          const int64_t length = section_len * 3;
+
+          torch::TensorOptions options =
+              torch::TensorOptions().dtype(torch::kLong).device(x.device());
+          torch::Tensor idx_first_half =
+              torch::arange(offset, length, 3, options);
+          torch::Tensor idx_second_half = torch::arange(
+              offset + mrope_length, length + mrope_length, 3, options);
+
+          torch::Tensor idx_tensor =
+              torch::cat({idx_first_half, idx_second_half}, 0);
+          torch::Tensor src = x[dim_idx].index_select(-1, idx_tensor);
+          freqs_t.index_copy_(-1, idx_tensor, src);
+        }
+        return freqs_t;
+      };
+      cos_pos = apply(cos_pos.reshape(
+          {positions.sizes().front(), -1, cos_pos.sizes().back()}));
+      sin_pos = apply(sin_pos.reshape(
+          {positions.sizes().front(), -1, sin_pos.sizes().back()}));
+    }
 
     // Generate attention mask
     torch::Tensor attn_mask;
@@ -218,6 +264,32 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
       return ModelOutput();
     }
 
+    spec_feature_dump::FeatureMetadata model_input_metadata;
+    model_input_metadata.model = "draft";
+    model_input_metadata.point = "model_input_hidden";
+    model_input_metadata.rank = rank_;
+    model_input_metadata.layer = -1;
+    spec_feature_dump::dump_hidden(
+        model_input_metadata, hidden_states, input_params, tokens);
+
+    const bool dump_layer = spec_feature_dump::should_dump_layer("draft", 0);
+    if (dump_layer) {
+      spec_feature_dump::FeatureMetadata layer_input_metadata;
+      layer_input_metadata.model = "draft";
+      layer_input_metadata.point = "layer_input_hidden";
+      layer_input_metadata.rank = rank_;
+      layer_input_metadata.layer = 0;
+      spec_feature_dump::dump_hidden(
+          layer_input_metadata, hidden_states, input_params);
+
+      spec_feature_dump::FeatureMetadata kv_input_metadata;
+      kv_input_metadata.model = "draft";
+      kv_input_metadata.point = "layer_kv_before";
+      kv_input_metadata.rank = rank_;
+      kv_input_metadata.layer = 0;
+      spec_feature_dump::dump_kv(kv_input_metadata, kv_caches[0], input_params);
+    }
+
     decoder_(hidden_states,
              hidden_states_extra,
              cos_pos,
@@ -227,8 +299,31 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
              input_params_new,
              event,
              event_flag);
+    if (dump_layer) {
+      spec_feature_dump::FeatureMetadata layer_output_metadata;
+      layer_output_metadata.model = "draft";
+      layer_output_metadata.point = "layer_output_hidden";
+      layer_output_metadata.rank = rank_;
+      layer_output_metadata.layer = 0;
+      spec_feature_dump::dump_hidden(
+          layer_output_metadata, hidden_states, input_params);
+
+      spec_feature_dump::FeatureMetadata kv_metadata;
+      kv_metadata.model = "draft";
+      kv_metadata.point = "layer_kv_after";
+      kv_metadata.rank = rank_;
+      kv_metadata.layer = 0;
+      spec_feature_dump::dump_kv(kv_metadata, kv_caches[0], input_params);
+    }
     auto aux_hidden_states = hidden_states.clone();
     hidden_states = norm_(hidden_states, 0);
+    spec_feature_dump::FeatureMetadata model_output_metadata;
+    model_output_metadata.model = "draft";
+    model_output_metadata.point = "model_output_hidden";
+    model_output_metadata.rank = rank_;
+    model_output_metadata.layer = -1;
+    spec_feature_dump::dump_hidden(
+        model_output_metadata, hidden_states, input_params);
 
     // For draft decode, we capture the hidden state before norm as
     // aux_hidden_states This is used for speculative decoding to pass hidden
@@ -240,7 +335,15 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
 
   virtual void load_state_dict(const StateDict& state_dict) {
     // fc: (hidden_size, 3*target_hidden_size) fusion layer
-    fc_->load_state_dict(state_dict.get_dict_with_prefix("fc."));
+    StateDict fc_state_dict = state_dict.get_dict_with_prefix("fc.");
+    torch::Tensor fc_weight = fc_state_dict.get_tensor("weight");
+    if (fc_weight.defined() && fc_weight.dim() >= 2) {
+      std::stringstream fc_weight_sizes_stream;
+      fc_weight_sizes_stream << fc_weight.sizes();
+      fc_weight_sizes_str_ = fc_weight_sizes_stream.str();
+      fc_weight_k_ = fc_weight.size(1);
+    }
+    fc_->load_state_dict(fc_state_dict);
 
     decoder_->load_state_dict(state_dict.get_dict_with_prefix("midlayer."));
 
@@ -273,8 +376,10 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
   torch::TensorOptions options_;
 
   int32_t dp_rank_ = 0;
+  int32_t rank_ = 0;
   int32_t dp_size_ = 1;
   int32_t dp_local_tp_size_ = 1;
+  std::vector<int64_t> mrope_section_;
 
   torch::Tensor cos_sin_;
   layer::NpuPosEmbedding atb_pos_emb_{nullptr};
@@ -285,6 +390,8 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
   // EAGLE-3 specific modules
   layer::NpuColumnParallelLinear fc_{nullptr};  // fusion layer
   layer::NpuRMSNorm norm_{nullptr};             // final norm
+  std::string fc_weight_sizes_str_;
+  int64_t fc_weight_k_ = 0;
 
   // Decoder
   QWen3Eagle3DecoderLayer decoder_{nullptr};
@@ -438,6 +545,18 @@ REGISTER_MODEL_ARGS(qwen3_eagle3, [&] {
   LOAD_ARG_OR(rms_norm_eps, "rms_norm_eps", 1e-6);
   LOAD_ARG_OR(eos_token_id, "eos_token_id", 151643);
   LOAD_ARG_OR(rope_theta, "rope_theta", 1000000.0f);
+  LOAD_ARG_OR(rope_scaling_mrope_section,
+              "text_config.rope_scaling.mrope_section",
+              std::vector<int64_t>{});
+  LOAD_ARG_OR(rope_scaling_mrope_section,
+              "text_config.rope_parameters.mrope_section",
+              args->rope_scaling_mrope_section());
+  LOAD_ARG_OR(rope_scaling_mrope_section,
+              "rope_parameters.mrope_section",
+              args->rope_scaling_mrope_section());
+  LOAD_ARG_OR(rope_scaling_mrope_section,
+              "rope_scaling.mrope_section",
+              args->rope_scaling_mrope_section());
 
   // For qwen3/2.5 model < 7B, tie_word_embeddings = true
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);

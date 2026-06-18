@@ -42,9 +42,17 @@ limitations under the License.
 #include "vlm_engine.h"
 
 namespace xllm {
+bool should_use_ssm_engine(const Options& options) {
+  return !options.draft_model_path().value_or("").empty() ||
+         (options.speculative_algorithm() == "Suffix" &&
+          options.num_speculative_tokens() > 0);
+}
 
 VLMMaster::VLMMaster(const Options& options)
-    : Master(options, EngineType::VLM) {
+    : Master(
+          options,
+          should_use_ssm_engine(options) ? EngineType::SSM : EngineType::VLM) {
+  set_engine_type(EngineType::VLM);
   CHECK(engine_->init());
 
   model_args_ = engine_->model_args();
@@ -65,6 +73,7 @@ VLMMaster::VLMMaster(const Options& options)
       .max_seqs_per_batch(options.max_seqs_per_batch())
       .max_tokens_per_chunk_for_prefill(
           options.max_tokens_per_chunk_for_prefill())
+      .num_speculative_tokens(options_.num_speculative_tokens())
       .dp_size(options_.dp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_chunked_prefill(options_.enable_chunked_prefill())
@@ -350,7 +359,11 @@ std::shared_ptr<Request> VLMMaster::generate_request(std::string prompt,
 
   // allocate enough capacity for prompt tokens, max tokens, and speculative
   // tokens, TODO: add image token size as well.
-  const size_t capacity = prompt_tokens.size() + max_tokens + 1;
+  size_t capacity = prompt_tokens.size() + max_tokens +
+                    options_.num_speculative_tokens() + /*bonus_token*/ 1;
+  if (options_.enable_schedule_overlap()) {
+    capacity += options_.num_speculative_tokens() + 1;
+  }
   const size_t best_of = sp.best_of.value_or(sp.n);
 
   RequestSamplingParam sampling_param;
