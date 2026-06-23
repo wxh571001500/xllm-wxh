@@ -171,12 +171,22 @@ NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
 
   auto parallel_args = context.get_parallel_args();
   auto model_args = context.get_model_args();
+  auto quant_args = context.get_quant_args();
   auto options = context.get_tensor_options();
 
   rank_ = parallel_args.rank();
   first_k_dense_replace_ = model_args.first_k_dense_replace();
   n_layers_ = model_args.n_layers();
   num_experts_ = model_args.n_routed_experts();
+  quant_group_size_ = static_cast<int32_t>(quant_args.group_size());
+  if (quantize_type_ == "w4a8_dynamic") {
+    CHECK_GE(quant_group_size_, 0)
+        << "W4A8_DYNAMIC group_size must be >= 0, got " << quant_group_size_;
+    CHECK_EQ(quant_args.quant_version(), "1.0.0")
+        << "W4A8_DYNAMIC only supports quant_version 1.0.0, got "
+        << (quant_args.quant_version().empty() ? "<empty>"
+                                               : quant_args.quant_version());
+  }
   localWorldSize_ = parallel_args.mapping().localWorldSize();
   ep_size_ = parallel_args.ep_size();
   ep_local_tp_size_ = parallel_args.world_size() / ep_size_;
@@ -296,9 +306,13 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_basic_parameters(
   param.attnLinearTransposeType = {1, 1, 1, 1, 1, 1};
   param.mlpLinearTransposeType = {1, -1, 1, -1};
 
-  param.moeLinearTransposeType = (layer_id_ < args.first_k_dense_replace())
-                                     ? std::vector<int>{-1, -1, -1, -1}
-                                     : std::vector<int>{1, 0, -1, 1};
+  if (layer_id_ < args.first_k_dense_replace()) {
+    param.moeLinearTransposeType = {-1, -1, -1, -1};
+  } else if (quantize_type_ == "w4a8_dynamic") {
+    param.moeLinearTransposeType = {1, 0, -1, 0};
+  } else {
+    param.moeLinearTransposeType = {1, 0, -1, 1};
+  }
 
   param.worldSize = parallel_args.world_size();
   param.normEps = args.rms_norm_eps();
@@ -316,7 +330,7 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_basic_parameters(
   param.numHiddenLayers = args.n_layers();
   param.enableIntraLayerAddNorm = false;
   param.enableInterLayerAddNorm = false;
-  if (quantize_type_ == "") {
+  if (quantize_type_ == "" || quantize_type_ == "w4a8_dynamic") {
     param.enableGMMSwigluQuant = false;
   } else {
     param.enableGMMSwigluQuant =
@@ -394,7 +408,8 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_mlp_parameters(
   param.topkGroups = atb::SVector<int>{args.topk_group()};
   param.isDynamicEp = param.expertParallelDegree == 2 ? true : false;
 
-  param.quantGroupSize = 0;
+  param.quantGroupSize =
+      quantize_type_ == "w4a8_dynamic" ? quant_group_size_ : 0;
   if (quantize_type_ == "") {
     param.enableInitQuant = false;
     param.enableSwigluQuant = false;
@@ -453,8 +468,12 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_kimi_k2_parameters(
   // TODO: Pending confirmation whether kimi_k2 model supports
   // enable_gmmswigluquant set to true
   bool enable_gmmswigluquant = false;
-  param.enableSwigluQuant =
-      quantize_type_ == "w8a8_dynamic" && !enable_gmmswigluquant;
+  if (quantize_type_ == "w4a8_dynamic") {
+    param.enableSwigluQuant = is_prefill && !enable_gmmswigluquant;
+  } else {
+    param.enableSwigluQuant =
+        quantize_type_ == "w8a8_dynamic" && !enable_gmmswigluquant;
+  }
   param.enableGMMSwigluQuant = enable_gmmswigluquant;
 }
 
@@ -499,8 +518,35 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_quantization_parameters(
                                   static_cast<int>(LinearType::INVALID),
                                   static_cast<int>(LinearType::FP)};
     }
-  } else {
+  } else if (quantize_type_ == "w8a8_dynamic") {
     param.moePackQuantType = static_cast<int>(PackType::ALL_W8A8_DYNAMIC);
+    param.packQuantType = {static_cast<int>(PackType::MIX_W8A8),
+                           static_cast<int>(PackType::ALL_W8A8_DYNAMIC)};
+    param.attnLinearQuantType = {static_cast<int>(LinearType::INT),
+                                 static_cast<int>(LinearType::INT),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::INT)};
+    param.mlpLinearQuantType = {static_cast<int>(LinearType::INT),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INT),
+                                static_cast<int>(LinearType::INVALID)};
+    if (layer_id_ < param.firstKDenseReplace) {
+      param.moeLinearQuantType = {static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INVALID)};
+    } else {
+      param.moeLinearQuantType = {static_cast<int>(LinearType::FP),
+                                  static_cast<int>(LinearType::INT),
+                                  static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INT)};
+    }
+  } else if (quantize_type_ == "w4a8_dynamic") {
+    param.moePackQuantType = static_cast<int>(PackType::ALL_W4A8);
+    // Kimi K2.5 keeps attention/dense/shared MLP on W8A8 dynamic; routed
+    // experts use the W4A8 grouped-matmul path.
     param.packQuantType = {static_cast<int>(PackType::MIX_W8A8),
                            static_cast<int>(PackType::ALL_W8A8_DYNAMIC)};
     param.attnLinearQuantType = {static_cast<int>(LinearType::INT),
