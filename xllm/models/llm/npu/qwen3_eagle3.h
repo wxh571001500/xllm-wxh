@@ -313,6 +313,12 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     embed_tokens_ = npu_word_embedding;
   }
 
+  virtual void set_restored_npu_word_embedding(
+      layer::NpuWordEmbedding& npu_word_embedding) {
+    embed_tokens_ = npu_word_embedding;
+    quarot_global_rotation_t_ = torch::Tensor();
+  }
+
  protected:
   torch::Tensor restore_quarot_hidden(torch::Tensor hidden_states,
                                       int64_t hidden_size) {
@@ -475,6 +481,11 @@ class QWen3Eagle3ForCausalLMImpl : public torch::nn::Module {
   virtual void set_npu_word_embedding(
       layer::NpuWordEmbedding& npu_word_embedding) {
     model_->set_npu_word_embedding(npu_word_embedding);
+  }
+
+  virtual void set_restored_npu_word_embedding(
+      layer::NpuWordEmbedding& npu_word_embedding) {
+    model_->set_restored_npu_word_embedding(npu_word_embedding);
   }
 
  protected:

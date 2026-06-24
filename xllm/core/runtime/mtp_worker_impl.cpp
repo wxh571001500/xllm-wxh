@@ -552,7 +552,11 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
       auto head = target_impl_->get_npu_lm_head();
       draft_impl_->set_npu_lm_head(head);
       auto word_embedding = target_impl_->get_npu_word_embedding();
-      draft_impl_->set_npu_word_embedding(word_embedding);
+      if (target_impl_->has_restored_npu_word_embedding()) {
+        draft_impl_->set_restored_npu_word_embedding(word_embedding);
+      } else {
+        draft_impl_->set_npu_word_embedding(word_embedding);
+      }
     } else {
       auto head = target_impl_->get_lm_head();
       draft_impl_->set_lm_head(head);
