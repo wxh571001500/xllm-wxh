@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <c10/core/DeviceGuard.h>
 #include <torch/nn/functional/normalization.h>
 
 #include <filesystem>
@@ -148,6 +149,7 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
 
     torch::Tensor restored;
     {
+      torch::DeviceGuard device_guard(device);
       auto npu_options =
           torch::TensorOptions().dtype(torch::kFloat32).device(device);
       auto cpu_options = torch::TensorOptions()
@@ -526,7 +528,13 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
         << "QuaRot global_rotation must be square";
 
     auto global_rotation_cpu =
-        global_rotation.to(torch::kCPU).to(torch::kFloat32).contiguous();
+        global_rotation
+            .to(torch::TensorOptions().dtype(torch::kFloat32).device(
+                    torch::kCPU),
+                /*non_blocking=*/false,
+                /*copy=*/true)
+            .contiguous();
+    torch::DeviceGuard device_guard(device_);
     auto global_rotation_device =
         global_rotation_cpu
             .to(torch::TensorOptions().dtype(dtype_).device(device_),

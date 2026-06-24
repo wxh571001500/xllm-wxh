@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <atb/atb_infer.h>
+#include <c10/core/DeviceGuard.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
@@ -509,6 +510,7 @@ class QWen3Eagle3ForCausalLMImpl : public torch::nn::Module {
     CHECK_EQ(global_rotation.size(0), global_rotation.size(1))
         << "QuaRot global_rotation must be square";
 
+    torch::DeviceGuard device_guard(device_);
     global_rotation =
         global_rotation
             .to(torch::TensorOptions().dtype(dtype_).device(device_),
