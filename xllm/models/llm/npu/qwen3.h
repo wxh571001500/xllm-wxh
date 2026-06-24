@@ -331,17 +331,13 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
-    const std::filesystem::path model_path(loader->model_weights_path());
     LlmForCausalLMImplBase<QWen3Model>::load_model(std::move(loader), prefix);
-    load_optional_quarot_rotation(model_path);
   }
 
   void lazy_load_model(std::unique_ptr<ModelLoader> loader,
                        std::string prefix = "model.") override {
-    const std::filesystem::path model_path(loader->model_weights_path());
     LlmForCausalLMImplBase<QWen3Model>::lazy_load_model(std::move(loader),
                                                         prefix);
-    load_optional_quarot_rotation(model_path);
   }
 
  private:
