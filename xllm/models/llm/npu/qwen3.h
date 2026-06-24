@@ -130,31 +130,40 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
   }
 
   void load_restored_embed_tokens(const StateDict& state_dict,
-                                  torch::Tensor global_rotation) {
+                                  torch::Tensor global_rotation,
+                                  const torch::Device& device) {
     auto embed_weight = state_dict.get_tensor("embed_tokens.weight");
     if (!embed_weight.defined()) {
       return;
     }
 
     CHECK_EQ(embed_weight.dim(), 2) << "Embedding weight must be a 2D tensor";
-    auto rotation_t = global_rotation.to(torch::kCPU)
-                          .to(torch::kFloat32)
-                          .transpose(0, 1)
-                          .contiguous();
-    CHECK_EQ(rotation_t.dim(), 2)
+    CHECK_EQ(global_rotation.dim(), 2)
         << "QuaRot global_rotation must be a 2D tensor";
-    CHECK_EQ(rotation_t.size(0), rotation_t.size(1))
+    CHECK_EQ(global_rotation.size(0), global_rotation.size(1))
         << "QuaRot global_rotation must be square";
-    CHECK_EQ(embed_weight.size(1), rotation_t.size(0))
+    CHECK_EQ(embed_weight.size(1), global_rotation.size(0))
         << "QuaRot global_rotation hidden size mismatch, expected "
-        << embed_weight.size(1) << ", got " << rotation_t.size(0);
+        << embed_weight.size(1) << ", got " << global_rotation.size(0);
 
-    auto restored =
-        torch::matmul(
-            embed_weight.to(torch::kCPU).to(torch::kFloat32).contiguous(),
-            rotation_t)
-            .to(embed_weight.scalar_type())
-            .contiguous();
+    torch::Tensor restored;
+    {
+      auto npu_options =
+          torch::TensorOptions().dtype(torch::kFloat32).device(device);
+      auto cpu_options = torch::TensorOptions()
+                             .dtype(embed_weight.scalar_type())
+                             .device(torch::kCPU);
+      auto embed_weight_npu =
+          embed_weight.to(npu_options, /*non_blocking=*/false, /*copy=*/true)
+              .contiguous();
+      auto rotation_t_npu =
+          global_rotation.to(npu_options, /*non_blocking=*/false, /*copy=*/true)
+              .transpose(0, 1)
+              .contiguous();
+      restored = torch::matmul(embed_weight_npu, rotation_t_npu)
+                     .to(cpu_options, /*non_blocking=*/false, /*copy=*/true)
+                     .contiguous();
+    }
     StateDict embed_state_dict({{"weight", restored}});
     restored_embed_tokens_->load_state_dict(embed_state_dict);
     has_restored_embed_tokens_ = true;
@@ -412,7 +421,8 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
                                    ""});
       model_->load_state_dict(model_state_dict);
       if (global_rotation.defined()) {
-        model_->load_restored_embed_tokens(model_state_dict, global_rotation);
+        model_->load_restored_embed_tokens(
+            model_state_dict, global_rotation, device_);
       }
       if (!embedding_mode_) {
         if (tie_word_embeddings) {
@@ -460,7 +470,8 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
                                    ""});
       model_->load_state_dict(model_state_dict);
       if (global_rotation.defined()) {
-        model_->load_restored_embed_tokens(model_state_dict, global_rotation);
+        model_->load_restored_embed_tokens(
+            model_state_dict, global_rotation, device_);
       }
       if (!embedding_mode_) {
         if (tie_word_embeddings) {
