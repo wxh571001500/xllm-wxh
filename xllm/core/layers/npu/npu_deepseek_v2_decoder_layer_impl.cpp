@@ -22,10 +22,12 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/util/utils.h"
 #include "layers/common/rotary_embedding_util.h"
 #include "loader/deepseek_v2_decoder_loader.h"
 
@@ -36,6 +38,11 @@ namespace {
 
 bool is_kimi_text_model(const ModelArgs& args) {
   return args.model_type() == "kimi_k2" || args.model_type() == "kimi_k25";
+}
+
+bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
+  return args.enable_mla() &&
+         util::is_deepseek_v2_family_model_type(args.model_type());
 }
 
 }  // namespace
@@ -173,6 +180,7 @@ NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
   auto model_args = context.get_model_args();
   auto quant_args = context.get_quant_args();
   auto options = context.get_tensor_options();
+  uses_deepseek_v2_mla_graph_ = uses_deepseek_v2_mla_graph(model_args);
 
   rank_ = parallel_args.rank();
   first_k_dense_replace_ = model_args.first_k_dense_replace();
@@ -213,7 +221,9 @@ NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
   param_from_args(decode_param_, model_args, parallel_args, false, false);
   param_from_args(decode_mla_param_, model_args, parallel_args, false, false);
   decode_mla_param_.enableCustomizeMla =
-      ::xllm::KernelConfig::get_instance().enable_customize_mla_kernel();
+      ::xllm::KernelConfig::get_instance().enable_customize_mla_kernel() ||
+      (uses_deepseek_v2_mla_graph_ &&
+       ::xllm::ExecutionConfig::get_instance().enable_graph());
 
   loader_ = std::make_unique<DeekseekV2DecoderLoader>(
       WEIGHT_COUNT_PER_LAYER,
@@ -852,13 +862,22 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
   } else {
-    const int num_tokens = x.sizes().at(0);
+    const int32_t num_tokens = static_cast<int32_t>(x.sizes().at(0));
     // decode phase with tokens more than this limit will lead to error in
     // customize mla kernel. once detect any input exceed the limit, fall back
     // to default kernel.
-    const int num_tokens_limit = 230;
-    if (!::xllm::KernelConfig::get_instance().enable_customize_mla_kernel() ||
-        num_tokens >= num_tokens_limit) {
+    constexpr int32_t kNumTokensLimit = 230;
+    const bool use_graph_decode =
+        ::xllm::ExecutionConfig::get_instance().enable_graph() &&
+        input_params_new.enable_graph;
+    const bool use_deepseek_v2_graph_mla =
+        use_graph_decode && uses_deepseek_v2_mla_graph_;
+    const bool enable_custom_mla =
+        ::xllm::KernelConfig::get_instance().enable_customize_mla_kernel() ||
+        use_deepseek_v2_graph_mla;
+    if ((!use_deepseek_v2_graph_mla && use_graph_decode) ||
+        !enable_custom_mla ||
+        (!use_deepseek_v2_graph_mla && num_tokens >= kNumTokensLimit)) {
       build_node_variant_pack(decode_node_,
                               x,
                               cos_pos,
@@ -937,8 +956,13 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.kv_seq_lens);
+    const int32_t* kv_seq_lens_host_data =
+        (input_params.enable_graph &&
+         input_params.attention.host.graph_kv_seq_lens_data != nullptr)
+            ? input_params.attention.host.graph_kv_seq_lens_data
+            : input_params.attention.host.kv_seq_lens.data();
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
-        const_cast<int32_t*>(input_params.attention.host.kv_seq_lens.data());
+        const_cast<int32_t*>(kv_seq_lens_host_data);
   }
 
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12) =
@@ -986,8 +1010,13 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
       node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17) =
           atb_speed::Utils::AtTensor2Tensor(
               input_params.attention.device.q_seq_lens);
+      const int32_t* q_seq_lens_host_data =
+          (input_params.enable_graph &&
+           input_params.attention.host.graph_q_seq_lens_data != nullptr)
+              ? input_params.attention.host.graph_q_seq_lens_data
+              : input_params.attention.host.q_seq_lens.data();
       node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17).hostData =
-          const_cast<int32_t*>(input_params.attention.host.q_seq_lens.data());
+          const_cast<int32_t*>(q_seq_lens_host_data);
     }
   } else {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17) =

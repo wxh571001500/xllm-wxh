@@ -52,6 +52,9 @@ constexpr uint64_t kSpecVerifyFieldMask = (1ull << 16) - 1;
 constexpr uint64_t kSpecVerifyExpandedBlockMask = (1ull << 15) - 1;
 constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
 constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
+constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
+constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
+constexpr int32_t kMlaGraphKvLenBucket = 2048;
 
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
@@ -222,6 +225,53 @@ ModelOutput forward_eager(CausalLM* model,
   return model->forward(materialized_tokens, positions, kv_cache, params);
 }
 
+bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
+  return args.enable_mla() &&
+         util::is_deepseek_v2_family_model_type(args.model_type());
+}
+
+void hash_graph_key_value(uint64_t& hash, uint64_t value) {
+  constexpr uint64_t kFnvPrime = 1099511628211ull;
+  for (int32_t i = 0; i < 8; ++i) {
+    hash ^= (value >> (i * 8)) & 0xffull;
+    hash *= kFnvPrime;
+  }
+}
+
+int32_t round_up_positive(int32_t value, int32_t bucket) {
+  const int32_t safe_value = std::max<int32_t>(value, 1);
+  return ((safe_value + bucket - 1) / bucket) * bucket;
+}
+
+int32_t get_mla_capture_kv_seq_len_bucket(const ModelInputParams& params,
+                                          const runtime::Options& options) {
+  const int32_t block_size = std::max<int32_t>(options.block_size(), 1);
+  int32_t capture_kv_len =
+      std::max<int32_t>(params.meta.kv_max_seq_len, block_size);
+  if (!params.parallel.dp_global_kv_max_seq_lens.empty()) {
+    capture_kv_len = std::max<int32_t>(
+        capture_kv_len, util::max(params.parallel.dp_global_kv_max_seq_lens));
+    return round_up_positive(capture_kv_len, kMlaGraphKvLenBucket);
+  }
+  const auto& block_tables = params.attention.device.block_tables;
+  if (block_tables.defined() && block_tables.dim() >= 2 &&
+      block_tables.size(1) > 0) {
+    capture_kv_len = std::max<int32_t>(
+        capture_kv_len,
+        static_cast<int32_t>(block_tables.size(1)) * block_size);
+  }
+  return round_up_positive(capture_kv_len, kMlaGraphKvLenBucket);
+}
+
+uint64_t get_mla_graph_key(uint32_t bucket_num_tokens,
+                           int32_t capture_kv_seq_len_bucket) {
+  constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ull;
+  uint64_t hash = kFnvOffsetBasis;
+  hash_graph_key_value(hash, bucket_num_tokens);
+  hash_graph_key_value(hash, static_cast<uint64_t>(capture_kv_seq_len_bucket));
+
+  return kMlaGraphKeyMask | (hash & kMlaGraphKeyPayloadMask);
+}
 }  // namespace
 
 bool AclGraph::capture(CausalLM* model,
@@ -268,7 +318,8 @@ bool AclGraph::capture(CausalLM* model,
                                                num_tokens_,
                                                /*return_capture_params=*/true,
                                                /*skip_token_update=*/
-                                               update_spec_verify_tokens);
+                                               update_spec_verify_tokens,
+                                               /*for_capture=*/true);
   if (update_spec_verify_tokens) {
     persistent_param_.update_spec_verify_inputs(
         tokens,
@@ -369,27 +420,51 @@ bool AclGraph::capture(CausalLM* model,
       graph_stream_ = capture_stream_.value().stream();
       need_restore_stream = true;
     }
-    LOG(INFO) << "capture begin, bucket_num_tokens: " << bucket_num_tokens
-              << ", actual_num_tokens: " << actual_num_tokens;
+    VLOG(kGraphExecutorLogVerboseLevel)
+        << "ACL graph capture begin, bucket_num_tokens=" << bucket_num_tokens
+        << ", actual_num_tokens=" << actual_num_tokens;
 
     // no mempool id, will create a new one; capture mode is thread local, allow
     // other threads to execute synchronous operations
-    graph_.capture_begin(
-        {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
-    // Execute forward pass - NPUGraph mempool manages temporary tensors
-    auto forward_result =
-        model->forward({persistent_param_.persistent_tokens(num_tokens_)},
-                       {persistent_param_.persistent_positions(num_tokens_)},
-                       kv_cache,
-                       {graph_params.value()});
+    bool capture_started = false;
+    try {
+      graph_.capture_begin(
+          {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+      capture_started = true;
+      // Execute forward pass - NPUGraph mempool manages temporary tensors
+      auto forward_result =
+          model->forward({persistent_param_.persistent_tokens(num_tokens_)},
+                         {persistent_param_.persistent_positions(num_tokens_)},
+                         kv_cache,
+                         {graph_params.value()});
 
-    // Store result in persistent buffer owned by NPUGraph mempool
-    persistent_param_.set_hidden_states(forward_result.hidden_states);
-    if (options.enable_graph_aux_hidden_states() &&
-        forward_result.aux_hidden_states.defined()) {
-      persistent_param_.set_aux_hidden_states(forward_result.aux_hidden_states);
+      // Store result in persistent buffer owned by NPUGraph mempool
+      persistent_param_.set_hidden_states(forward_result.hidden_states);
+      if (options.enable_graph_aux_hidden_states() &&
+          forward_result.aux_hidden_states.defined()) {
+        persistent_param_.set_aux_hidden_states(
+            forward_result.aux_hidden_states);
+      }
+      graph_.capture_end();
+      capture_started = false;
+    } catch (...) {
+      if (capture_started) {
+        try {
+          graph_.capture_end();
+        } catch (const std::exception& cleanup_error) {
+          LOG(ERROR) << "ACL graph capture_end during cleanup failed: "
+                     << cleanup_error.what();
+        } catch (...) {
+          LOG(ERROR) << "ACL graph capture_end during cleanup failed.";
+        }
+        graph_.reset();
+      }
+      if (need_restore_stream) {
+        c10_npu::setCurrentNPUStream(
+            c10_npu::getDefaultNPUStream(tensor_options.device().index()));
+      }
+      throw;
     }
-    graph_.capture_end();
     if (graph_task_context_ != nullptr) {
       graph_task_context_->end_capture();
     }
@@ -526,9 +601,10 @@ void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
   CHECK_EQ(aclrtCreateEventWithFlag(&replay_done_event_, ACL_EVENT_SYNC),
            ACL_SUCCESS)
       << "Failed to create ACL graph replay completion event";
-  LOG(INFO) << "Initialized capture_stream"
-            << ", id: " << capture_stream_.value().id()
-            << ", device_index: " << device_index;
+  VLOG(kGraphExecutorLogVerboseLevel)
+      << "Initialized capture_stream"
+      << ", id: " << capture_stream_.value().id()
+      << ", device_index: " << static_cast<int32_t>(device_index);
 }
 
 void AclGraph::make_graph_wait_for_current_stream(aclrtStream current_stream) {
@@ -816,7 +892,6 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     COUNTER_INC(num_model_execution_total_eager);
     return model_->forward(tokens, positions, kv_caches, params);
   }
-
   if (in_decoding_phase &&
       params_single.parallel.dp_global_token_nums.size() > 1) {
     if (params_single.parallel.dp_is_decode.size() !=
@@ -1012,8 +1087,11 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                      bucket_num_tokens);
   } catch (const std::exception& e) {
     LOG(ERROR) << "ACL graph capture threw exception for bucket num_tokens="
-               << bucket_num_tokens << ": " << e.what()
-               << ". Falling back to eager mode.";
+               << bucket_num_tokens << ": " << e.what();
+    if (uses_deepseek_v2_mla_graph(args_)) {
+      throw;
+    }
+    LOG(ERROR) << "Falling back to eager mode.";
     COUNTER_INC(num_model_execution_total_eager);
     return forward_eager(model_, tokens, positions, kv_caches, params);
   }
@@ -1220,7 +1298,7 @@ uint32_t AclGraphExecutorImpl::get_bucket_num_tokens(
   } else if (num_tokens <= 8) {
     return 8;
   } else {
-    // For num_tokens > 16, use multiples of 16
+    // For num_tokens > 8, use multiples of 16.
     return ((num_tokens + 15) / 16) * 16;
   }
 }
@@ -1273,6 +1351,11 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
     }
     return static_cast<uint64_t>(bucket_num_tokens) | kSpecVerifyGraphKeyMask |
            (q_max_seq_len << kSpecVerifyQMaxSeqLenShift);
+  }
+  if (uses_deepseek_v2_mla_graph(args_)) {
+    const int32_t capture_kv_seq_len_bucket =
+        get_mla_capture_kv_seq_len_bucket(params, options_);
+    return get_mla_graph_key(bucket_num_tokens, capture_kv_seq_len_bucket);
   }
   return static_cast<uint64_t>(bucket_num_tokens);
 }
