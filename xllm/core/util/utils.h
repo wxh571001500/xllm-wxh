@@ -131,6 +131,12 @@ inline bool is_mla_model_type(std::string_view model_type) {
   return mla_model_type_set().contains(std::string(model_type));
 }
 
+inline bool is_deepseek_v2_family_model_type(std::string_view model_type) {
+  return model_type == "deepseek_v2" || model_type == "deepseek_v3" ||
+         model_type == "deepseek_v3_mtp" || model_type == "kimi_k2" ||
+         model_type == "kimi_k25" || model_type == "joyai_llm_flash";
+}
+
 inline bool has_mtp_model_type_marker(std::string_view model_type) {
   return model_type.find("mtp") != std::string_view::npos;
 }

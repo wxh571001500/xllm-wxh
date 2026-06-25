@@ -362,6 +362,7 @@ std::vector<ForwardInput> RecEngine::LlmRecEnginePipeline::prepare_inputs(
 
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(engine_.dp_size_);
+  std::vector<int32_t> dp_global_kv_max_seq_lens(engine_.dp_size_);
   std::vector<int32_t> dp_is_decode(engine_.dp_size_, 0);
   // when enable dp, we need to check the forward type of each batch
   // and set the empty forward type of each batch to the same value as the first
@@ -376,6 +377,8 @@ std::vector<ForwardInput> RecEngine::LlmRecEnginePipeline::prepare_inputs(
         engine_.args_, engine_.threadpool_.get())));
     dp_global_token_nums[dp_rank] =
         static_cast<int32_t>(batched_inputs[dp_rank].host_token_ids().numel());
+    dp_global_kv_max_seq_lens[dp_rank] =
+        batched_inputs[dp_rank].input_params.meta.kv_max_seq_len;
     if (batch_forward_type.is_empty() &&
         !batched_inputs[dp_rank]
              .input_params.meta.batch_forward_type.is_empty()) {
@@ -390,6 +393,8 @@ std::vector<ForwardInput> RecEngine::LlmRecEnginePipeline::prepare_inputs(
   for (int32_t dp_rank = 0; dp_rank < engine_.dp_size_; ++dp_rank) {
     batched_inputs[dp_rank].input_params.parallel.dp_global_token_nums =
         dp_global_token_nums;
+    batched_inputs[dp_rank].input_params.parallel.dp_global_kv_max_seq_lens =
+        dp_global_kv_max_seq_lens;
     batched_inputs[dp_rank].input_params.parallel.dp_is_decode = dp_is_decode;
     if (batched_inputs[dp_rank]
             .input_params.meta.batch_forward_type.is_empty()) {

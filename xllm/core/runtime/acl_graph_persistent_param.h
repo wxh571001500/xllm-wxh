@@ -49,18 +49,19 @@ class GraphPersistentParam final {
   ~GraphPersistentParam();
 
   // Update persistent tensors with new input data
-  // If return_capture_params is true, returns a ModelInputParams with
-  // persistent buffer references. padded_num_tokens must be > 0 when
-  // return_capture_params is true, used for build new ModelInputParams for
-  // capture. If return_capture_params is false, only updates persistent buffers
-  // and returns std::nullopt.
+  // If return_graph_params is true, returns a ModelInputParams with persistent
+  // buffer references. During capture, pass for_capture=true so model-specific
+  // host parameters can be bucketed for graph tiling/workspace. During replay,
+  // return_graph_params may still be true for metadata refresh, but
+  // for_capture must stay false so dynamic host metadata uses actual lengths.
   std::optional<ModelInputParams> update(const torch::Tensor& tokens,
                                          const torch::Tensor& k_cache,
                                          const torch::Tensor& v_cache,
                                          const torch::Tensor& positions,
                                          const ModelInputParams& params,
                                          uint32_t padded_num_tokens,
-                                         bool return_capture_params = false);
+                                         bool return_graph_params = false,
+                                         bool for_capture = false);
 
   // Getter methods for persistent tensors
   torch::Tensor persistent_tokens(uint32_t actual_tokens = 0) const {
@@ -128,6 +129,18 @@ class GraphPersistentParam final {
           /*dim=*/0, /*start=*/0, /*end=*/actual_batch_size);
     }
     return kv_seq_lens_;
+  }
+  const int32_t* persistent_host_q_seq_lens_data() const {
+    return persistent_host_q_seq_lens_.data();
+  }
+  const int32_t* persistent_host_kv_seq_lens_data() const {
+    return persistent_host_kv_seq_lens_.data();
+  }
+  const int32_t* capture_host_q_seq_lens_data() const {
+    return capture_host_q_seq_lens_.data();
+  }
+  const int32_t* capture_host_kv_seq_lens_data() const {
+    return capture_host_kv_seq_lens_.data();
   }
   bool need_update_attn_mask() const { return need_update_attn_mask_; }
   void set_need_update_attn_mask(bool value) { need_update_attn_mask_ = value; }
@@ -221,6 +234,11 @@ class GraphPersistentParam final {
   torch::Tensor q_seq_lens_default_;
   torch::Tensor kv_seq_lens_default_;
   torch::Tensor expanded_kv_seq_lens_;
+  std::vector<int32_t> persistent_host_q_seq_lens_;
+  std::vector<int32_t> persistent_host_kv_seq_lens_;
+  std::vector<int32_t> persistent_host_expanded_kv_seq_lens_;
+  std::vector<int32_t> capture_host_q_seq_lens_;
+  std::vector<int32_t> capture_host_kv_seq_lens_;
 
   // for deepseekv3.2
   torch::Tensor q_cu_seq_lens_;

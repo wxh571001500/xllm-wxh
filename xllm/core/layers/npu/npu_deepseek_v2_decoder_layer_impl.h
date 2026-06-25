@@ -235,6 +235,7 @@ class NpuDeepseekV2DecoderLayerImpl : public BaseLayer {
   float sm_scale_;
   int32_t quant_group_size_ = 0;
   int32_t num_speculative_tokens_ = 0;
+  bool uses_deepseek_v2_mla_graph_ = false;
 
   atb_speed::deepseekV2::DecoderLayerParam prefill_param_;
   atb_speed::deepseekV2::DecoderLayerParam prefill_param_prefixcache_;

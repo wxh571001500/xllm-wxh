@@ -351,6 +351,9 @@ struct AttentionHostInput {
   std::vector<int32_t> ring_cur_seqlen;
   std::vector<int32_t> ring_cache_seqlen;
   torch::Tensor block_tables;
+
+  const int32_t* graph_q_seq_lens_data = nullptr;
+  const int32_t* graph_kv_seq_lens_data = nullptr;
 };
 
 struct AttentionDeviceInput {
@@ -785,6 +788,9 @@ struct MultiModalInput {
 struct ParallelInput {
   // num tokens of all workers, mainly used for dp case
   std::vector<int32_t> dp_global_token_nums;
+  // max kv seq len of all dp shards. Graph key generation uses this so empty
+  // DP decode ranks pick the same graph as ranks with real decode tokens.
+  std::vector<int32_t> dp_global_kv_max_seq_lens;
   std::vector<int32_t> dp_is_decode;
 
   DpEpPaddingData dp_ep_padding_data;
@@ -807,6 +813,7 @@ struct ParallelInput {
   ParallelInput to(const torch::Device& device) const {
     ParallelInput out;
     out.dp_global_token_nums = dp_global_token_nums;
+    out.dp_global_kv_max_seq_lens = dp_global_kv_max_seq_lens;
     out.dp_is_decode = dp_is_decode;
     out.dp_ep_padding_data = dp_ep_padding_data;
     out.cp_ep_padding_data

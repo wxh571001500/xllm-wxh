@@ -141,8 +141,8 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   std::unique_ptr<GraphPersistentParam> persistent_param_;
 
   // Get bucket num_tokens for given num_tokens
-  // For num_tokens < 8: use 1, 2, 4, 8
-  // For num_tokens >= 8: use multiples of 8
+  // For num_tokens <= 8: use 1, 2, 4, 8
+  // For num_tokens > 8: use multiples of 16
   uint32_t get_bucket_num_tokens(uint32_t num_tokens) const;
 
   uint64_t get_graph_key(uint32_t bucket_num_tokens,

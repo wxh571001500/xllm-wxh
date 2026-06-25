@@ -131,6 +131,38 @@ bool is_qwen3_5_model_type(const std::string& model_type) {
          model_type == "qwen3_5_text" || model_type.rfind("qwen3_5_", 0) == 0;
 }
 
+bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
+  return args.enable_mla() &&
+         util::is_deepseek_v2_family_model_type(args.model_type());
+}
+
+constexpr int32_t kMlaGraphKvLenBucket = 2048;
+
+int32_t round_up_positive(int32_t value, int32_t bucket) {
+  const int32_t safe_value = std::max<int32_t>(value, 1);
+  return ((safe_value + bucket - 1) / bucket) * bucket;
+}
+
+int32_t graph_mla_capture_kv_seq_len(const ModelInputParams& params,
+                                     const runtime::Options& options) {
+  const int32_t block_size = std::max<int32_t>(options.block_size(), 1);
+  int32_t capture_kv_len =
+      std::max<int32_t>(params.meta.kv_max_seq_len, block_size);
+  if (!params.parallel.dp_global_kv_max_seq_lens.empty()) {
+    capture_kv_len = std::max<int32_t>(
+        capture_kv_len, util::max(params.parallel.dp_global_kv_max_seq_lens));
+    return round_up_positive(capture_kv_len, kMlaGraphKvLenBucket);
+  }
+  const auto& block_tables = params.attention.device.block_tables;
+  if (block_tables.defined() && block_tables.dim() >= 2 &&
+      block_tables.size(1) > 0) {
+    capture_kv_len = std::max<int32_t>(
+        capture_kv_len,
+        static_cast<int32_t>(block_tables.size(1)) * block_size);
+  }
+  return round_up_positive(capture_kv_len, kMlaGraphKvLenBucket);
+}
+
 }  // namespace
 
 // GraphPersistentParam implementation
@@ -147,9 +179,10 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
       need_update_attn_mask_(need_update_attn_mask) {
   // Determine whether attention plan needs to be updated based on model type
   // Future logic can be extended here for more complex model-specific behavior
-  need_update_attention_plan_ = (args.model_type() != "deepseek_v32" &&
-                                 args.model_type() != "deepseek_v4" &&
-                                 args.model_type() != "glm_moe_dsa");
+  need_update_attention_plan_ =
+      (args.model_type() != "deepseek_v32" &&
+       args.model_type() != "deepseek_v4" &&
+       args.model_type() != "glm_moe_dsa" && !uses_deepseek_v2_mla_graph(args));
 
   // Check if mRoPE is used (for VLM models like qwen2-vl)
   use_mrope_ = !args.rope_scaling_mrope_section().empty();
@@ -194,6 +227,14 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
                                      torch::dtype(torch::kInt).device(device));
   expanded_kv_seq_lens_ = torch::zeros(
       {max_tokens_per_batch}, torch::dtype(torch::kInt).device(device));
+  persistent_host_q_seq_lens_.assign(static_cast<size_t>(max_seqs_per_batch),
+                                     1);
+  persistent_host_kv_seq_lens_.assign(static_cast<size_t>(max_seqs_per_batch),
+                                      1);
+  persistent_host_expanded_kv_seq_lens_.assign(
+      static_cast<size_t>(max_tokens_per_batch), 1);
+  capture_host_q_seq_lens_.assign(static_cast<size_t>(max_seqs_per_batch), 1);
+  capture_host_kv_seq_lens_.assign(static_cast<size_t>(max_seqs_per_batch), 1);
 
   // Block table tensors with maximum possible size
   const int64_t block_size = options.block_size();
@@ -581,7 +622,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     const torch::Tensor& positions,
     const ModelInputParams& params,
     uint32_t padded_num_tokens,
-    bool return_capture_params) {
+    bool return_graph_params,
+    bool for_capture) {
   CHECK_GT(padded_num_tokens, 0) << "padded_num_tokens must be > 0";
   const uint32_t actual_num_tokens = tokens.size(0);
   const bool is_decode = params.meta.batch_forward_type.is_decode();
@@ -908,6 +950,24 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     expanded_kv_seq_lens_vec = update_expanded_spec_decode_attention(
         params, actual_num_tokens, padded_num_tokens, actual_batch_size);
   }
+  CHECK_LE(static_cast<size_t>(padded_batch_size),
+           persistent_host_kv_seq_lens_.size())
+      << "padded_batch_size exceeds persistent host seq lens capacity";
+  std::copy(padded_kv_seq_lens_vec.begin(),
+            padded_kv_seq_lens_vec.end(),
+            persistent_host_kv_seq_lens_.begin());
+  std::copy(padded_q_seq_lens_vec.begin(),
+            padded_q_seq_lens_vec.end(),
+            persistent_host_q_seq_lens_.begin());
+  if (use_expanded_spec_decode_attention) {
+    CHECK_LE(static_cast<size_t>(padded_num_tokens),
+             persistent_host_expanded_kv_seq_lens_.size())
+        << "padded_num_tokens exceeds persistent expanded host seq lens "
+           "capacity";
+    std::copy(expanded_kv_seq_lens_vec.begin(),
+              expanded_kv_seq_lens_vec.end(),
+              persistent_host_expanded_kv_seq_lens_.begin());
+  }
 
   if (uses_paged_attention_tiling()) {
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
@@ -960,79 +1020,123 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   update_persistent_cp_ep_padding(params.parallel.cp_ep_padding_data,
                                   padded_num_tokens);
 
-  // Return ModelInputParams with persistent buffer references if requested
-  if (return_capture_params) {
-    std::optional<ModelInputParams> params_for_capture =
+  // Return ModelInputParams with persistent buffer references if requested.
+  // Capture uses bucketed DeepSeekV2-family MLA host lengths to size ATB
+  // tiling/workspace. Replay uses the same stable hostData addresses, but
+  // refreshes them with the actual per-step lengths above before graph replay.
+  if (return_graph_params) {
+    std::optional<ModelInputParams> graph_params =
         std::make_optional<ModelInputParams>(params);
-    // Set persistent buffers in params_for_capture
-    params_for_capture->attention.device.kv_seq_lens =
+    std::vector<int32_t> capture_host_kv_seq_lens_vec =
+        persistent_host_kv_seq_lens_;
+    std::vector<int32_t> capture_host_q_seq_lens_vec =
+        persistent_host_q_seq_lens_;
+    const bool use_mla_capture_host_lens =
+        for_capture && is_decode && uses_deepseek_v2_mla_graph(args_);
+    if (use_mla_capture_host_lens) {
+      const int32_t capture_kv_seq_len =
+          graph_mla_capture_kv_seq_len(params, options_);
+      std::fill(capture_host_kv_seq_lens_vec.begin(),
+                capture_host_kv_seq_lens_vec.begin() + padded_batch_size,
+                capture_kv_seq_len);
+      std::fill(capture_host_q_seq_lens_vec.begin(),
+                capture_host_q_seq_lens_vec.begin() + padded_batch_size,
+                1);
+    }
+    CHECK_LE(static_cast<size_t>(padded_batch_size),
+             capture_host_kv_seq_lens_.size())
+        << "padded_batch_size exceeds capture host seq lens capacity";
+    std::copy(capture_host_kv_seq_lens_vec.begin(),
+              capture_host_kv_seq_lens_vec.begin() + padded_batch_size,
+              capture_host_kv_seq_lens_.begin());
+    std::copy(capture_host_q_seq_lens_vec.begin(),
+              capture_host_q_seq_lens_vec.begin() + padded_batch_size,
+              capture_host_q_seq_lens_.begin());
+
+    const int32_t* graph_kv_seq_lens_data =
+        use_mla_capture_host_lens ? capture_host_kv_seq_lens_data()
+                                  : persistent_host_kv_seq_lens_data();
+    const int32_t* graph_q_seq_lens_data =
+        use_mla_capture_host_lens ? capture_host_q_seq_lens_data()
+                                  : persistent_host_q_seq_lens_data();
+    const std::vector<int32_t>& graph_host_kv_seq_lens_vec =
+        use_mla_capture_host_lens ? capture_host_kv_seq_lens_vec
+                                  : persistent_host_kv_seq_lens_;
+    const std::vector<int32_t>& graph_host_q_seq_lens_vec =
+        use_mla_capture_host_lens ? capture_host_q_seq_lens_vec
+                                  : persistent_host_q_seq_lens_;
+
+    // Set persistent buffers in graph_params.
+    graph_params->attention.device.kv_seq_lens =
         kv_seq_lens(static_cast<uint32_t>(padded_batch_size));
-    params_for_capture->attention.device.q_seq_lens =
+    graph_params->attention.device.q_seq_lens =
         q_seq_lens(static_cast<uint32_t>(padded_batch_size));
-    params_for_capture->meta.actual_num_sequences =
+    graph_params->meta.actual_num_sequences =
         is_empty_dp_decode_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
-    params_for_capture->attention.host.kv_seq_lens = padded_kv_seq_lens_vec;
-    params_for_capture->attention.host.q_seq_lens = padded_q_seq_lens_vec;
-    params_for_capture->meta.num_sequences =
-        static_cast<int32_t>(padded_batch_size);
-    params_for_capture->meta.batch_forward_type =
-        params.meta.batch_forward_type;
-    params_for_capture->enable_graph = true;
-    if (params_for_capture->parallel.dp_global_token_nums.size() > 1) {
-      params_for_capture->parallel.dp_global_token_nums = std::vector<int32_t>(
-          params_for_capture->parallel.dp_global_token_nums.size(),
+    graph_params->attention.host.kv_seq_lens.assign(
+        graph_host_kv_seq_lens_vec.begin(),
+        graph_host_kv_seq_lens_vec.begin() + padded_batch_size);
+    graph_params->attention.host.q_seq_lens.assign(
+        graph_host_q_seq_lens_vec.begin(),
+        graph_host_q_seq_lens_vec.begin() + padded_batch_size);
+    graph_params->attention.host.graph_kv_seq_lens_data =
+        graph_kv_seq_lens_data;
+    graph_params->attention.host.graph_q_seq_lens_data = graph_q_seq_lens_data;
+    graph_params->meta.num_sequences = static_cast<int32_t>(padded_batch_size);
+    graph_params->meta.batch_forward_type = params.meta.batch_forward_type;
+    graph_params->enable_graph = true;
+    if (graph_params->parallel.dp_global_token_nums.size() > 1) {
+      graph_params->parallel.dp_global_token_nums = std::vector<int32_t>(
+          graph_params->parallel.dp_global_token_nums.size(),
           static_cast<int32_t>(padded_num_tokens));
     }
-    params_for_capture->attention.device.new_cache_slots =
+    graph_params->attention.device.new_cache_slots =
         persistent_new_cache_slots(padded_num_tokens);
-    params_for_capture->attention.device.block_tables =
+    graph_params->attention.device.block_tables =
         persistent_block_tables(static_cast<uint32_t>(padded_batch_size));
     if (!params.embedding.linear_state_ids.empty()) {
-      params_for_capture->embedding.linear_state_ids =
+      graph_params->embedding.linear_state_ids =
           params.embedding.linear_state_ids;
-      params_for_capture->embedding.linear_state_ids.resize(
+      graph_params->embedding.linear_state_ids.resize(
           static_cast<size_t>(padded_batch_size), kPaddingLinearStateId);
-      params_for_capture->embedding.linear_state_indices =
+      graph_params->embedding.linear_state_indices =
           persistent_linear_state_indices(
               static_cast<uint32_t>(padded_batch_size));
     }
 
     // Only set attn_mask if need_update_attn_mask_ is true
     if (need_update_attn_mask_) {
-      params_for_capture->graph.attn_mask = persistent_mask(padded_num_tokens);
+      graph_params->graph.attn_mask = persistent_mask(padded_num_tokens);
     }
     if (uses_paged_attention_tiling()) {
-      params_for_capture->graph.tiling_data = tiling_data();
+      graph_params->graph.tiling_data = tiling_data();
     } else {
-      params_for_capture->graph.tiling_data = torch::Tensor();
+      graph_params->graph.tiling_data = torch::Tensor();
     }
     // Set persistent embedding if available
     if (params.embedding.input_embedding.defined()) {
-      params_for_capture->embedding.input_embedding =
+      graph_params->embedding.input_embedding =
           persistent_embedding(padded_num_tokens);
     }
     if (params.num_accepted_tokens.defined()) {
-      params_for_capture->num_accepted_tokens = persistent_num_accepted_tokens(
+      graph_params->num_accepted_tokens = persistent_num_accepted_tokens(
           static_cast<uint32_t>(padded_batch_size));
     }
     if (use_expanded_spec_decode_attention) {
-      params_for_capture->graph.use_expanded_decode_for_spec_verify_attention =
-          true;
-      params_for_capture->graph.expanded_kv_seq_lens =
-          expanded_kv_seq_lens_.slice(
-              /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens);
-      params_for_capture->graph.expanded_block_tables =
+      graph_params->graph.use_expanded_decode_for_spec_verify_attention = true;
+      graph_params->graph.expanded_kv_seq_lens = expanded_kv_seq_lens_.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens);
+      graph_params->graph.expanded_block_tables =
           persistent_expanded_block_tables_.slice(
               /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens);
-      params_for_capture->graph.expanded_tiling_data =
+      graph_params->graph.expanded_tiling_data =
           uses_paged_attention_tiling() ? tiling_data() : torch::Tensor();
-      params_for_capture->graph.expanded_kv_seq_lens_vec =
-          expanded_kv_seq_lens_vec;
+      graph_params->graph.expanded_kv_seq_lens_vec = expanded_kv_seq_lens_vec;
     }
     if (params.attention.device.q_cu_seq_lens.defined()) {
       const bool use_qwen3_5_query_start_loc =
           is_qwen3_5_model_type(args_.model_type());
-      params_for_capture->attention.device.q_cu_seq_lens = q_cu_seq_lens_.slice(
+      graph_params->attention.device.q_cu_seq_lens = q_cu_seq_lens_.slice(
           /*dim=*/0,
           /*start=*/0,
           /*end=*/padded_batch_size + (use_qwen3_5_query_start_loc ? 1 : 0));
@@ -1044,14 +1148,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     // dp ep and cp ep are mutually exclusive; when neither is enabled the
     // src fields are all undefined and we leave dst untouched so that the
     // captured graph behaves identically to eager mode.
-    replace_capture_dp_ep_padding(
-        params.parallel.dp_ep_padding_data,
-        params_for_capture->parallel.dp_ep_padding_data);
-    replace_capture_cp_ep_padding(
-        params.parallel.cp_ep_padding_data,
-        params_for_capture->parallel.cp_ep_padding_data);
+    replace_capture_dp_ep_padding(params.parallel.dp_ep_padding_data,
+                                  graph_params->parallel.dp_ep_padding_data);
+    replace_capture_cp_ep_padding(params.parallel.cp_ep_padding_data,
+                                  graph_params->parallel.cp_ep_padding_data);
 
-    return params_for_capture;
+    return graph_params;
   }
   return std::nullopt;
 }
