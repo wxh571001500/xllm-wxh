@@ -54,12 +54,14 @@ ProcessGroup* spec_broadcast_group(const ParallelArgs& parallel_args) {
 void broadcast_spec_tokens(torch::Tensor& tokens,
                            ProcessGroup* process_group,
                            int32_t root_rank = 0) {
-  if (process_group == nullptr || process_group->world_size() <= 1 ||
-      !tokens.defined()) {
-    return;
-  }
-  tokens = tokens.contiguous();
-  process_group->broadcast(tokens, root_rank);
+  (void)tokens;
+  (void)process_group;
+  (void)root_rank;
+}
+
+bool enable_spec_token_broadcast(const OptimizationConfig& config) {
+  (void)config;
+  return false;
 }
 
 int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
@@ -454,6 +456,12 @@ bool is_qwen3_5_target_model_type(const std::string& model_type) {
          model_type.rfind("qwen3_5_", 0) == 0;
 }
 
+bool is_kimi_k25_eagle3_draft(const std::string& target_model_type,
+                              const std::string& draft_model_type) {
+  return target_model_type == "kimi_k25" &&
+         draft_model_type == "kimi_k25_eagle3";
+}
+
 #if defined(USE_NPU)
 std::string read_model_type_from_config(const std::string& model_weights_path) {
   JsonReader reader;
@@ -628,6 +636,63 @@ int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
   return static_cast<int64_t>(embedding_size_);
 }
 
+bool MTPWorkerImpl::should_use_separate_draft_kv_cache_shape() const {
+  if (target_impl_ == nullptr || draft_impl_ == nullptr) {
+    return false;
+  }
+  return is_kimi_k25_eagle3_draft(
+      target_impl_->context_.get_model_args().model_type(),
+      draft_impl_->context_.get_model_args().model_type());
+}
+
+KVCacheShape MTPWorkerImpl::get_draft_kv_cache_shape(
+    const KVCacheShape& target_kv_cache_shape) const {
+  CHECK(should_use_separate_draft_kv_cache_shape())
+      << "separate draft KV cache shape is only supported for kimi_k25 Eagle3";
+  CHECK(!target_kv_cache_shape.key_cache_shape().empty())
+      << "target KV cache shape must contain key cache shape";
+
+  const int64_t num_blocks = target_kv_cache_shape.key_cache_shape()[0];
+  CHECK_GT(num_blocks, 0) << "draft KV cache num_blocks must be positive";
+
+  const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
+  const ParallelArgs& draft_parallel_args =
+      draft_impl_->context_.get_parallel_args();
+  const int64_t draft_tp_size = get_dp_local_tp_size(draft_parallel_args);
+  const int64_t dtype_size =
+      static_cast<int64_t>(torch::elementSize(draft_impl_->dtype()));
+  const int64_t total_kv_heads =
+      draft_args.n_kv_heads().value_or(draft_args.n_heads());
+  const int64_t local_kv_heads =
+      std::max<int64_t>(1, total_kv_heads / draft_tp_size);
+  const int64_t cache_dtype_size =
+      options_.kv_cache_dtype() == "auto" ? dtype_size : 1;
+
+  KVCacheCapacity draft_kv_cache_cap;
+  draft_kv_cache_cap.n_blocks(num_blocks)
+      .block_size(options_.block_size())
+      .slot_size(2 * cache_dtype_size * draft_args.head_dim() * local_kv_heads)
+      .index_slot_size(draft_args.index_n_heads() > 0
+                           ? dtype_size * draft_args.index_head_dim()
+                           : 0)
+      .scale_slot_size(options_.kv_cache_dtype() == "auto"
+                           ? 0
+                           : 2 * sizeof(float) * local_kv_heads)
+      .n_layers(draft_args.num_nextn_predict_layers() > 0
+                    ? draft_args.num_nextn_predict_layers()
+                    : draft_args.n_layers());
+
+  LOG(INFO) << "Using separate Eagle3 draft KV cache shape for kimi_k25"
+            << ", num_blocks=" << num_blocks
+            << ", draft_tp_size=" << draft_tp_size
+            << ", local_kv_heads=" << local_kv_heads
+            << ", slot_size=" << draft_kv_cache_cap.slot_size()
+            << ", index_slot_size=" << draft_kv_cache_cap.index_slot_size()
+            << ", scale_slot_size=" << draft_kv_cache_cap.scale_slot_size()
+            << ", n_layers=" << draft_kv_cache_cap.n_layers();
+  return KVCacheShape(draft_kv_cache_cap, draft_args, draft_tp_size);
+}
+
 bool MTPWorkerImpl::use_qwen3_5_spec_verify_path() const {
   return target_impl_ != nullptr &&
          target_impl_->get_status() != WorkerImpl::Status::UNINITIALIZED &&
@@ -641,12 +706,7 @@ bool MTPWorkerImpl::use_qwen3_5_spec_verify_path() const {
 // position p) within the same batch call, but all-reads-then-all-writes
 // ordering means it reads garbage.  Chunked prefill executes tokens causally
 // so token 1 always sees token 0's committed KV.
-bool MTPWorkerImpl::use_mimo_spec_verify_path() const {
-  return target_impl_ != nullptr &&
-         target_impl_->get_status() != WorkerImpl::Status::UNINITIALIZED &&
-         is_mimo_target_model_type(
-             target_impl_->context_.get_model_args().model_type());
-}
+bool MTPWorkerImpl::use_mimo_spec_verify_path() const { return false; }
 
 bool MTPWorkerImpl::use_chunked_prefill_spec_verify_path() const {
   return use_qwen3_5_spec_verify_path() || use_mimo_spec_verify_path();
@@ -677,7 +737,10 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   bool draft_allocated = true;
   const auto draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated = draft_impl_->allocate_kv_cache(kv_cache_shape);
+    draft_allocated = draft_impl_->allocate_kv_cache(
+        should_use_separate_draft_kv_cache_shape()
+            ? get_draft_kv_cache_shape(kv_cache_shape)
+            : kv_cache_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
@@ -727,7 +790,10 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   const auto draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
     draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
+        kv_cache_transfer_,
+        should_use_separate_draft_kv_cache_shape()
+            ? get_draft_kv_cache_shape(kv_cache_shape)
+            : kv_cache_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
@@ -1064,7 +1130,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     // process_draft_sample_output() compresses the still-full [batch, vocab]
     // probs into the cache: gathering the cached prob with a unified token
     // yields a unified prob, so only the [batch] token tensor is broadcast.
-    if (get_optimization_config().enable_spec_token_broadcast &&
+    if (enable_spec_token_broadcast(get_optimization_config()) &&
         enable_schedule_overlap()) {
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
       SampleOutput& draft_sample = draft_outputs.back().sample_output;
@@ -1161,7 +1227,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   // Catch-all for cross-rank RNG divergence: unify the accepted next_tokens to
   // the consensus group's rank 0 so all_draft_accepted and the next
   // draft-extend row layout agree across ranks.
-  if (get_optimization_config().enable_spec_token_broadcast &&
+  if (enable_spec_token_broadcast(get_optimization_config()) &&
       enable_schedule_overlap()) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     broadcast_spec_tokens(val_output.next_tokens,

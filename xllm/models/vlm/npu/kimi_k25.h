@@ -1005,6 +1005,12 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     return language_model_->logits(hidden_states, seleted_idxes);
   }
 
+  torch::Tensor logits(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes,
+                       torch::Tensor& out_hidden) {
+    return language_model_->logits(hidden_states, seleted_idxes, out_hidden);
+  }
+
   void load_model(std::unique_ptr<ModelLoader> loader) {
     LOG(INFO) << "loading vit / projector weight...";
     for (const auto& state_dict : loader->get_state_dicts()) {
@@ -1144,6 +1150,10 @@ REGISTER_MODEL_ARGS(kimi_k25, [&] {
       rope_scaling_attn_factor, "text_config.rope_scaling.attn_factor", 1.0f);
   LOAD_ARG_OR(
       num_nextn_predict_layers, "text_config.num_nextn_predict_layers", 1);
+  LOAD_ARG_OR(layers_to_capture, "layers_to_capture", std::vector<int32_t>{});
+  LOAD_ARG_OR(layers_to_capture,
+              "text_config.layers_to_capture",
+              args->layers_to_capture());
 
   LOAD_ARG_OR(bos_token_id, "text_config.bos_token_id", 163584);
   LOAD_ARG_OR(eos_token_id, "text_config.eos_token_id", 163585);

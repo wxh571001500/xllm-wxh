@@ -51,6 +51,7 @@ class Eagle3WorkerImpl : public MTPWorkerImpl {
   // EAGLE-3 specific: hot_token_id for draft-to-target token mapping
   // hot_token_id = d2t + arange(d2t.size(0))
   torch::Tensor hot_token_id_;
+  bool use_draft_token_mapping_ = true;
 };
 
 }  // namespace xllm
