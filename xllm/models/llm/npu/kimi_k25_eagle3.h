@@ -27,9 +27,7 @@ namespace xllm::npu::model {
 class KimiK25Eagle3ForCausalLMImpl : public QWen3Eagle3ForCausalLMImpl {
  public:
   explicit KimiK25Eagle3ForCausalLMImpl(const ModelContext& context)
-      : QWen3Eagle3ForCausalLMImpl(context) {
-    load_lm_head_from_target_ = true;
-  }
+      : QWen3Eagle3ForCausalLMImpl(context) {}
 };
 TORCH_MODULE(KimiK25Eagle3ForCausalLM);
 

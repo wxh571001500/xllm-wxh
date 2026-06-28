@@ -227,9 +227,12 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
   auto& sampling_params = input.sampling_params;
+  const bool has_aux_hidden_states = model_output.aux_hidden_states.defined();
   torch::Tensor logits;
   torch::Tensor lm_head_selected_token_idxes;
   torch::Tensor selected_hidden_from_lm_head;
+  torch::Tensor selected_aux_hidden;
+  torch::Tensor selected_hidden_for_target_cache;
   if (sampling_params.selected_token_idxes.defined()) {
     lm_head_selected_token_idxes = choose_lm_head_selected_token_idxes(
         sampling_params.selected_token_idxes,
@@ -241,6 +244,18 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
       logits = model_->logits(model_output.hidden_states,
                               lm_head_selected_token_idxes,
                               selected_hidden_from_lm_head);
+      if (has_aux_hidden_states) {
+        selected_aux_hidden = select_hidden_rows(model_output.aux_hidden_states,
+                                                 lm_head_selected_token_idxes);
+      } else if (selected_hidden_from_lm_head.defined()) {
+        selected_hidden_for_target_cache = selected_hidden_from_lm_head;
+      } else if (!input.input_params.meta.batch_forward_type.is_decode() &&
+                 !is_spec_draft_) {
+        selected_hidden_for_target_cache = select_hidden_rows(
+            has_aux_hidden_states ? model_output.aux_hidden_states
+                                  : model_output.hidden_states,
+            lm_head_selected_token_idxes);
+      }
     } else {
       logits = model_->logits(model_output.hidden_states,
                               lm_head_selected_token_idxes);
@@ -275,7 +290,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
 
   if (options_.enable_speculative_decode()) {
     torch::Tensor embeddings;
-    if (model_output.aux_hidden_states.defined()) {
+    if (has_aux_hidden_states) {
       embeddings = model_output.aux_hidden_states;
     } else {
       embeddings = model_output.hidden_states;
@@ -283,18 +298,18 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     if (!input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_) {
       output.sample_output.embeddings = embeddings;
-      if (selected_hidden_from_lm_head.defined()) {
-        output.sample_output.selected_embeddings = selected_hidden_from_lm_head;
-      } else if (sampling_params.selected_token_idxes.defined()) {
+      if (selected_hidden_for_target_cache.defined()) {
         output.sample_output.selected_embeddings =
-            select_hidden_rows(embeddings, lm_head_selected_token_idxes);
+            selected_hidden_for_target_cache;
       }
     } else if (sampling_params.selected_token_idxes.defined()) {
-      if (selected_hidden_from_lm_head.defined()) {
+      if (selected_aux_hidden.defined()) {
+        output.sample_output.embeddings = selected_aux_hidden;
+      } else if (selected_hidden_from_lm_head.defined()) {
         output.sample_output.embeddings = selected_hidden_from_lm_head;
       } else {
-        output.sample_output.embeddings = embeddings.index_select(
-            /*dim=*/0, lm_head_selected_token_idxes);
+        output.sample_output.embeddings =
+            select_hidden_rows(embeddings, lm_head_selected_token_idxes);
       }
     }
   }

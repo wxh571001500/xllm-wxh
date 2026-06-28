@@ -120,6 +120,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Returns true when validation must use chunked-prefill to avoid the
   // FlashInfer batch-decode read-before-write race on the bonus token.
   bool use_chunked_prefill_spec_verify_path() const;
+  bool is_kimi_k25_eagle3_pair() const;
+  bool use_kimi_eagle3_step_major_validate_layout() const;
 
   // Prepare target validate input from cached target context.
   void prepare_validate_inputs(const ForwardInput& inputs,

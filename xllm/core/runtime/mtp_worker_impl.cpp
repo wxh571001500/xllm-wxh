@@ -700,6 +700,22 @@ bool MTPWorkerImpl::use_qwen3_5_spec_verify_path() const {
              target_impl_->context_.get_model_args().model_type());
 }
 
+bool MTPWorkerImpl::is_kimi_k25_eagle3_pair() const {
+  if (target_impl_ == nullptr || draft_impl_ == nullptr ||
+      target_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED ||
+      draft_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
+    return false;
+  }
+  return is_kimi_k25_eagle3_draft(
+      target_impl_->context_.get_model_args().model_type(),
+      draft_impl_->context_.get_model_args().model_type());
+}
+
+bool MTPWorkerImpl::use_kimi_eagle3_step_major_validate_layout() const {
+  return is_kimi_k25_eagle3_pair() && !use_chunked_prefill_spec_verify_path() &&
+         !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+}
+
 // MiMo MTP validation requires chunked-prefill mode (same as Qwen3.5) to
 // avoid the read-before-write race in FlashInfer batch-decode: validation
 // token 1 (at position p+1) must attend to the KV written by token 0 (at
@@ -1180,8 +1196,12 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
   const auto token_options = validate_input.token_ids.options();
   c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
   wait_metadata_ready_event(validate_input, compute_stream);
+  const bool step_major_validate_layout =
+      use_kimi_eagle3_step_major_validate_layout();
   torch::Tensor validate_token_rows =
-      validate_input.token_ids.view({num_sequences, num_val_tokens});
+      step_major_validate_layout
+          ? validate_input.token_ids.view({num_val_tokens, num_sequences})
+          : validate_input.token_ids.view({num_sequences, num_val_tokens});
 
   validate_input.device_tensors_ready = false;
   for (int32_t i = 0; i < num_speculative_tokens; ++i) {
@@ -1193,8 +1213,13 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
         safe_to(next_tokens.flatten(), token_options, /*non_blocking=*/true);
     CHECK_EQ(draft_tokens.numel(), num_sequences)
         << "draft token count must match validate sequence count";
-    validate_token_rows.select(/*dim=*/1, /*index=*/i + 1)
-        .copy_(draft_tokens, /*non_blocking=*/true);
+    if (step_major_validate_layout) {
+      validate_token_rows.select(/*dim=*/0, /*index=*/i + 1)
+          .copy_(draft_tokens, /*non_blocking=*/true);
+    } else {
+      validate_token_rows.select(/*dim=*/1, /*index=*/i + 1)
+          .copy_(draft_tokens, /*non_blocking=*/true);
+    }
   }
   validate_input.device_tensors_ready = true;
 }
@@ -1452,6 +1477,8 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   std::vector<int32_t> atb_q_seq_lens_vec;
   std::vector<int32_t> atb_q_cu_seq_lens_vec;
   int32_t atb_kv_max_seq_len = 0;
+  const bool step_major_validate_layout =
+      use_kimi_eagle3_step_major_validate_layout();
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     const int32_t kv_len =
         specBuilder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
@@ -1462,23 +1489,39 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
           << ", start_position=" << start_position << ", kv_len=" << kv_len;
     }
 
-    for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
-      specBuilder::RowSpec row;
-      row.seq_id = seq_id;
-      row.token_id = val_idx == 0 ? token_ids[seq_id] : -val_idx;
-      row.position_offset = val_idx;
-      row.append_kv_len = !use_atb_spec_kernel;
-      row.append_q_len_one = !use_atb_spec_kernel;
-      row.append_block_table = !use_atb_spec_kernel;
-      specBuilder::append_decode_row(row_ctx, row, block_size, buf);
-    }
-
     if (use_atb_spec_kernel) {
       const int32_t kv_len_after_validation = kv_len + num_speculative_tokens;
       specBuilder::update_kv_seq_lens_and_max(
           atb_kv_seq_lens_vec, kv_len_after_validation, atb_kv_max_seq_len);
       specBuilder::append_q_seq_len(
           atb_q_seq_lens_vec, atb_q_cu_seq_lens_vec, num_val_tokens);
+    }
+  }
+  if (step_major_validate_layout) {
+    for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
+      for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+        specBuilder::RowSpec row;
+        row.seq_id = seq_id;
+        row.token_id = val_idx == 0 ? token_ids[seq_id] : -val_idx;
+        row.position_offset = val_idx;
+        row.append_kv_len = true;
+        row.append_q_len_one = true;
+        row.append_block_table = true;
+        specBuilder::append_decode_row(row_ctx, row, block_size, buf);
+      }
+    }
+  } else {
+    for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+      for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
+        specBuilder::RowSpec row;
+        row.seq_id = seq_id;
+        row.token_id = val_idx == 0 ? token_ids[seq_id] : -val_idx;
+        row.position_offset = val_idx;
+        row.append_kv_len = !use_atb_spec_kernel;
+        row.append_q_len_one = !use_atb_spec_kernel;
+        row.append_block_table = !use_atb_spec_kernel;
+        specBuilder::append_decode_row(row_ctx, row, block_size, buf);
+      }
     }
   }
 
@@ -1565,6 +1608,44 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   const bool dp_enabled = parallel_args_.dp_size() > 1;
   const bool use_chunked_prefill =
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+  const bool force_kimi_k25_eagle3_two_rows =
+      target_impl_ != nullptr && draft_impl_ != nullptr &&
+      is_kimi_k25_eagle3_draft(
+          target_impl_->context_.get_model_args().model_type(),
+          draft_impl_->context_.get_model_args().model_type()) &&
+      dp_enabled && !use_chunked_prefill;
+  const bool has_dp_token_counts =
+      input_params.parallel.dp_global_token_nums.size() ==
+      static_cast<size_t>(parallel_args_.dp_size());
+  ProcessGroup* dp_row_count_group = nullptr;
+  ProcessGroup* world_row_count_group = nullptr;
+  auto collect_row_count_group = [&](const ParallelArgs& args) {
+    if (dp_row_count_group == nullptr &&
+        args.dp_local_process_group_ != nullptr &&
+        args.dp_local_process_group_->world_size() ==
+            static_cast<int32_t>(
+                input_params.parallel.dp_global_token_nums.size())) {
+      dp_row_count_group = args.dp_local_process_group_;
+    }
+    if (world_row_count_group == nullptr && args.process_group_ != nullptr &&
+        args.process_group_->world_size() > 1) {
+      world_row_count_group = args.process_group_;
+    }
+  };
+  collect_row_count_group(parallel_args_);
+  if (target_impl_ != nullptr) {
+    collect_row_count_group(target_impl_->context_.get_parallel_args());
+  }
+  if (draft_impl_ != nullptr) {
+    collect_row_count_group(draft_impl_->context_.get_parallel_args());
+  }
+  const bool can_sync_variable_dp_rows =
+      dp_enabled && !force_kimi_k25_eagle3_two_rows && !use_chunked_prefill &&
+      has_dp_token_counts &&
+      (dp_row_count_group != nullptr || world_row_count_group != nullptr);
+  const bool use_uniform_single_dp_rows =
+      dp_enabled && !force_kimi_k25_eagle3_two_rows && !use_chunked_prefill &&
+      !can_sync_variable_dp_rows;
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
 
@@ -1652,15 +1733,25 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       selected_row_idx.emplace_back(2 * seq_id + 1);
       continue;
     }
-    const bool use_two_rows = dp_enabled || state.all_draft_accepted;
+    const bool has_prev_token =
+        state.prev_token_id >= 0 && state.prev_embedding.defined();
+    const bool use_two_rows = force_kimi_k25_eagle3_two_rows ||
+                              (!use_uniform_single_dp_rows &&
+                               state.all_draft_accepted && has_prev_token);
     if (use_two_rows) {
       int32_t prev_token_id = state.prev_token_id;
       int32_t prev_position_offset = -1;
       torch::Tensor prev_embedding = state.prev_embedding;
       if (prev_token_id < 0) {
+        // Kimi Eagle3 on DP needs uniform draft-extend rows.  On the first
+        // decode step there is no real previous target token yet, so use the
+        // current verifier hidden state instead of falling back to token
+        // embedding inside the draft model.
         prev_token_id = state.token_id;
-        prev_embedding = torch::Tensor();
+        prev_embedding = state.embedding;
       }
+      CHECK_GE(prev_token_id, 0)
+          << "Eagle/MTP draft extend previous row requires a real token";
       add_row(prev_token_id, prev_position_offset, prev_embedding);
     }
 
@@ -1733,11 +1824,58 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       for (int32_t& token_num : input_params.parallel.dp_global_token_nums) {
         token_num *= 2;
       }
-    } else if (dp_enabled) {
+    } else if (dp_enabled && force_kimi_k25_eagle3_two_rows) {
       constexpr int32_t num_extend_tokens = 2;
       for (int32_t& token_num : input_params.parallel.dp_global_token_nums) {
         token_num *= num_extend_tokens;
       }
+    } else if (dp_enabled && can_sync_variable_dp_rows) {
+      CHECK_EQ(input_params.parallel.dp_global_token_nums.size(),
+               static_cast<size_t>(parallel_args_.dp_size()))
+          << "dp token counts should be available for every DP rank";
+      torch::Tensor local_rows = torch::tensor(
+          {static_cast<int32_t>(buf.position_helper.out_position_columns)},
+          torch::dtype(torch::kInt).device(device_));
+      torch::Tensor gathered_rows = local_rows;
+      if (dp_row_count_group != nullptr) {
+        gathered_rows = dp_row_count_group->allgather_base_sync(local_rows);
+      } else {
+        CHECK(world_row_count_group != nullptr)
+            << "variable DP draft rows require a DP or world process group";
+        gathered_rows = world_row_count_group->allgather_base_sync(local_rows);
+      }
+      torch::Tensor gathered_rows_cpu =
+          gathered_rows.reshape({-1}).to(torch::kCPU).contiguous();
+      const int32_t* gathered_data =
+          gathered_rows_cpu.const_data_ptr<int32_t>();
+      if (dp_row_count_group != nullptr) {
+        CHECK_EQ(gathered_rows_cpu.numel(),
+                 static_cast<int64_t>(
+                     input_params.parallel.dp_global_token_nums.size()))
+            << "gathered draft extend row count does not match DP size";
+        for (int32_t i = 0; i < gathered_rows_cpu.numel(); ++i) {
+          input_params.parallel.dp_global_token_nums[static_cast<size_t>(i)] =
+              gathered_data[i];
+        }
+      } else {
+        const int32_t dp_size = parallel_args_.dp_size();
+        const int32_t world_size =
+            static_cast<int32_t>(gathered_rows_cpu.numel());
+        CHECK_EQ(world_size % dp_size, 0)
+            << "world row count gather size must be divisible by DP size";
+        const int32_t local_tp_size = world_size / dp_size;
+        const int32_t local_tp_rank =
+            world_row_count_group->rank() % local_tp_size;
+        for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
+          const int32_t world_row_idx = dp_rank * local_tp_size + local_tp_rank;
+          input_params.parallel.dp_global_token_nums[dp_rank] =
+              gathered_data[world_row_idx];
+        }
+      }
+    } else if (dp_enabled && use_uniform_single_dp_rows) {
+      // The no-process-group fallback emits exactly one draft-extend row per
+      // live request, so the original per-DP token counts remain valid and no
+      // row-count collective is needed.
     } else if (input_params.parallel.dp_global_token_nums.size() == 1) {
       input_params.parallel.dp_global_token_nums[0] =
           buf.position_helper.out_position_columns;
@@ -1863,13 +2001,40 @@ SampleOutput MTPWorkerImpl::validate(const SamplingParameters& sampling_params,
 
   using torch::indexing::None;
   using ISlice = torch::indexing::Slice;
+  const bool step_major_validate_layout =
+      use_kimi_eagle3_step_major_validate_layout();
+  torch::Tensor target_next_tokens = target_output.sample_output.next_tokens;
+  torch::Tensor target_logits;
+  torch::Tensor target_embeddings = target_output.sample_output.embeddings;
+  if (step_major_validate_layout) {
+    target_next_tokens = target_next_tokens.view({num_val_tokens, batch_size})
+                             .transpose(/*dim0=*/0, /*dim1=*/1)
+                             .contiguous()
+                             .view({num_target_tokens});
+    target_logits =
+        target_output.logits.view({num_val_tokens, batch_size, vocab_size})
+            .permute({1, 0, 2})
+            .contiguous();
+    if (target_embeddings.defined()) {
+      target_embeddings =
+          target_embeddings
+              .view({num_val_tokens, batch_size, target_embeddings.size(-1)})
+              .permute({1, 0, 2})
+              .contiguous();
+    }
+  } else {
+    target_logits =
+        target_output.logits.view({batch_size, num_val_tokens, vocab_size});
+    if (target_embeddings.defined()) {
+      target_embeddings = target_embeddings.view(
+          {batch_size, num_val_tokens, target_embeddings.size(-1)});
+    }
+  }
+
   auto bonus_token_ids =
-      target_output.sample_output.next_tokens
+      target_next_tokens
           .index({"...", ISlice(num_val_tokens - 1, None, num_val_tokens)})
           .view({-1, 1});
-
-  auto target_logits =
-      target_output.logits.view({batch_size, num_val_tokens, vocab_size});
 
   // prepare input for rejection sampling
   auto rejection_sampler =
@@ -1889,9 +2054,7 @@ SampleOutput MTPWorkerImpl::validate(const SamplingParameters& sampling_params,
                                  /*mask_out_rejected_tokens=*/true);
 
   // process embedding
-  auto embeddings = target_output.sample_output.embeddings;
-  sample_output.embeddings =
-      embeddings.view({batch_size, num_val_tokens, embeddings.size(-1)});
+  sample_output.embeddings = target_embeddings;
 
   return sample_output;
 }
