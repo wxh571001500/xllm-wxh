@@ -108,6 +108,44 @@ void load_layernorm_if_defined(const StateDict& state_dict,
                          layernorm_name + ".bias");
 }
 
+void check_tensor_finite(const torch::Tensor& tensor, const char* name) {
+  CHECK(tensor.defined()) << name << " is not defined.";
+  CHECK(torch::isfinite(tensor).all().item<bool>())
+      << name << " contains NaN or Inf, shape=" << tensor.sizes()
+      << ", dtype=" << tensor.scalar_type();
+}
+
+void check_multimodal_mask_matches_tokens(const torch::Tensor& input_ids,
+                                          const torch::Tensor& mask,
+                                          int64_t token_id,
+                                          const char* modality_name) {
+  if (!input_ids.defined() || input_ids.numel() == 0 || !mask.defined() ||
+      mask.numel() == 0) {
+    return;
+  }
+  CHECK_EQ(mask.scalar_type(), torch::kBool)
+      << modality_name
+      << " mask must be bool, got dtype=" << mask.scalar_type();
+  CHECK_EQ(mask.dim(), 1) << modality_name
+                          << " mask must be 1-D, got shape=" << mask.sizes();
+  CHECK_EQ(input_ids.dim(), 1)
+      << "Kimi K25 input_ids must be 1-D for multimodal mask check, got shape="
+      << input_ids.sizes();
+  CHECK_EQ(mask.size(0), input_ids.size(0))
+      << modality_name
+      << " mask length must match input_ids length, mask=" << mask.size(0)
+      << ", input_ids=" << input_ids.size(0);
+  auto expected_mask =
+      input_ids.to(mask.device(), /*non_blocking=*/false).eq(token_id);
+  CHECK(torch::equal(mask.to(torch::kCPU), expected_mask.to(torch::kCPU)))
+      << modality_name
+      << " mask positions do not match multimodal token positions, token_id="
+      << token_id << ", mask_true=" << mask.to(torch::kCPU).sum()
+      << ", expected_true=" << expected_mask.to(torch::kCPU).sum()
+      << ", input_ids=" << input_ids.to(torch::kCPU)
+      << ", mask=" << mask.to(torch::kCPU);
+}
+
 bool is_w8a8_dynamic_quant(const QuantArgs& quant_args,
                            const std::string& tensor_name) {
   auto quant = quant_args.get_quant_method(tensor_name);
@@ -924,12 +962,40 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       // visual
       auto pixel_values = image_input->pixel_values.to(options_);
       auto grid_thw = image_input->image_grid_thw.to(pixel_values.device());
+      check_tensor_finite(pixel_values, "kimi_k25 pixel_values");
+      CHECK_EQ(grid_thw.dim(), 2)
+          << "image_grid_thw must be a 2-D tensor, got shape="
+          << grid_thw.sizes();
+      CHECK_EQ(grid_thw.size(-1), 3)
+          << "image_grid_thw last dim must be 3, got shape="
+          << grid_thw.sizes();
+      CHECK_GT(grid_thw.size(0), 0)
+          << "image_grid_thw must contain at least one image";
       CHECK(grid_thw.scalar_type() == torch::kInt32 ||
             grid_thw.scalar_type() == torch::kInt64)
           << "image_grid_thw must be int tensor, got dtype="
           << grid_thw.scalar_type();
+      const auto expected_patches =
+          image_input->image_grid_thw.prod(-1).sum().item<int64_t>();
+      CHECK_EQ(pixel_values.size(0), expected_patches)
+          << "pixel_values rows must match sum(image_grid_thw.prod(-1)), "
+          << "pixel_values rows=" << pixel_values.size(0)
+          << ", expected_patches=" << expected_patches
+          << ", image_grid_thw=" << image_input->image_grid_thw;
       auto image_features = process_vision_features(pixel_values, grid_thw);
+      CHECK(!image_features.empty())
+          << "Kimi K25 vision encoder produced no image features.";
+      for (const auto& image_feature : image_features) {
+        check_tensor_finite(image_feature, "kimi_k25 image_feature");
+      }
       auto image_embeds = torch::cat(image_features, 0);
+      check_tensor_finite(image_embeds, "kimi_k25 image_embeds");
+      auto patch_remainders =
+          image_input->image_grid_thw.prod(-1) % (merge_size * merge_size);
+      CHECK_EQ(patch_remainders.abs().sum().item<int64_t>(), 0)
+          << "image patch count must be divisible by merge_size^2, "
+          << "merge_size=" << merge_size
+          << ", image_grid_thw=" << image_input->image_grid_thw;
       auto image_tokens =
           (image_input->image_grid_thw.prod(-1) / merge_size / merge_size)
               .cpu()
@@ -938,6 +1004,26 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       std::vector<int64_t> image_tokens_vec(
           image_tokens.data_ptr<int64_t>(),
           image_tokens.data_ptr<int64_t>() + image_tokens.numel());
+      CHECK_EQ(static_cast<int64_t>(image_tokens_vec.size()), grid_thw.size(0))
+          << "image token split count must match image count, split_count="
+          << image_tokens_vec.size() << ", image_count=" << grid_thw.size(0);
+      int64_t total_image_tokens = 0;
+      for (int64_t token_count : image_tokens_vec) {
+        CHECK_GT(token_count, 0)
+            << "each image must produce positive visual tokens, token_count="
+            << token_count
+            << ", image_grid_thw=" << image_input->image_grid_thw;
+        total_image_tokens += token_count;
+      }
+      CHECK_EQ(image_embeds.size(0), total_image_tokens)
+          << "image embedding rows must match image token split sum, rows="
+          << image_embeds.size(0)
+          << ", total_image_tokens=" << total_image_tokens
+          << ", image_grid_thw=" << image_input->image_grid_thw;
+      CHECK_EQ(image_embeds.size(-1), model_args_.hidden_size())
+          << "image embedding hidden dim must match language hidden size, "
+          << "image_hidden=" << image_embeds.size(-1)
+          << ", hidden_size=" << model_args_.hidden_size();
       multimodal_embeds["image|embedding"] =
           image_embeds.split(image_tokens_vec, 0 /*dim*/);
     }
@@ -965,7 +1051,53 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       torch::Tensor inputs_embeds,
       const torch::Tensor& multimodal_embeds,
       const torch::Tensor& is_multimodal) {
+    CHECK(inputs_embeds.defined()) << "inputs_embeds is not defined.";
+    CHECK(multimodal_embeds.defined()) << "multimodal_embeds is not defined.";
+    CHECK(is_multimodal.defined()) << "multimodal mask is not defined.";
+    CHECK_EQ(is_multimodal.scalar_type(), torch::kBool)
+        << "multimodal mask must be bool, got dtype="
+        << is_multimodal.scalar_type();
+    CHECK_EQ(inputs_embeds.dim(), 2)
+        << "inputs_embeds must be 2-D, got shape=" << inputs_embeds.sizes();
+    CHECK_EQ(multimodal_embeds.dim(), 2)
+        << "multimodal_embeds must be 2-D, got shape="
+        << multimodal_embeds.sizes();
+    CHECK_EQ(is_multimodal.dim(), 1)
+        << "multimodal mask must be 1-D, got shape=" << is_multimodal.sizes();
+    CHECK_EQ(is_multimodal.size(0), inputs_embeds.size(0))
+        << "multimodal mask length must match token embedding rows, "
+        << "mask_len=" << is_multimodal.size(0)
+        << ", input_rows=" << inputs_embeds.size(0);
+    CHECK_EQ(multimodal_embeds.size(-1), inputs_embeds.size(-1))
+        << "multimodal embedding hidden dim must match token embedding hidden "
+        << "dim, mm_hidden=" << multimodal_embeds.size(-1)
+        << ", input_hidden=" << inputs_embeds.size(-1);
+    const int64_t mask_tokens =
+        is_multimodal.to(torch::kCPU).sum().item<int64_t>();
+    CHECK_EQ(multimodal_embeds.size(0), mask_tokens)
+        << "multimodal embedding rows must match multimodal mask true count, "
+        << "embedding_rows=" << multimodal_embeds.size(0)
+        << ", mask_tokens=" << mask_tokens
+        << ", input_rows=" << inputs_embeds.size(0);
+    check_tensor_finite(inputs_embeds, "kimi_k25 inputs_embeds before merge");
+    check_tensor_finite(multimodal_embeds, "kimi_k25 multimodal_embeds");
+    auto before_mm_embeds = inputs_embeds.index({is_multimodal}).contiguous();
     inputs_embeds.index_put_({is_multimodal}, multimodal_embeds);
+    auto after_mm_embeds = inputs_embeds.index({is_multimodal}).contiguous();
+    CHECK(torch::allclose(after_mm_embeds.to(torch::kFloat32),
+                          multimodal_embeds.to(torch::kFloat32),
+                          1e-3,
+                          1e-3))
+        << "multimodal embedding merge did not write expected values, "
+        << "after_shape=" << after_mm_embeds.sizes()
+        << ", mm_shape=" << multimodal_embeds.sizes();
+    CHECK(!torch::allclose(before_mm_embeds.to(torch::kFloat32),
+                           after_mm_embeds.to(torch::kFloat32),
+                           1e-6,
+                           1e-6))
+        << "multimodal embedding merge left image token embeddings unchanged, "
+        << "mask_tokens=" << mask_tokens;
+    check_tensor_finite(inputs_embeds, "kimi_k25 inputs_embeds after merge");
     return inputs_embeds;
   }
 
@@ -975,7 +1107,9 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     torch::Tensor inputs_embeds =
         language_model_->get_npu_word_embedding()(input_ids, 0);
     auto merge_modality = [&](const std::string& embed_key,
-                              const std::string& mask_key) {
+                              const std::string& mask_key,
+                              int64_t token_id,
+                              const char* modality_name) {
       auto emb = mm_data.get<torch::Tensor>(embed_key);
       if (!emb.has_value() || !emb.value().defined()) {
         return;
@@ -984,12 +1118,16 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       if (!mask.has_value() || !mask.value().defined()) {
         return;
       }
+      check_multimodal_mask_matches_tokens(
+          input_ids, mask.value(), token_id, modality_name);
       inputs_embeds =
           merge_multimodal_embeddings(inputs_embeds, emb.value(), mask.value());
     };
 
-    merge_modality("image|embedding", "image|mask");
-    merge_modality("video|embedding", "video|mask");
+    merge_modality(
+        "image|embedding", "image|mask", model_args_.image_token_id(), "image");
+    merge_modality(
+        "video|embedding", "video|mask", model_args_.video_token_id(), "video");
     return inputs_embeds;
   }
 

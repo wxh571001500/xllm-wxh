@@ -16,6 +16,8 @@ limitations under the License.
 #include "block_manager_pool.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 
@@ -33,6 +35,31 @@ namespace xllm {
 namespace {
 
 constexpr size_t kMaxStickyPrefixRoutes = 65536;
+constexpr const char* kDebugForceDpRankEnv = "XLLM_DEBUG_FORCE_DP_RANK";
+
+int32_t get_debug_force_dp_rank(size_t dp_size) {
+  const char* raw_value = std::getenv(kDebugForceDpRankEnv);
+  if (raw_value == nullptr || raw_value[0] == '\0') {
+    return -1;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const long parsed = std::strtol(raw_value, &end, 10);
+  CHECK(raw_value != end && *end == '\0' && errno != ERANGE)
+      << kDebugForceDpRankEnv << " must be an integer in [0, " << dp_size
+      << ") or a negative value to disable, got: " << raw_value;
+  if (parsed < 0) {
+    return -1;
+  }
+  CHECK_LT(static_cast<size_t>(parsed), dp_size)
+      << kDebugForceDpRankEnv << " out of range, got: " << parsed
+      << ", dp_size=" << dp_size;
+  LOG_FIRST_N(WARNING, 1)
+      << kDebugForceDpRankEnv << "=" << parsed
+      << " is active: all newly assigned sequences will use this DP rank.";
+  return static_cast<int32_t>(parsed);
+}
 
 }  // namespace
 
@@ -133,7 +160,10 @@ int32_t BlockManagerPool::get_dp_rank(Sequence* sequence) const {
   if (sequence->dp_rank() >= 0) {
     dp_rank = sequence->dp_rank();
   } else {
-    dp_rank = find_sticky_dp_rank(sequence);
+    dp_rank = get_debug_force_dp_rank(block_managers_.size());
+    if (dp_rank < 0) {
+      dp_rank = find_sticky_dp_rank(sequence);
+    }
     if (dp_rank < 0) {
       dp_rank = get_manager_with_max_free_blocks();
     }

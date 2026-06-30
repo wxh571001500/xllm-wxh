@@ -38,6 +38,39 @@ namespace xllm {
 
 namespace {
 
+bool has_tensor_data(const torch::Tensor& tensor) {
+  return tensor.defined() && tensor.numel() > 0;
+}
+
+void check_finite_if_present(const torch::Tensor& tensor, const char* name) {
+  if (!has_tensor_data(tensor) || !tensor.is_floating_point()) {
+    return;
+  }
+  CHECK(torch::isfinite(tensor).all().item<bool>())
+      << name << " contains NaN or Inf, shape=" << tensor.sizes()
+      << ", dtype=" << tensor.scalar_type() << ", device=" << tensor.device();
+}
+
+void check_index_range_if_present(const torch::Tensor& idxes,
+                                  int64_t upper_bound,
+                                  const char* name) {
+  if (!has_tensor_data(idxes)) {
+    return;
+  }
+  CHECK_GT(upper_bound, 0)
+      << name << " cannot be checked against non-positive upper bound "
+      << upper_bound;
+  torch::Tensor idxes_cpu =
+      idxes.to(torch::dtype(torch::kLong).device(torch::kCPU));
+  const int64_t min_idx = idxes_cpu.min().item<int64_t>();
+  const int64_t max_idx = idxes_cpu.max().item<int64_t>();
+  CHECK_GE(min_idx, 0) << name << " contains negative index " << min_idx
+                       << ", values=" << idxes_cpu;
+  CHECK_LT(max_idx, upper_bound)
+      << name << " contains out-of-range index " << max_idx
+      << ", upper_bound=" << upper_bound << ", values=" << idxes_cpu;
+}
+
 void wait_input_ready_events(const ForwardInput& input, const Stream& stream) {
   CHECK(stream.wait_event(input.metadata_ready_event))
       << "failed to wait ForwardInput metadata ready event";
@@ -226,6 +259,22 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
+  if (has_tensor_data(input.token_ids)) {
+    CHECK(model_output.hidden_states.defined())
+        << "VLM model_output.hidden_states is not defined for non-empty input.";
+    CHECK_EQ(model_output.hidden_states.dim(), 2)
+        << "VLM model_output.hidden_states must be 2-D, got shape="
+        << model_output.hidden_states.sizes();
+    CHECK_EQ(model_output.hidden_states.size(-1),
+             context_.get_model_args().hidden_size())
+        << "VLM model_output.hidden_states hidden dim mismatch, hidden="
+        << model_output.hidden_states.size(-1)
+        << ", expected=" << context_.get_model_args().hidden_size();
+  }
+  check_finite_if_present(model_output.hidden_states,
+                          "VLM model_output.hidden_states");
+  check_finite_if_present(model_output.aux_hidden_states,
+                          "VLM model_output.aux_hidden_states");
   auto& sampling_params = input.sampling_params;
   const bool has_aux_hidden_states = model_output.aux_hidden_states.defined();
   torch::Tensor logits;
@@ -240,6 +289,9 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
         context_.get_parallel_args(),
         model_output.hidden_states.size(0),
         model_output.hidden_states.device());
+    check_index_range_if_present(lm_head_selected_token_idxes,
+                                 model_output.hidden_states.size(0),
+                                 "VLM lm_head_selected_token_idxes");
     if (options_.enable_speculative_decode()) {
       logits = model_->logits(model_output.hidden_states,
                               lm_head_selected_token_idxes,
@@ -260,6 +312,41 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
       logits = model_->logits(model_output.hidden_states,
                               lm_head_selected_token_idxes);
     }
+    CHECK(logits.defined()) << "VLM logits is not defined after lm_head.";
+    CHECK_EQ(logits.dim(), 2)
+        << "VLM logits must be 2-D, got shape=" << logits.sizes();
+    CHECK_EQ(logits.size(0), lm_head_selected_token_idxes.numel())
+        << "VLM logits rows must match selected token count, rows="
+        << logits.size(0)
+        << ", selected=" << lm_head_selected_token_idxes.numel();
+    CHECK_EQ(logits.size(-1), context_.get_model_args().vocab_size())
+        << "VLM logits vocab dim mismatch, vocab=" << logits.size(-1)
+        << ", expected=" << context_.get_model_args().vocab_size();
+    check_finite_if_present(logits, "VLM logits before sampler");
+    if (has_tensor_data(sampling_params.sample_idxes) &&
+        sampling_params.sample_idxes.numel() !=
+            sampling_params.selected_token_idxes.numel()) {
+      check_index_range_if_present(sampling_params.sample_idxes,
+                                   logits.size(0),
+                                   "VLM sampling_params.sample_idxes");
+    }
+    if (sampling_params.do_sample.defined()) {
+      CHECK_EQ(sampling_params.do_sample.dim(), 1)
+          << "VLM sampling_params.do_sample must be 1-D, got shape="
+          << sampling_params.do_sample.sizes();
+      const int64_t sample_rows =
+          has_tensor_data(sampling_params.sample_idxes) &&
+                  sampling_params.sample_idxes.numel() !=
+                      sampling_params.selected_token_idxes.numel()
+              ? sampling_params.sample_idxes.numel()
+              : logits.size(0);
+      CHECK_EQ(sampling_params.do_sample.numel(), sample_rows)
+          << "VLM sampling_params.do_sample size mismatch, do_sample="
+          << sampling_params.do_sample.numel()
+          << ", sample_rows=" << sample_rows
+          << ", logits_rows=" << logits.size(0)
+          << ", selected=" << sampling_params.selected_token_idxes.numel();
+    }
   }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
@@ -276,6 +363,14 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   ForwardOutput output;
   if (sampling_params.selected_token_idxes.defined()) {
     auto sample_output = sampler_->forward(logits, sampling_params);
+    check_index_range_if_present(sample_output.next_tokens,
+                                 context_.get_model_args().vocab_size(),
+                                 "VLM sample_output.next_tokens");
+    check_finite_if_present(sample_output.probs, "VLM sample_output.probs");
+    check_finite_if_present(sample_output.logprobs,
+                            "VLM sample_output.logprobs");
+    check_finite_if_present(sample_output.top_logprobs,
+                            "VLM sample_output.top_logprobs");
     output.logits = logits;
     COUNTER_ADD(execution_latency_seconds_sampling, timer.elapsed_seconds());
 
