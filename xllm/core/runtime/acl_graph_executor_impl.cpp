@@ -407,19 +407,14 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     COUNTER_INC(num_model_execution_total_eager);
     return model_->forward(tokens, positions, kv_caches, params);
   }
-  if (in_spec_verify_phase && !is_qwen3_5_model_type(args_.model_type())) {
+  const bool use_kimi_k25_eagle3_acl_graph =
+      is_kimi_k25_eagle3_target_graph(args_, options_);
+  if (in_spec_verify_phase && !is_qwen3_5_model_type(args_.model_type()) &&
+      !use_kimi_k25_eagle3_acl_graph) {
     LOG_FIRST_N(WARNING, 1)
         << "Falling back to eager mode for spec verify because the "
            "chunked-prefill validate graph path is currently only adapted for "
            "Qwen3.5.";
-    COUNTER_INC(num_model_execution_total_eager);
-    return model_->forward(tokens, positions, kv_caches, params);
-  }
-  if (is_kimi_k25_eagle3_target_graph(args_, options_)) {
-    LOG_FIRST_N(WARNING, 1)
-        << "Falling back to eager mode for kimi_k25 Eagle3 target validation; "
-           "the ACL graph path is not adapted for Eagle3 aux hidden-state "
-           "validation yet.";
     COUNTER_INC(num_model_execution_total_eager);
     return model_->forward(tokens, positions, kv_caches, params);
   }
@@ -464,24 +459,29 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   }
   // Keep actual n_tokens for replay output slicing.
   const uint32_t n_tokens = tokens_tensor.size(/*dim=*/0);
-  const uint32_t local_batch_size = n_tokens / options_.num_decoding_tokens();
-  const uint32_t global_batch_size =
-      graph_num_tokens / options_.num_decoding_tokens();
+  const uint32_t num_decoding_tokens = static_cast<uint32_t>(
+      std::max<int64_t>(options_.num_decoding_tokens(), 1));
+  const uint32_t local_batch_size = n_tokens / num_decoding_tokens;
+  const uint32_t global_batch_size = graph_num_tokens / num_decoding_tokens;
 
-  // Large decode batches create too many/too large ACL graphs and may OOM.
+  // Large decode batches create too many/too large ACL graphs and may exceed
+  // backend safety limits.
   // Fall back to eager mode when batch size exceeds the safety threshold.
   // Use global_batch_size so all DP ranks make the same decision and stay in
   // sync on HCCL collectives.
-  const uint32_t decode_batch_size_limit = static_cast<uint32_t>(
+  const uint32_t raw_decode_batch_size_limit = static_cast<uint32_t>(
       std::max<int32_t>(1,
                         ::xllm::ExecutionConfig::get_instance()
                             .acl_graph_decode_batch_size_limit()));
+  const uint32_t decode_batch_size_limit = raw_decode_batch_size_limit;
   if (global_batch_size > decode_batch_size_limit) {
     LOG_FIRST_N(WARNING, 1)
         << "Falling back to eager mode because decode batch_size (global="
         << global_batch_size << ", local=" << local_batch_size << ") > "
         << decode_batch_size_limit
-        << "; ACL graph is disabled for this request size to avoid OOM. "
+        << " (raw_limit=" << raw_decode_batch_size_limit
+        << ", num_decoding_tokens=" << num_decoding_tokens << ")"
+        << "; ACL graph is disabled for this request size. "
         << "This message is logged only once. "
         << "Monitor counter 'num_model_execution_total_eager' for frequency.";
     COUNTER_INC(num_model_execution_total_eager);

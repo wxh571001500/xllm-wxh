@@ -54,9 +54,17 @@ ProcessGroup* spec_broadcast_group(const ParallelArgs& parallel_args) {
 void broadcast_spec_tokens(torch::Tensor& tokens,
                            ProcessGroup* process_group,
                            int32_t root_rank = 0) {
-  (void)tokens;
-  (void)process_group;
-  (void)root_rank;
+  if (process_group == nullptr || process_group->world_size() <= 1 ||
+      !tokens.defined()) {
+    return;
+  }
+  tokens = tokens.contiguous();
+  CHECK_GE(root_rank, 0) << "broadcast root rank must be non-negative";
+  CHECK_LT(root_rank, process_group->world_size())
+      << "broadcast root rank exceeds process group size";
+  torch::Tensor gathered_tokens = process_group->allgather_base_sync(tokens);
+  tokens.copy_(gathered_tokens.select(/*dim=*/0, /*index=*/root_rank),
+               /*non_blocking=*/false);
 }
 
 bool enable_spec_token_broadcast(const OptimizationConfig& config) {
@@ -456,6 +464,10 @@ bool is_qwen3_5_target_model_type(const std::string& model_type) {
          model_type.rfind("qwen3_5_", 0) == 0;
 }
 
+bool is_mimo_target_model_type(const std::string& model_type) {
+  return model_type == "mimo" || model_type.rfind("mimo_", 0) == 0;
+}
+
 bool is_kimi_k25_eagle3_draft(const std::string& target_model_type,
                               const std::string& draft_model_type) {
   return target_model_type == "kimi_k25" &&
@@ -746,7 +758,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
 // position p) within the same batch call, but all-reads-then-all-writes
 // ordering means it reads garbage.  Chunked prefill executes tokens causally
 // so token 1 always sees token 0's committed KV.
-bool MTPWorkerImpl::use_mimo_spec_verify_path() const { return false; }
+bool MTPWorkerImpl::use_mimo_spec_verify_path() const {
+  return target_impl_ != nullptr &&
+         target_impl_->get_status() != WorkerImpl::Status::UNINITIALIZED &&
+         is_mimo_target_model_type(
+             target_impl_->context_.get_model_args().model_type());
+}
 
 bool MTPWorkerImpl::use_chunked_prefill_spec_verify_path() const {
   return use_qwen3_5_spec_verify_path() || use_mimo_spec_verify_path();

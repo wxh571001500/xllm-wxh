@@ -40,6 +40,10 @@ void check_finite_if_present(const torch::Tensor& tensor, const char* name) {
       << ", dtype=" << tensor.scalar_type() << ", device=" << tensor.device();
 }
 
+bool should_check_kimi_k25_vlm_tensors(const ModelArgs& args) {
+  return args.model_type() == "kimi_k25";
+}
+
 }  // namespace
 
 VlmExecutorImpl::VlmExecutorImpl(CausalLM* model,
@@ -105,23 +109,25 @@ ModelOutput VlmExecutorImpl::run(const torch::Tensor& tokens,
 
   params.embedding.input_embedding =
       model_->get_input_embeddings(tokens, params);
-  if (has_tensor_data(tokens)) {
-    CHECK(params.embedding.input_embedding.defined())
-        << "VLM input_embedding is not defined for non-empty tokens.";
-    CHECK_EQ(params.embedding.input_embedding.dim(), 2)
-        << "VLM input_embedding must be 2-D, got shape="
-        << params.embedding.input_embedding.sizes();
-    CHECK_EQ(params.embedding.input_embedding.size(0), tokens.numel())
-        << "VLM input_embedding rows must match token count, rows="
-        << params.embedding.input_embedding.size(0)
-        << ", tokens=" << tokens.numel();
-    CHECK_EQ(params.embedding.input_embedding.size(-1), args_.hidden_size())
-        << "VLM input_embedding hidden dim mismatch, hidden="
-        << params.embedding.input_embedding.size(-1)
-        << ", expected=" << args_.hidden_size();
+  if (should_check_kimi_k25_vlm_tensors(args_)) {
+    if (has_tensor_data(tokens)) {
+      CHECK(params.embedding.input_embedding.defined())
+          << "VLM input_embedding is not defined for non-empty tokens.";
+      CHECK_EQ(params.embedding.input_embedding.dim(), 2)
+          << "VLM input_embedding must be 2-D, got shape="
+          << params.embedding.input_embedding.sizes();
+      CHECK_EQ(params.embedding.input_embedding.size(0), tokens.numel())
+          << "VLM input_embedding rows must match token count, rows="
+          << params.embedding.input_embedding.size(0)
+          << ", tokens=" << tokens.numel();
+      CHECK_EQ(params.embedding.input_embedding.size(-1), args_.hidden_size())
+          << "VLM input_embedding hidden dim mismatch, hidden="
+          << params.embedding.input_embedding.size(-1)
+          << ", expected=" << args_.hidden_size();
+    }
+    check_finite_if_present(params.embedding.input_embedding,
+                            "VLM input_embedding after multimodal merge");
   }
-  check_finite_if_present(params.embedding.input_embedding,
-                          "VLM input_embedding after multimodal merge");
 
   if (llm_executor_) {
     return llm_executor_->run(tokens, positions, kv_caches, params);

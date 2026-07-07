@@ -28,13 +28,6 @@ bool is_eagle3_model_type(const std::string& model_type) {
   return model_type == "qwen3_eagle3" || model_type == "kimi_k25_eagle3";
 }
 
-bool is_kimi_k25_eagle3_speculative_target(const ModelArgs& args,
-                                           const runtime::Options& options) {
-  return args.model_type() == "kimi_k25" &&
-         options.enable_speculative_decode() &&
-         options.speculative_algorithm() == "Eagle3";
-}
-
 }  // namespace
 
 Executor::Executor(CausalLM* model,
@@ -42,8 +35,7 @@ Executor::Executor(CausalLM* model,
                    const torch::Device& device,
                    const runtime::Options& options) {
   const bool enable_model_graph =
-      options.enable_graph() && !is_eagle3_model_type(args.model_type()) &&
-      !is_kimi_k25_eagle3_speculative_target(args, options);
+      options.enable_graph() && !is_eagle3_model_type(args.model_type());
   std::string backend = options.backend() != "vlm" && enable_model_graph
                             ? Device::type_str()
                             : options.backend();
