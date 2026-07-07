@@ -720,6 +720,26 @@ bool MTPWorkerImpl::use_kimi_eagle3_step_major_validate_layout() const {
   return is_kimi_k25_eagle3_pair() && !use_chunked_prefill_spec_verify_path();
 }
 
+void MTPWorkerImpl::synchronize_kimi_eagle3_npu_forward() {
+#if defined(USE_NPU)
+  if (is_kimi_k25_eagle3_pair()) {
+    compute_stream_->synchronize();
+  }
+#endif
+}
+
+std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
+    WorkerImpl& worker,
+    const ForwardInput& input,
+    ForwardInput& processed_input) {
+  std::optional<ForwardOutput> output = run_worker_no_sync_impl(
+      worker, input, *prepare_stream_, *compute_stream_, processed_input);
+  // Kimi K25 Eagle3 re-enters target/draft workers several times per step.
+  // Wait for ATB to finish before the next prepare/execute mutates layer state.
+  synchronize_kimi_eagle3_npu_forward();
+  return output;
+}
+
 // MiMo MTP validation requires chunked-prefill mode (same as Qwen3.5) to
 // avoid the read-before-write race in FlashInfer batch-decode: validation
 // token 1 (at position p+1) must attend to the KV written by token 0 (at
@@ -845,16 +865,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
   if (!input.input_params.meta.batch_forward_type.is_decode()) {
     ForwardInput target_prepared;
     ForwardInput draft_prepared;
-    auto output = run_worker_no_sync_impl(*target_impl_,
-                                          input,
-                                          *prepare_stream_,
-                                          *compute_stream_,
-                                          target_prepared);
-    auto draft_output = run_worker_no_sync_impl(*draft_impl_,
-                                                input,
-                                                *prepare_stream_,
-                                                *compute_stream_,
-                                                draft_prepared);
+    std::optional<ForwardOutput> output =
+        run_worker_no_sync(*target_impl_, input, target_prepared);
+    std::optional<ForwardOutput> draft_output =
+        run_worker_no_sync(*draft_impl_, input, draft_prepared);
     (void)draft_output;
     clear_all_output_embeddings(*output);
     return output;
@@ -870,21 +884,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
       token_num *= 2;
     }
     ForwardOutput draft_extend_output =
-        run_worker_no_sync_impl(*draft_impl_,
-                                new_input,
-                                *prepare_stream_,
-                                *compute_stream_,
-                                draft_extend_prepared)
+        run_worker_no_sync(*draft_impl_, new_input, draft_extend_prepared)
             .value();
     (void)draft_extend_output;
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
       ForwardOutput draft_output =
-          run_worker_no_sync_impl(*draft_impl_,
-                                  input,
-                                  *prepare_stream_,
-                                  *compute_stream_,
-                                  draft_step_prepared[i])
+          run_worker_no_sync(*draft_impl_, input, draft_step_prepared[i])
               .value();
       (void)draft_output;
     }
@@ -894,12 +900,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
          new_input.input_params.parallel.dp_global_token_nums) {
       token_num *= options_.num_speculative_tokens() + 1;
     }
-    ForwardOutput output = run_worker_no_sync_impl(*target_impl_,
-                                                   new_input,
-                                                   *prepare_stream_,
-                                                   *compute_stream_,
-                                                   target_prepared)
-                               .value();
+    ForwardOutput output =
+        run_worker_no_sync(*target_impl_, new_input, target_prepared).value();
     clear_all_output_embeddings(output);
     return output;
   }
@@ -912,12 +914,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   ForwardInput draft_prepared;
 
   // run the target model to get first token and hidden states
-  ForwardOutput output = run_worker_no_sync_impl(*target_impl_,
-                                                 input,
-                                                 *prepare_stream_,
-                                                 *compute_stream_,
-                                                 target_prepared)
-                             .value();
+  ForwardOutput output =
+      run_worker_no_sync(*target_impl_, input, target_prepared).value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
   // MTP path that depends on hidden states.
@@ -951,12 +949,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   }
   // generate kv cache for draft model
   timer.reset();
-  ForwardOutput draft_output = run_worker_no_sync_impl(*draft_impl_,
-                                                       prefill_input,
-                                                       *prepare_stream_,
-                                                       *compute_stream_,
-                                                       draft_prepared)
-                                   .value();
+  ForwardOutput draft_output =
+      run_worker_no_sync(*draft_impl_, prefill_input, draft_prepared).value();
   process_draft_sample_output(draft_output.sample_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
@@ -1125,12 +1119,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     if (reuse_mtp_topk_indices) {
       current_draft_input.input_params.dsa_topk_indices = mtp_topk_indices;
     }
-    std::optional<ForwardOutput> draft_output_opt =
-        run_worker_no_sync_impl(*draft_impl_,
-                                current_draft_input,
-                                *prepare_stream_,
-                                *compute_stream_,
-                                draft_prepared[draft_idx]);
+    std::optional<ForwardOutput> draft_output_opt = run_worker_no_sync(
+        *draft_impl_, current_draft_input, draft_prepared[draft_idx]);
 
     // Overlap next-step input preparation with async draft forward.
     if (draft_idx == num_speculative_tokens - 1) {
@@ -1226,6 +1216,7 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
     }
   }
   validate_input.device_tensors_ready = true;
+  record_metadata_ready_event(compute_stream, validate_input);
 }
 
 std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
@@ -1237,12 +1228,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   ForwardInput target_prepared;
   fill_validate_input_from_draft_outputs(
       draft_outputs, validate_input, *compute_stream_);
-  ForwardOutput target_output = run_worker_no_sync_impl(*target_impl_,
-                                                        validate_input,
-                                                        *prepare_stream_,
-                                                        *compute_stream_,
-                                                        target_prepared)
-                                    .value();
+  ForwardOutput target_output =
+      run_worker_no_sync(*target_impl_, validate_input, target_prepared)
+          .value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
