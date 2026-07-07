@@ -32,6 +32,8 @@ namespace xllm {
 
 namespace {
 
+constexpr size_t kMaxMediaPrefillRequestsPerBatch = 2;
+
 // LCM helper (std::lcm is C++17; the existing codebase already uses
 // std::gcd elsewhere, so we depend on that and inline the lcm to avoid
 // header churn). Returns 0 when either argument is 0 so callers can use
@@ -127,6 +129,12 @@ void ChunkedPrefillScheduler::handle_running_queue_requests(
          remaining_token_budget > min_speculative_tokens_required_ &&
          latency_budget > estimate_latency && remaining_seq_budget > 0) {
     std::shared_ptr<Request> request(running_queue->top());
+    if (should_limit_media_prefill_requests() &&
+        request_has_media_prefill(request) &&
+        count_media_prefill_requests_in_batch() >=
+            kMaxMediaPrefillRequestsPerBatch) {
+      break;
+    }
 
     const size_t num_sequences = request->sequences().size();
     std::vector<Sequence*> candidate_sequences;
@@ -344,6 +352,12 @@ void ChunkedPrefillScheduler::handle_prefill_requests(
     }
 
     std::shared_ptr<Request> request(waiting_priority_queue->top());
+    if (should_limit_media_prefill_requests() &&
+        request_has_media_prefill(request) &&
+        count_media_prefill_requests_in_batch() >=
+            kMaxMediaPrefillRequestsPerBatch) {
+      break;
+    }
     if (request->finished() || request->cancelled()) {
       kv_cache_manager_->deallocate(request.get());
       // release the ownership of the request

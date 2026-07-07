@@ -320,6 +320,9 @@ class ContinuousScheduler : public Scheduler {
       size_t& num_online_decode_preempt_online_requests,
       size_t& num_online_decode_preempt_offline_requests,
       RequestPriorityQueue* running_queue);
+  bool request_has_media_prefill(const std::shared_ptr<Request>& request) const;
+  size_t count_media_prefill_requests_in_batch() const;
+  bool should_limit_media_prefill_requests() const;
   void get_latency_budget_and_request_order(
       RequestPriorityQueue* request_priority_queue,
       double& latency_budget,

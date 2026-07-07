@@ -182,8 +182,22 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
   target_kv_cache_cap.cache_size_in_bytes() = kv_cache_size;
   draft_kv_cache_cap.n_blocks() = n_blocks;
   draft_kv_cache_cap.cache_size_in_bytes() = kv_cache_size;
+  if (should_skip_external_draft_kv_cache()) {
+    return engine_->allocate_kv_cache(target_kv_cache_cap);
+  }
   return engine_->allocate_kv_cache(target_kv_cache_cap) &&
          draft_engine_->allocate_kv_cache(draft_kv_cache_cap);
+}
+
+template <typename TargetEngine>
+bool SpeculativeEngineBase<TargetEngine>::should_skip_external_draft_kv_cache()
+    const {
+  if (!use_draft_engine_ || draft_engine_ == nullptr) {
+    return false;
+  }
+  return options_.speculative_algorithm() == "Eagle3" &&
+         model_args_.model_type() == "kimi_k25" &&
+         draft_engine_->model_args().model_type() == "kimi_k25_eagle3";
 }
 
 // TODO: support dp batches later
@@ -224,17 +238,9 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
   const int64_t draft_full_attention_slot_size =
       draft_kv_cache_cap.slot_size() + draft_kv_cache_cap.index_slot_size() +
       draft_kv_cache_cap.scale_slot_size();
-  CHECK_LE(draft_full_attention_slot_size, target_full_attention_slot_size)
-      << "draft full-attention kv cache slot size must not exceed target slot "
-         "size because the current speculative worker allocates draft KV "
-         "tensors with the target KVCacheShape";
-  // The current speculative worker allocates draft KV tensors with the
-  // target KVCacheShape, so draft physical allocation uses target slot size.
-  const int64_t draft_allocated_full_attention_slot_size =
-      target_full_attention_slot_size;
   CHECK_GT(target_full_attention_slot_size, 0)
       << "target full-attention kv cache slot size must be greater than 0";
-  CHECK_GT(draft_allocated_full_attention_slot_size, 0)
+  CHECK_GT(draft_full_attention_slot_size, 0)
       << "draft full-attention kv cache slot size must be greater than 0";
 
   const int64_t target_full_attention_layers =
@@ -245,8 +251,7 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
       block_size * target_full_attention_layers *
       target_full_attention_slot_size;
   const int64_t draft_full_attention_block_size_in_bytes =
-      block_size * draft_full_attention_layers *
-      draft_allocated_full_attention_slot_size;
+      block_size * draft_full_attention_layers * draft_full_attention_slot_size;
   const int64_t full_attention_block_size_in_bytes =
       target_full_attention_block_size_in_bytes +
       draft_full_attention_block_size_in_bytes;

@@ -47,6 +47,8 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+constexpr size_t kMaxMediaPrefillRequestsPerBatch = 2;
+
 size_t estimate_decode_extra_blocks(Sequence* sequence,
                                     size_t updated_num_tokens,
                                     size_t block_size) {
@@ -363,6 +365,34 @@ void ContinuousScheduler::clear_mtp_bootstrap(Request* request) {
   sequence->clear_mtp_bootstrap_embedding();
 }
 
+bool ContinuousScheduler::request_has_media_prefill(
+    const std::shared_ptr<Request>& request) const {
+  if (request == nullptr) {
+    return false;
+  }
+  for (const auto& sequence : request->sequences()) {
+    if (sequence && sequence->is_prefill_stage() &&
+        sequence->mm_data().valid()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+size_t ContinuousScheduler::count_media_prefill_requests_in_batch() const {
+  size_t count = 0;
+  for (const auto& request : running_requests_) {
+    if (request_has_media_prefill(request)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+bool ContinuousScheduler::should_limit_media_prefill_requests() const {
+  return engine_ != nullptr && engine_->model_args().model_type() == "kimi_k25";
+}
+
 void ContinuousScheduler::handle_prefill_requests(
     double& latency_budget,
     double& estimate_latency,
@@ -399,6 +429,12 @@ void ContinuousScheduler::handle_prefill_requests(
     }
 
     std::shared_ptr<Request> request(waiting_priority_queue->top());
+    if (should_limit_media_prefill_requests() &&
+        request_has_media_prefill(request) &&
+        count_media_prefill_requests_in_batch() >=
+            kMaxMediaPrefillRequestsPerBatch) {
+      break;
+    }
     if (request->finished() || request->cancelled()) {
       clear_mtp_bootstrap(request.get());
       kv_cache_manager_->deallocate(request.get());
