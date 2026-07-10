@@ -20,6 +20,8 @@ limitations under the License.
 #include <algorithm>
 #include <cctype>
 #include <memory>
+#include <sstream>
+#include <unordered_map>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -1269,6 +1271,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   }
 
   compute_stream_->synchronize();
+
   val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
   write_target_context_to_cache(input, val_output);
 
@@ -1541,9 +1544,12 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   CHECK_EQ(buf.position_helper.out_position_columns, buf.out_token_ids.size())
       << "validate positions/tokens mismatch";
 
+  torch::Tensor validate_positions =
+      buf.position_helper.make_cpu_position_tensor();
+
   set_token_position_tensors(validate_input,
                              buf.out_token_ids,
-                             buf.position_helper.make_cpu_position_tensor(),
+                             validate_positions,
                              token_options,
                              position_options);
   if (!use_atb_spec_kernel) {
@@ -1620,7 +1626,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   const bool use_chunked_prefill =
       !is_kimi_k25_eagle3_pair() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
-  const bool force_kimi_k25_eagle3_two_rows =
+  const bool is_kimi_k25_eagle3_dp_decode =
       target_impl_ != nullptr && draft_impl_ != nullptr &&
       is_kimi_k25_eagle3_draft(
           target_impl_->context_.get_model_args().model_type(),
@@ -1652,12 +1658,13 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     collect_row_count_group(draft_impl_->context_.get_parallel_args());
   }
   const bool can_sync_variable_dp_rows =
-      dp_enabled && !force_kimi_k25_eagle3_two_rows && !use_chunked_prefill &&
+      dp_enabled && !is_kimi_k25_eagle3_dp_decode && !use_chunked_prefill &&
       has_dp_token_counts &&
       (dp_row_count_group != nullptr || world_row_count_group != nullptr);
   const bool use_uniform_single_dp_rows =
-      dp_enabled && !force_kimi_k25_eagle3_two_rows && !use_chunked_prefill &&
-      !can_sync_variable_dp_rows;
+      dp_enabled && !use_chunked_prefill &&
+      (is_kimi_k25_eagle3_dp_decode || !can_sync_variable_dp_rows);
+  const bool force_kimi_k25_eagle3_two_rows = false;
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
 
@@ -1704,7 +1711,8 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     auto add_row = [&](int32_t token_id,
                        int32_t position_offset,
-                       const torch::Tensor& embedding) {
+                       const torch::Tensor& embedding,
+                       bool selected) {
       specBuilder::RowSpec row;
       row.seq_id = seq_id;
       row.token_id = token_id >= 0 ? token_id : 0;
@@ -1733,8 +1741,14 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
         prev_token_id = current_token_id >= 0 ? current_token_id : 0;
         prev_embedding = torch::Tensor();
       }
-      add_row(prev_token_id, /*position_offset=*/-1, prev_embedding);
-      add_row(state.token_id, /*position_offset=*/0, state.embedding);
+      add_row(prev_token_id,
+              /*position_offset=*/-1,
+              prev_embedding,
+              /*selected=*/false);
+      add_row(state.token_id,
+              /*position_offset=*/0,
+              state.embedding,
+              /*selected=*/true);
       specBuilder::append_seq_len_by_layout(buf.out_q_seq_lens, 2);
       const int32_t kv_len = specBuilder::calc_kv_len(
           base_input.input_params.attention.host.kv_seq_lens,
@@ -1754,22 +1768,20 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       int32_t prev_token_id = state.prev_token_id;
       int32_t prev_position_offset = -1;
       torch::Tensor prev_embedding = state.prev_embedding;
-      if (prev_token_id < 0) {
-        // Kimi Eagle3 on DP needs uniform draft-extend rows.  On the first
-        // decode step there is no real previous target token yet, so use the
-        // current verifier hidden state instead of falling back to token
-        // embedding inside the draft model.
-        prev_token_id = state.token_id;
-        prev_embedding = state.embedding;
-      }
       CHECK_GE(prev_token_id, 0)
           << "Eagle/MTP draft extend previous row requires a real token";
-      add_row(prev_token_id, prev_position_offset, prev_embedding);
+      add_row(prev_token_id,
+              prev_position_offset,
+              prev_embedding,
+              /*selected=*/false);
     }
 
     selected_row_idx.emplace_back(
         static_cast<int32_t>(expanded_embeddings.size()));
-    add_row(state.token_id, /*position_offset=*/0, state.embedding);
+    add_row(state.token_id,
+            /*position_offset=*/0,
+            state.embedding,
+            /*selected=*/true);
   }
 
   CHECK_EQ(buf.out_new_cache_slots.size(),

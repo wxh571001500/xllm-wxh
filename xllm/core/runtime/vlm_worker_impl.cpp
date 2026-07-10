@@ -21,9 +21,13 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "common/metrics.h"
 #include "core/framework/config/load_config.h"
@@ -31,6 +35,7 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/model_registry.h"
+#include "util/env_var.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
@@ -186,8 +191,12 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
   context.set_encoder_embedding_mode(false);
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
-  model_executor_ = std::make_unique<Executor>(
-      model_.get(), context.get_model_args(), device_, options_);
+  model_executor_ =
+      std::make_unique<Executor>(model_.get(),
+                                 context.get_model_args(),
+                                 device_,
+                                 options_,
+                                 context.get_parallel_args().mapping_data());
   return true;
 }
 

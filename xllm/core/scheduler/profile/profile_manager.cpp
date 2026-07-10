@@ -36,6 +36,7 @@ limitations under the License.
 #include "framework/batch/batch_factory.h"
 #include "framework/request/request_state.h"
 #include "scheduler/profile/graph_warmup.h"
+#include "util/env_var.h"
 #include "util/rec_model_utils.h"
 #include "util/utils.h"
 
@@ -43,6 +44,7 @@ namespace xllm {
 namespace {
 
 constexpr int32_t kMlaGraphKvLenBucket = 2048;
+constexpr char kDisableGraphWarmupEnv[] = "XLLM_DISABLE_GRAPH_WARMUP";
 
 bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
   return args.enable_mla() &&
@@ -1043,6 +1045,13 @@ void ProfileManager::generate_random_decode_batch(
 }
 
 void ProfileManager::warmup_for_graph() {
+  if (util::get_bool_env(kDisableGraphWarmupEnv, /*defaultValue=*/false)) {
+    LOG(INFO) << "Graph warmup skipped because " << kDisableGraphWarmupEnv
+              << "=1. ACL graph buckets will be captured lazily by real "
+                 "decode requests.";
+    return;
+  }
+
   auto& model_args = engine_->model_args();
   int32_t max_context_len = model_args.max_position_embeddings();
 

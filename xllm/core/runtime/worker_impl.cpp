@@ -59,6 +59,9 @@ limitations under the License.
 #include "platform/torch_profiler.h"
 #endif
 #include "core/distributed_runtime/master.h"
+#if defined(USE_NPU)
+#include "core/runtime/kimi_eagle3_graph_mode.h"
+#endif
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
@@ -864,12 +867,34 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
         !(context_.get_parallel_args().cp_size() > 1) &&
         (context_.get_parallel_args().dp_size() > 1 ||
          context_.get_parallel_args().ep_size() > 1)) {
-      torch::Tensor token_size_per_dp_group = torch::tensor(
-          processed_input.input_params.parallel.dp_global_token_nums,
-          torch::TensorOptions()
-              .device(torch::kCPU)
-              .dtype(torch::kInt32)
-              .pinned_memory(true));
+      // Kimi K25 Eagle3 canonicalize: when this decode step will run the
+      // canonicalized ACL graph (same all-DP-rank-consistent predicate the
+      // executor uses), build DpEpPadding from a UNIFORM [B,B,B,B] layout
+      // instead of the real per-rank counts. The graph path (persistent_param)
+      // pads every rank's local rows to the same bucket B and forces uniform
+      // metadata, so a uniform DpEpPadding makes one graph replay for any real
+      // layout. When canonicalize does not apply (>limit, non-kimi, non-decode)
+      // we keep the real counts and the step runs pure eager, staying in sync.
+      std::vector<int32_t> dp_token_counts =
+          processed_input.input_params.parallel.dp_global_token_nums;
+#if defined(USE_NPU)
+      const uint32_t canonical_bucket =
+          ::xllm::npu::kimi_eagle3_canonicalize_bucket(
+              context_.get_model_args(),
+              options_,
+              processed_input.input_params);
+      if (canonical_bucket > 0) {
+        std::fill(dp_token_counts.begin(),
+                  dp_token_counts.end(),
+                  static_cast<int32_t>(canonical_bucket));
+      }
+#endif
+      torch::Tensor token_size_per_dp_group =
+          torch::tensor(dp_token_counts,
+                        torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kInt32)
+                            .pinned_memory(true));
       const bool is_prefill =
           processed_input.input_params.meta.batch_forward_type.no_decode();
       DpEpPadding dp_ep_padding(token_size_per_dp_group,

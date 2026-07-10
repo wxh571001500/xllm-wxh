@@ -136,12 +136,6 @@ class GraphPersistentParam final {
   const int32_t* persistent_host_kv_seq_lens_data() const {
     return persistent_host_kv_seq_lens_.data();
   }
-  const int32_t* capture_host_q_seq_lens_data() const {
-    return capture_host_q_seq_lens_.data();
-  }
-  const int32_t* capture_host_kv_seq_lens_data() const {
-    return capture_host_kv_seq_lens_.data();
-  }
   bool need_update_attn_mask() const { return need_update_attn_mask_; }
   void set_need_update_attn_mask(bool value) { need_update_attn_mask_ = value; }
   bool need_update_attention_plan() const {
@@ -237,8 +231,6 @@ class GraphPersistentParam final {
   std::vector<int32_t> persistent_host_q_seq_lens_;
   std::vector<int32_t> persistent_host_kv_seq_lens_;
   std::vector<int32_t> persistent_host_expanded_kv_seq_lens_;
-  std::vector<int32_t> capture_host_q_seq_lens_;
-  std::vector<int32_t> capture_host_kv_seq_lens_;
 
   // for deepseekv3.2
   torch::Tensor q_cu_seq_lens_;
@@ -281,13 +273,16 @@ class GraphPersistentParam final {
 
   // Copy src padding data into pre-allocated persistent buffers.
   void update_persistent_dp_ep_padding(const DpEpPaddingData& src,
+                                       const std::vector<int32_t>& dp_tokens,
                                        uint32_t padded_tokens);
   void update_persistent_cp_ep_padding(const CpEpPaddingData& src,
                                        uint32_t padded_tokens);
   void replace_capture_dp_ep_padding(const DpEpPaddingData& src,
-                                     DpEpPaddingData& dst) const;
+                                     DpEpPaddingData& dst,
+                                     uint32_t padded_tokens) const;
   void replace_capture_cp_ep_padding(const CpEpPaddingData& src,
-                                     CpEpPaddingData& dst) const;
+                                     CpEpPaddingData& dst,
+                                     uint32_t padded_tokens) const;
 };
 
 }  // namespace xllm::npu

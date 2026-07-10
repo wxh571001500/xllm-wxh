@@ -23,6 +23,11 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <sstream>
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
@@ -34,6 +39,7 @@ limitations under the License.
 #endif
 #include "core/common/metrics.h"
 #include "core/platform/device.h"
+#include "core/runtime/kimi_eagle3_graph_mode.h"
 #include "core/util/utils.h"
 #include "platform/npu/device_capture_lock.h"
 
@@ -45,6 +51,8 @@ constexpr uint64_t kSpecVerifyQMaxSeqLenShift = 32;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
 constexpr int32_t kMlaGraphKvLenBucket = 2048;
+constexpr char kAclGraphReplayInputSyncEnv[] =
+    "XLLM_ACL_GRAPH_REPLAY_INPUT_SYNC";
 
 std::pair<torch::Tensor, torch::Tensor> find_attention_plan_kv_cache(
     const std::vector<KVCache>& kv_caches) {
@@ -71,9 +79,73 @@ bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
 
 bool is_kimi_k25_eagle3_target_graph(const ModelArgs& args,
                                      const runtime::Options& options) {
-  return args.model_type() == "kimi_k25" &&
-         options.enable_speculative_decode() && !options.is_draft_engine() &&
-         options.speculative_algorithm() == "Eagle3";
+  return is_kimi_k25_eagle3_target(args, options);
+}
+
+bool enable_acl_graph_replay_input_sync() {
+  const char* value = std::getenv(kAclGraphReplayInputSyncEnv);
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+         std::strcmp(value, "off") != 0 && std::strcmp(value, "false") != 0;
+}
+
+bool is_kimi_eagle3_spec_validate_graph(const ModelInputParams& params,
+                                        uint32_t n_tokens,
+                                        uint32_t num_decoding_tokens) {
+  if (params.is_spec_verify) {
+    return true;
+  }
+  if (!params.meta.batch_forward_type.is_decode() || num_decoding_tokens <= 1 ||
+      n_tokens == 0 || n_tokens % num_decoding_tokens != 0) {
+    return false;
+  }
+  if (params.meta.q_max_seq_len != 1 ||
+      !params.attention.device.new_cache_slots.defined()) {
+    return false;
+  }
+  return params.attention.device.new_cache_slots.numel() ==
+         static_cast<int64_t>(n_tokens);
+}
+
+std::string tensor_desc(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+
+  std::ostringstream oss;
+  oss << "shape=" << tensor.sizes() << ", dtype=" << tensor.dtype()
+      << ", device=" << tensor.device();
+  if (tensor.numel() == 0) {
+    oss << ", numel=0";
+    return oss.str();
+  }
+
+  torch::Tensor cpu_tensor =
+      tensor.detach().to(torch::kCPU).contiguous().to(torch::kFloat32);
+  const float min_value = cpu_tensor.min().item<float>();
+  const float max_value = cpu_tensor.max().item<float>();
+  const float mean_value = cpu_tensor.mean().item<float>();
+  const float l2_norm = cpu_tensor.pow(2).sum().sqrt().item<float>();
+  oss << ", min=" << min_value << ", max=" << max_value
+      << ", mean=" << mean_value << ", l2=" << l2_norm;
+  return oss.str();
+}
+
+std::string string_values_to_string(const std::vector<std::string>& values,
+                                    size_t max_values = 16) {
+  std::ostringstream oss;
+  oss << "[";
+  const size_t value_count = std::min(values.size(), max_values);
+  for (size_t i = 0; i < value_count; ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << values[i];
+  }
+  if (values.size() > max_values) {
+    oss << ",...";
+  }
+  oss << "]";
+  return oss.str();
 }
 
 void hash_graph_key_value(uint64_t& hash, uint64_t value) {
@@ -110,11 +182,16 @@ int32_t get_mla_capture_kv_seq_len_bucket(const ModelInputParams& params,
 }
 
 uint64_t get_mla_graph_key(uint32_t bucket_num_tokens,
-                           int32_t capture_kv_seq_len_bucket) {
+                           int32_t capture_kv_seq_len_bucket,
+                           uint32_t graph_num_tokens,
+                           bool include_graph_num_tokens) {
   constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ull;
   uint64_t hash = kFnvOffsetBasis;
   hash_graph_key_value(hash, bucket_num_tokens);
   hash_graph_key_value(hash, static_cast<uint64_t>(capture_kv_seq_len_bucket));
+  if (include_graph_num_tokens) {
+    hash_graph_key_value(hash, static_cast<uint64_t>(graph_num_tokens));
+  }
 
   return kMlaGraphKeyMask | (hash & kMlaGraphKeyPayloadMask);
 }
@@ -202,6 +279,7 @@ bool AclGraph::capture(CausalLM* model,
     // no mempool id, will create a new one; capture mode is thread local, allow
     // other threads to execute synchronous operations
     bool capture_started = false;
+    bool capture_end_started = false;
     try {
       graph_.capture_begin(
           {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
@@ -220,10 +298,12 @@ bool AclGraph::capture(CausalLM* model,
         persistent_param_.set_aux_hidden_states(
             forward_result.aux_hidden_states);
       }
+      capture_end_started = true;
       graph_.capture_end();
+      capture_end_started = false;
       capture_started = false;
     } catch (...) {
-      if (capture_started) {
+      if (capture_started && !capture_end_started) {
         try {
           graph_.capture_end();
         } catch (const std::exception& cleanup_error) {
@@ -232,7 +312,14 @@ bool AclGraph::capture(CausalLM* model,
         } catch (...) {
           LOG(ERROR) << "ACL graph capture_end during cleanup failed.";
         }
+      }
+      try {
         graph_.reset();
+      } catch (const std::exception& cleanup_error) {
+        LOG(ERROR) << "ACL graph reset during cleanup failed: "
+                   << cleanup_error.what();
+      } catch (...) {
+        LOG(ERROR) << "ACL graph reset during cleanup failed.";
       }
       if (need_restore_stream) {
         c10_npu::setCurrentNPUStream(
@@ -266,6 +353,10 @@ AclGraph::~AclGraph() {
     aclrtDestroyEvent(replay_done_event_);
     replay_done_event_ = nullptr;
   }
+  if (input_ready_event_ != nullptr) {
+    aclrtDestroyEvent(input_ready_event_);
+    input_ready_event_ = nullptr;
+  }
 }
 
 void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
@@ -275,6 +366,11 @@ void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
   // torch_npu/csrc/core/npu/NPUGraph.cpp:159).
   capture_stream_ = c10_npu::getStreamFromPool(true, device_index);
   device_index_ = device_index;
+  if (enable_acl_graph_replay_input_sync()) {
+    CHECK_EQ(aclrtCreateEventWithFlag(&input_ready_event_, ACL_EVENT_SYNC),
+             ACL_SUCCESS)
+        << "Failed to create ACL graph input-ready event";
+  }
   CHECK_EQ(aclrtCreateEventWithFlag(&replay_done_event_, ACL_EVENT_SYNC),
            ACL_SUCCESS)
       << "Failed to create ACL graph replay completion event";
@@ -282,6 +378,19 @@ void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
       << "Initialized capture_stream"
       << ", id: " << capture_stream_.value().id()
       << ", device_index: " << static_cast<int32_t>(device_index);
+}
+
+void AclGraph::make_graph_wait_for_current_stream(aclrtStream current_stream) {
+  CHECK_NE(graph_stream_, nullptr) << "graph_stream is not initialized";
+  CHECK_NE(input_ready_event_, nullptr)
+      << "input_ready_event is not initialized";
+  if (current_stream == graph_stream_) {
+    return;
+  }
+  CHECK_EQ(aclrtRecordEvent(input_ready_event_, current_stream), ACL_SUCCESS)
+      << "aclrtRecordEvent(input_ready_event) failed";
+  CHECK_EQ(aclrtStreamWaitEvent(graph_stream_, input_ready_event_), ACL_SUCCESS)
+      << "aclrtStreamWaitEvent(graph_stream, input_ready_event) failed";
 }
 
 void AclGraph::make_current_stream_wait_for_graph(aclrtStream current_stream) {
@@ -354,6 +463,9 @@ ModelOutput AclGraph::replay(CausalLM* model,
   // Get current NPU stream from libtorch NPU API
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
+  if (enable_acl_graph_replay_input_sync()) {
+    make_graph_wait_for_current_stream(stream);
+  }
   graph_.replay();
 
   make_current_stream_wait_for_graph(stream);
@@ -490,10 +602,24 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   const uint32_t bucket_num_tokens = get_bucket_num_tokens(graph_num_tokens);
 
-  // Check if conditions are suitable for graph execution (replay or capture)
+  // Kimi K25 Eagle3 target MLA graph uses a bucket-only key (canonicalize): the
+  // worker pads every DP rank to this same bucket B and builds DpEpPadding from
+  // a uniform [B,B,B,B] layout, so one graph per bucket replays correctly for
+  // any real DP token layout. All models use bucket-only keying.
+
+  // Check if conditions are suitable for graph execution (replay or capture).
+  // Under kimi canonicalize, use the DP-GLOBAL kv_max_seq_len so every rank
+  // makes the same graph/eager decision (a per-rank local check could make one
+  // rank fall back to eager while others graph -> HCCL desync/hang). This
+  // matches the gate in kimi_eagle3_canonicalize_bucket() used by the worker.
   const auto max_seq_len = args_.max_position_embeddings();
-  const bool seq_len_supported =
-      params_single.meta.kv_max_seq_len <= max_seq_len;
+  int32_t gate_kv_max_seq_len = params_single.meta.kv_max_seq_len;
+  if (use_kimi_k25_eagle3_acl_graph &&
+      !params_single.parallel.dp_global_kv_max_seq_lens.empty()) {
+    gate_kv_max_seq_len =
+        util::max(params_single.parallel.dp_global_kv_max_seq_lens);
+  }
+  const bool seq_len_supported = gate_kv_max_seq_len <= max_seq_len;
 
   // Combined condition for graph capture support
   // ACL graph executor only supports single tensor inputs (no micro-batching)
@@ -510,7 +636,8 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     return model_->forward(tokens, positions, kv_caches, params);
   }
 
-  const uint64_t graph_key = get_graph_key(bucket_num_tokens, params_single);
+  const uint64_t graph_key =
+      get_graph_key(bucket_num_tokens, params_single, graph_num_tokens);
 
   // Check if captured graph exists for this bucket num_tokens
   auto it = graphs_.find(graph_key);
@@ -545,12 +672,25 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                      kv_caches,
                                      bucket_num_tokens);
   } catch (const std::exception& e) {
-    LOG(ERROR) << "ACL graph capture threw exception for bucket num_tokens="
-               << bucket_num_tokens << ": " << e.what();
-    if (uses_deepseek_v2_mla_graph(args_)) {
+    // Under kimi canonicalize the worker has already built a uniform
+    // [B,B,B,B] DpEpPadding for this step; silently falling back to eager here
+    // would run real-row eager against uniform collective sizing on this rank
+    // while other ranks may still graph -> HCCL desync/hang. So fail fast for
+    // kimi (canonicalize) too, in addition to other deepseek MLA graphs.
+    const bool fail_fast_on_capture_failure =
+        uses_deepseek_v2_mla_graph(args_) || use_kimi_k25_eagle3_acl_graph;
+    if (fail_fast_on_capture_failure) {
+      LOG(ERROR) << "ACL graph capture threw exception for bucket num_tokens="
+                 << bucket_num_tokens << ": " << e.what();
       throw;
     }
-    LOG(ERROR) << "Falling back to eager mode.";
+    LOG_FIRST_N(WARNING, 1)
+        << "Falling back to eager mode after ACL graph capture failure. "
+        << "model_type=" << args_.model_type() << ", graph_key=" << graph_key
+        << ", bucket_num_tokens=" << bucket_num_tokens
+        << ", graph_num_tokens=" << graph_num_tokens
+        << ", kv_max_seq_len=" << params_single.meta.kv_max_seq_len
+        << ", error=" << e.what() << ". This message is logged only once.";
     COUNTER_INC(num_model_execution_total_eager);
     return model_->forward(tokens, positions, kv_caches, params);
   }
@@ -601,27 +741,12 @@ void AclGraph::print_graph_tensors() const {
 // bucket will be [1, 2, 4, 8, 16, 32, 48, 64, ..., max_seqs_per_batch]
 uint32_t AclGraphExecutorImpl::get_bucket_num_tokens(
     uint32_t num_tokens) const {
-  if (::xllm::ExecutionConfig::get_instance()
-          .enable_graph_mode_decode_no_padding()) {
-    return num_tokens;
-  }
-  if (num_tokens <= 1) {
-    return 1;
-  } else if (num_tokens <= 2) {
-    return 2;
-  } else if (num_tokens <= 4) {
-    return 4;
-  } else if (num_tokens <= 8) {
-    return 8;
-  } else {
-    // For num_tokens > 8, use multiples of 16.
-    return ((num_tokens + 15) / 16) * 16;
-  }
+  return kimi_eagle3_bucket_num_tokens(num_tokens);
 }
 
-uint64_t AclGraphExecutorImpl::get_graph_key(
-    uint32_t bucket_num_tokens,
-    const ModelInputParams& params) const {
+uint64_t AclGraphExecutorImpl::get_graph_key(uint32_t bucket_num_tokens,
+                                             const ModelInputParams& params,
+                                             uint32_t graph_num_tokens) const {
   if (params.is_spec_verify &&
       params.meta.batch_forward_type.is_chunked_prefill()) {
     const uint64_t q_max_seq_len =
@@ -632,7 +757,10 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
   if (uses_deepseek_v2_mla_graph(args_)) {
     const int32_t capture_kv_seq_len_bucket =
         get_mla_capture_kv_seq_len_bucket(params, options_);
-    return get_mla_graph_key(bucket_num_tokens, capture_kv_seq_len_bucket);
+    return get_mla_graph_key(bucket_num_tokens,
+                             capture_kv_seq_len_bucket,
+                             graph_num_tokens,
+                             /*include_graph_num_tokens=*/false);
   }
   return static_cast<uint64_t>(bucket_num_tokens);
 }

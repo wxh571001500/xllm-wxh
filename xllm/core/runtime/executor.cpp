@@ -33,7 +33,8 @@ bool is_eagle3_model_type(const std::string& model_type) {
 Executor::Executor(CausalLM* model,
                    const ModelArgs& args,
                    const torch::Device& device,
-                   const runtime::Options& options) {
+                   const runtime::Options& options,
+                   const nlohmann::json& mapping_npu) {
   const bool enable_model_graph =
       options.enable_graph() && !is_eagle3_model_type(args.model_type());
   std::string backend = options.backend() != "vlm" && enable_model_graph
@@ -41,6 +42,7 @@ Executor::Executor(CausalLM* model,
                             : options.backend();
   impl_ = ExecutorImplFactory::get_instance().create_executor_impl(
       model, args, device, options, backend);
+  impl_->set_parallel_mapping(mapping_npu);
 }
 
 ForwardInput Executor::prepare_inputs(Batch& batch) {

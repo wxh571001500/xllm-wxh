@@ -27,12 +27,15 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/model/model_output.h"
 #include "options.h"
+#include "util/json_reader.h"
 
 namespace xllm {
 
 class ExecutorImpl {
  public:
   virtual ~ExecutorImpl() = default;
+
+  virtual void set_parallel_mapping(const nlohmann::json& /*mapping_npu*/) {}
 
   virtual ForwardInput prepare_inputs(Batch& batch) = 0;
 
