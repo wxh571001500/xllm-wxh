@@ -127,7 +127,8 @@ bool AclGraph::capture(CausalLM* model,
                        const torch::Tensor& positions,
                        const ModelInputParams& params,
                        std::vector<KVCache>& kv_cache,
-                       uint32_t bucket_num_tokens) {
+                       uint32_t bucket_num_tokens,
+                       bool use_global_capture_mode) {
   // Save bucket num_tokens for this graph instance
   num_tokens_ = bucket_num_tokens;
 
@@ -199,13 +200,19 @@ bool AclGraph::capture(CausalLM* model,
         << "ACL graph capture begin, bucket_num_tokens=" << bucket_num_tokens
         << ", actual_num_tokens=" << actual_num_tokens;
 
-    // no mempool id, will create a new one; capture mode is thread local, allow
-    // other threads to execute synchronous operations
+    // no mempool id, will create a new one. DeepSeekV2 MLA graph uses global
+    // capture because its ATB graph can launch auxiliary communication streams.
     bool capture_started = false;
+    bool capture_active_marked = false;
     try {
-      graph_.capture_begin(
-          {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+      const aclmdlRICaptureMode capture_mode =
+          use_global_capture_mode
+              ? aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_GLOBAL
+              : aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL;
+      graph_.capture_begin({0, 0}, capture_mode);
       capture_started = true;
+      ::xllm::npu::DeviceCaptureLock::get_instance().begin_capture(device_idx);
+      capture_active_marked = true;
       // Execute forward pass - NPUGraph mempool manages temporary tensors
       auto forward_result =
           model->forward({persistent_param_.persistent_tokens(num_tokens_)},
@@ -220,9 +227,14 @@ bool AclGraph::capture(CausalLM* model,
         persistent_param_.set_aux_hidden_states(
             forward_result.aux_hidden_states);
       }
+      ::xllm::npu::DeviceCaptureLock::get_instance().end_capture(device_idx);
+      capture_active_marked = false;
       graph_.capture_end();
       capture_started = false;
     } catch (...) {
+      if (capture_active_marked) {
+        ::xllm::npu::DeviceCaptureLock::get_instance().end_capture(device_idx);
+      }
       if (capture_started) {
         try {
           graph_.capture_end();
@@ -543,7 +555,8 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                      positions_tensor,
                                      params_single,
                                      kv_caches,
-                                     bucket_num_tokens);
+                                     bucket_num_tokens,
+                                     uses_deepseek_v2_mla_graph(args_));
   } catch (const std::exception& e) {
     LOG(ERROR) << "ACL graph capture threw exception for bucket num_tokens="
                << bucket_num_tokens << ": " << e.what();

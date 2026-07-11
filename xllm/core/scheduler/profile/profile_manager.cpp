@@ -36,6 +36,7 @@ limitations under the License.
 #include "framework/batch/batch_factory.h"
 #include "framework/request/request_state.h"
 #include "scheduler/profile/graph_warmup.h"
+#include "util/env_var.h"
 #include "util/rec_model_utils.h"
 #include "util/utils.h"
 
@@ -43,10 +44,16 @@ namespace xllm {
 namespace {
 
 constexpr int32_t kMlaGraphKvLenBucket = 2048;
+constexpr const char* kDisableMlaGraphWarmupEnv =
+    "XLLM_DISABLE_MLA_GRAPH_WARMUP";
 
 bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
   return args.enable_mla() &&
          util::is_deepseek_v2_family_model_type(args.model_type());
+}
+
+bool disable_mla_graph_warmup() {
+  return util::get_bool_env(kDisableMlaGraphWarmupEnv, /*defaultValue=*/false);
 }
 
 struct MlaGraphWarmupShape {
@@ -135,7 +142,14 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
   // Warmup ACL graph executor if enabled
   if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
     if (!is_rec_multi_round_mode()) {
-      warmup_for_graph();
+      if (uses_deepseek_v2_mla_graph(engine_->model_args()) &&
+          disable_mla_graph_warmup()) {
+        LOG(INFO) << "Skip MLA graph warmup because "
+                  << kDisableMlaGraphWarmupEnv
+                  << "=1; ACL graphs will be captured lazily.";
+      } else {
+        warmup_for_graph();
+      }
     }
   }
 #endif

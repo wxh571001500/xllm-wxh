@@ -66,7 +66,8 @@ class AclGraph {
                const torch::Tensor& positions,
                const ModelInputParams& params,
                std::vector<KVCache>& kv_cache,
-               uint32_t bucket_num_tokens);
+               uint32_t bucket_num_tokens,
+               bool use_global_capture_mode);
 
   // Replay captured graph with new input data
   ModelOutput replay(CausalLM* model,

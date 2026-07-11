@@ -108,7 +108,7 @@ enum class LinearTypeV2 : int {
 class BaseLayer : public torch::nn::Module {
  public:
   explicit BaseLayer(const ModelContext& context);
-  virtual ~BaseLayer() override = default;
+  ~BaseLayer() override;
 
   atb::Status execute_node(atb_speed::Model::Node& node,
                            int nodeId = 0,
@@ -235,6 +235,7 @@ class BaseLayer : public torch::nn::Module {
   atb::Context* context_;
   std::shared_ptr<AtbWorkspace> work_space_ = nullptr;
   std::vector<atb::Tensor> atb_weight_tensors_;
+  std::vector<aclrtEvent> graph_join_events_;
   bool graph_captured_{false};
 };
 

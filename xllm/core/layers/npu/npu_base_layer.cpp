@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "npu_base_layer.h"
 
+#include <vector>
+
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
@@ -24,9 +26,85 @@ limitations under the License.
 #endif
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
+#include "platform/npu/device_capture_lock.h"
 
 namespace xllm {
 namespace layer {
+namespace {
+
+bool should_join_graph_execute_streams(c10::DeviceIndex device_index,
+                                       aclrtStream main_stream) {
+  if (!::xllm::ExecutionConfig::get_instance().enable_graph()) {
+    return false;
+  }
+  if (main_stream == c10_npu::getDefaultNPUStream(device_index).stream()) {
+    return false;
+  }
+  return ::xllm::npu::DeviceCaptureLock::get_instance().is_capture_active(
+      device_index);
+}
+
+void destroy_event(aclrtEvent event) {
+  if (event == nullptr) {
+    return;
+  }
+  aclError ret = aclrtDestroyEvent(event);
+  LOG_IF(ERROR, ret != ACL_SUCCESS)
+      << "Destroy graph execute stream join event failed, acl error: " << ret;
+}
+
+void join_graph_execute_streams(atb::Context* context,
+                                c10::DeviceIndex device_index,
+                                std::vector<aclrtEvent>& join_events) {
+  aclrtStream main_stream = context->GetExecuteStream();
+  if (!should_join_graph_execute_streams(device_index, main_stream)) {
+    return;
+  }
+
+  std::vector<aclrtStream> execute_streams = context->GetExecuteStreams();
+  LOG_FIRST_N(INFO, 1)
+      << "Joining ATB execute streams for ACL graph capture, stream_count="
+      << execute_streams.size();
+  if (join_events.size() < execute_streams.size()) {
+    join_events.resize(execute_streams.size(), nullptr);
+  }
+
+  for (size_t stream_index = 0; stream_index < execute_streams.size();
+       ++stream_index) {
+    aclrtStream stream = execute_streams[stream_index];
+    if (stream == nullptr || stream == main_stream) {
+      continue;
+    }
+
+    if (join_events[stream_index] == nullptr) {
+      aclError ret =
+          aclrtCreateEventWithFlag(&join_events[stream_index], ACL_EVENT_SYNC);
+      if (ret != ACL_SUCCESS) {
+        LOG(ERROR)
+            << "Create graph execute stream join event failed, acl error: "
+            << ret;
+        continue;
+      }
+    }
+
+    aclrtEvent event = join_events[stream_index];
+    aclError ret = aclrtRecordEvent(event, stream);
+    if (ret != ACL_SUCCESS) {
+      LOG(ERROR) << "Record graph execute stream join event failed, acl error: "
+                 << ret;
+      continue;
+    }
+
+    ret = aclrtStreamWaitEvent(main_stream, event);
+    if (ret != ACL_SUCCESS) {
+      LOG(ERROR) << "Wait graph execute stream join event failed, acl error: "
+                 << ret;
+      continue;
+    }
+  }
+}
+
+}  // namespace
 
 BaseLayer::BaseLayer(const ModelContext& context)
     : device_(context.get_tensor_options().device()),
@@ -56,6 +134,12 @@ BaseLayer::BaseLayer(const ModelContext& context)
 
   context_ = const_cast<atb::Context*>(context.get_atb_context());
   work_space_ = context.get_atb_workspace();
+}
+
+BaseLayer::~BaseLayer() {
+  for (aclrtEvent event : graph_join_events_) {
+    destroy_event(event);
+  }
 }
 
 atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
@@ -126,6 +210,9 @@ atb::Status BaseLayer::execute_plan(const atb_speed::Model::Node& node,
   atb::Status st = node.operation->Execute(
       node.variantPack, (uint8_t*)node.workspace, node.workspaceSize, context_);
   LOG_IF(ERROR, st != 0) << name_ << " execute plan fail, error code: " << st;
+  if (st == 0) {
+    join_graph_execute_streams(context_, device_.index(), graph_join_events_);
+  }
   if (st == 0 && event != nullptr) {
     aclrtStream stream = context_->GetExecuteStream();
 

@@ -49,6 +49,26 @@ class DeviceCaptureLock {
     return *it->second;
   }
 
+  void begin_capture(c10::DeviceIndex device_index) {
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
+    ++capture_counts_[device_index];
+  }
+
+  void end_capture(c10::DeviceIndex device_index) {
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
+    auto it = capture_counts_.find(device_index);
+    if (it == capture_counts_.end() || it->second == 0) {
+      return;
+    }
+    --it->second;
+  }
+
+  bool is_capture_active(c10::DeviceIndex device_index) {
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
+    auto it = capture_counts_.find(device_index);
+    return it != capture_counts_.end() && it->second > 0;
+  }
+
  private:
   DISALLOW_COPY_AND_ASSIGN(DeviceCaptureLock);
   DeviceCaptureLock() = default;
@@ -56,6 +76,7 @@ class DeviceCaptureLock {
 
   // Map from device index to mutex
   std::unordered_map<c10::DeviceIndex, std::unique_ptr<std::mutex>> locks_;
+  std::unordered_map<c10::DeviceIndex, int32_t> capture_counts_;
   // Mutex to protect the map itself
   std::mutex map_mutex_;
 };
