@@ -27,8 +27,28 @@ std::vector<int32_t> graph_warmup_buckets(int32_t max_seqs_per_batch);
 
 bool skip_graph_bucket(int32_t bucket, int32_t dp_size);
 
+// Returns true when a warmup decode bucket (global sequence count) would be
+// executed eagerly at runtime, so capturing a graph for it during warmup is
+// wasted work. The ACL graph executor gates on the per-DP-rank batch size
+// (global_batch_size = ceil(bucket / dp_size)); when it exceeds
+// decode_batch_size_limit the request falls back to eager. A non-positive
+// limit disables the cap (keep every bucket).
+bool skip_graph_bucket_over_batch_limit(int32_t bucket,
+                                        int32_t dp_size,
+                                        int32_t decode_batch_size_limit);
+
+// max_seqs_per_batch: largest global decode batch (sequence count) to warm up.
+// dp_size: data-parallel group count; buckets smaller than it are skipped.
+// decode_batch_size_limit: the runtime ACL-graph batch-size cap; buckets whose
+//   per-DP-rank batch size exceeds it are skipped because the runtime would run
+//   them eagerly (never replaying a captured graph). A non-positive value keeps
+//   every bucket. Keeping warmup aligned with the runtime gate avoids capturing
+//   graphs that are never used -- and on multi-node EP that oversized capture
+//   can fail outright (HCCL all-to-all leaves an unjoined stream at
+//   capture_end).
 std::vector<int32_t> graph_decode_buckets(int32_t max_seqs_per_batch,
-                                          int32_t dp_size);
+                                          int32_t dp_size,
+                                          int32_t decode_batch_size_limit = 0);
 
 std::string graph_warmup_progress(int32_t completed,
                                   int32_t total,
