@@ -190,6 +190,10 @@ class NpuDeepseekV2DecoderLayerImpl : public BaseLayer {
       torch::Tensor& target_buffer,
       const std::vector<torch::Tensor>& experts_down);
 
+  bool use_dispatch_ffn_combine(
+      const atb_speed::deepseekV2::DecoderLayerParam& param) const;
+  void prepare_dispatch_ffn_combine_weights();
+
   int64_t init_node(atb_speed::Model::Node& node,
                     atb_speed::deepseekV2::DecoderLayerParam& param);
 
@@ -260,6 +264,13 @@ class NpuDeepseekV2DecoderLayerImpl : public BaseLayer {
   torch::Tensor final_hidden_states_;
   torch::Tensor at_start_expert_id_;
   torch::Tensor at_in_device_expert_count_;
+  torch::Tensor dispatch_ffn_gateup_scale_;
+  torch::Tensor dispatch_ffn_down_scale_;
+
+  atb::Tensor atb_dispatch_ffn_gateup_scale_;
+  atb::Tensor atb_dispatch_ffn_down_scale_;
+  atb::Tensor atb_prefill_moe_gateup_scale_;
+  atb::Tensor atb_prefill_moe_down_scale_;
 
   std::vector<int32_t> int_placeholder_;
 

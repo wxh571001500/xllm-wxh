@@ -19,6 +19,8 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
+#include <memory>
+
 #include "comm_channel.h"
 #include "common/macros.h"
 #include "common/types.h"
@@ -124,7 +126,7 @@ class RemoteWorker : public WorkerClient {
       const ForwardInput& inputs) override;
 
   virtual folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
-      const ForwardInput& inputs) override;
+      const std::shared_ptr<const ForwardInput>& inputs) override;
 
   virtual folly::SemiFuture<folly::Unit> process_group_test_async() override;
 
@@ -169,5 +171,9 @@ class RemoteWorker : public WorkerClient {
                               /*cpu_binding=*/false,
                               /*pool_name=*/"RemoteWorker.copy"};
   const torch::Device device_;
+  // Counts step_remote_async calls (one per step). Used only to throttle the
+  // env-gated dispatch profiling log so it samples every N steps instead of
+  // flooding every step.
+  int64_t step_dispatch_call_count_ = 0;
 };
 }  // namespace xllm

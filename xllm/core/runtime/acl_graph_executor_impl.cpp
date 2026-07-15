@@ -280,6 +280,12 @@ bool AclGraph::capture(CausalLM* model,
     // other threads to execute synchronous operations
     bool capture_started = false;
     bool capture_end_started = false;
+    // BUILD MARKER: prove the running binary contains the current source. If
+    // this line is absent from the log right before a capture error, the
+    // machine is running a stale binary and NONE of the recent edits are live.
+    LOG(WARNING) << "[capture_build_marker v10] bucket_num_tokens="
+                 << bucket_num_tokens
+                 << " aux_enabled=" << options.enable_graph_aux_hidden_states();
     try {
       graph_.capture_begin(
           {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
@@ -293,10 +299,33 @@ bool AclGraph::capture(CausalLM* model,
 
       // Store result in persistent buffer owned by NPUGraph mempool
       persistent_param_.set_hidden_states(forward_result.hidden_states);
-      if (options.enable_graph_aux_hidden_states() &&
-          forward_result.aux_hidden_states.defined()) {
-        persistent_param_.set_aux_hidden_states(
-            forward_result.aux_hidden_states);
+      // DIAGNOSTIC (XLLM_CAPTURE_SKIP_AUX_STORE=1): skip ONLY the executor-side
+      // set_aux_hidden_states (its lazy torch::zeros + copy), while the
+      // model-side aux buffer copy still runs. Bisects the aux side-stream
+      // between model-side and executor-side. Breaks draft correctness; test
+      // only whether capture succeeds.
+      const char* skip_aux_store_env =
+          std::getenv("XLLM_CAPTURE_SKIP_AUX_STORE");
+      const bool skip_aux_store =
+          skip_aux_store_env != nullptr && skip_aux_store_env[0] == '1';
+      if (!skip_aux_store && options.enable_graph_aux_hidden_states()) {
+        if (!forward_result.aux_hidden_states_list.empty()) {
+          // Eagle3 graph path: per-layer aux tensors, un-combined. Each copy is
+          // ~917KB (below the CANN large-copy/SDMA threshold), keeping capture
+          // side-stream-free. The hidden-dim concat is deferred to the getter.
+          LOG(WARNING)
+              << "[capture_build_marker v10] set_aux_hidden_states_list n="
+              << forward_result.aux_hidden_states_list.size()
+              << " each=" << forward_result.aux_hidden_states_list[0].sizes();
+          persistent_param_.set_aux_hidden_states_list(
+              forward_result.aux_hidden_states_list);
+        } else if (forward_result.aux_hidden_states.defined()) {
+          LOG(WARNING) << "[capture_build_marker v10] set_aux_hidden_states"
+                       << " aux_shape="
+                       << forward_result.aux_hidden_states.sizes();
+          persistent_param_.set_aux_hidden_states(
+              forward_result.aux_hidden_states);
+        }
       }
       capture_end_started = true;
       graph_.capture_end();

@@ -322,6 +322,10 @@ class ContinuousScheduler : public Scheduler {
       RequestPriorityQueue* running_queue);
   bool request_has_media_prefill(const std::shared_ptr<Request>& request) const;
   size_t count_media_prefill_requests_in_batch() const;
+  // Whether the media-prefill cap is already reached and no more media prefills
+  // should be admitted this batch. Global mode: total media prefills >= cap.
+  // Per-DP mode: every DP rank has >= cap media prefills already admitted.
+  bool media_prefill_cap_reached() const;
   bool should_limit_media_prefill_requests() const;
   void get_latency_budget_and_request_order(
       RequestPriorityQueue* request_priority_queue,

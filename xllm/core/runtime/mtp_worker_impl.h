@@ -161,6 +161,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // If false, selected-only cache values are restored to dense [B, S, V].
   bool enable_opt_validate_probs_ = false;
 
+  // Counts decode steps on this worker. Used only to throttle the env-gated
+  // [step_timing] per-rank host-side breakdown so it samples every N steps.
+  int64_t step_timing_decode_count_ = 0;
+
 #if defined(USE_NPU) || defined(USE_MLU)
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
 #endif

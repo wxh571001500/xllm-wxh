@@ -45,6 +45,22 @@ bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
          util::is_deepseek_v2_family_model_type(args.model_type());
 }
 
+torch::Tensor convert_dispatch_ffn_scale_to_int64(const torch::Tensor& scale) {
+  torch::Tensor normalized_scale = scale;
+  if (normalized_scale.dim() == 3 && normalized_scale.size(-1) == 1) {
+    normalized_scale = normalized_scale.squeeze(-1);
+  }
+  CHECK_EQ(normalized_scale.dim(), 2)
+      << "DispatchFFNCombine scale must be [expert, output], got "
+      << scale.sizes();
+  return normalized_scale.to(torch::kFloat32)
+      .contiguous()
+      .view(torch::kInt32)
+      .to(torch::kInt64);
+}
+
+constexpr size_t kMoeDownLinearIndex = 3;
+
 }  // namespace
 
 enum DecoderLayerTensorId : int {
@@ -755,6 +771,17 @@ void NpuDeepseekV2DecoderLayerImpl::update_expert_weight() {
     decode_node_.inTensors.at(index) = &atb_weight_tensors_[index];
     decode_mla_node_.inTensors.at(index) = &atb_weight_tensors_[index];
   }
+  if (use_dispatch_ffn_combine(decode_param_)) {
+    prepare_dispatch_ffn_combine_weights();
+    prefill_node_.inTensors.at(IN_MLP_GATEUP_SCALE_EXPERT) =
+        &atb_prefill_moe_gateup_scale_;
+    prefill_node_.inTensors.at(IN_MLP_DOWN_SCALE_EXPERT) =
+        &atb_prefill_moe_down_scale_;
+    prefill_node_prefixcache_.inTensors.at(IN_MLP_GATEUP_SCALE_EXPERT) =
+        &atb_prefill_moe_gateup_scale_;
+    prefill_node_prefixcache_.inTensors.at(IN_MLP_DOWN_SCALE_EXPERT) =
+        &atb_prefill_moe_down_scale_;
+  }
   expert_routing_map_[layer_id_ - first_k_dense_replace_] =
       expert_routing_map_buffer_;
   expert_routing_map_ = expert_routing_map_.contiguous();
@@ -763,12 +790,75 @@ void NpuDeepseekV2DecoderLayerImpl::update_expert_weight() {
 int64_t NpuDeepseekV2DecoderLayerImpl::init_layer() {
   name_ = "deepseek_v2_decoder_layer " + std::to_string(layer_id_);
   model_name_ = "DeepSeek_V2";
+  if (use_dispatch_ffn_combine(decode_param_)) {
+    prefill_param_.moeLinearTransposeType.at(kMoeDownLinearIndex) = 0;
+    prefill_param_prefixcache_.moeLinearTransposeType.at(kMoeDownLinearIndex) =
+        0;
+    decode_param_.moeLinearTransposeType.at(kMoeDownLinearIndex) = 0;
+    decode_mla_param_.moeLinearTransposeType.at(kMoeDownLinearIndex) = 0;
+    prepare_dispatch_ffn_combine_weights();
+  }
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
   CHECK_OPERATION_STATUS_RETURN(
       init_node(prefill_node_prefixcache_, prefill_param_prefixcache_));
   CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
   CHECK_OPERATION_STATUS_RETURN(init_node(decode_mla_node_, decode_mla_param_));
   return atb::NO_ERROR;
+}
+
+bool NpuDeepseekV2DecoderLayerImpl::use_dispatch_ffn_combine(
+    const atb_speed::deepseekV2::DecoderLayerParam& param) const {
+  return quantize_type_ == "w8a8_dynamic" && !param.isPrefill &&
+         !param.isDenseLayer && param.isDynamicEp && param.enableAllToAllMC2;
+}
+
+void NpuDeepseekV2DecoderLayerImpl::prepare_dispatch_ffn_combine_weights() {
+  auto& weights = loader_->get_at_weight_tensors();
+  const torch::Tensor& gateup_weight = weights[IN_MLP_GATEUP_WEIGHT_EXPERT];
+  torch::Tensor& down_weight = weights[IN_MLP_DOWN_WEIGHT_EXPERT];
+  CHECK_EQ(gateup_weight.dim(), 3)
+      << "DispatchFFNCombine gate/up weight must be 3D, got "
+      << gateup_weight.sizes();
+  CHECK_EQ(down_weight.dim(), 3)
+      << "DispatchFFNCombine down weight must be 3D, got "
+      << down_weight.sizes();
+  const bool needs_layout_conversion =
+      down_weight.size(1) == gateup_weight.size(1) &&
+      gateup_weight.size(2) == down_weight.size(2) * 2;
+  const bool layout_is_prepared =
+      down_weight.size(2) == gateup_weight.size(1) &&
+      gateup_weight.size(2) == down_weight.size(1) * 2;
+  CHECK(needs_layout_conversion || layout_is_prepared)
+      << "DispatchFFNCombine weight layout mismatch: gate/up="
+      << gateup_weight.sizes() << ", down=" << down_weight.sizes();
+
+  if (needs_layout_conversion) {
+    down_weight.set_data(down_weight.transpose(1, 2).contiguous());
+    down_weight.set_data(
+        at_npu::native::npu_format_cast(down_weight, ACL_FORMAT_FRACTAL_NZ)
+            .contiguous());
+  }
+  dispatch_ffn_gateup_scale_ =
+      convert_dispatch_ffn_scale_to_int64(weights[IN_MLP_GATEUP_SCALE_EXPERT])
+          .contiguous();
+  dispatch_ffn_down_scale_ =
+      convert_dispatch_ffn_scale_to_int64(weights[IN_MLP_DOWN_SCALE_EXPERT])
+          .contiguous();
+
+  atb_dispatch_ffn_gateup_scale_ =
+      atb_speed::Utils::AtTensor2Tensor(dispatch_ffn_gateup_scale_);
+  atb_dispatch_ffn_down_scale_ =
+      atb_speed::Utils::AtTensor2Tensor(dispatch_ffn_down_scale_);
+
+  atb_prefill_moe_gateup_scale_ =
+      atb_weight_tensors_[IN_MLP_GATEUP_SCALE_EXPERT];
+  atb_prefill_moe_down_scale_ = atb_weight_tensors_[IN_MLP_DOWN_SCALE_EXPERT];
+  atb_weight_tensors_[IN_MLP_DOWN_WEIGHT_EXPERT] =
+      atb_speed::Utils::AtTensor2Tensor(down_weight);
+  atb_weight_tensors_[IN_MLP_GATEUP_SCALE_EXPERT] =
+      atb_dispatch_ffn_gateup_scale_;
+  atb_weight_tensors_[IN_MLP_DOWN_SCALE_EXPERT] = atb_dispatch_ffn_down_scale_;
+  Device::empty_cache(device_id_);
 }
 
 int64_t NpuDeepseekV2DecoderLayerImpl::init_node(
@@ -801,6 +891,12 @@ int64_t NpuDeepseekV2DecoderLayerImpl::init_node(
   for (size_t weightTensorId = 0; weightTensorId < WEIGHT_COUNT_PER_LAYER;
        ++weightTensorId) {
     node.inTensors.at(weightTensorId) = &atb_weight_tensors_[weightTensorId];
+  }
+  if (param.isPrefill && quantize_type_ == "w8a8_dynamic" &&
+      !param.isDenseLayer && param.isDynamicEp && param.enableAllToAllMC2) {
+    node.inTensors.at(IN_MLP_GATEUP_SCALE_EXPERT) =
+        &atb_prefill_moe_gateup_scale_;
+    node.inTensors.at(IN_MLP_DOWN_SCALE_EXPERT) = &atb_prefill_moe_down_scale_;
   }
 
   node.variantPack.inTensors.reserve(node.inTensors.size());
