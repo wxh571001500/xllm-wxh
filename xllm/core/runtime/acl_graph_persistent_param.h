@@ -168,19 +168,6 @@ class GraphPersistentParam final {
     if (!aux_hidden_states_.defined() || aux_hidden_states_.numel() == 0) {
       return aux_hidden_states_;
     }
-    // Eagle3 graph path stores aux as [nc, max_tokens, hidden] (dim-0 stacked,
-    // written by contiguous copies inside capture). Do the hidden-dim concat
-    // HERE — this runs AFTER capture_end() (graph-external), so permute+reshape
-    // (which touches the hidden dim) is safe. Return [tokens, nc*hidden] to
-    // match the eager path's cat(dim=1), so the draft consumer is unchanged.
-    if (aux_hidden_states_.dim() == 3) {
-      auto sliced = actual_tokens > 0
-                        ? aux_hidden_states_.slice(/*dim=*/1, 0, actual_tokens)
-                        : aux_hidden_states_;
-      // [nc, tokens, hidden] -> [tokens, nc, hidden] -> [tokens, nc*hidden]
-      return sliced.permute({1, 0, 2}).reshape({sliced.size(1), -1});
-    }
-    // Legacy 2D [max_tokens, nc*hidden] layout (eager-stored): slice tokens.
     if (actual_tokens > 0) {
       return aux_hidden_states_.slice(
           /*dim=*/0, /*start=*/0, /*end=*/actual_tokens);
@@ -189,11 +176,6 @@ class GraphPersistentParam final {
   }
   // Setter for aux_hidden_states (for assignment)
   void set_aux_hidden_states(const torch::Tensor& value);
-  // Eagle3 graph path: store per-layer aux tensors (un-combined) into the
-  // persistent [nc, max_tokens, hidden] buffer via per-layer contiguous copies
-  // (each ~917KB, below the CANN large-copy/SDMA threshold). Runs inside the
-  // capture region; the hidden-dim concat is deferred to the getter.
-  void set_aux_hidden_states_list(const std::vector<torch::Tensor>& values);
 
  private:
   bool uses_paged_attention_tiling() const {

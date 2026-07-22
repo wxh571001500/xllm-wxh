@@ -40,16 +40,6 @@ class AttentionMask : public torch::nn::Module {
                               torch::Dtype dtype,
                               torch::Device device);
 
-  // Precompute + cache the free mask so it is materialized on the device BEFORE
-  // ACL Graph capture. Call once at model setup. During a captured
-  // (spec-verify) forward, gen_free_mask then just returns the cached constant
-  // instead of running torch::full/torch::triu inside the capture region —
-  // those per-call ops were leaving an unjoined side-stream and failing
-  // capture_end().
-  void warmup_free_mask(int32_t q_len,
-                        torch::Dtype dtype,
-                        torch::Device device);
-
   torch::Tensor gen_append_mask(int32_t q_len,
                                 int32_t kv_len,
                                 int32_t max_kv_len,
@@ -64,10 +54,6 @@ class AttentionMask : public torch::nn::Module {
   int seq_len_cached_;
   float mask_value_;
   at::Tensor atten_mask_cache_;
-  // Cached free mask (spec-verify). Keyed by q_len; q_len is constant
-  // (num_speculative_tokens+1) so a single entry suffices.
-  int free_mask_q_len_cached_ = -1;
-  at::Tensor free_mask_cache_;
 };
 
 }  // namespace layer

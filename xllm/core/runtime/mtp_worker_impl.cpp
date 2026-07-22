@@ -48,16 +48,6 @@ constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
 
-// Sampling period (in decode steps) for the env-gated [step_timing] host-side
-// per-rank breakdown. 0 or unset => disabled. Read once and cached.
-int64_t step_timing_log_period() {
-  static const int64_t period = []() -> int64_t {
-    const int64_t v = util::get_int_env("XLLM_LOG_STEP_TIMING", 0);
-    return v <= 0 ? 0 : v;
-  }();
-  return period;
-}
-
 ProcessGroup* spec_broadcast_group(const ParallelArgs& parallel_args) {
   return parallel_args.tp_group_ != nullptr ? parallel_args.tp_group_
                                             : parallel_args.process_group_;
@@ -1085,17 +1075,6 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   std::vector<ForwardInput> draft_prepared(num_speculative_tokens);
   Timer timer;
 
-  // Env-gated per-rank host-side timing. Because run_worker_no_sync ends with a
-  // hard compute_stream_->synchronize(), the host wall-time between phases ~=
-  // that rank's real work, so comparing across ranks/DP domains shows who is
-  // the straggler at the first decode all-gather. Sampled every N steps.
-  const int64_t timing_period = step_timing_log_period();
-  const bool log_timing =
-      timing_period > 0 && (step_timing_decode_count_++ % timing_period == 0);
-  Timer step_timing_timer;
-  double t_prep_us = 0.0;
-  double t_draft_loop_us = 0.0;
-
   CHECK(embedding_cache_ != nullptr) << "MTP embedding cache is not allocated";
 
   const auto& embedding = input.input_params.embedding;
@@ -1151,13 +1130,6 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                           enable_schedule_overlap());
   update_decode_step_input(input, last_states);
   prepare_draft_extend_inputs(input, last_states, current_draft_input);
-  if (log_timing) {
-    // Host-prep phase: bootstrap writes, read_decode_states, decode-step input
-    // build, draft-extend input build. All per-rank, non-collective work —
-    // where arrival skew at the first all-gather originates.
-    t_prep_us = step_timing_timer.elapsed_microseconds();
-    step_timing_timer.reset();
-  }
   draft_outputs.reserve(num_speculative_tokens);
   const bool reuse_mtp_topk_indices = should_reuse_mtp_topk_indices(
       draft_impl_->context_.get_model_args(), enable_schedule_overlap());
@@ -1214,33 +1186,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   }
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
-  if (log_timing) {
-    // Draft loop: num_speculative_tokens draft forwards, each with its own hard
-    // sync. This is device compute + per-forward sync (includes any collective
-    // waits inside the draft model).
-    t_draft_loop_us = step_timing_timer.elapsed_microseconds();
-    step_timing_timer.reset();
-  }
-  std::optional<ForwardOutput> validate_result =
-      run_validate(input, draft_outputs, validate_input);
-  if (log_timing) {
-    // Validate: the target (DeepseekV2) forward — the one whose first
-    // all-gather (gatherPreNorm) exposes DP arrival skew. Its wall-time on a
-    // late-arriving rank is SHORT (it doesn't wait; others wait for it), so
-    // read t_prep_us across ranks to find who is slow BEFORE the collective.
-    const double t_validate_us = step_timing_timer.elapsed_microseconds();
-    const int32_t global_rank = parallel_args_.rank();
-    const int32_t dp_size = std::max<int32_t>(parallel_args_.dp_size(), 1);
-    const int32_t tp_times_cp =
-        std::max<int32_t>(parallel_args_.world_size() / dp_size, 1);
-    const int32_t dp_rank = global_rank / tp_times_cp;
-    LOG(INFO) << "[step_timing] rank=" << global_rank << " dp=" << dp_rank
-              << " num_seqs=" << input.input_params.meta.num_sequences
-              << " host_prep_us=" << t_prep_us
-              << " draft_loop_us=" << t_draft_loop_us
-              << " validate_us=" << t_validate_us;
-  }
-  return validate_result;
+  return run_validate(input, draft_outputs, validate_input);
 }
 
 void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
@@ -1680,19 +1626,8 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   const bool use_chunked_prefill =
       !is_kimi_k25_eagle3_pair() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
-  // DIAGNOSTIC toggle: the kimi_k25_eagle3 DP-decode path normally forces
-  // uniform-single-dp-rows and SKIPS the per-step row-count all-gather barrier
-  // (see can_sync_variable_dp_rows / use_uniform_single_dp_rows below). This is
-  // a suspect for per-DP arrival skew at the first decode all-gather (no
-  // rendezvous before the extend forward). Setting
-  // XLLM_KIMI_EAGLE3_SYNC_DP_ROWS=1 disables the special-casing so the normal
-  // variable-dp-row all-gather barrier runs, letting us A/B whether re-adding
-  // that sync changes the skew.
-  static const bool kimi_eagle3_sync_dp_rows =
-      util::get_bool_env("XLLM_KIMI_EAGLE3_SYNC_DP_ROWS", false);
   const bool is_kimi_k25_eagle3_dp_decode =
-      !kimi_eagle3_sync_dp_rows && target_impl_ != nullptr &&
-      draft_impl_ != nullptr &&
+      target_impl_ != nullptr && draft_impl_ != nullptr &&
       is_kimi_k25_eagle3_draft(
           target_impl_->context_.get_model_args().model_type(),
           draft_impl_->context_.get_model_args().model_type()) &&

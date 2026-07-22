@@ -853,22 +853,13 @@ void GraphPersistentParam::set_aux_hidden_states(const torch::Tensor& value) {
   if (!value.defined()) {
     return;
   }
-  // Eagle3 graph path passes value as [nc, tokens, hidden] (dim-0 stacked; the
-  // hidden-dim concat is deferred to the getter, graph-external). tokens is
-  // dim-1 here. This function runs INSIDE the ACL Graph capture region, so
-  // every device op below must stay on the current (capture) stream: allocate
-  // the persistent buffer as [nc, max_tokens, hidden] and write each layer with
-  // a CONTIGUOUS dim-1 (per-layer, per-token-prefix) copy. No non_blocking (a
-  // separate async copy stream would not be joined -> capture_end fails), and
-  // no hidden-dim combine (that is what left an unjoined side stream before).
-  const int64_t token_dim = value.dim() == 3 ? 1 : 0;
-  const uint32_t result_tokens = value.size(token_dim);
+  const uint32_t result_tokens = value.size(0);
   if (aux_hidden_states_.numel() == 0) {
-    // Lazy initialization: buffer mirrors value shape with the token dim
-    // expanded to max_tokens_per_batch.
+    // Lazy initialization: create aux_hidden_states tensor if not already
+    // created
     const int64_t max_tokens_per_batch = options_.max_tokens_per_batch();
     auto shape = value.sizes().vec();
-    shape[token_dim] = max_tokens_per_batch;
+    shape[0] = max_tokens_per_batch;
     torch::Dtype dtype = util::parse_dtype(args_.dtype(), device_);
     if (args_.dtype() == "float" || args_.dtype() == "float32") {
       dtype = torch::kFloat32;
@@ -876,52 +867,12 @@ void GraphPersistentParam::set_aux_hidden_states(const torch::Tensor& value) {
     aux_hidden_states_ =
         torch::zeros(shape, torch::dtype(dtype).device(device_));
   }
-  auto slice = aux_hidden_states_.slice(
-      /*dim=*/token_dim, /*start=*/0, /*end=*/result_tokens);
-  if (slice.sizes() != value.sizes()) {
-    return;
-  }
-  if (value.dim() == 3) {
-    // Per-layer contiguous copy: buf[k, :tokens, :] <- value[k]. Each dst is a
-    // contiguous [tokens, hidden] block (same capture-safe primitive as
-    // set_hidden_states); avoids any strided/side-stream copy during capture.
-    for (int64_t k = 0; k < value.size(0); ++k) {
-      slice[k].copy_(value[k], /*non_blocking=*/false);
-    }
-  } else {
-    slice.copy_(value, /*non_blocking=*/false);
-  }
-}
-
-void GraphPersistentParam::set_aux_hidden_states_list(
-    const std::vector<torch::Tensor>& values) {
-  if (values.empty() || !values[0].defined()) {
-    return;
-  }
-  // Eagle3 graph path: values = nc tensors, each [tokens, hidden]. Store into a
-  // persistent [nc, max_tokens, hidden] buffer (dim-0 = layer). This runs
-  // INSIDE the ACL Graph capture region, so each copy must stay on the capture
-  // stream: per-layer buf[k, :tokens, :].copy_(values[k]) is a contiguous
-  // [tokens, hidden] (~917KB) copy — below the CANN large-copy/SDMA threshold
-  // that a combined [tokens, nc*hidden] copy would cross. No non_blocking
-  // (async copy stream would not be joined). The getter concatenates AFTER
-  // capture_end.
-  const int64_t nc = static_cast<int64_t>(values.size());
-  const int64_t result_tokens = values[0].size(0);
-  const int64_t hidden = values[0].size(1);
-  if (aux_hidden_states_.numel() == 0) {
-    const int64_t max_tokens_per_batch = options_.max_tokens_per_batch();
-    torch::Dtype dtype = util::parse_dtype(args_.dtype(), device_);
-    if (args_.dtype() == "float" || args_.dtype() == "float32") {
-      dtype = torch::kFloat32;
-    }
-    aux_hidden_states_ = torch::zeros({nc, max_tokens_per_batch, hidden},
-                                      torch::dtype(dtype).device(device_));
-  }
-  for (int64_t k = 0; k < nc; ++k) {
-    aux_hidden_states_[k]
-        .slice(/*dim=*/0, /*start=*/0, /*end=*/result_tokens)
-        .copy_(values[k], /*non_blocking=*/false);
+  // Slice to match the actual shape
+  auto slice =
+      aux_hidden_states_.slice(/*dim=*/0, /*start=*/0, /*end=*/result_tokens);
+  // Reshape slice if needed to match value shape
+  if (slice.sizes() == value.sizes()) {
+    slice.copy_(value, /*non_blocking=*/true);
   }
 }
 
