@@ -479,16 +479,6 @@ void ContinuousScheduler::handle_prefill_requests(
     std::shared_ptr<Request> request(waiting_priority_queue->top());
     if (should_limit_media_prefill_requests() &&
         request_has_media_prefill(request) && media_prefill_cap_reached()) {
-      // Cap reached: stop admitting more media prefills into this batch. This
-      // defers the remaining prefills to later steps and, under high
-      // concurrency, can create prefill/decode imbalance across DP ranks
-      // (long waits at the post-word-embedding all-gather). Logged (throttled)
-      // so the frequency of hitting the cap is observable.
-      LOG_EVERY_N(INFO, 100)
-          << "[media_prefill_cap] reached cap of "
-          << max_media_prefill_requests_per_batch()
-          << " media prefills per DP rank in batch; deferring remaining "
-             "prefills";
       break;
     }
     if (request->finished() || request->cancelled()) {
@@ -1232,52 +1222,6 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
                            running_sequences_,
                            running_sequences_budgets_,
                            kv_cache_manager_->get_swap_block_transfer_infos());
-
-  // Env-gated: log per-DP-rank sequence counts EVERY step (no sampling) so DP
-  // load imbalance (a suspect for the MoE 32-way collective always waiting on
-  // the busiest DP) is directly observable over the whole run. batches[i] is
-  // DP rank i's batch. Non-empty steps only, to keep volume bounded.
-  if (util::get_bool_env("XLLM_LOG_DP_SEQS", false)) {
-    std::string per_dp;
-    int32_t total_seqs = 0, max_seqs = 0, min_seqs = INT32_MAX;
-    // KV-length sum per DP: attention cost ∝ Σ kv_cache_tokens, NOT seq count.
-    // Balanced seq counts can still mean skewed attention time (long vs short
-    // prompts) → DPs arrive at the pre-MoE allgather at different times → the
-    // 32-way collective waits on the slowest DP. This is the skew seq-count
-    // alone cannot show (esp. the first decode after prefill, where KV = full
-    // prompt and prompt lengths differ most). max/min on KV is the real proxy.
-    int64_t max_kv = 0, min_kv = INT64_MAX;
-    for (size_t dp = 0; dp < batches.size(); ++dp) {
-      int32_t nseq = 0, nprefill = 0;
-      int64_t kv_sum = 0;
-      for (Sequence* seq : batches[dp].get_sequences()) {
-        ++nseq;
-        if (seq->is_prefill_stage()) {
-          ++nprefill;
-        }
-        kv_sum += static_cast<int64_t>(seq->kv_cache_tokens_num());
-      }
-      total_seqs += nseq;
-      max_seqs = std::max(max_seqs, nseq);
-      min_seqs = std::min(min_seqs, nseq);
-      if (nseq > 0) {
-        max_kv = std::max(max_kv, kv_sum);
-        min_kv = std::min(min_kv, kv_sum);
-      }
-      per_dp += " dp" + std::to_string(dp) + "=" + std::to_string(nseq) + "(p" +
-                std::to_string(nprefill) + ",kv" + std::to_string(kv_sum) + ")";
-    }
-    if (total_seqs > 0) {
-      const double imbalance =
-          min_seqs > 0 ? static_cast<double>(max_seqs) / min_seqs : -1.0;
-      const double kv_imbalance =
-          min_kv > 0 ? static_cast<double>(max_kv) / min_kv : -1.0;
-      LOG(INFO) << "[dp_seqs] total=" << total_seqs << " max=" << max_seqs
-                << " min=" << min_seqs << " max/min=" << imbalance
-                << " kv_max=" << max_kv << " kv_min=" << min_kv
-                << " kv_max/min=" << kv_imbalance << per_dp;
-    }
-  }
 
   bool is_batches_empty =
       (std::all_of(batches.begin(), batches.end(), [](const Batch& one_batch) {

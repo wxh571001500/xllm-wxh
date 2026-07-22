@@ -171,9 +171,5 @@ class RemoteWorker : public WorkerClient {
                               /*cpu_binding=*/false,
                               /*pool_name=*/"RemoteWorker.copy"};
   const torch::Device device_;
-  // Counts step_remote_async calls (one per step). Used only to throttle the
-  // env-gated dispatch profiling log so it samples every N steps instead of
-  // flooding every step.
-  int64_t step_dispatch_call_count_ = 0;
 };
 }  // namespace xllm

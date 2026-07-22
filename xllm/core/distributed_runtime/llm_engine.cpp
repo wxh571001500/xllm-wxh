@@ -22,7 +22,6 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
-#include <atomic>
 #include <boost/algorithm/string.hpp>
 #include <chrono>
 #include <cstdint>
@@ -934,19 +933,6 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
-  // Env-gated dispatch profiling: measure how long the per-worker dispatch
-  // loop takes on this (engine) thread. If dispatch is effectively serial,
-  // this grows with worker_clients_num_ and the last worker is enqueued late.
-  // Sampled every N steps (default 500, via XLLM_LOG_STEP_DISPATCH_PERIOD) to
-  // avoid flooding.
-  static std::atomic<int64_t> s_dispatch_step_counter{0};
-  const int64_t dispatch_log_period = std::max<int64_t>(
-      1, util::get_int_env("XLLM_LOG_STEP_DISPATCH_PERIOD", 500));
-  const bool log_dispatch =
-      util::get_bool_env("XLLM_LOG_STEP_DISPATCH", false) &&
-      (s_dispatch_step_counter++ % dispatch_log_period == 0);
-  Timer dispatch_timer;
-
   // CP partitioning is performed worker-side in
   // WorkerImpl::prepare_work_before_execute (see runtime/cp_input_partition).
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
@@ -955,20 +941,8 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
         shared_inputs[dp_rank]));
   }
 
-  if (log_dispatch) {
-    LOG(INFO) << "[step_dispatch] enqueue loop for " << worker_clients_num_
-              << " workers took " << dispatch_timer.elapsed_milliseconds()
-              << " ms (engine-thread serial portion)";
-  }
-
   // wait for the all future to complete
   auto results = folly::collectAll(futures).get();
-
-  if (log_dispatch) {
-    LOG(INFO) << "[step_dispatch] all workers returned after "
-              << dispatch_timer.elapsed_milliseconds()
-              << " ms (dispatch + remote execute + wait)";
-  }
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb() &&
       !options_.enable_schedule_overlap()) {

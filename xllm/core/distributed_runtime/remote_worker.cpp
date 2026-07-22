@@ -21,7 +21,6 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
-#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -34,7 +33,6 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #include "runtime/params_utils.h"
-#include "util/env_var.h"
 #include "util/hash_util.h"
 
 namespace xllm {
@@ -179,43 +177,7 @@ RemoteWorker::step_remote_async(
     const std::shared_ptr<const ForwardInput>& input) {
   folly::Promise<std::optional<RawForwardOutput>> promise;
   auto future = promise.getSemiFuture();
-  // Capture the shared_ptr (a cheap refcount bump) instead of deep-copying
-  // ForwardInput on the caller thread. Serialization/shm-write happens inside
-  // execute_model_async on this worker's own thread, so all workers of a step
-  // dispatch in parallel and their forward() starts stay aligned.
-  // Sample the dispatch profiling log every N steps (default 500) to avoid
-  // flooding: this fires on every step for all 32 workers otherwise. Period is
-  // configurable via XLLM_LOG_STEP_DISPATCH_PERIOD. Each worker increments its
-  // own counter once per step, so all workers sample the same steps in
-  // lockstep.
-  const int64_t log_period = std::max<int64_t>(
-      1, util::get_int_env("XLLM_LOG_STEP_DISPATCH_PERIOD", 500));
-  const bool log_dispatch =
-      util::get_bool_env("XLLM_LOG_STEP_DISPATCH", false) &&
-      (step_dispatch_call_count_++ % log_period == 0);
-  const int32_t rank = global_rank_;
-  // steady_clock timestamp captured on the engine (caller) thread at enqueue.
-  const auto enqueue_time = std::chrono::steady_clock::now();
-  threadpool_.schedule([this,
-                        input,
-                        promise = std::move(promise),
-                        log_dispatch,
-                        rank,
-                        enqueue_time]() mutable {
-    if (log_dispatch) {
-      // Time from enqueue (engine thread) to send start (worker thread). A
-      // large, rank-increasing value means dispatch is effectively serial.
-      const double queue_wait_us =
-          std::chrono::duration<double, std::micro>(
-              std::chrono::steady_clock::now() - enqueue_time)
-              .count();
-      Timer send_timer;
-      channel_->execute_model_async(*input, promise);
-      LOG(INFO) << "[step_dispatch] rank=" << rank
-                << " queue_wait_us=" << queue_wait_us
-                << " send_us=" << send_timer.elapsed_microseconds();
-      return;
-    }
+  threadpool_.schedule([this, input, promise = std::move(promise)]() mutable {
     channel_->execute_model_async(*input, promise);
   });
   return future;

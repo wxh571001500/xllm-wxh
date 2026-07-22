@@ -333,10 +333,8 @@ bool AclGraph::capture(CausalLM* model,
           c10_npu::getDefaultNPUStream(tensor_options.device().index()));
     }
   }
-  // Synchronize and test replay to verify graph capture
-  aclrtSynchronizeStream(graph_stream_);
-  aclrtSynchronizeStream(stream);
-
+  // Replay completion is ordered back to the caller stream by the event below.
+  // Communication graphs must not host-synchronize the captured stream.
   graph_.replay();
 
   make_current_stream_wait_for_graph(stream);
