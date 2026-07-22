@@ -48,6 +48,15 @@ constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
 
+constexpr char kKimiEagle3NpuForwardSyncEnv[] =
+    "XLLM_KIMI_EAGLE3_NPU_FORWARD_SYNC";
+
+bool enable_kimi_eagle3_npu_forward_sync() {
+  static const bool enabled =
+      util::get_bool_env(kKimiEagle3NpuForwardSyncEnv, true);
+  return enabled;
+}
+
 ProcessGroup* spec_broadcast_group(const ParallelArgs& parallel_args) {
   return parallel_args.tp_group_ != nullptr ? parallel_args.tp_group_
                                             : parallel_args.process_group_;
@@ -736,7 +745,7 @@ bool MTPWorkerImpl::use_kimi_eagle3_step_major_validate_layout() const {
 
 void MTPWorkerImpl::synchronize_kimi_eagle3_npu_forward() {
 #if defined(USE_NPU)
-  if (is_kimi_k25_eagle3_pair()) {
+  if (is_kimi_k25_eagle3_pair() && enable_kimi_eagle3_npu_forward_sync()) {
     compute_stream_->synchronize();
   }
 #endif
