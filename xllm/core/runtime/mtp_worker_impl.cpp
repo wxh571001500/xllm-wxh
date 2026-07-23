@@ -50,10 +50,16 @@ namespace {
 
 constexpr char kKimiEagle3NpuForwardSyncEnv[] =
     "XLLM_KIMI_EAGLE3_NPU_FORWARD_SYNC";
+constexpr char kDpPrefillProfileEnv[] = "XLLM_PROFILE_DP_PREFILL";
 
 bool enable_kimi_eagle3_npu_forward_sync() {
   static const bool enabled =
       util::get_bool_env(kKimiEagle3NpuForwardSyncEnv, true);
+  return enabled;
+}
+
+bool enable_dp_prefill_profile() {
+  static const bool enabled = util::get_bool_env(kDpPrefillProfileEnv, false);
   return enabled;
 }
 
@@ -890,7 +896,16 @@ void MTPWorkerImpl::prepare_work_before_execute(const ForwardInput& input,
 
 std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     const ForwardInput& input) {
-  if (!input.input_params.meta.batch_forward_type.is_decode()) {
+  const bool is_prefill =
+      !input.input_params.meta.batch_forward_type.is_decode();
+  const bool profile_prefill = is_prefill && should_profile_dp_prefill();
+  std::optional<Timer> prefill_profile_timer;
+  if (profile_prefill) {
+    synchronize_dp_prefill_profile();
+    prefill_profile_timer.emplace();
+  }
+
+  if (is_prefill) {
     ForwardInput target_prepared;
     ForwardInput draft_prepared;
     std::optional<ForwardOutput> output =
@@ -899,6 +914,11 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
         run_worker_no_sync(*draft_impl_, input, draft_prepared);
     (void)draft_output;
     clear_all_output_embeddings(*output);
+    if (profile_prefill) {
+      synchronize_dp_prefill_profile();
+      record_dp_prefill_profile(input,
+                                prefill_profile_timer->elapsed_milliseconds());
+    }
     return output;
   } else {
     ForwardInput draft_extend_prepared;
@@ -937,6 +957,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
 
 std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
     const ForwardInput& input) {
+  const bool profile_prefill = should_profile_dp_prefill();
+  std::optional<Timer> prefill_profile_timer;
+  if (profile_prefill) {
+    synchronize_dp_prefill_profile();
+    prefill_profile_timer.emplace();
+  }
   Timer timer;
   ForwardInput target_prepared;
   ForwardInput draft_prepared;
@@ -1015,10 +1041,58 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
     clear_all_output_embeddings(output);
   }
 
+  if (profile_prefill) {
+    synchronize_dp_prefill_profile();
+    record_dp_prefill_profile(input,
+                              prefill_profile_timer->elapsed_milliseconds());
+  }
+
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
     return std::nullopt;
   }
   return output;
+}
+
+bool MTPWorkerImpl::should_profile_dp_prefill() const {
+  return enable_dp_prefill_profile() && is_driver();
+}
+
+void MTPWorkerImpl::synchronize_dp_prefill_profile() {
+  const int ret = compute_stream_->synchronize();
+  CHECK_EQ(ret, 0) << "failed to synchronize compute stream for DP prefill "
+                      "profiling";
+}
+
+void MTPWorkerImpl::record_dp_prefill_profile(const ForwardInput& input,
+                                              double elapsed_ms) {
+  ++dp_prefill_step_count_;
+  const int32_t num_sequences =
+      std::max<int32_t>(input.input_params.meta.num_sequences, 0);
+  dp_prefill_request_count_ += static_cast<uint64_t>(num_sequences);
+  dp_prefill_total_ms_ += elapsed_ms;
+
+  int64_t num_tokens = 0;
+  if (input.token_ids_host.defined()) {
+    num_tokens = input.token_ids_host.numel();
+  } else if (input.token_ids.defined()) {
+    num_tokens = input.token_ids.numel();
+  }
+
+  const int32_t dp_size = std::max<int32_t>(parallel_args_.dp_size(), 1);
+  const int32_t ranks_per_dp = parallel_args_.world_size() / dp_size;
+  CHECK_GT(ranks_per_dp, 0) << "invalid ranks per DP domain";
+  const int32_t dp_rank = parallel_args_.rank() / ranks_per_dp;
+  const double average_elapsed_ms =
+      dp_prefill_total_ms_ / static_cast<double>(dp_prefill_step_count_);
+
+  LOG(INFO) << "[DP_PREFILL_PROFILE] dp_rank=" << dp_rank
+            << " global_rank=" << parallel_args_.rank()
+            << " step=" << dp_prefill_step_count_
+            << " step_requests=" << num_sequences
+            << " cumulative_requests=" << dp_prefill_request_count_
+            << " input_tokens=" << num_tokens << " elapsed_ms=" << elapsed_ms
+            << " cumulative_elapsed_ms=" << dp_prefill_total_ms_
+            << " average_elapsed_ms=" << average_elapsed_ms;
 }
 
 void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,

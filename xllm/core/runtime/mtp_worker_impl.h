@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
+
 #include "framework/kv_cache/embedding_cache.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #if defined(USE_NPU)
@@ -124,6 +126,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   bool is_kimi_k25_eagle3_pair() const;
   bool use_kimi_eagle3_step_major_validate_layout() const;
   void synchronize_kimi_eagle3_npu_forward();
+  bool should_profile_dp_prefill() const;
+  void synchronize_dp_prefill_profile();
+  void record_dp_prefill_profile(const ForwardInput& input, double elapsed_ms);
   std::optional<ForwardOutput> run_worker_no_sync(
       WorkerImpl& worker,
       const ForwardInput& input,
@@ -160,6 +165,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Whether validation directly uses selected-only draft_probs [B, S].
   // If false, selected-only cache values are restored to dense [B, S, V].
   bool enable_opt_validate_probs_ = false;
+
+  uint64_t dp_prefill_step_count_ = 0;
+  uint64_t dp_prefill_request_count_ = 0;
+  double dp_prefill_total_ms_ = 0.0;
 
 #if defined(USE_NPU) || defined(USE_MLU)
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
