@@ -1162,6 +1162,9 @@ REGISTER_CAUSAL_VLM_MODEL(kimi_k25, KimiK2_5_VLForConditionalGeneration);
 
 REGISTER_MODEL_ARGS(kimi_k25, [&] {
   ModelConfig::get_instance().enable_fia_decode(true);
+  ModelConfig::get_instance().enable_moe_gating_topk(true);
+  ModelConfig::get_instance().enable_moe_mc2(true);
+  ModelConfig::get_instance().enable_moe_prefill_ep1(true);
 
   // text config (Kimi-K2.5): args are under text_config.* in HF config.
   LOAD_ARG_OR(model_type, "model_type", "kimi_k25");

@@ -190,6 +190,14 @@ class NpuDeepseekV2DecoderLayerImpl : public BaseLayer {
       torch::Tensor& target_buffer,
       const std::vector<torch::Tensor>& experts_down);
 
+  bool use_dispatch_ffn_combine(
+      const atb_speed::deepseekV2::DecoderLayerParam& param) const;
+  void prepare_dispatch_ffn_combine_weights();
+  bool use_prefill_ep1_graph(
+      const atb_speed::deepseekV2::DecoderLayerParam& param) const;
+  void prepare_prefill_ep1_weights();
+  void bind_prefill_ep1_weights(atb_speed::Model::Node& node);
+
   int64_t init_node(atb_speed::Model::Node& node,
                     atb_speed::deepseekV2::DecoderLayerParam& param);
 
@@ -235,18 +243,26 @@ class NpuDeepseekV2DecoderLayerImpl : public BaseLayer {
   float sm_scale_;
   int32_t quant_group_size_ = 0;
   int32_t num_speculative_tokens_ = 0;
+  int32_t kimi_k25_moe_mc2_token_capacity_ = 256;
   bool uses_deepseek_v2_mla_graph_ = false;
   bool use_kimi_k25_fia_decode_ = false;
+  bool use_kimi_k25_moe_gating_topk_ = false;
+  bool use_kimi_k25_moe_mc2_ = false;
+  bool use_kimi_k25_moe_prefill_ep1_ = false;
 
   atb_speed::deepseekV2::DecoderLayerParam prefill_param_;
   atb_speed::deepseekV2::DecoderLayerParam prefill_param_prefixcache_;
   atb_speed::deepseekV2::DecoderLayerParam decode_param_;
   atb_speed::deepseekV2::DecoderLayerParam decode_mla_param_;
+  atb_speed::deepseekV2::DecoderLayerParam decode_alltoall_param_;
+  atb_speed::deepseekV2::DecoderLayerParam decode_mla_alltoall_param_;
 
   atb_speed::Model::Node prefill_node_;
   atb_speed::Model::Node prefill_node_prefixcache_;
   atb_speed::Model::Node decode_node_;
   atb_speed::Model::Node decode_mla_node_;
+  atb_speed::Model::Node decode_alltoall_node_;
+  atb_speed::Model::Node decode_mla_alltoall_node_;
 
   atb::Tensor internal_tensor_;
 
@@ -261,6 +277,14 @@ class NpuDeepseekV2DecoderLayerImpl : public BaseLayer {
   torch::Tensor final_hidden_states_;
   torch::Tensor at_start_expert_id_;
   torch::Tensor at_in_device_expert_count_;
+  torch::Tensor dispatch_ffn_gateup_scale_;
+  torch::Tensor dispatch_ffn_down_scale_;
+  atb::Tensor atb_dispatch_ffn_gateup_scale_;
+  atb::Tensor atb_dispatch_ffn_down_scale_;
+  atb::Tensor atb_prefill_moe_gateup_scale_;
+  atb::Tensor atb_prefill_moe_down_scale_;
+  std::vector<torch::Tensor> prefill_ep1_weight_tensors_;
+  std::vector<atb::Tensor> atb_prefill_ep1_weight_tensors_;
 
   std::vector<int32_t> int_placeholder_;
 

@@ -435,6 +435,8 @@ void RecWorkerImpl::RecWorkPipeline::prepare_work_before_execute(
   if (!runtime_.context->get_parallel_args().mapping_data().empty() &&
       (runtime_.context->get_parallel_args().dp_size() > 1 ||
        runtime_.context->get_parallel_args().ep_size() > 1)) {
+    const nlohmann::json& mapping_data =
+        runtime_.context->get_parallel_args().mapping_data();
     torch::Tensor token_size_per_dp_group = torch::tensor(
         processed_inputs.input_params.parallel.dp_global_token_nums,
         torch::TensorOptions()
@@ -443,13 +445,20 @@ void RecWorkerImpl::RecWorkPipeline::prepare_work_before_execute(
             .pinned_memory(true));
     bool is_prefill =
         processed_inputs.input_params.meta.batch_forward_type.is_prefill();
+    int32_t expert_parallel_degree = 0;
+    if (mapping_data.contains("moeEpSize") &&
+        mapping_data["moeEpSize"].get<int64_t>() > 1) {
+      expert_parallel_degree =
+          ::xllm::EPLBConfig::get_instance().expert_parallel_degree();
+    }
     DpEpPadding dp_ep_padding(
         token_size_per_dp_group,
         runtime_.context->get_model_args().num_experts_per_tok(),
-        runtime_.context->get_parallel_args().mapping_data(),
+        mapping_data,
         runtime_.worker.device(),
         runtime_.worker.dtype(),
-        is_prefill);
+        is_prefill,
+        expert_parallel_degree);
     processed_inputs.input_params.parallel.dp_ep_padding_data =
         dp_ep_padding.build();
   }
