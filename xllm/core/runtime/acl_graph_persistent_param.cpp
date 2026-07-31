@@ -578,12 +578,13 @@ void GraphPersistentParam::set_aux_hidden_states(const torch::Tensor& value) {
   if (!value.defined()) {
     return;
   }
-  const uint32_t result_tokens = value.size(0);
+  const int64_t token_dim = value.dim() == 3 ? 1 : 0;
+  const uint32_t result_tokens = value.size(token_dim);
   if (aux_hidden_states_.numel() == 0) {
     const int64_t graph_token_capacity =
         get_decode_graph_token_capacity(options_);
     auto shape = value.sizes().vec();
-    shape[0] = graph_token_capacity;
+    shape[token_dim] = graph_token_capacity;
     torch::Dtype dtype = util::parse_dtype(args_.dtype(), device_);
     if (args_.dtype() == "float" || args_.dtype() == "float32") {
       dtype = torch::kFloat32;
@@ -591,12 +592,45 @@ void GraphPersistentParam::set_aux_hidden_states(const torch::Tensor& value) {
     aux_hidden_states_ =
         torch::zeros(shape, torch::dtype(dtype).device(device_));
   }
-  CHECK_LE(result_tokens, aux_hidden_states_.size(0))
+  CHECK_LE(result_tokens, aux_hidden_states_.size(token_dim))
       << "aux hidden state output exceeds graph token capacity";
-  auto slice =
-      aux_hidden_states_.slice(/*dim=*/0, /*start=*/0, /*end=*/result_tokens);
-  if (slice.sizes() == value.sizes()) {
-    slice.copy_(value, /*non_blocking=*/true);
+  auto slice = aux_hidden_states_.slice(
+      /*dim=*/token_dim, /*start=*/0, /*end=*/result_tokens);
+  if (slice.sizes() != value.sizes()) {
+    return;
+  }
+  if (value.dim() == 3) {
+    for (int64_t k = 0; k < value.size(0); ++k) {
+      slice[k].copy_(value[k], /*non_blocking=*/false);
+    }
+  } else {
+    slice.copy_(value, /*non_blocking=*/false);
+  }
+}
+
+void GraphPersistentParam::set_aux_hidden_states_list(
+    const std::vector<torch::Tensor>& values) {
+  if (values.empty() || !values[0].defined()) {
+    return;
+  }
+  const int64_t num_captured = static_cast<int64_t>(values.size());
+  const int64_t result_tokens = values[0].size(0);
+  const int64_t hidden = values[0].size(1);
+  if (aux_hidden_states_.numel() == 0) {
+    const int64_t graph_token_capacity =
+        get_decode_graph_token_capacity(options_);
+    torch::Dtype dtype = util::parse_dtype(args_.dtype(), device_);
+    if (args_.dtype() == "float" || args_.dtype() == "float32") {
+      dtype = torch::kFloat32;
+    }
+    aux_hidden_states_ = torch::zeros(
+        {num_captured, graph_token_capacity, hidden},
+        torch::dtype(dtype).device(device_));
+  }
+  for (int64_t k = 0; k < num_captured; ++k) {
+    aux_hidden_states_[k]
+        .slice(/*dim=*/0, /*start=*/0, /*end=*/result_tokens)
+        .copy_(values[k], /*non_blocking=*/false);
   }
 }
 

@@ -417,10 +417,26 @@ bool AclGraph::capture(CausalLM* model,
                          {graph_params.value()});
 
       persistent_param_.set_hidden_states(forward_result.hidden_states);
-      if (options.enable_graph_aux_hidden_states() &&
-          forward_result.aux_hidden_states.defined()) {
-        persistent_param_.set_aux_hidden_states(
-            forward_result.aux_hidden_states);
+      // DIAGNOSTIC (XLLM_CAPTURE_SKIP_AUX_STORE=1): skip ONLY the executor-side
+      // set_aux_hidden_states (its lazy torch::zeros + copy), while the
+      // model-side aux buffer copy still runs. Bisects the aux side-stream
+      // between model-side and executor-side. Breaks draft correctness; test
+      // only whether capture succeeds.
+      const char* skip_aux_store_env =
+          std::getenv("XLLM_CAPTURE_SKIP_AUX_STORE");
+      const bool skip_aux_store =
+          skip_aux_store_env != nullptr && skip_aux_store_env[0] == '1';
+      if (!skip_aux_store && options.enable_graph_aux_hidden_states()) {
+        if (!forward_result.aux_hidden_states_list.empty()) {
+          // Eagle3 graph path: per-layer aux tensors, un-combined. Each copy is
+          // ~917KB (below the CANN large-copy/SDMA threshold), keeping capture
+          // side-stream-free. The hidden-dim concat is deferred to the getter.
+          persistent_param_.set_aux_hidden_states_list(
+              forward_result.aux_hidden_states_list);
+        } else if (forward_result.aux_hidden_states.defined()) {
+          persistent_param_.set_aux_hidden_states(
+              forward_result.aux_hidden_states);
+        }
       }
       graph_.capture_end();
       capture_started = false;

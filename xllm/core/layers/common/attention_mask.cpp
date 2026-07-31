@@ -55,6 +55,17 @@ torch::Tensor AttentionMask::get_attn_mask(int64_t max_s,
 torch::Tensor AttentionMask::gen_free_mask(int32_t q_len,
                                            torch::Dtype dtype,
                                            torch::Device device) {
+  // Return the precomputed constant when available (populated by
+  // warmup_free_mask at model setup). This keeps torch::full/torch::triu OUT of
+  // the ACL Graph capture region; running them per-forward inside capture left
+  // an unjoined side-stream and failed capture_end(). q_len is constant across
+  // forwards (num_speculative_tokens+1), so a single cached entry always hits.
+  if (free_mask_cache_.defined() && free_mask_q_len_cached_ == q_len &&
+      free_mask_cache_.scalar_type() == dtype &&
+      free_mask_cache_.device() == device) {
+    return free_mask_cache_;
+  }
+
   float pre_mask_factor = -10000.0f;
   if (dtype == torch::kBFloat16) {
     pre_mask_factor = 1.0f;
@@ -65,6 +76,15 @@ torch::Tensor AttentionMask::gen_free_mask(int32_t q_len,
       torch::full({125 + 2 * q_len, 128}, pre_mask_factor, mask_options);
   mask_free = torch::triu(mask_free, 2 - q_len);
   return mask_free;
+}
+
+void AttentionMask::warmup_free_mask(int32_t q_len,
+                                     torch::Dtype dtype,
+                                     torch::Device device) {
+  // Materialize + cache the free mask now (model setup, before ACL Graph
+  // capture). After this, gen_free_mask returns the cached constant.
+  free_mask_cache_ = gen_free_mask(q_len, dtype, device).contiguous();
+  free_mask_q_len_cached_ = q_len;
 }
 
 torch::Tensor AttentionMask::gen_append_mask(int32_t q_len,

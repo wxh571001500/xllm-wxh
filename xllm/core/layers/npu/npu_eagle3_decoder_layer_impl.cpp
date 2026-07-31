@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -324,9 +324,17 @@ void NpuEagle3DecoderLayerImpl::build_node_variant_pack(
   internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(hidden_states);
   internal_tensors_extra_ =
       atb_speed::Utils::AtTensor2Tensor(hidden_states_extra);
-  const bool has_attention_metadata =
+  const bool has_kv_seq_lens =
+      input_params.attention.device.kv_seq_lens.defined() &&
+      input_params.attention.device.kv_seq_lens.numel() > 0 &&
+      !input_params.attention.host.kv_seq_lens.empty();
+  const bool has_block_tables =
       input_params.attention.device.block_tables.defined() &&
+      input_params.attention.device.block_tables.numel() > 0 &&
       input_params.attention.device.block_tables.storage().data() != nullptr;
+  const bool has_new_cache_slots =
+      input_params.attention.device.new_cache_slots.defined() &&
+      input_params.attention.device.new_cache_slots.numel() > 0;
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensors_;
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
       atb_speed::Utils::AtTensor2Tensor(cos_pos);
@@ -338,7 +346,7 @@ void NpuEagle3DecoderLayerImpl::build_node_variant_pack(
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 5) =
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
-  if (has_attention_metadata) {
+  if (has_kv_seq_lens) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 6) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.kv_seq_lens);
@@ -354,7 +362,7 @@ void NpuEagle3DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 7).hostData =
       placeholder_vec_.data();
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 8) = placeholder_;
-  if (has_attention_metadata) {
+  if (has_block_tables && has_new_cache_slots) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 9) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.block_tables);
@@ -369,13 +377,34 @@ void NpuEagle3DecoderLayerImpl::build_node_variant_pack(
   }
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
       internal_tensors_extra_;
+  const int32_t input_idx = WEIGHT_COUNT_PER_LAYER + 12;
   if (is_prefill &&
       ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12) =
-        atb_speed::Utils::AtTensor2Tensor(
-            input_params.attention.device.q_seq_lens);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12).hostData =
-        input_params.attention.host.q_seq_lens.data();
+    if (input_idx <
+        static_cast<int32_t>(node.variantPack.inTensors.size())) {
+      const bool has_q_seq_lens =
+          input_params.attention.device.q_seq_lens.defined() &&
+          input_params.attention.device.q_seq_lens.numel() > 0 &&
+          !input_params.attention.host.q_seq_lens.empty();
+      if (has_q_seq_lens) {
+        node.variantPack.inTensors.at(input_idx) =
+            atb_speed::Utils::AtTensor2Tensor(
+                input_params.attention.device.q_seq_lens);
+        node.variantPack.inTensors.at(input_idx).hostData =
+            input_params.attention.host.q_seq_lens.data();
+      } else {
+        node.variantPack.inTensors.at(input_idx) =
+            atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
+        node.variantPack.inTensors.at(input_idx).hostData =
+            placeholder_vec_.data();
+      }
+    } else {
+      LOG_FIRST_N(WARNING, 1)
+          << "Eagle3 prefill ATB operation does not expose q_seq_lens input; "
+          << "skip optional chunked-prefill input, input_num="
+          << node.variantPack.inTensors.size()
+          << ", required_index=" << input_idx;
+    }
   }
 
   for (size_t i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {

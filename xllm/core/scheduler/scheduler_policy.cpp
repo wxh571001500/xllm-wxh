@@ -26,6 +26,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -89,6 +90,72 @@ size_t get_sequence_free_blocks_for_rank(KVCacheManager* kv_cache_manager,
     return free_blocks[dp_rank];
   }
   return util::max(free_blocks);
+}
+
+bool request_has_media_prefill(const std::shared_ptr<Request>& request) {
+  if (request == nullptr) {
+    return false;
+  }
+  for (const auto& sequence : request->sequences()) {
+    if (sequence != nullptr && sequence->is_prefill_stage() &&
+        sequence->mm_data().valid()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int32_t select_media_prefill_dp_rank(const Sequence* sequence,
+                                     const SchedulerState& state) {
+  const size_t cap = static_cast<size_t>(
+      ModelConfig::get_instance().max_media_prefill_requests_per_batch());
+  if (cap == 0) {
+    return sequence->dp_rank();
+  }
+
+  const int32_t dp_size = state.options.dp_size();
+  std::vector<size_t> per_dp_counts(static_cast<size_t>(dp_size), 0);
+  for (const auto& request : state.running_requests) {
+    if (!request_has_media_prefill(request)) {
+      continue;
+    }
+    std::vector<bool> counted_dp_ranks(static_cast<size_t>(dp_size), false);
+    for (const auto& running_sequence : request->sequences()) {
+      if (running_sequence == nullptr ||
+          !running_sequence->is_prefill_stage()) {
+        continue;
+      }
+      const int32_t dp_rank = running_sequence->dp_rank();
+      if (dp_rank >= 0 && dp_rank < dp_size &&
+          !counted_dp_ranks[static_cast<size_t>(dp_rank)]) {
+        ++per_dp_counts[static_cast<size_t>(dp_rank)];
+        counted_dp_ranks[static_cast<size_t>(dp_rank)] = true;
+      }
+    }
+  }
+
+  const int32_t current_dp_rank = sequence->dp_rank();
+  if (current_dp_rank >= 0 && current_dp_rank < dp_size) {
+    return per_dp_counts[static_cast<size_t>(current_dp_rank)] < cap
+               ? current_dp_rank
+               : -1;
+  }
+
+  const std::vector<size_t> free_blocks =
+      state.kv_cache_manager->num_free_blocks();
+  int32_t selected_dp_rank = -1;
+  size_t selected_free_blocks = 0;
+  for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
+    const size_t rank = static_cast<size_t>(dp_rank);
+    if (rank >= free_blocks.size() || per_dp_counts[rank] >= cap) {
+      continue;
+    }
+    if (selected_dp_rank < 0 || free_blocks[rank] > selected_free_blocks) {
+      selected_dp_rank = dp_rank;
+      selected_free_blocks = free_blocks[rank];
+    }
+  }
+  return selected_dp_rank;
 }
 
 }  // namespace
@@ -301,6 +368,18 @@ void SchedulerPolicy::schedule_prefill_from_queue(
               << "[prefill_cap] no eligible DP rank is below the cap of "
               << state.model_args.max_concurrent_prefills_per_dp()
               << " prefill requests; deferring remaining prefills";
+          can_schedule = false;
+          break;
+        }
+        prefill_sequence->set_dp_rank(dp_rank);
+      }
+
+      if (request_has_media_prefill(request) &&
+          ModelConfig::get_instance().max_media_prefill_requests_per_batch() >
+              0) {
+        const int32_t dp_rank =
+            select_media_prefill_dp_rank(prefill_sequence.get(), state);
+        if (dp_rank < 0) {
           can_schedule = false;
           break;
         }

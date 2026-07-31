@@ -21,6 +21,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -170,13 +171,17 @@ folly::SemiFuture<std::optional<ForwardOutput>> RemoteWorker::step_async(
 }
 
 folly::SemiFuture<std::optional<RawForwardOutput>>
-RemoteWorker::step_remote_async(const ForwardInput& input) {
+RemoteWorker::step_remote_async(
+    const std::shared_ptr<const ForwardInput>& input) {
   folly::Promise<std::optional<RawForwardOutput>> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule(
-      [this, input = std::move(input), promise = std::move(promise)]() mutable {
-        channel_->execute_model_async(input, promise);
-      });
+  // Capture the shared_ptr (a cheap refcount bump) instead of deep-copying
+  // ForwardInput on the caller thread. Serialization/shm-write happens inside
+  // execute_model_async on this worker's own thread, so all workers of a step
+  // dispatch in parallel and their forward() starts stay aligned.
+  threadpool_.schedule([this, input, promise = std::move(promise)]() mutable {
+    channel_->execute_model_async(*input, promise);
+  });
   return future;
 }
 
