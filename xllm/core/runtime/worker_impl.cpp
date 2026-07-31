@@ -1834,16 +1834,15 @@ void WorkerImpl::prepare_mla_prefixcache_inputs(
   }
   int32_t sum_prefix =
       input_params.attention.device.kv_cache_tokens_nums.sum().item<int>();
+  const torch::TensorOptions workspace_options =
+      torch::TensorOptions().dtype(dtype_).device(device_);
   input_params.attention.device.history_compressed_kv =
       torch::empty({sum_prefix, context_.get_model_args().kv_lora_rank()},
-                   torch::TensorOptions().dtype(dtype_).pinned_memory(true))
-          .to(device_);
+                   workspace_options);
 
   input_params.attention.device.history_k_rope =
       torch::empty({sum_prefix, context_.get_model_args().qk_rope_head_dim()},
-                   torch::TensorOptions().dtype(dtype_).pinned_memory(true))
-          .to(device_);
-  ;
+                   workspace_options);
 
   input_params.attention.device.ring_cur_seqlen =
       torch::stack({input_params.attention.device.q_seq_lens,

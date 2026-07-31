@@ -44,6 +44,9 @@ namespace xllm {
 const int32_t KIMIV_VT_INFER_MAX_PATCH_NUM = 16328;
 
 namespace {
+constexpr uint64_t kKimiK25BrpcMaxBodySize = 128ULL * 1024 * 1024;
+constexpr uint64_t kKimiK25MaxMediaPrefillRequestsPerBatch = 2;
+
 StateDict get_dict_with_prefix_fallback(
     const StateDict& state_dict,
     const std::vector<std::string>& prefixes) {
@@ -1163,6 +1166,9 @@ REGISTER_MULTIMODAL_PROCESSOR(kimi_k25, KimiK25MultimodalProcessor);
 REGISTER_CAUSAL_VLM_MODEL(kimi_k25, KimiK2_5_VLForConditionalGeneration);
 
 REGISTER_MODEL_ARGS(kimi_k25, [&] {
+  ModelConfig::get_instance().brpc_max_body_size(kKimiK25BrpcMaxBodySize);
+  ModelConfig::get_instance().max_media_prefill_requests_per_batch(
+      kKimiK25MaxMediaPrefillRequestsPerBatch);
   ModelConfig::get_instance().enable_fia_decode(true);
   ModelConfig::get_instance().enable_moe_gating_topk(true);
   ModelConfig::get_instance().enable_moe_mc2(true);

@@ -18,12 +18,15 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v2_decoder_layer_impl.h"
 #include "llm_model_base.h"
+#include "util/env_var.h"
 
 // DeepSeek v2 compatible with huggingface weights
 // ref to:
@@ -164,6 +167,15 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       const auto& layer_ids_from_config = model_args.layers_to_capture();
       set_eagle3_layers_to_capture(
           layer_ids_from_config.empty() ? nullptr : &layer_ids_from_config);
+      aux_num_captured_ = static_cast<int64_t>(layers_to_capture_set_.size());
+      if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
+        // Graph capture requires stable addresses and cannot allocate while
+        // recording. Eager execution allocates only its actual output below.
+        const int64_t max_tokens =
+            ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch();
+        aux_capture_buffer_ = torch::empty(
+            {aux_num_captured_, max_tokens, model_args.hidden_size()}, options);
+      }
     }
 
     norm_ = register_module("norm", layer::NpuRMSNorm(context));
@@ -196,6 +208,16 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       CHECK_GE(layer_id, 0) << "Eagle3 layer id must be non-negative";
       CHECK_LT(layer_id, static_cast<int32_t>(layers_.size()))
           << "Eagle3 layer id exceeds target layer count";
+    }
+
+    // Precompute the spec-verify free mask now (model setup, before ACL Graph
+    // warmup/capture) so the captured forward references a ready constant
+    // instead of running torch::full/torch::triu inside the capture region —
+    // those per-forward ops left an unjoined side-stream and failed
+    // capture_end() ("capture model contains a stream that was not joined").
+    // q_len = num_speculative_tokens + 1, constant across forwards.
+    if (num_speculative_tokens_ > 0) {
+      attn_mask_.warmup_free_mask(num_speculative_tokens_ + 1, dtype_, device_);
     }
   }
 
@@ -241,12 +263,19 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     const int64_t num_tokens = h.size(0);
     const int64_t hidden_size = h.size(-1);
     int64_t capture_idx = 0;
-    torch::Tensor aux_output_buffer;
-    if (capture_aux_hidden_states_) {
-      aux_output_buffer = torch::empty(
-          {num_tokens,
-           hidden_size * static_cast<int64_t>(layers_to_capture_set_.size())},
-          h.options());
+    // DIAGNOSTIC (XLLM_CAPTURE_SKIP_AUX=1): skip aux hidden-state capture to
+    // bisect the ACL Graph "stream not joined" failure. Breaks Eagle3 draft
+    // correctness (draft gets no aux) — used ONLY to test whether the aux path
+    // is the unjoined side-stream. If capture then succeeds, aux is the
+    // culprit; if it still fails, the side-stream is in the spec-verify
+    // attention.
+    const bool skip_aux =
+        ::xllm::util::get_bool_env("XLLM_CAPTURE_SKIP_AUX", false);
+    const bool do_aux_capture = capture_aux_hidden_states_ && !skip_aux;
+    torch::Tensor eager_aux_hidden_states;
+    if (do_aux_capture && !input_params.enable_graph) {
+      eager_aux_hidden_states = torch::empty(
+          {num_tokens, aux_num_captured_ * hidden_size}, h.options());
     }
 
     RollingLayerGuard rolling_guard(rolling_mgr_);
@@ -264,12 +293,21 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
       auto& layer = layers_[i];
       const int32_t layer_index = static_cast<int32_t>(i);
-      if (capture_aux_hidden_states_ &&
-          layers_to_capture_set_.count(layer_index) != 0) {
-        aux_output_buffer.slice(0, 0, num_tokens)
-            .slice(
-                1, capture_idx * hidden_size, (capture_idx + 1) * hidden_size)
-            .copy_(h.reshape({num_tokens, hidden_size}));
+      if (do_aux_capture && layers_to_capture_set_.count(layer_index) != 0) {
+        if (input_params.enable_graph) {
+          CHECK(aux_capture_buffer_.defined())
+              << "Eagle3 graph capture buffer is not allocated";
+          aux_capture_buffer_[capture_idx]
+              .slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens)
+              .copy_(h.reshape({num_tokens, hidden_size}));
+        } else {
+          const int64_t hidden_start = capture_idx * hidden_size;
+          eager_aux_hidden_states
+              .slice(/*dim=*/1,
+                     /*start=*/hidden_start,
+                     /*end=*/hidden_start + hidden_size)
+              .copy_(h.reshape({num_tokens, hidden_size}));
+        }
         ++capture_idx;
       }
       rolling_guard.before_layer(layer_index);
@@ -284,10 +322,27 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       rolling_guard.after_layer(layer_index);
     }
     auto hidden_states = norm_(h, 0);
-    if (capture_aux_hidden_states_) {
-      CHECK_EQ(capture_idx, static_cast<int64_t>(layers_to_capture_set_.size()))
+    if (do_aux_capture) {
+      CHECK_EQ(capture_idx, aux_num_captured_)
           << "captured Eagle3 layer count mismatch";
-      return ModelOutput(hidden_states, torch::Tensor(), aux_output_buffer);
+      if (input_params.enable_graph) {
+        // GRAPH (captured) path: return per-layer VIEWS into the pre-allocated
+        // scratch buffer (no allocation, no combine inside capture). The
+        // executor copies these per-layer (contiguous ~917KB each) into its
+        // persistent buffer, and the getter concatenates AFTER capture_end
+        // (graph-external). Mirrors vLLM (aux list, cat outside the graph).
+        ModelOutput out(hidden_states);
+        out.aux_hidden_states_list.reserve(aux_num_captured_);
+        for (int64_t k = 0; k < aux_num_captured_; ++k) {
+          out.aux_hidden_states_list.push_back(
+              aux_capture_buffer_[k].slice(/*dim=*/0,
+                                           /*start=*/0,
+                                           /*end=*/num_tokens));
+        }
+        return out;
+      }
+      return ModelOutput(
+          hidden_states, torch::Tensor(), eager_aux_hidden_states);
     }
     return ModelOutput(hidden_states);
   }
@@ -409,6 +464,16 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
   layer::NpuPosEmbedding atb_pos_emb_{nullptr};
   layer::AttentionMask attn_mask_;
   torch::Tensor kimi_k25_fia_decode_mask_;
+  // Eagle3 aux capture scratch buffer [nc, max_tokens, hidden], pre-allocated
+  // ONCE at construction (before any ACL Graph capture). The captured decode
+  // forward copies each layer's hidden into a contiguous dim-0 slice of this
+  // buffer — NO per-forward allocation inside the capture region. A mid-forward
+  // mempool allocation (clone / torch::empty) is what left an unjoined side
+  // stream and failed capture_end() at bucket>=32 (proven: clone-h AND
+  // clone-const both crash; SKIP_AUX and set_hidden_states, which never
+  // allocate mid-forward, pass). Mirrors the working set_hidden_states pattern.
+  torch::Tensor aux_capture_buffer_;
+  int64_t aux_num_captured_ = 0;
   layer::NpuRMSNorm norm_{nullptr};
   RollingLoadManager* rolling_mgr_ = nullptr;
 };

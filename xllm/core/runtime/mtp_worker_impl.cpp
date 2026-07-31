@@ -2154,8 +2154,12 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   const bool use_chunked_prefill =
       !is_kimi_k25_eagle3_pair() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+  static const bool kimi_eagle3_sync_dp_rows =
+      util::get_bool_env("XLLM_KIMI_EAGLE3_SYNC_DP_ROWS",
+                         /*defaultValue=*/false);
   const bool is_kimi_k25_eagle3_dp_decode =
-      target_impl_ != nullptr && draft_impl_ != nullptr &&
+      !kimi_eagle3_sync_dp_rows && target_impl_ != nullptr &&
+      draft_impl_ != nullptr &&
       is_kimi_k25_eagle3_draft(
           target_impl_->context_.get_model_args().model_type(),
           draft_impl_->context_.get_model_args().model_type()) &&

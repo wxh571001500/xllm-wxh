@@ -229,13 +229,13 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     torch::Tensor attn_mask;
     if (!input_params.meta.batch_forward_type.is_decode()) {
       if (::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
-        int num_sequences = input_params.meta.num_sequences;
+        const int32_t num_sequences = input_params.meta.num_sequences;
         if (num_sequences > 0) {
           std::vector<torch::Tensor> req_mask_vec;
           req_mask_vec.reserve(num_sequences);
 
-          for (int j = 0; j < num_sequences; j++) {
-            auto mask = attn_mask_.gen_append_mask(
+          for (int32_t j = 0; j < num_sequences; ++j) {
+            torch::Tensor mask = attn_mask_.gen_append_mask(
                 input_params.attention.host.q_seq_lens[j],
                 input_params.attention.host.kv_seq_lens[j],
                 input_params.meta.kv_max_seq_len,
@@ -244,6 +244,9 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
             req_mask_vec.emplace_back(mask);
           }
           attn_mask = torch::cat(req_mask_vec, 0);
+        } else {
+          attn_mask = attn_mask_.get_attn_mask(
+              128, cos_pos.dtype().toScalarType(), cos_pos.device());
         }
       } else {
         attn_mask = attn_mask_.get_attn_mask(

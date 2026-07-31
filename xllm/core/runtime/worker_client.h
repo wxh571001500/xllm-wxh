@@ -18,6 +18,8 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
+#include <memory>
+
 #include "common/types.h"
 #include "forward_params.h"
 #include "framework/kv_cache/kv_cache_shape.h"
@@ -143,8 +145,12 @@ class WorkerClient {
 
   // Remote execution path: send ForwardInput transport payload and decode
   // worker response as RawForwardOutput for distributed engine handling.
+  // The input is passed as a shared_ptr so the same payload can fan out to all
+  // TP peers of a DP rank without deep-copying ForwardInput on the caller
+  // (engine) thread. The heavy serialize/write then runs in parallel on each
+  // worker's own thread instead of serializing the per-step dispatch.
   virtual folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
-      const ForwardInput& inputs);
+      const std::shared_ptr<const ForwardInput>& inputs);
 
   virtual folly::SemiFuture<folly::Unit> process_group_test_async();
 

@@ -19,6 +19,8 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
+#include <memory>
+
 #include "comm_channel.h"
 #include "common/macros.h"
 #include "common/types.h"
@@ -47,66 +49,59 @@ class RemoteWorker : public WorkerClient {
 
   bool wait_for_server_ready(const std::string& server_address);
 
-  bool init_model(const std::string& model_weights_path,
-                  int32_t random_seed,
-                  MasterStatus master_status) override;
+  virtual bool init_model(const std::string& model_weights_path,
+                          int32_t random_seed,
+                          MasterStatus master_status) override;
 
-  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
+  virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
 
-  bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
+  virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
 
-  void get_cache_info(uint64_t& cluster_id,
-                      std::string& addr,
-                      uint16_t& port) override;
+  virtual void get_cache_info(uint64_t& cluster_id,
+                              std::string& addr,
+                              uint16_t& port) override;
 
-  bool link_cluster(const std::vector<uint64_t>& cluster_ids,
-                    const std::vector<std::string>& addrs,
-                    const std::vector<uint16_t>& ports) override;
+  virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
+                            const std::vector<std::string>& addrs,
+                            const std::vector<uint16_t>& ports) override;
 
-  bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
-                      const std::vector<std::string>& addrs,
-                      const std::vector<uint16_t>& ports) override;
+  virtual bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
+                              const std::vector<std::string>& addrs,
+                              const std::vector<uint16_t>& ports) override;
 
   // P2P link for weight transfer
-  bool link_p2p(const std::string& remote_addr) override;
-  bool unlink_p2p(const std::string& remote_addr) override;
+  virtual bool link_p2p(const std::string& remote_addr) override;
+  virtual bool unlink_p2p(const std::string& remote_addr) override;
 
-  bool pull_kv_blocks(
+  virtual bool pull_kv_blocks(
       const uint64_t src_cluster_id,
       const std::string& src_addr,
-      const std::vector<uint64_t>& src_blocks,
-      const std::vector<uint64_t>& dst_blocks,
-      const std::vector<uint64_t>& src_linear_state_ids = {},
-      const std::vector<uint64_t>& dst_linear_state_ids = {}) override;
-
-  virtual bool pull_hetero_kv_blocks(
-      const std::vector<uint64_t>& src_cluster_ids,
-      const std::vector<std::string>& src_addrs,
       const std::vector<uint64_t>& src_blocks,
       const std::vector<uint64_t>& dst_blocks,
       const std::vector<uint64_t>& src_linear_state_ids = {},
       const std::vector<uint64_t>& dst_linear_state_ids = {}) override;
 
   // prepare input request
-  ForwardInput prepare_inputs(Batch& batch) override;
+  virtual ForwardInput prepare_inputs(Batch& batch) override;
 
-  std::optional<ForwardOutput> step(const ForwardInput& inputs) override;
+  virtual std::optional<ForwardOutput> step(
+      const ForwardInput& inputs) override;
 
-  folly::SemiFuture<bool> init_model_async(
+  virtual folly::SemiFuture<bool> init_model_async(
       const std::string& model_weights_path,
       int32_t random_seed,
       MasterStatus master_status) override;
 
-  folly::SemiFuture<std::tuple<int64_t, int64_t>>
+  virtual folly::SemiFuture<std::tuple<int64_t, int64_t>>
   estimate_kv_cache_capacity_async() override;
 
-  folly::SemiFuture<bool> allocate_kv_cache_async(
+  virtual folly::SemiFuture<bool> allocate_kv_cache_async(
       const KVCacheShape& kv_cache_shape) override;
 
-  folly::SemiFuture<bool> allocate_kv_cache_with_transfer_async(
+  virtual folly::SemiFuture<bool> allocate_kv_cache_with_transfer_async(
       const KVCacheShape& kv_cache_shape) override;
 
-  folly::SemiFuture<bool> pull_kv_blocks_async(
+  virtual folly::SemiFuture<bool> pull_kv_blocks_async(
       const uint64_t src_cluster_id,
       const std::string& src_addr,
       const std::vector<uint64_t>& src_blocks,
@@ -114,35 +109,36 @@ class RemoteWorker : public WorkerClient {
       const std::vector<uint64_t>& src_linear_state_ids = {},
       const std::vector<uint64_t>& dst_linear_state_ids = {}) override;
 
-  folly::SemiFuture<uint32_t> transfer_kv_blocks(
+  virtual folly::SemiFuture<uint32_t> transfer_kv_blocks(
       const std::vector<BlockTransferInfo>& block_transfer_info) override;
 
-  void transfer_kv_blocks(
+  virtual void transfer_kv_blocks(
       const uint64_t batch_id,
       const std::vector<BlockTransferInfo>& block_transfer_info) override;
 
-  void prefetch_from_storage(
+  virtual void prefetch_from_storage(
       const std::vector<BlockTransferInfo>& block_transfer_info,
       std::shared_ptr<std::atomic<int32_t>> flag,
       std::shared_ptr<std::atomic<uint32_t>> success_cnt) override;
 
   // Run the model and return the output.
-  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
+  virtual folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& inputs) override;
 
-  folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
-      const ForwardInput& inputs) override;
+  virtual folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
+      const std::shared_ptr<const ForwardInput>& inputs) override;
 
-  folly::SemiFuture<folly::Unit> process_group_test_async() override;
+  virtual folly::SemiFuture<folly::Unit> process_group_test_async() override;
 
-  const torch::Device& device() const override;
+  virtual const torch::Device& device() const override;
 
   folly::SemiFuture<std::optional<RawForwardOutput>>
   get_last_step_result_async();
 
-  int64_t get_active_activation_memory() override;
+  virtual int64_t get_active_activation_memory() override;
 
-  folly::SemiFuture<int64_t> get_active_activation_memory_async() override;
+  virtual folly::SemiFuture<int64_t> get_active_activation_memory_async()
+      override;
 
   // Check if the connection to worker is healthy
   bool check_health();
@@ -150,16 +146,18 @@ class RemoteWorker : public WorkerClient {
   // Get worker global rank
   int32_t global_rank() const { return global_rank_; }
 
-  folly::SemiFuture<bool> sleep_async(MasterStatus master_status) override;
+  virtual folly::SemiFuture<bool> sleep_async(
+      MasterStatus master_status) override;
 
-  folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options) override;
+  virtual folly::SemiFuture<bool> wakeup_async(
+      const WakeupOptions& options) override;
 
-  folly::SemiFuture<bool> update_weights_async(
+  virtual folly::SemiFuture<bool> update_weights_async(
       const std::string& weights_path) override;
 
-  folly::SemiFuture<bool> start_profile_async() override;
+  virtual folly::SemiFuture<bool> start_profile_async() override;
 
-  folly::SemiFuture<bool> stop_profile_async() override;
+  virtual folly::SemiFuture<bool> stop_profile_async() override;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(RemoteWorker);

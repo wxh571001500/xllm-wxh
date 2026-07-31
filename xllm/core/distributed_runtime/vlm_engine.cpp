@@ -385,6 +385,15 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
       << "The processed forward inputs size " << forward_inputs.size()
       << " is not equal to dp size " << dp_size_ << ".";
 
+  // Wrap each DP-rank input once so fanning out to TP peers is a refcount bump
+  // rather than a per-worker deep copy on this thread (see LLMEngine::step).
+  std::vector<std::shared_ptr<const ForwardInput>> shared_inputs;
+  shared_inputs.reserve(forward_inputs.size());
+  for (auto& forward_input : forward_inputs) {
+    shared_inputs.emplace_back(
+        std::make_shared<const ForwardInput>(std::move(forward_input)));
+  }
+
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
@@ -392,7 +401,7 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
     auto dp_rank = worker_rank / dp_local_tp_size_;
     futures.emplace_back(worker_clients_[worker_rank]->step_remote_async(
-        forward_inputs[dp_rank]));
+        shared_inputs[dp_rank]));
   }
 
   // wait for the all future to complete
