@@ -60,7 +60,8 @@ class DpEpPadding {
               const nlohmann::json& mapping_npu,
               at::Device device,
               torch::ScalarType dtype,
-              bool is_prefill);
+              bool is_prefill,
+              int32_t expert_parallel_degree);
 
   DpEpPaddingData build();
 
@@ -84,7 +85,7 @@ class DpEpPadding {
   int32_t num_experts_per_tok_;
   torch::Tensor token_size_per_dp_group_;
   const nlohmann::json mapping_npu_;
-  int expert_parallel_degree_;
+  int32_t expert_parallel_degree_;
   int64_t rank_;
   int64_t input_ids_len_;
   int64_t max_dp_batch_size_;

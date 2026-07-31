@@ -50,6 +50,7 @@ limitations under the License.
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/profile_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -102,6 +103,11 @@ constexpr uint32_t TIMEOUT_S = 60;      // second
 constexpr uint32_t TIMEOUT_MS = 60000;  // millisecond
 
 namespace {
+
+bool use_moe_prefill_ep1(const BatchForwardType& forward_type) {
+  return forward_type.no_decode() &&
+         ModelConfig::get_instance().enable_moe_prefill_ep1();
+}
 
 // During TP model initialization, each rank loads weights concurrently.
 // MoE weight assembly (especially stack/cat on large expert tensors) runs on
@@ -875,13 +881,28 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
                                                         .pinned_memory(true));
       const bool is_prefill =
           processed_input.input_params.meta.batch_forward_type.no_decode();
+      int32_t expert_parallel_degree = 0;
+      const nlohmann::json& mapping_data =
+          context_.get_parallel_args().mapping_data();
+      if (mapping_data.contains("moeEpSize") &&
+          mapping_data["moeEpSize"].get<int64_t>() > 1) {
+        expert_parallel_degree =
+            ::xllm::EPLBConfig::get_instance().expert_parallel_degree();
+      }
+      if (expert_parallel_degree == 2 &&
+          context_.get_quant_args().quantize_type() == "w8a8_dynamic" &&
+          use_moe_prefill_ep1(
+              processed_input.input_params.meta.batch_forward_type)) {
+        expert_parallel_degree = 1;
+      }
       DpEpPadding dp_ep_padding(token_size_per_dp_group,
                                 raw_token_size_per_dp_group,
                                 context_.get_model_args().num_experts_per_tok(),
-                                context_.get_parallel_args().mapping_data(),
+                                mapping_data,
                                 device_,
                                 dtype_,
-                                is_prefill);
+                                is_prefill,
+                                expert_parallel_degree);
       processed_input.input_params.parallel.dp_ep_padding_data =
           dp_ep_padding.build();
       if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
