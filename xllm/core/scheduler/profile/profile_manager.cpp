@@ -38,6 +38,7 @@ limitations under the License.
 #include "framework/batch/batch_factory.h"
 #include "framework/request/request_state.h"
 #include "scheduler/profile/graph_warmup.h"
+#include "util/env_var.h"
 #include "util/rec_model_utils.h"
 #include "util/utils.h"
 
@@ -45,6 +46,7 @@ namespace xllm {
 namespace {
 
 constexpr int32_t kMlaGraphKvLenBucket = 2048;
+constexpr char kDisableGraphWarmupEnv[] = "XLLM_DISABLE_GRAPH_WARMUP";
 
 bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
   return args.enable_mla() &&
@@ -1045,6 +1047,11 @@ void ProfileManager::generate_random_decode_batch(
 }
 
 void ProfileManager::warmup_for_graph() {
+  if (util::get_bool_env(kDisableGraphWarmupEnv, /*defaultValue=*/false)) {
+    LOG(INFO) << "Graph warmup skipped because " << kDisableGraphWarmupEnv
+              << "=1. ACL graph buckets will be captured lazily.";
+    return;
+  }
   const GraphWarmupPlan plan = graph_warmup_plan(options_.instance_role());
   if (plan == GraphWarmupPlan::PREFILL_ONLY) {
     LOG(INFO) << "PREFILL graph warmup: prefill only";
@@ -1127,13 +1134,23 @@ void ProfileManager::warmup_decode_for_graph() {
   }
   int32_t decode_seq_len = std::min(16, max_context_len);
 
-  std::vector<int32_t> decode_batch_sizes =
-      graph_decode_buckets(max_decode_batch_size, options_.dp_size());
+  // Only warm up buckets the runtime will actually replay as graphs. The ACL
+  // graph executor falls back to eager when the per-DP-rank decode batch size
+  // exceeds acl_graph_decode_batch_size_limit, so capturing larger buckets is
+  // wasted work -- and on multi-node EP that oversized all-to-all capture can
+  // fail (HCCL leaves a stream unjoined at capture_end). Passing the same limit
+  // keeps warmup and runtime consistent.
+  const int32_t decode_batch_size_limit =
+      ::xllm::ExecutionConfig::get_instance()
+          .acl_graph_decode_batch_size_limit();
+  std::vector<int32_t> decode_batch_sizes = graph_decode_buckets(
+      max_decode_batch_size, options_.dp_size(), decode_batch_size_limit);
   const int32_t decode_bucket_count =
       static_cast<int32_t>(decode_batch_sizes.size());
 
   LOG(INFO) << "Graph warmup started: bucket_count=" << decode_bucket_count
-            << ", max_seqs_per_batch=" << max_seqs_per_batch
+            << ", max_seqs_per_batch=" << max_decode_batch_size
+            << ", decode_batch_size_limit=" << decode_batch_size_limit
             << ", decode_seq_len=" << decode_seq_len;
 
   // Capture from the largest bucket down to the smallest so every smaller

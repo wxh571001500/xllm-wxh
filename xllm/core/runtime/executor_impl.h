@@ -27,22 +27,15 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/model/model_output.h"
 #include "options.h"
-#include "platform/stream.h"
-#include "platform/stream_event.h"
+#include "util/json_reader.h"
 
 namespace xllm {
-
-struct SpecVerifyGraphTaskSignal {
-  int64_t linear_state_id = 0;
-  int64_t num_accepted_tokens = 0;
-  int64_t spec_width = 0;
-  int64_t block_table_width = 0;
-  int64_t max_kv_seq_len = 0;
-};
 
 class ExecutorImpl {
  public:
   virtual ~ExecutorImpl() = default;
+
+  virtual void set_parallel_mapping(const nlohmann::json& /*mapping_npu*/) {}
 
   virtual ForwardInput prepare_inputs(Batch& batch) = 0;
 
@@ -58,12 +51,6 @@ class ExecutorImpl {
                                    const torch::Tensor& /*positions*/,
                                    std::vector<KVCache>& /*kv_caches*/,
                                    const ModelInputParams& /*params*/) {}
-
-  virtual bool prepare_static_mtp_graph_tasks(
-      const SpecVerifyGraphTaskSignal& /*signal*/,
-      const Stream& /*signal_stream*/) {
-    return false;
-  }
 };
 
 }  // namespace xllm

@@ -21,6 +21,8 @@ limitations under the License.
 #include <cctype>
 #include <exception>
 #include <memory>
+#include <sstream>
+#include <unordered_map>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -482,6 +484,10 @@ bool is_qwen3_5_draft_model_type(const std::string& model_type) {
          mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
 }
 
+bool is_mimo_target_model_type(const std::string& model_type) {
+  return model_type == "mimo" || model_type.rfind("mimo_", 0) == 0;
+}
+
 bool is_kimi_k25_eagle3_draft(const std::string& target_model_type,
                               const std::string& draft_model_type) {
   return target_model_type == "kimi_k25" &&
@@ -762,6 +768,15 @@ bool MTPWorkerImpl::use_kimi_eagle3_step_major_validate_layout() const {
   return is_kimi_k25_eagle3_pair() && !use_chunked_prefill_spec_verify_path();
 }
 
+void MTPWorkerImpl::synchronize_kimi_eagle3_npu_forward() {
+#if defined(USE_NPU)
+  if (is_kimi_k25_eagle3_pair()) {
+    const int32_t ret = compute_stream_->synchronize();
+    CHECK_EQ(ret, 0) << "failed to synchronize Kimi K2.5 Eagle3 forward";
+  }
+#endif
+}
+
 // MiMo MTP validation requires chunked-prefill mode (same as Qwen3.5) to
 // avoid the read-before-write race in FlashInfer batch-decode: validation
 // token 1 (at position p+1) must attend to the KV written by token 0 (at
@@ -930,11 +945,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     ForwardInput draft_prepared;
     auto output = run_worker_no_sync_impl(
         *target_impl_, input, *prepare_stream_, *compute_stream_, target_prepared);
+    synchronize_kimi_eagle3_npu_forward();
     auto draft_output = run_worker_no_sync_impl(*draft_impl_,
                                              input,
                                              *prepare_stream_,
                                              *compute_stream_,
                                              draft_prepared);
+    synchronize_kimi_eagle3_npu_forward();
     if (draft_output.has_value()) {
       transfer_retained_inputs(*output, draft_output.value());
     }
@@ -965,6 +982,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
                                                     *compute_stream_,
                                                     draft_extend_prepared)
                                    .value());
+    synchronize_kimi_eagle3_npu_forward();
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
       draft_outputs.emplace_back(run_worker_no_sync_impl(*draft_impl_,
@@ -973,6 +991,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
                                                       *compute_stream_,
                                                       draft_step_prepared[i])
                                      .value());
+      synchronize_kimi_eagle3_npu_forward();
     }
 
     new_input = input;
@@ -990,6 +1009,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
                                                 *compute_stream_,
                                                 target_prepared)
                                .value();
+    synchronize_kimi_eagle3_npu_forward();
     for (ForwardOutput& draft_output : draft_outputs) {
       transfer_retained_inputs(output, draft_output);
     }
@@ -1015,6 +1035,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
                                                  *compute_stream_,
                                                  target_prepared)
                              .value();
+  synchronize_kimi_eagle3_npu_forward();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
   // MTP path that depends on hidden states.
@@ -1046,6 +1067,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
                                                     *compute_stream_,
                                                     draft_prepared)
                                    .value();
+  synchronize_kimi_eagle3_npu_forward();
   {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     process_draft_sample_output(draft_output.sample_output);
@@ -1318,6 +1340,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                               *compute_stream_,
                                               *compute_stream_,
                                               draft_prepared[draft_idx]);
+      synchronize_kimi_eagle3_npu_forward();
     }
 
     if ((use_device_target_context || use_prelaunched_first_draft) &&
@@ -1459,6 +1482,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                                                      *compute_stream_,
                                                      target_prepared)
                                     .value();
+  synchronize_kimi_eagle3_npu_forward();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
@@ -2130,7 +2154,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   const bool use_chunked_prefill =
       !is_kimi_k25_eagle3_pair() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
-  const bool force_kimi_k25_eagle3_two_rows =
+  const bool is_kimi_k25_eagle3_dp_decode =
       target_impl_ != nullptr && draft_impl_ != nullptr &&
       is_kimi_k25_eagle3_draft(
           target_impl_->context_.get_model_args().model_type(),
@@ -2162,12 +2186,13 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     collect_row_count_group(draft_impl_->context_.get_parallel_args());
   }
   const bool can_sync_variable_dp_rows =
-      dp_enabled && !force_kimi_k25_eagle3_two_rows && !use_chunked_prefill &&
+      dp_enabled && !is_kimi_k25_eagle3_dp_decode && !use_chunked_prefill &&
       has_dp_token_counts &&
       (dp_row_count_group != nullptr || world_row_count_group != nullptr);
   const bool use_uniform_single_dp_rows =
-      dp_enabled && !force_kimi_k25_eagle3_two_rows && !use_chunked_prefill &&
-      !can_sync_variable_dp_rows;
+      dp_enabled && !use_chunked_prefill &&
+      (is_kimi_k25_eagle3_dp_decode || !can_sync_variable_dp_rows);
+  const bool force_kimi_k25_eagle3_two_rows = false;
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
 
@@ -2214,7 +2239,8 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     auto add_row = [&](int32_t token_id,
                        int32_t position_offset,
-                       const torch::Tensor& embedding) {
+                       const torch::Tensor& embedding,
+                       bool selected) {
       specBuilder::RowSpec row;
       row.seq_id = seq_id;
       row.token_id = token_id >= 0 ? token_id : 0;
@@ -2244,12 +2270,18 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
         prev_token_id = current_token_id >= 0 ? current_token_id : 0;
         prev_embedding = torch::Tensor();
       }
-      add_row(prev_token_id, /*position_offset=*/-1, prev_embedding);
+      add_row(prev_token_id,
+              /*position_offset=*/-1,
+              prev_embedding,
+              /*selected=*/false);
       if (prev_is_placeholder) {
         // Redirect to padding block 0 to avoid overwriting correct KV cache.
         buf.out_new_cache_slots.back() = 0;
       }
-      add_row(state.token_id, /*position_offset=*/0, state.embedding);
+      add_row(state.token_id,
+              /*position_offset=*/0,
+              state.embedding,
+              /*selected=*/true);
       specBuilder::append_seq_len_by_layout(buf.out_q_seq_lens, 2);
       const int32_t kv_len = specBuilder::calc_kv_len(
           base_input.input_params.attention.host.kv_seq_lens,
@@ -2281,7 +2313,10 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       }
       CHECK_GE(prev_token_id, 0)
           << "Eagle/MTP draft extend previous row requires a real token";
-      add_row(prev_token_id, prev_position_offset, prev_embedding);
+      add_row(prev_token_id,
+              prev_position_offset,
+              prev_embedding,
+              /*selected=*/false);
       if (prev_is_placeholder) {
         // Redirect to padding block 0 to avoid overwriting correct KV cache.
         buf.out_new_cache_slots.back() = 0;
@@ -2290,7 +2325,10 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
 
     selected_row_idx.emplace_back(
         static_cast<int32_t>(expanded_embeddings.size()));
-    add_row(state.token_id, /*position_offset=*/0, state.embedding);
+    add_row(state.token_id,
+            /*position_offset=*/0,
+            state.embedding,
+            /*selected=*/true);
   }
 
   CHECK_EQ(buf.out_new_cache_slots.size(),

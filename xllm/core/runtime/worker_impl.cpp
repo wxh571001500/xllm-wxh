@@ -68,6 +68,9 @@ limitations under the License.
 #include "platform/cuda_profiler.h"
 #endif
 #include "core/distributed_runtime/master.h"
+#if defined(USE_NPU)
+#include "core/runtime/kimi_eagle3_graph_mode.h"
+#endif
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/linear_state_restore.h"
@@ -843,8 +846,20 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
         !(context_.get_parallel_args().cp_size() > 1) &&
         (context_.get_parallel_args().dp_size() > 1 ||
          context_.get_parallel_args().ep_size() > 1)) {
+      std::vector<int32_t> dp_token_counts =
+          processed_input.input_params.parallel.dp_global_token_nums;
+      const uint32_t canonical_bucket =
+          ::xllm::npu::kimi_eagle3_canonicalize_bucket(
+              context_.get_model_args(),
+              options_,
+              processed_input.input_params);
+      if (canonical_bucket > 0) {
+        std::fill(dp_token_counts.begin(),
+                  dp_token_counts.end(),
+                  static_cast<int32_t>(canonical_bucket));
+      }
       torch::Tensor token_size_per_dp_group = torch::tensor(
-          processed_input.input_params.parallel.dp_global_token_nums,
+          dp_token_counts,
           torch::TensorOptions()
               .device(torch::kCPU)
               .dtype(torch::kInt32)

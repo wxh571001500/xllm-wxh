@@ -24,6 +24,7 @@ limitations under the License.
 #include "framework/model/model_output.h"
 #include "runtime/executor_impl.h"
 #include "runtime/options.h"
+#include "util/json_reader.h"
 
 namespace xllm {
 
@@ -32,7 +33,8 @@ class Executor final {
   Executor(CausalLM* model,
            const ModelArgs& args,
            const torch::Device& device,
-           const runtime::Options& options);
+           const runtime::Options& options,
+           const nlohmann::json& mapping_npu = nlohmann::json());
 
   virtual ~Executor() = default;
 
