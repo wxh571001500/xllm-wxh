@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/util/utils.h"
 #include "layers/common/rotary_embedding_util.h"
@@ -181,6 +182,8 @@ NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
   auto quant_args = context.get_quant_args();
   auto options = context.get_tensor_options();
   uses_deepseek_v2_mla_graph_ = uses_deepseek_v2_mla_graph(model_args);
+  use_kimi_k25_fia_decode_ =
+      ModelConfig::get_instance().enable_fia_decode();
 
   rank_ = parallel_args.rank();
   first_k_dense_replace_ = model_args.first_k_dense_replace();
@@ -348,6 +351,8 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_basic_parameters(
   }
   param.enableDpOut = false;  // TODO
   param.enableSpeculate = num_speculative_tokens_ > 0 && !is_prefill;
+  param.speculativeTokenNum =
+      param.enableSpeculate ? num_speculative_tokens_ + 1 : 1;
   param.maskfree = true;                            // TODO
   param.enableSwiGLUQuantForSharedExperts = false;  // TODO
   num_key_value_heads_ = static_cast<int>(args.n_kv_heads().value());
@@ -361,6 +366,7 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_attention_parameters(
     atb_speed::deepseekV2::DecoderLayerParam& param,
     const ModelArgs& args,
     const ParallelArgs& parallel_args) {
+  param.enableKimiK25FiaDecode = use_kimi_k25_fia_decode_;
   param.qLoraRank = args.q_lora_rank();
   // NOTE: The operation in this conditional is theoretically compatible with
   // DeepSeek, but we add this specific check to ensure DeepSeek behavior
@@ -871,6 +877,10 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
     const bool enable_custom_mla =
         ::xllm::KernelConfig::get_instance().enable_customize_mla_kernel() ||
         use_deepseek_v2_graph_mla;
+    torch::Tensor* decode_attn_mask = &tensor_placeholder_;
+    if (use_kimi_k25_fia_decode_ && num_speculative_tokens_ > 0) {
+      decode_attn_mask = &attn_mask;
+    }
     if ((!use_deepseek_v2_graph_mla && use_graph_decode) ||
         !enable_custom_mla ||
         (!use_deepseek_v2_graph_mla && num_tokens >= kNumTokensLimit)) {
@@ -878,7 +888,7 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
                               x,
                               cos_pos,
                               sin_pos,
-                              /*attn_mask*/ tensor_placeholder_,
+                              /*attn_mask*/ *decode_attn_mask,
                               kv_cache,
                               input_params_new,
                               false);
@@ -890,7 +900,7 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
                               x,
                               cos_pos,
                               sin_pos,
-                              /*attn_mask*/ tensor_placeholder_,
+                              /*attn_mask*/ *decode_attn_mask,
                               kv_cache,
                               input_params_new,
                               false);

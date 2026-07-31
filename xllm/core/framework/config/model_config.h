@@ -89,6 +89,8 @@ class ModelConfig final {
   PROPERTY(bool, use_audio_in_video) = false;
 
   PROPERTY(bool, use_cpp_chat_template) = true;
+
+  PROPERTY(bool, enable_fia_decode) = false;
 };
 
 }  // namespace xllm

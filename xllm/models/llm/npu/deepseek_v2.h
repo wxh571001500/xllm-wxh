@@ -19,6 +19,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v2_decoder_layer_impl.h"
@@ -136,6 +137,17 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     attn_mask_ = layer::AttentionMask(options.device(),
                                       options.dtype().toScalarType(),
                                       /*mask_value=*/mask_value);
+    const bool enable_kimi_k25_fia_decode =
+        ModelConfig::get_instance().enable_fia_decode();
+    if (enable_kimi_k25_fia_decode && num_speculative_tokens_ > 0) {
+      kimi_k25_fia_decode_mask_ =
+          torch::triu(torch::ones({2048, 2048},
+                                  torch::TensorOptions()
+                                      .dtype(torch::kInt8)
+                                      .device(device_)),
+                      /*diagonal=*/1)
+              .contiguous();
+    }
 
     for (int32_t i = 0; i < model_args.n_layers(); ++i) {
       auto block = DeepseekV2DecoderLayer(context, i);
@@ -218,6 +230,8 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     } else if (input_params.meta.batch_forward_type.is_prefill() ||
                is_spec_verify_chunked) {
       attn_mask = attn_mask_.get_attn_mask(128, dtype_, device_);
+    } else if (kimi_k25_fia_decode_mask_.defined()) {
+      attn_mask = kimi_k25_fia_decode_mask_;
     } else if (num_speculative_tokens_ > 0) {
       // TODO :the judgement of gen_free_mask need more check
       attn_mask = attn_mask_.gen_free_mask(
@@ -394,6 +408,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
   torch::Tensor cos_sin_;
   layer::NpuPosEmbedding atb_pos_emb_{nullptr};
   layer::AttentionMask attn_mask_;
+  torch::Tensor kimi_k25_fia_decode_mask_;
   layer::NpuRMSNorm norm_{nullptr};
   RollingLoadManager* rolling_mgr_ = nullptr;
 };
