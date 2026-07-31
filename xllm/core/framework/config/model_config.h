@@ -103,6 +103,14 @@ class ModelConfig final {
   PROPERTY(bool, use_audio_in_video) = false;
 
   PROPERTY(bool, use_cpp_chat_template) = true;
+
+  PROPERTY(bool, enable_fia_decode) = false;
+
+  PROPERTY(bool, enable_moe_gating_topk) = false;
+
+  PROPERTY(bool, enable_moe_mc2) = false;
+
+  PROPERTY(bool, enable_moe_prefill_ep1) = false;
 };
 
 }  // namespace xllm

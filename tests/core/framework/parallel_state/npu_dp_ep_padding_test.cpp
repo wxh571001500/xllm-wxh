@@ -45,7 +45,8 @@ TEST(DpEpPaddingTest, Build) {
                             data,
                             torch::Device(torch::kCPU),
                             torch::Dtype(torch::kInt32),
-                            true);
+                            true,
+                            /*expert_parallel_degree=*/0);
   DpEpPaddingData dp_ep_padding_data = dp_ep_padding.build();
   LOG(INFO) << "attn_padding_idx:" << dp_ep_padding_data.attn_padding_idx();
   LOG(INFO) << "attn_unpadding_idx:" << dp_ep_padding_data.attn_unpadding_idx();

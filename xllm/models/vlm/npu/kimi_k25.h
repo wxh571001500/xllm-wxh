@@ -26,6 +26,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
@@ -1079,6 +1080,11 @@ REGISTER_MULTIMODAL_PROCESSOR(kimi_k25, KimiK25MultimodalProcessor);
 REGISTER_CAUSAL_VLM_MODEL(kimi_k25, KimiK2_5_VLForConditionalGeneration);
 
 REGISTER_MODEL_ARGS(kimi_k25, [&] {
+  ModelConfig::get_instance().enable_fia_decode(true);
+  ModelConfig::get_instance().enable_moe_gating_topk(true);
+  ModelConfig::get_instance().enable_moe_mc2(true);
+  ModelConfig::get_instance().enable_moe_prefill_ep1(true);
+
   // text config (Kimi-K2.5): args are under text_config.* in HF config.
   LOAD_ARG_OR(model_type, "model_type", "kimi_k25");
   LOAD_ARG_OR_FUNC(dtype, "dtype", [&] {

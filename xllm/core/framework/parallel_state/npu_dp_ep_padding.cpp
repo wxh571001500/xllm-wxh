@@ -15,11 +15,8 @@ limitations under the License.
 
 #include "framework/parallel_state/npu_dp_ep_padding.h"
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "common/global_flags.h"
-#include "core/framework/config/eplb_config.h"
 #include "util/tensor_helper.h"
 
 namespace xllm {
@@ -86,14 +83,15 @@ DpEpPadding::DpEpPadding(torch::Tensor token_size_per_dp_group,
                          const nlohmann::json& mapping_npu,
                          at::Device device,
                          torch::ScalarType dtype,
-                         bool is_prefill)
+                         bool is_prefill,
+                         int32_t expert_parallel_degree)
     : token_size_per_dp_group_(token_size_per_dp_group.contiguous()),
       num_experts_per_tok_(num_experts_per_tok),
       mapping_npu_(mapping_npu),
       device_(device),
       dtype_(dtype),
       is_prefill_(is_prefill),
-      expert_parallel_degree_(0) {
+      expert_parallel_degree_(expert_parallel_degree) {
   // Validate input tensor
   if (token_size_per_dp_group_.dim() != 1) {
     LOG(FATAL)
@@ -126,12 +124,6 @@ DpEpPadding::DpEpPadding(torch::Tensor token_size_per_dp_group,
 
   rank_ = attn_tp_rank + attn_dp_rank * attn_tp_size;
 
-  // Set expert parallel degree
-  if (mapping_npu_.contains("moeEpSize") &&
-      mapping_npu_["moeEpSize"].get<int64_t>() > 1) {
-    expert_parallel_degree_ =
-        ::xllm::EPLBConfig::get_instance().expert_parallel_degree();
-  }
   input_ids_len_ = token_size_per_dp_group_[attn_dp_rank].item<int64_t>();
   max_dp_batch_size_ = token_size_per_dp_group_.max().item<int64_t>();
 
