@@ -42,7 +42,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
  public:
   MTPWorkerImpl(const ParallelArgs& parallel_args,
                 const torch::Device& device,
-                const runtime::Options& options);
+                const runtime::Options& options,
+                WorkerType worker_type);
 
   ~MTPWorkerImpl() override = default;
 
@@ -56,6 +57,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                 const runtime::Options& options,
                 const runtime::Options& target_options,
                 const runtime::Options& draft_options,
+                WorkerType worker_type,
                 bool enable_opt_validate_probs = false,
                 bool enable_adaptive_speculative_decode = false);
 
@@ -133,6 +135,12 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Hook for algorithm-specific draft output post-processing during decode.
   // Default MTP behavior always compresses probs for cache storage.
   virtual void process_draft_sample_output(SampleOutput& sample_output);
+
+  virtual void check_draft_input_embedding(const torch::Tensor& embedding,
+                                           const std::string& phase) const {
+    (void)embedding;
+    (void)phase;
+  }
 
   SampleOutput validate(
       const SamplingParameters& sampling_params,

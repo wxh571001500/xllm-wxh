@@ -76,11 +76,11 @@ class TestMTPWorker final : public MTPWorkerImpl {
   TestMTPWorker(const ParallelArgs& parallel_args,
                 const torch::Device& device,
                 const runtime::Options& options)
-      : MTPWorkerImpl(parallel_args, device, options) {}
+      : MTPWorkerImpl(parallel_args, device, options, WorkerType::LLM) {}
 
   void replace_transfer_workers(std::unique_ptr<LLMWorkerImpl> target,
                                 std::unique_ptr<LLMWorkerImpl> draft) {
-    impl_ = std::move(target);
+    target_impl_ = std::move(target);
     draft_impl_ = std::move(draft);
   }
 };

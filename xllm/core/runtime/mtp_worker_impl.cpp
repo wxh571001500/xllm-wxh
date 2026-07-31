@@ -335,8 +335,8 @@ void clear_ready_events(ForwardInput& input) {
   input.metadata_ready_event.reset();
 }
 
-std::optional<ForwardOutput> run_llm_no_sync_impl(
-    LLMWorkerImpl& worker,
+std::optional<ForwardOutput> run_worker_no_sync_impl(
+    WorkerImpl& worker,
     const ForwardInput& input,
     Stream& prepare_stream,
     Stream& compute_stream,
@@ -347,8 +347,12 @@ std::optional<ForwardOutput> run_llm_no_sync_impl(
       prepare_stream,
       /*record_ready_event=*/&prepare_stream != &compute_stream);
   worker.set_hierarchy_layer_synchronizer(processed_input.input_params);
-  return worker.execute_no_sync_on_stream(
-      processed_input, compute_stream, /*record_ready_event=*/false);
+  if (auto* llm_worker = dynamic_cast<LLMWorkerImpl*>(&worker);
+      llm_worker != nullptr) {
+    return llm_worker->execute_no_sync_on_stream(
+        processed_input, compute_stream, /*record_ready_event=*/false);
+  }
+  return worker.execute_no_sync_on_stream(processed_input, compute_stream);
 }
 
 torch::Tensor clone_host_tensor(const torch::Tensor& tensor) {
@@ -564,13 +568,15 @@ using adaptive_pruning::truncate_draft_outputs;
 
 MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
-                             const runtime::Options& options)
+                             const runtime::Options& options,
+                             WorkerType worker_type)
     : MTPWorkerImpl(
           parallel_args,
           device,
           options,
           MTPTargetOptions(options),
           mtp_draft_options(options),
+          worker_type,
           ::xllm::SpeculativeConfig::get_instance().enable_opt_validate_probs(),
           /*enable_adaptive_speculative_decode=*/true) {}
 
@@ -579,9 +585,11 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              const runtime::Options& options,
                              const runtime::Options& target_options,
                              const runtime::Options& draft_options,
+                             WorkerType worker_type,
                              bool enable_opt_validate_probs,
                              bool enable_adaptive_speculative_decode)
-    : SpeculativeWorkerImpl(parallel_args, device, options, target_options),
+    : SpeculativeWorkerImpl(
+          parallel_args, device, options, target_options, worker_type),
       enable_opt_validate_probs_(enable_opt_validate_probs) {
   draft_impl_ = std::make_unique<LLMWorkerImpl>(
       MTPDraftParallelArgs(parallel_args, options),
@@ -607,7 +615,7 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
   // Load target model via base class
   bool result = true;
   const bool loading_target =
-      impl_->get_status() == WorkerImpl::Status::UNINITIALIZED;
+      target_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED;
   if (loading_target) {
     result = SpeculativeWorkerImpl::init_model(
         model_weights_path, random_seed, master_status);
@@ -617,8 +625,9 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
         model_weights_path, random_seed, master_status);
   }
 
-  if (impl_ != nullptr && impl_->get_status() == WorkerImpl::Status::LOADED) {
-    context_ = impl_->context_;
+  if (target_impl_ != nullptr &&
+      target_impl_->get_status() == WorkerImpl::Status::LOADED) {
+    context_ = target_impl_->context_;
     target_spec_verify_mode_ = mtp_async::classify_target_spec_verify_mode(
         context_.get_model_args().model_type());
   }
@@ -637,25 +646,29 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
     // only their transformer body is replicated with TP1 parallel arguments.
     if (!draft_owns_shared_weights) {
       const bool python_weights_shared =
-          draft_impl_->share_weights_from(*impl_);
+          draft_impl_->share_weights_from(*target_impl_);
       if (!python_weights_shared) {
 #if defined(USE_NPU)
         if (::xllm::KernelConfig::get_instance().npu_kernel_backend() !=
             "TORCH") {
-          auto head = impl_->get_npu_lm_head();
+          auto head = target_impl_->get_npu_lm_head();
           draft_impl_->set_npu_lm_head(head);
-          auto word_embedding = impl_->get_npu_word_embedding();
-          draft_impl_->set_npu_word_embedding(word_embedding);
+          auto word_embedding = target_impl_->get_npu_word_embedding();
+          if (target_impl_->has_restored_npu_word_embedding()) {
+            draft_impl_->set_restored_npu_word_embedding(word_embedding);
+          } else {
+            draft_impl_->set_npu_word_embedding(word_embedding);
+          }
         } else {
-          auto head = impl_->get_lm_head();
+          auto head = target_impl_->get_lm_head();
           draft_impl_->set_lm_head(head);
-          auto word_embedding = impl_->get_word_embedding();
+          auto word_embedding = target_impl_->get_word_embedding();
           draft_impl_->set_word_embedding(word_embedding);
         }
 #else
-        auto head = impl_->get_lm_head();
+        auto head = target_impl_->get_lm_head();
         draft_impl_->set_lm_head(head);
-        auto word_embedding = impl_->get_word_embedding();
+        auto word_embedding = target_impl_->get_word_embedding();
         draft_impl_->set_word_embedding(word_embedding);
 #endif
       }
@@ -671,11 +684,11 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
 }
 
 std::tuple<int64_t, int64_t> MTPWorkerImpl::estimate_kv_cache_capacity() {
-  CHECK(impl_ != nullptr);
+  CHECK(target_impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
   const std::tuple<int64_t, int64_t> target_memory =
-      impl_->estimate_kv_cache_capacity();
+      target_impl_->estimate_kv_cache_capacity();
   const std::tuple<int64_t, int64_t> draft_memory =
       draft_impl_->estimate_kv_cache_capacity();
   const int64_t cache_size_in_bytes =
@@ -683,7 +696,7 @@ std::tuple<int64_t, int64_t> MTPWorkerImpl::estimate_kv_cache_capacity() {
   const int64_t total_memory =
       std::min(std::get<1>(target_memory), std::get<1>(draft_memory));
 
-  const ModelArgs& target_model_args = impl_->context_.get_model_args();
+  const ModelArgs& target_model_args = target_impl_->context_.get_model_args();
   const ModelArgs& draft_model_args = draft_impl_->context_.get_model_args();
   if (!util::is_target_model_type(target_model_args.model_type(),
                                   /*target_model_type=*/"deepseek_v4",
@@ -716,8 +729,8 @@ int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
   // DeepSeek-V4 MTP stashes the pre-hc_head 3D hidden flattened to
   // [num_tokens, hc_mult*hidden], so the cache placeholder must cover
   // hc_mult*hidden per row.
-  if (impl_ != nullptr) {
-    const ModelArgs& args = impl_->context_.get_model_args();
+  if (target_impl_ != nullptr) {
+    const ModelArgs& args = target_impl_->context_.get_model_args();
     return mtp_hidden_state_width(args);
   }
   return static_cast<int64_t>(embedding_size_);
@@ -782,10 +795,10 @@ int64_t MTPWorkerImpl::spec_verify_block_table_width(
   CHECK(block_tables.defined() && block_tables.dim() == 2);
   CHECK_GT(options_.block_size(), 0);
   int64_t required_width = block_tables.size(1);
-  if (impl_ != nullptr) {
+  if (target_impl_ != nullptr) {
     const int64_t declared_capacity =
         mtp_async::speculative_verify_block_table_capacity(
-            impl_->context_.get_model_args().max_position_embeddings(),
+            target_impl_->context_.get_model_args().max_position_embeddings(),
             options_.block_size());
     CHECK_LE(required_width, declared_capacity)
         << "block table width exceeds the model position capacity";
@@ -811,13 +824,13 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
           torch::zeros({size}, torch::dtype(dtype_).device(device_)));
     }
   }
-  CHECK(impl_ != nullptr);
+  CHECK(target_impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
   bool target_allocated = true;
-  const auto target_status = impl_->get_status();
+  const auto target_status = target_impl_->get_status();
   if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache(kv_cache_shape);
+    target_allocated = target_impl_->allocate_kv_cache(kv_cache_shape);
   } else {
     CHECK_EQ(target_status, WorkerImpl::Status::READY);
   }
@@ -845,11 +858,11 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 uint32_t MTPWorkerImpl::transfer_kv_blocks(
     uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
-  CHECK(impl_ != nullptr);
+  CHECK(target_impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
   const uint32_t target_transferred =
-      impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+      target_impl_->transfer_kv_blocks(batch_id, block_transfer_info);
   const uint32_t draft_transferred =
       draft_impl_->transfer_kv_blocks(batch_id, block_transfer_info);
   return validate_paired_transfer_counts(target_transferred, draft_transferred);
@@ -858,11 +871,11 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
 uint32_t MTPWorkerImpl::transfer_kv_blocks(
     uint64_t batch_id,
     Slice<BlockTransferInfo>& block_transfer_info) {
-  CHECK(impl_ != nullptr);
+  CHECK(target_impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
   const uint32_t target_transferred =
-      impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+      target_impl_->transfer_kv_blocks(batch_id, block_transfer_info);
   const uint32_t draft_transferred =
       draft_impl_->transfer_kv_blocks(batch_id, block_transfer_info);
   return validate_paired_transfer_counts(target_transferred, draft_transferred);
@@ -872,7 +885,7 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
 bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
   const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
-  CHECK(impl_ != nullptr);
+  CHECK(target_impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
   if (kv_cache_transfer_ == nullptr) {
@@ -910,9 +923,9 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   }
 
   bool target_allocated = true;
-  const auto target_status = impl_->get_status();
+  const auto target_status = target_impl_->get_status();
   if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache_with_transfer(
+    target_allocated = target_impl_->allocate_kv_cache_with_transfer(
         kv_cache_transfer_, kv_cache_shape);
   } else {
     CHECK_EQ(target_status, WorkerImpl::Status::READY);
@@ -956,7 +969,7 @@ ForwardInput MTPWorkerImpl::update_input_by_last_step_output(
 
 void MTPWorkerImpl::prepare_work_before_execute(const ForwardInput& input,
                                                 ForwardInput& processed_input) {
-  // Composite skips CP prepare; leaves run it in run_llm_no_sync_impl.
+  // Composite skips CP prepare; leaves run it in run_worker_no_sync_impl.
   SpeculativeWorkerImpl::prepare_work_before_execute(input, processed_input);
 }
 
@@ -983,9 +996,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
   if (!input.input_params.meta.batch_forward_type.is_decode()) {
     ForwardInput target_prepared;
     ForwardInput draft_prepared;
-    auto output = run_llm_no_sync_impl(
-        *impl_, input, *prepare_stream_, *compute_stream_, target_prepared);
-    auto draft_output = run_llm_no_sync_impl(*draft_impl_,
+    auto output = run_worker_no_sync_impl(
+        *target_impl_, input, *prepare_stream_, *compute_stream_, target_prepared);
+    auto draft_output = run_worker_no_sync_impl(*draft_impl_,
                                              input,
                                              *prepare_stream_,
                                              *compute_stream_,
@@ -1020,7 +1033,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
       draft_extend_prepared = std::move(pending_draft_context_.prepared_input);
       pending_draft_context_ = PendingDraftContext();
     } else {
-      draft_outputs.emplace_back(run_llm_no_sync_impl(*draft_impl_,
+      draft_outputs.emplace_back(run_worker_no_sync_impl(*draft_impl_,
                                                       new_input,
                                                       *prepare_stream_,
                                                       *compute_stream_,
@@ -1029,7 +1042,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     }
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
-      draft_outputs.emplace_back(run_llm_no_sync_impl(*draft_impl_,
+      draft_outputs.emplace_back(run_worker_no_sync_impl(*draft_impl_,
                                                       input,
                                                       *prepare_stream_,
                                                       *compute_stream_,
@@ -1046,7 +1059,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
          new_input.input_params.parallel.raw_dp_global_token_nums) {
       token_num *= options_.num_speculative_tokens() + 1;
     }
-    ForwardOutput output = run_llm_no_sync_impl(*impl_,
+    ForwardOutput output = run_worker_no_sync_impl(*target_impl_,
                                                 new_input,
                                                 *prepare_stream_,
                                                 *compute_stream_,
@@ -1084,8 +1097,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
 
   // run the target model to get first token and hidden states
   ForwardOutput output =
-      run_llm_no_sync_impl(
-          *impl_, input, *prepare_stream_, *compute_stream_, target_prepared)
+      run_worker_no_sync_impl(
+          *target_impl_, input, *prepare_stream_, *compute_stream_, target_prepared)
           .value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
@@ -1096,6 +1109,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
 
   // prepare input for draft model
   auto& embeddings = output.sample_output.embeddings;
+  check_draft_input_embedding(embeddings, "prefill");
 
   {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
@@ -1124,7 +1138,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   }
   // generate kv cache for draft model
   timer.reset();
-  ForwardOutput draft_output = run_llm_no_sync_impl(*draft_impl_,
+  ForwardOutput draft_output = run_worker_no_sync_impl(*draft_impl_,
                                                     prefill_input,
                                                     *prepare_stream_,
                                                     *compute_stream_,
@@ -1477,7 +1491,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
           std::move(pending_draft_context_.prepared_input);
       pending_draft_context_ = PendingDraftContext();
     } else {
-      draft_output_opt = run_llm_no_sync_impl(*draft_impl_,
+      draft_output_opt = run_worker_no_sync_impl(*draft_impl_,
                                               current_draft_input,
                                               *compute_stream_,
                                               *compute_stream_,
@@ -1573,6 +1587,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     }
 
     const SampleOutput& last_output = draft_outputs.back().sample_output;
+    check_draft_input_embedding(last_output.embeddings, "decode");
     current_draft_input = next_step_input;
     set_token_ids_device_tensor(current_draft_input,
                                 last_output.next_tokens,
@@ -1873,7 +1888,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   ForwardInput target_prepared;
   fill_validate_input_from_draft_outputs(
       draft_outputs, validate_input, per_seq_val_tokens, *compute_stream_);
-  ForwardOutput target_output = run_llm_no_sync_impl(*impl_,
+  ForwardOutput target_output = run_worker_no_sync_impl(*target_impl_,
                                                      validate_input,
                                                      *compute_stream_,
                                                      *compute_stream_,
@@ -2389,7 +2404,7 @@ void MTPWorkerImpl::submit_pending_first_draft(
   pending_draft_context_.dp_global_batch_generations =
       batch_identity_input.input_params.parallel.dp_global_batch_generations;
   pending_draft_context_.output =
-      run_llm_no_sync_impl(*draft_impl_,
+      run_worker_no_sync_impl(*draft_impl_,
                            draft_input,
                            *compute_stream_,
                            *compute_stream_,
@@ -2980,7 +2995,11 @@ bool MTPWorkerImpl::prepare_static_mtp_graph_tasks_before_final_draft(
       .block_table_width = verify_block_table_width,
       .max_kv_seq_len = spec_verify_max_kv_seq_len,
   };
-  return impl_->prepare_static_mtp_graph_tasks(signal, *compute_stream_);
+  auto* llm_target = dynamic_cast<LLMWorkerImpl*>(target_impl_.get());
+  if (llm_target == nullptr) {
+    return false;
+  }
+  return llm_target->prepare_static_mtp_graph_tasks(signal, *compute_stream_);
 #else
   (void)input;
   return false;
@@ -3354,6 +3373,8 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   input_params.attention.rebuild_device_buffer(device_);
 
   input_params.embedding.input_embedding = torch::stack(expanded_embeddings);
+  check_draft_input_embedding(input_params.embedding.input_embedding,
+                              "decode extend");
 
   if (!input_params.parallel.dp_global_token_nums.empty()) {
     if (use_chunked_prefill) {
