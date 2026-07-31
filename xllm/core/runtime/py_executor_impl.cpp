@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,93 +13,116 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/runtime/py_executor_impl.h"
+#include "py_executor_impl.h"
 
 #include <glog/logging.h>
-#include <pybind11/pybind11.h>
-#include <torch/python.h>
+#include <pybind11/embed.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
 
 #include <memory>
-#include <optional>
 #include <vector>
 
 #include "common/metrics.h"
-#include "core/framework/config/execution_config.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
-#include "core/runtime/py_attention_metadata.h"
-#include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
-
-#if defined(USE_NPU)
-#include <torch_npu/csrc/core/npu/NPUStream.h>
-
-#include "platform/npu/npu_layer_synchronizer.h"
-#endif
 
 namespace py = pybind11;
 
 namespace xllm {
+
 namespace {
 
-thread_local PyCausalLM* active_py_causal_lm = nullptr;
+class AttentionMetadataView final {
+ public:
+  explicit AttentionMetadataView(
+      std::shared_ptr<layer::AttentionMetadata> metadata)
+      : metadata_(std::move(metadata)),
+        kv_seq_lens_host_(make_kv_seq_lens_host(metadata_)) {}
 
-void register_xllm_runtime_module(py::module_& m) {
-  register_attention_metadata_views(m);
+  const torch::Tensor& slot_mapping() const { return metadata_->slot_mapping; }
+  const torch::Tensor& paged_kv_indptr() const {
+    return metadata_->paged_kv_indptr;
+  }
+  const torch::Tensor& paged_kv_indices() const {
+    return metadata_->paged_kv_indices;
+  }
+  const torch::Tensor& paged_kv_last_page_len() const {
+    return metadata_->paged_kv_last_page_len;
+  }
+  py::object qo_indptr() const {
+    if (!metadata_->qo_indptr.has_value() || !metadata_->qo_indptr->defined()) {
+      return py::none();
+    }
+    return py::cast(*metadata_->qo_indptr);
+  }
+  py::object q_cu_seq_lens() const {
+    return optional_tensor(metadata_->q_cu_seq_lens);
+  }
+  py::object kv_cu_seq_lens() const {
+    return optional_tensor(metadata_->kv_cu_seq_lens);
+  }
+  py::object kv_seq_lens_host() const {
+    return optional_tensor(kv_seq_lens_host_);
+  }
+  py::object block_table() const {
+    return optional_tensor(metadata_->block_table);
+  }
+  py::object kv_seq_lens() const {
+    return optional_tensor(metadata_->kv_seq_lens);
+  }
+  bool is_prefill() const { return metadata_->is_prefill; }
+  bool is_chunked_prefill() const { return metadata_->is_chunked_prefill; }
 
-  m.def("tp_all_reduce", [](torch::Tensor tensor) {
-    if (active_py_causal_lm != nullptr) {
-      active_py_causal_lm->tp_all_reduce(tensor);
+ private:
+  static torch::Tensor make_kv_seq_lens_host(
+      const std::shared_ptr<layer::AttentionMetadata>& metadata) {
+    if (metadata->kv_seq_lens_vec.empty()) {
+      return torch::Tensor();
     }
-    return tensor;
-  });
-  m.def("tp_all_gather", [](torch::Tensor tensor, int64_t dim) {
-    if (active_py_causal_lm != nullptr) {
-      return active_py_causal_lm->tp_all_gather(tensor, dim);
-    }
-    return tensor;
-  });
-  m.def("moe_tp_all_reduce", [](torch::Tensor tensor) {
-    if (active_py_causal_lm != nullptr) {
-      active_py_causal_lm->moe_tp_all_reduce(tensor);
-    }
-    return tensor;
-  });
-  m.def("moe_ep_all_reduce", [](torch::Tensor tensor) {
-    if (active_py_causal_lm != nullptr) {
-      active_py_causal_lm->moe_ep_all_reduce(tensor);
-    }
-    return tensor;
-  });
 
-#if defined(USE_NPU)
-  py::class_<NPULayerSynchronizerImpl,
-             std::shared_ptr<NPULayerSynchronizerImpl>>(m, "LayerSynchronizer")
-      .def("record_event",
-           [](NPULayerSynchronizerImpl& self, int64_t layer_id) {
-             int32_t device_id = static_cast<int32_t>(
-                 c10_npu::getCurrentNPUStream().device_index());
-             return self.record_event(layer_id, device_id);
-           });
-#endif
-}
-
-void ensure_xllm_runtime_module() {
-  py::module_ sys = py::module_::import("sys");
-  py::dict modules = py::reinterpret_borrow<py::dict>(sys.attr("modules"));
-  const py::str module_name("xllm_runtime");
-  if (modules.contains(module_name)) {
-    return;
+    std::shared_ptr<layer::AttentionMetadata> owner = metadata;
+    return torch::from_blob(
+        metadata->kv_seq_lens_vec.data(),
+        {static_cast<int64_t>(metadata->kv_seq_lens_vec.size())},
+        [owner = std::move(owner)](void*) mutable { owner.reset(); },
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
   }
 
-  py::object module_object =
-      py::module_::import("types").attr("ModuleType")(module_name);
-  py::module_ module = py::reinterpret_borrow<py::module_>(module_object);
-  register_xllm_runtime_module(module);
-  modules[module_name] = module;
-}
+  static py::object optional_tensor(const torch::Tensor& tensor) {
+    return tensor.defined() ? py::cast(tensor) : py::none();
+  }
+
+  std::shared_ptr<layer::AttentionMetadata> metadata_;
+  torch::Tensor kv_seq_lens_host_;
+};
 
 }  // namespace
+
+PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
+  py::class_<AttentionMetadataView>(m, "AttentionMetadataView")
+      .def_property_readonly("slot_mapping",
+                             &AttentionMetadataView::slot_mapping)
+      .def_property_readonly("paged_kv_indptr",
+                             &AttentionMetadataView::paged_kv_indptr)
+      .def_property_readonly("paged_kv_indices",
+                             &AttentionMetadataView::paged_kv_indices)
+      .def_property_readonly("paged_kv_last_page_len",
+                             &AttentionMetadataView::paged_kv_last_page_len)
+      .def_property_readonly("qo_indptr", &AttentionMetadataView::qo_indptr)
+      .def_property_readonly("q_cu_seq_lens",
+                             &AttentionMetadataView::q_cu_seq_lens)
+      .def_property_readonly("kv_cu_seq_lens",
+                             &AttentionMetadataView::kv_cu_seq_lens)
+      .def_property_readonly("kv_seq_lens_host",
+                             &AttentionMetadataView::kv_seq_lens_host)
+      .def_property_readonly("block_table", &AttentionMetadataView::block_table)
+      .def_property_readonly("kv_seq_lens", &AttentionMetadataView::kv_seq_lens)
+      .def_property_readonly("is_prefill", &AttentionMetadataView::is_prefill)
+      .def_property_readonly("is_chunked_prefill",
+                             &AttentionMetadataView::is_chunked_prefill);
+}
 
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                const ModelArgs& args,
@@ -107,28 +130,23 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                const runtime::Options& options)
     : py_causal_lm_(dynamic_cast<PyCausalLM*>(model)),
       args_(args),
-      device_(device),
       options_(options),
       enable_mla_(args.enable_mla()) {
   CHECK(py_causal_lm_ != nullptr) << "PyExecutorImpl requires PyCausalLM";
 
   py::gil_scoped_acquire gil;
-  ensure_xllm_runtime_module();
+  py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
-  py_executor_ = executor_module.attr("ModelExecutor")(
-      py_causal_lm_->python_model(),
-      py_causal_lm_->config_dict(),
-      options_.max_seqs_per_batch(),
-      options_.num_decoding_tokens(),
-      ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit());
+  py_executor_ =
+      executor_module.attr("ModelExecutor")(py_causal_lm_->python_model(),
+                                            py_causal_lm_->config_dict(),
+                                            options_.max_seqs_per_batch());
 }
 
 PyExecutorImpl::~PyExecutorImpl() {
-  if (active_py_causal_lm == py_causal_lm_) {
-    active_py_causal_lm = nullptr;
-  }
-  clear_python_object(py_executor_);
+  py::gil_scoped_acquire gil;
+  py_executor_ = py::object();
 }
 
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {
@@ -142,15 +160,13 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                 const ModelInputParams& params) {
   torch::NoGradGuard no_grad;
   COUNTER_INC(num_model_execution_total_eager);
-  active_py_causal_lm = py_causal_lm_;
 
   // Build or reuse attention metadata.
   std::shared_ptr<layer::AttentionMetadata> attn_metadata =
       params.attn_metadata;
   if (!attn_metadata) {
     attn_metadata = std::make_shared<layer::AttentionMetadata>(
-        layer::AttentionMetadataBuilder::build(
-            params, enable_mla_, std::nullopt, device_));
+        layer::AttentionMetadataBuilder::build(params, enable_mla_));
   }
 
   py::gil_scoped_acquire gil;
@@ -160,22 +176,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   if (!kv_bound_) {
     py::list kv_caches_py;
     for (auto& kv : kv_caches) {
-      // Slot order must match ``LayerCache`` on the Python side.
-      // Keep this order synchronized with LayerCache/_LAYER_CACHE_SLOTS.
-      // Generic caches use the first five entries; DeepSeek-V4 uses the
-      // trailing six entries returned by KVCache's DSV4 getters.
-      kv_caches_py.append(
-          py::make_tuple(optional_tensor(kv.get_k_cache()),
-                         optional_tensor(kv.get_v_cache()),
-                         optional_tensor(kv.get_index_cache()),
-                         optional_tensor(kv.get_conv_cache()),
-                         optional_tensor(kv.get_ssm_cache()),
-                         optional_tensor(kv.get_swa_cache()),
-                         optional_tensor(kv.get_compress_kv_state()),
-                         optional_tensor(kv.get_compress_score_state()),
-                         optional_tensor(kv.get_compress_index_kv_state()),
-                         optional_tensor(kv.get_compress_index_score_state()),
-                         optional_tensor(kv.get_indexer_cache_scale())));
+      kv_caches_py.append(py::make_tuple(
+          kv.get_k_cache(), kv.get_v_cache(), kv.get_index_cache()));
     }
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
     kv_bound_ = true;
@@ -185,103 +187,11 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         << "KV cache layer count changed after initial bind";
   }
 
-  py::object py_metadata =
-      py::cast(PyAttentionMetadataView(attn_metadata, params));
-  py::object input_embedding =
-      optional_tensor(params.embedding.input_embedding);
+  py::object py_metadata = py::cast(AttentionMetadataView(attn_metadata));
 
-  // --- VLM: vision encode + embedding merge on image/video prefill steps ---
-  // On steps carrying multimodal input, ``params.multimodal.mm_data`` holds the
-  // batched ``pixel_values`` + ``image_grid_thw`` (still images) and/or
-  // ``pixel_values_videos`` + ``video_grid_thw`` (video) — same accessors the
-  // C++ Qwen3-VL base uses in qwen3_vl_base.h. Drive the Python model's
-  // ``encode`` -> ``get_input_embeddings`` pipeline: the latter scatters each
-  // modality's embeddings at its placeholder-token positions and sets
-  // ``model._inputs_embeds`` / ``deepstack_input_embeds`` for the runner-driven
-  // ``Qwen3VLModel.forward``. Decode steps carry no mm_data, so the attributes
-  // stay clear and the aclgraph embed path is used.
-  //
-  // NOTE: this scatters the FULL image/video embedding into the current
-  // forward's tokens, so it assumes every multimodal token is in this batch
-  // (i.e. enable_chunked_prefill=False). Chunked prefill — where a chunk
-  // boundary can land inside an item's token span — needs item-level scatter
-  // (reuse EncoderEmbeddingGatherVisitor + the NPU backend's paged mixed-batch
-  // attention, both tracked for a follow-up PR).
-  auto& mm_data = params.multimodal.mm_data;
-  if (mm_data.valid()) {
-    torch::Tensor pixel_values;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values")) {
-      pixel_values = res.value();
-    }
-    torch::Tensor image_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("image_grid_thw")) {
-      image_grid_thw = res.value();
-    }
-    torch::Tensor pixel_values_videos;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values_videos")) {
-      pixel_values_videos = res.value();
-    }
-    torch::Tensor video_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("video_grid_thw")) {
-      video_grid_thw = res.value();
-    }
-
-    if (pixel_values.defined() || pixel_values_videos.defined()) {
-      py::object top_model = py_causal_lm_->python_model();
-      // encode() moves the tensors onto device internally.
-      py::object image_embeds = py::none();
-      if (pixel_values.defined() && image_grid_thw.defined()) {
-        image_embeds = top_model.attr("encode")(pixel_values, image_grid_thw);
-      }
-      py::object video_embeds = py::none();
-      if (pixel_values_videos.defined() && video_grid_thw.defined()) {
-        video_embeds =
-            top_model.attr("encode")(pixel_values_videos, video_grid_thw);
-      }
-      // Sets top_model.model._inputs_embeds + deepstack_input_embeds.
-      top_model.attr("get_input_embeddings")(
-          tokens, image_embeds, video_embeds);
-    }
-  }
-
-  // --- mRoPE: collapse [3, N] decode positions to 1-D ---
-  // Only PURE decode collapses to 1-D: decode rows are identical
-  // (batch_input_builder get_mrope_positions), and mRoPE(p,p,p) == standard
-  // RoPE at p, so a single row feeds the captured aclgraph's 1-D
-  // static_positions unchanged. Chunked/mixed prefill (is_prefill=false but
-  // is_chunked_prefill=true) still needs the full [3, N] for the Python mRoPE
-  // path, so it is excluded here. The 2-D shape itself is the mRoPE signal:
-  // non-mRoPE models never receive 2-D positions, so no config flag is needed.
-  torch::Tensor positions_arg = positions;
-  if (positions.dim() == 2 && !attn_metadata->is_prefill &&
-      !attn_metadata->is_chunked_prefill) {
-    positions_arg = positions.slice(/*dim=*/0, /*start=*/0, /*end=*/1)
-                        .squeeze(0)
-                        .contiguous();
-  }
-
-  py::object py_sync = py::none();
-#if defined(USE_NPU)
-  if (params.parallel.layer_synchronizer) {
-    py_sync = py::cast(params.parallel.layer_synchronizer);
-  }
-#endif
-
-  // Execute: one C++ -> Python call per step. input_embedding stays None for
-  // the Qwen3-VL python path (embeddings are merged via the attribute set by
-  // get_input_embeddings above), so the runner takes the 2-arg model() branch
-  // and Qwen3VLModel.forward reads _inputs_embeds. positions_arg carries the
-  // mRoPE [3,N]->1-D decode collapse.
-  py::object hidden_obj = py_executor_.attr("execute")(
-      tokens, positions_arg, py_metadata, input_embedding, py_sync);
-  if (py::isinstance<py::tuple>(hidden_obj)) {
-    py::tuple output = hidden_obj.cast<py::tuple>();
-    CHECK_EQ(output.size(), 2) << "Python model tuple output must be "
-                                  "(hidden_states, aux_hidden_states)";
-    return ModelOutput(output[0].cast<torch::Tensor>(),
-                       torch::Tensor(),
-                       output[1].cast<torch::Tensor>());
-  }
+  // Execute: one C++ -> Python call per step.
+  py::object hidden_obj =
+      py_executor_.attr("execute")(tokens, positions, py_metadata);
   return ModelOutput(hidden_obj.cast<torch::Tensor>());
 }
 
