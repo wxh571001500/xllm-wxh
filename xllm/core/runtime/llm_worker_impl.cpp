@@ -113,8 +113,12 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
 
   // Dont find model in causal models
   CHECK(model_ != nullptr) << "Failed to create model.";
-  model_executor_ = std::make_unique<Executor>(
-      model_.get(), context.get_model_args(), device_, options_);
+  model_executor_ =
+      std::make_unique<Executor>(model_.get(),
+                                 context.get_model_args(),
+                                 device_,
+                                 options_,
+                                 context.get_parallel_args().mapping_data());
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     eplb_executor_ = std::make_unique<EplbExecutor>(*model_, device_);

@@ -17,27 +17,39 @@ limitations under the License.
 
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
+#include <string>
 #include "executor_impl_factory.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 
 namespace xllm {
 
+namespace {
+
+bool is_eagle3_model_type(const std::string& model_type) {
+  return model_type == "qwen3_eagle3" || model_type == "kimi_k25_eagle3";
+}
+
+}  // namespace
+
 Executor::Executor(CausalLM* model,
                    const ModelArgs& args,
                    const torch::Device& device,
-                   const runtime::Options& options) {
+                   const runtime::Options& options,
+                   const nlohmann::json& mapping_npu) {
   const auto& model_config = ModelConfig::get_instance();
   std::string backend;
   if (ModelConfig::is_python_model_impl(model_config.model_impl())) {
     backend = "python";
-  } else if (options.backend() != "vlm" && options.enable_graph()) {
+  } else if (options.backend() != "vlm" && options.enable_graph() &&
+             !is_eagle3_model_type(args.model_type())) {
     backend = Platform::type_str();
   } else {
     backend = options.backend();
   }
   impl_ = ExecutorImplFactory::get_instance().create_executor_impl(
       model, args, device, options, backend);
+  impl_->set_parallel_mapping(mapping_npu);
 }
 
 ForwardInput Executor::prepare_inputs(Batch& batch) {

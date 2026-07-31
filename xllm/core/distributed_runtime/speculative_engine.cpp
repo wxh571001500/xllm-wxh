@@ -199,16 +199,18 @@ int64_t SpeculativeEngine::calculate_kv_cache(
   const int64_t draft_full_attention_slot_size =
       draft_kv_cache_cap.slot_size() + draft_kv_cache_cap.index_slot_size() +
       draft_kv_cache_cap.scale_slot_size();
-  const bool draft_body_uses_tp1 = options_.enable_mtp_draft_body_tp1();
-  if (!draft_body_uses_tp1) {
+  const bool draft_uses_own_kv_cache_shape =
+      options_.enable_mtp_draft_body_tp1() ||
+      should_skip_external_draft_kv_cache();
+  if (!draft_uses_own_kv_cache_shape) {
     CHECK_LE(draft_full_attention_slot_size, target_full_attention_slot_size)
         << "draft full-attention kv cache slot size must not exceed target "
            "slot size because the current speculative worker allocates draft "
            "KV tensors with the target KVCacheShape";
   }
   const int64_t draft_allocated_full_attention_slot_size =
-      draft_body_uses_tp1 ? draft_full_attention_slot_size
-                          : target_full_attention_slot_size;
+      draft_uses_own_kv_cache_shape ? draft_full_attention_slot_size
+                                    : target_full_attention_slot_size;
   CHECK_GT(target_full_attention_slot_size, 0)
       << "target full-attention kv cache slot size must be greater than 0";
   CHECK_GT(draft_allocated_full_attention_slot_size, 0)
@@ -225,7 +227,7 @@ int64_t SpeculativeEngine::calculate_kv_cache(
        target_kv_cache_cap.num_indexer_layers() *
            target_kv_cache_cap.index_slot_size());
   const int64_t draft_full_attention_block_size_in_bytes =
-      draft_body_uses_tp1
+      draft_uses_own_kv_cache_shape
           ? block_size * (draft_full_attention_layers *
                               (draft_kv_cache_cap.slot_size() +
                                draft_kv_cache_cap.scale_slot_size()) +

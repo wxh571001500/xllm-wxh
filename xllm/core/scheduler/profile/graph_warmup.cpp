@@ -71,15 +71,38 @@ bool skip_graph_bucket(int32_t bucket, int32_t dp_size) {
   return bucket < dp_size;
 }
 
+bool skip_graph_bucket_over_batch_limit(int32_t bucket,
+                                        int32_t dp_size,
+                                        int32_t decode_batch_size_limit) {
+  CHECK_GT(bucket, 0);
+  CHECK_GT(dp_size, 0);
+  if (decode_batch_size_limit <= 0) {
+    return false;
+  }
+  // Mirror AclGraphExecutorImpl::run(): global_batch_size is the per-DP-rank
+  // batch size (num_decoding_tokens cancels out between the token count and the
+  // divisor), so a bucket of `bucket` global sequences spread over `dp_size`
+  // ranks yields ceil(bucket / dp_size). Above the limit the runtime executes
+  // eagerly, so this bucket's graph would never be replayed.
+  const int32_t global_batch_size = (bucket + dp_size - 1) / dp_size;
+  return global_batch_size > decode_batch_size_limit;
+}
+
 std::vector<int32_t> graph_decode_buckets(int32_t max_seqs_per_batch,
-                                          int32_t dp_size) {
+                                          int32_t dp_size,
+                                          int32_t decode_batch_size_limit) {
   std::vector<int32_t> buckets = graph_warmup_buckets(max_seqs_per_batch);
   std::vector<int32_t> decode_buckets;
   decode_buckets.reserve(buckets.size());
   for (int32_t bucket : buckets) {
-    if (!skip_graph_bucket(bucket, dp_size)) {
-      decode_buckets.emplace_back(bucket);
+    if (skip_graph_bucket(bucket, dp_size)) {
+      continue;
     }
+    if (skip_graph_bucket_over_batch_limit(
+            bucket, dp_size, decode_batch_size_limit)) {
+      continue;
+    }
+    decode_buckets.emplace_back(bucket);
   }
 
   return decode_buckets;
