@@ -815,7 +815,7 @@ struct ParallelInput {
     out.dp_global_token_nums = dp_global_token_nums;
     out.dp_global_kv_max_seq_lens = dp_global_kv_max_seq_lens;
     out.dp_is_decode = dp_is_decode;
-    out.dp_ep_padding_data = dp_ep_padding_data;
+    out.dp_ep_padding_data = dp_ep_padding_data.to(device);
     out.cp_ep_padding_data
         .attn_padding_idx(
             safe_to(cp_ep_padding_data.attn_padding_idx(), device, true))

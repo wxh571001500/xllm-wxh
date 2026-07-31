@@ -164,6 +164,12 @@ void clear_ready_events(ForwardInput& input) {
   input.metadata_ready_event.reset();
 }
 
+void clear_mla_prefixcache_workspace(ForwardInput& input) {
+  auto& attention = input.input_params.attention.device;
+  attention.history_compressed_kv = torch::Tensor();
+  attention.history_k_rope = torch::Tensor();
+}
+
 bool should_reuse_mtp_topk_indices(const ModelArgs& model_args,
                                    bool enable_schedule_overlap) {
   const bool reuse_enabled = model_args.index_share_for_mtp_iteration() &&
@@ -751,6 +757,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
   // Kimi K25 Eagle3 re-enters target/draft workers several times per step.
   // Wait for ATB to finish before the next prepare/execute mutates layer state.
   synchronize_kimi_eagle3_npu_forward();
+  if (is_kimi_k25_eagle3_pair()) {
+    clear_mla_prefixcache_workspace(processed_input);
+    if (output.has_value() && output->retained_input != nullptr) {
+      clear_mla_prefixcache_workspace(*output->retained_input);
+    }
+  }
   return output;
 }
 
@@ -1186,7 +1198,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   }
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
-  return run_validate(input, draft_outputs, validate_input);
+  std::optional<ForwardOutput> validate_result =
+      run_validate(input, draft_outputs, validate_input);
+  return validate_result;
 }
 
 void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
@@ -1626,8 +1640,11 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   const bool use_chunked_prefill =
       !is_kimi_k25_eagle3_pair() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+  static const bool kimi_eagle3_sync_dp_rows =
+      util::get_bool_env("XLLM_KIMI_EAGLE3_SYNC_DP_ROWS", false);
   const bool is_kimi_k25_eagle3_dp_decode =
-      target_impl_ != nullptr && draft_impl_ != nullptr &&
+      !kimi_eagle3_sync_dp_rows && target_impl_ != nullptr &&
+      draft_impl_ != nullptr &&
       is_kimi_k25_eagle3_draft(
           target_impl_->context_.get_model_args().model_type(),
           draft_impl_->context_.get_model_args().model_type()) &&

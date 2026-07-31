@@ -35,6 +35,25 @@ void DpEpPaddingData::set_placeholder(const torch::Tensor& placeholder) {
   expert_array_ = placeholder;
 }
 
+DpEpPaddingData DpEpPaddingData::to(const torch::Device& device) const {
+  DpEpPaddingData out;
+  out.attn_padding_idx(safe_to(attn_padding_idx(), device, true))
+      .attn_unpadding_idx(safe_to(attn_unpadding_idx(), device, true))
+      .ffn_padding_idx(safe_to(ffn_padding_idx(), device, true))
+      .ffn_unpadding_idx(safe_to(ffn_unpadding_idx(), device, true))
+      .lm_head_skip_padding_token_indices(
+          safe_to(lm_head_skip_padding_token_indices(), device, true))
+      .gather_prenorm_idx(safe_to(gather_prenorm_idx(), device, true))
+      .padding_idx(safe_to(padding_idx(), device, true))
+      .un_padding_idx(safe_to(un_padding_idx(), device, true))
+      .dynamic_ep_idx(safe_to(dynamic_ep_idx(), device, true))
+      .moe_idx(safe_to(moe_idx(), device, true))
+      .expert_array(safe_to(expert_array(), device, true))
+      .post_lmhead_gather_indices(
+          safe_to(post_lmhead_gather_indices(), device, true));
+  return out;
+}
+
 DpEpPadding::DpEpPadding(torch::Tensor token_size_per_dp_group,
                          int32_t num_experts_per_tok,
                          const nlohmann::json& mapping_npu,

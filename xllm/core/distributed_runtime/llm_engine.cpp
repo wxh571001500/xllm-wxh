@@ -22,6 +22,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <boost/algorithm/string.hpp>
 #include <chrono>
 #include <cstdint>
@@ -52,7 +53,6 @@ limitations under the License.
 #include "runtime/params_utils.h"
 #include "runtime/worker.h"
 #include "server/xllm_server_registry.h"
-#include "util/env_var.h"
 #include "util/pretty_print.h"
 #include "util/tensor_helper.h"
 #include "util/utils.h"
@@ -918,6 +918,18 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
       << "The processed forward inputs size " << forward_inputs.size()
       << " is not equal to dp size " << dp_size_ << ".";
 
+  // Wrap each DP-rank input in a shared_ptr once, so fanning it out to the
+  // dp_local_size_ TP peers is a refcount bump rather than a deep copy of
+  // ForwardInput on this (engine) thread. Copying serially per worker would
+  // stagger the sends and misalign the workers' forward() start times, showing
+  // up as long waits at the post-word-embedding all-gather.
+  std::vector<std::shared_ptr<const ForwardInput>> shared_inputs;
+  shared_inputs.reserve(forward_inputs.size());
+  for (auto& forward_input : forward_inputs) {
+    shared_inputs.emplace_back(
+        std::make_shared<const ForwardInput>(std::move(forward_input)));
+  }
+
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
@@ -926,7 +938,7 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
     const int32_t dp_rank = worker_rank / dp_local_size_;
     futures.emplace_back(worker_clients_[worker_rank]->step_remote_async(
-        forward_inputs[dp_rank]));
+        shared_inputs[dp_rank]));
   }
 
   // wait for the all future to complete

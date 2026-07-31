@@ -33,6 +33,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
@@ -47,7 +48,10 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-constexpr size_t kMaxMediaPrefillRequestsPerBatch = 2;
+size_t max_media_prefill_requests_per_batch() {
+  return static_cast<size_t>(
+      ModelConfig::get_instance().max_media_prefill_requests_per_batch());
+}
 
 size_t estimate_decode_extra_blocks(Sequence* sequence,
                                     size_t updated_num_tokens,
@@ -389,8 +393,53 @@ size_t ContinuousScheduler::count_media_prefill_requests_in_batch() const {
   return count;
 }
 
+int32_t ContinuousScheduler::select_media_prefill_dp_rank(
+    const Sequence* sequence) const {
+  const size_t cap = max_media_prefill_requests_per_batch();
+  const int32_t dp_size = options_.dp_size();
+  std::vector<size_t> per_dp_counts(dp_size, 0);
+  for (const auto& request : running_requests_) {
+    if (!request_has_media_prefill(request)) {
+      continue;
+    }
+    // A request counts once on every DP rank that owns one of its sequences.
+    std::vector<bool> counted_dp_ranks(dp_size, false);
+    for (const auto& running_sequence : request->sequences()) {
+      if (!running_sequence || !running_sequence->is_prefill_stage()) {
+        continue;
+      }
+      const int32_t dp_rank = running_sequence->dp_rank();
+      if (dp_rank >= 0 && dp_rank < dp_size &&
+          !counted_dp_ranks[dp_rank]) {
+        ++per_dp_counts[dp_rank];
+        counted_dp_ranks[dp_rank] = true;
+      }
+    }
+  }
+
+  const int32_t current_dp_rank = sequence->dp_rank();
+  if (current_dp_rank >= 0 && current_dp_rank < dp_size) {
+    return per_dp_counts[current_dp_rank] < cap ? current_dp_rank : -1;
+  }
+
+  const std::vector<size_t> free_blocks = kv_cache_manager_->num_free_blocks();
+  int32_t selected_dp_rank = -1;
+  size_t selected_free_blocks = 0;
+  for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
+    if (static_cast<size_t>(dp_rank) >= free_blocks.size() ||
+        per_dp_counts[dp_rank] >= cap) {
+      continue;
+    }
+    if (selected_dp_rank < 0 || free_blocks[dp_rank] > selected_free_blocks) {
+      selected_dp_rank = dp_rank;
+      selected_free_blocks = free_blocks[dp_rank];
+    }
+  }
+  return selected_dp_rank;
+}
+
 bool ContinuousScheduler::should_limit_media_prefill_requests() const {
-  return engine_ != nullptr && engine_->model_args().model_type() == "kimi_k25";
+  return max_media_prefill_requests_per_batch() > 0;
 }
 
 void ContinuousScheduler::handle_prefill_requests(
@@ -429,12 +478,6 @@ void ContinuousScheduler::handle_prefill_requests(
     }
 
     std::shared_ptr<Request> request(waiting_priority_queue->top());
-    if (should_limit_media_prefill_requests() &&
-        request_has_media_prefill(request) &&
-        count_media_prefill_requests_in_batch() >=
-            kMaxMediaPrefillRequestsPerBatch) {
-      break;
-    }
     if (request->finished() || request->cancelled()) {
       clear_mtp_bootstrap(request.get());
       kv_cache_manager_->deallocate(request.get());
@@ -474,6 +517,17 @@ void ContinuousScheduler::handle_prefill_requests(
     for (auto& prefill_sequence : request->sequences()) {
       if (prefill_sequence->finished()) {
         continue;
+      }
+
+      if (should_limit_media_prefill_requests() &&
+          request_has_media_prefill(request)) {
+        const int32_t dp_rank =
+            select_media_prefill_dp_rank(prefill_sequence.get());
+        if (dp_rank < 0) {
+          can_schedule = false;
+          break;
+        }
+        prefill_sequence->set_dp_rank(dp_rank);
       }
 
       // FIXME: use actual num_tokens to handle

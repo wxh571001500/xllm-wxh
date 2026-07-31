@@ -27,6 +27,8 @@ namespace xllm {
 struct DpEpPaddingData {
   void set_placeholder(const torch::Tensor& placeholder);
 
+  DpEpPaddingData to(const torch::Device& device) const;
+
   PROPERTY(torch::Tensor, attn_padding_idx);
 
   PROPERTY(torch::Tensor, attn_unpadding_idx);

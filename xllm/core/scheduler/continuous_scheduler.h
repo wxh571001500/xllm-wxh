@@ -322,6 +322,7 @@ class ContinuousScheduler : public Scheduler {
       RequestPriorityQueue* running_queue);
   bool request_has_media_prefill(const std::shared_ptr<Request>& request) const;
   size_t count_media_prefill_requests_in_batch() const;
+  int32_t select_media_prefill_dp_rank(const Sequence* sequence) const;
   bool should_limit_media_prefill_requests() const;
   void get_latency_budget_and_request_order(
       RequestPriorityQueue* request_priority_queue,
