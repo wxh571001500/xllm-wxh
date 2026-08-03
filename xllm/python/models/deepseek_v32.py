@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch_npu  # noqa: F401
 
 from xllm.python import ops
+from xllm.python.attention.backend import MlaIndexContext
 from xllm.python.layers import (
     Attention,
     ColumnParallelLinear,
@@ -481,9 +482,10 @@ class DeepseekV3MLAAttention(Attention):
             torch.empty(num_heads, kv_lora, v_head, dtype=dtype, device=device),
             persistent=False,
         )
-        self.is_v32 = cfg.index_topk > 0
-        if self.is_v32:
-            self.indexer = DeepseekV3Indexer(cfg, dtype, device)
+        self.indexer: DeepseekV3Indexer | None = (
+            DeepseekV3Indexer(cfg, dtype, device) if cfg.index_topk > 0 else None
+        )
+        if self.indexer is not None:
             self.indexer.rotary = self.rotary
 
     def process_weights_after_loading(self) -> None:
@@ -525,24 +527,9 @@ class DeepseekV3MLAAttention(Attention):
         q_c = self.q_a_layernorm(q_a)
         backend = get_forward_context().attention_backend
         topk = None
-        if self.is_v32:
-            metadata = backend._metadata
-            _, _, index_cache = backend._kv_caches[self.layer_id]
-            kv_seq_lens = metadata.kv_seq_lens
-            batch = kv_seq_lens.size(0)
-            actual_seq_kv = kv_seq_lens.to(torch.int32).to(hidden.device)
-            if metadata.q_cu_seq_lens is not None:
-                cu = metadata.q_cu_seq_lens
-                actual_seq_q = cu[1:].to(torch.int32).to(hidden.device)
-            else:
-                actual_seq_q = torch.arange(
-                    1, batch + 1, dtype=torch.int32, device=hidden.device
-                )
-            topk = self.indexer.select_qli(
-                hidden, q_c, positions, index_cache,
-                metadata.slot_mapping, actual_seq_q, actual_seq_kv,
-                metadata.block_table,
-            )
+        if self.indexer is not None:
+            ctx = backend.mla_index_context(self)
+            topk = self.indexer.select_qli(hidden, q_c, positions, ctx)
         q = self.q_b_proj(q_c)
         q = q.view(
             num_tokens,
@@ -602,8 +589,13 @@ class DeepseekV3Indexer(nn.Module):
                                    dtype=dtype, device=device)
         self.rotary = None
 
-    def select_qli(self, hidden, qr, positions, index_cache, slot_mapping,
-                   actual_seq_q, actual_seq_kv, block_table):
+    def select_qli(
+        self,
+        hidden: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: MlaIndexContext,
+    ) -> torch.Tensor:
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -628,14 +620,14 @@ class DeepseekV3Indexer(nn.Module):
         k_pe = torch.cat([ko1, ko2], dim=-1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
-        if index_cache is not None and slot_mapping is not None:
-            k_view = index_cache.view(-1, index_cache.size(-1))
+        if ctx.index_cache is not None and ctx.slot_mapping is not None:
+            k_view = ctx.index_cache.view(-1, ctx.index_cache.size(-1))
             ops.scatter_nd_update(
-                k_view, slot_mapping.reshape(-1, 1).clamp_min(0), k
+                k_view, ctx.slot_mapping.reshape(-1, 1).clamp_min(0), k
             )
         topk = ops.lightning_indexer(
-            q, index_cache, weights,
-            actual_seq_q, actual_seq_kv, block_table,
+            q, ctx.index_cache, weights,
+            ctx.actual_seq_q, ctx.actual_seq_kv, ctx.block_table,
             "TND", "PA_BSND", self.topk, 3,
             9223372036854775807, 9223372036854775807,
             False,
