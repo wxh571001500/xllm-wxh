@@ -44,6 +44,7 @@ from xllm.python.ops.collectives import (
     init_tp_group,
     tp_rank,
 )
+from xllm.python.ops.vision import encoder_attention
 
 __all__ = [
     "rms_norm",
@@ -62,4 +63,5 @@ __all__ = [
     "all_gather",
     "init_tp_group",
     "tp_rank",
+    "encoder_attention",
 ]
