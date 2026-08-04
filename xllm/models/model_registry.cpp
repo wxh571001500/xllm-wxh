@@ -20,13 +20,18 @@ limitations under the License.
 
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
+#include <vector>
 
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/util/dit_model_discovery.h"
 #include "llm/py_causal_lm.h"
+#include "models/vlm/py_causal_vlm.h"
 #include "models.h"
+#include "processors/kimi25_image_processor.h"
+#include "processors/multimodal_processor.h"
 
 namespace {
 
@@ -63,6 +68,115 @@ namespace {
 namespace xllm {
 
 namespace {
+
+using KimiK3MultimodalProcessor =
+    MultimodalProcessor<KimiK25PromptProcessor, KimiK25ImageProcessor>;
+
+REGISTER_MULTIMODAL_PROCESSOR(kimi_k3, KimiK3MultimodalProcessor);
+const bool kimi_k3_python_vlm_registered = []() {
+  ModelRegistry::register_model_backend("kimi_k3", "vlm");
+  return true;
+}();
+
+REGISTER_MODEL_ARGS(kimi_k3, [&] {
+  LOAD_ARG_OR(model_type, "model_type", "kimi_k3");
+  LOAD_ARG_OR_FUNC(dtype, "dtype", [&] {
+    return json.value_or<std::string>("torch_dtype", "bfloat16");
+  });
+
+  LOAD_ARG_OR(n_layers, "text_config.num_hidden_layers", 93);
+  LOAD_ARG_OR(hidden_size, "text_config.hidden_size", 7168);
+  SET_ARG(head_dim, 1);
+  SET_ARG(n_heads, 1);
+  SET_ARG(n_kv_heads, std::optional<int64_t>(1));
+  LOAD_ARG_OR(vocab_size, "text_config.vocab_size", 163840);
+  LOAD_ARG_OR(max_position_embeddings,
+              "text_config.max_position_embeddings",
+              1048576);
+  LOAD_ARG_OR(eos_token_id, "text_config.eos_token_id", 163586);
+  LOAD_ARG_OR(pad_token_id, "text_config.pad_token_id", 163839);
+
+  LOAD_ARG_OR(mm_num_channels, "vision_config.in_chans", 3);
+  LOAD_ARG_OR(mm_patch_size, "vision_config.patch_size", 14);
+  LOAD_ARG_OR(mm_hidden_size, "vision_config.vt_hidden_size", 1024);
+  LOAD_ARG_OR(mm_intermediate_size,
+              "vision_config.vt_intermediate_size",
+              4096);
+  LOAD_ARG_OR(mm_num_attention_heads,
+              "vision_config.vt_num_attention_heads",
+              12);
+  LOAD_ARG_OR(mm_num_hidden_layers,
+              "vision_config.vt_num_hidden_layers",
+              27);
+  LOAD_ARG_OR_FUNC(mm_projection_dim, "vision_config.text_hidden_size", [&] {
+    return json.value_or<int64_t>("text_config.hidden_size", 7168);
+  });
+  LOAD_ARG_OR(mm_projector_type,
+              "vision_config.mm_projector_type",
+              "patchmergerv2");
+  LOAD_ARG_OR(mm_projector_hidden_act,
+              "vision_config.projector_hidden_act",
+              "gelu");
+  LOAD_ARG_OR(mm_layer_norm_eps,
+              "vision_config.projector_ln_eps",
+              1e-5f);
+  [&] {
+    auto merge_kernel_size =
+        json.value<std::vector<int64_t>>("vision_config.merge_kernel_size");
+    args->mm_spatial_merge_size() =
+        merge_kernel_size.has_value() && !merge_kernel_size->empty()
+            ? (*merge_kernel_size)[0]
+            : int64_t(2);
+  }();
+  SET_ARG(mm_image_merge_size, args->mm_spatial_merge_size());
+  LOAD_ARG_OR(mm_init_pos_emb_time,
+              "vision_config.init_pos_emb_time",
+              4);
+  LOAD_ARG_OR(mm_init_pos_emb_width,
+              "vision_config.init_pos_emb_width",
+              64);
+  LOAD_ARG_OR(mm_init_pos_emb_height,
+              "vision_config.init_pos_emb_height",
+              64);
+
+  SET_ARG(vision_start_token_id, 163602);
+  SET_ARG(vision_token_id, 163603);
+  SET_ARG(vision_end_token_id, 163604);
+  SET_ARG(image_token_id, 163605);
+  SET_ARG(video_token_id, 163605);
+  SET_ARG(mm_km_patch_size, 14);
+  SET_ARG(mm_km_merge_kernel_size, 2);
+  SET_ARG(stop_token_ids,
+          std::unordered_set<int32_t>({0, 163585, 163586}));
+});
+
+REGISTER_TOKENIZER_ARGS(kimi_k3, [&] {
+  SET_ARG(tokenizer_type, "tiktoken");
+  SET_ARG(vocab_file, "tiktoken.model");
+  SET_ARG(special_tokens,
+          std::vector<SpecialToken>({{"[BOS]", 163584},
+                                     {"[EOS]", 163585},
+                                     {"<|end_of_msg|>", 163586},
+                                     {"<|open|>", 163587},
+                                     {"<|close|>", 163588},
+                                     {"<|sep|>", 163589},
+                                     {"[start_header_id]", 163590},
+                                     {"[end_header_id]", 163591},
+                                     {"[EOT]", 163593},
+                                     {"<|media_begin|>", 163602},
+                                     {"<|media_content|>", 163603},
+                                     {"<|media_end|>", 163604},
+                                     {"<|media_pad|>", 163605},
+                                     {"[UNK]", 163838},
+                                     {"[PAD]", 163839}}));
+  SET_ARG(visible_special_tokens,
+          std::vector<std::string>({"<|end_of_msg|>",
+                                    "<|open|>",
+                                    "<|close|>",
+                                    "<|sep|>"}));
+  SET_ARG(pattern,
+          R"([\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+[^\s]|\s+)");
+});
 
 #if defined(USE_NPU)
 constexpr char kAutoBackend[] = "AUTO";
@@ -229,6 +343,12 @@ void ModelRegistry::register_causalvlm_factory(const std::string& name,
     instance->model_registry_[name].causal_vlm_factory = factory;
     instance->model_backend_[name] = "vlm";
   }
+}
+
+void ModelRegistry::register_model_backend(const std::string& name,
+                                           const std::string& backend) {
+  ModelRegistry* instance = get_instance();
+  instance->model_backend_[name] = backend;
 }
 
 void ModelRegistry::register_dit_model_factory(const std::string& name,
@@ -506,6 +626,18 @@ std::unique_ptr<CausalLM> create_rec_model(const ModelContext& context) {
 }
 
 std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
+  const auto& model_impl = context.get_model_impl();
+#if defined(USE_CUDA) || defined(USE_NPU)
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    return std::make_unique<PyCausalVLM>(context);
+  }
+#else
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    LOG(ERROR) << "--model_impl=python is only supported on CUDA/NPU builds.";
+    return nullptr;
+  }
+#endif
+
   std::string resolved_name;
   std::string error_message;
   if (!resolve_model_registration_name(context.get_model_args().model_type(),

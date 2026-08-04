@@ -31,7 +31,7 @@ limitations under the License.
 
 namespace xllm {
 
-class PyCausalLM;
+class PyModelBridge;
 
 class __attribute__((visibility("hidden"))) PyExecutorImpl final
     : public ExecutorImpl {
@@ -51,7 +51,7 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                   const ModelInputParams& params) override;
 
  private:
-  PyCausalLM* py_causal_lm_;
+  PyModelBridge* py_model_bridge_;
   ModelArgs args_;
   runtime::Options options_;
   bool enable_mla_ = false;

@@ -56,6 +56,19 @@ cc_library (
     absl::strings
 )
 
+cc_library (
+  NAME
+    kimi_k3_chat_template
+  HDRS
+    kimi_k3_chat_template.h
+  SRCS
+    kimi_k3_chat_template.cpp
+  DEPS
+    :chat_template_base
+    nlohmann_json::nlohmann_json
+    glog::glog
+)
+
 # Factory (depends on all implementations)
 cc_library (
   NAME
@@ -67,6 +80,7 @@ cc_library (
     :jinja_chat_template
     :deepseek_v32_cpp_template
     :deepseek_v4_cpp_template
+    :kimi_k3_chat_template
     nlohmann_json::nlohmann_json
     glog::glog
     gflags

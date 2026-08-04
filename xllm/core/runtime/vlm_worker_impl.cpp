@@ -26,6 +26,7 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "core/framework/config/model_config.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
@@ -47,6 +48,7 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
 
   // initialize model
   context.set_encoder_embedding_mode(false);
+  context.set_model_impl(ModelConfig::get_instance().model_impl());
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(

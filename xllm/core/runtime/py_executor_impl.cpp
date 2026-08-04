@@ -26,7 +26,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
-#include "models/llm/py_causal_lm.h"
+#include "models/py_model_bridge.h"
 
 namespace py = pybind11;
 
@@ -128,19 +128,20 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                const ModelArgs& args,
                                const torch::Device& device,
                                const runtime::Options& options)
-    : py_causal_lm_(dynamic_cast<PyCausalLM*>(model)),
+    : py_model_bridge_(dynamic_cast<PyModelBridge*>(model)),
       args_(args),
       options_(options),
       enable_mla_(args.enable_mla()) {
-  CHECK(py_causal_lm_ != nullptr) << "PyExecutorImpl requires PyCausalLM";
+  CHECK(py_model_bridge_ != nullptr)
+      << "PyExecutorImpl requires a Python model bridge";
 
   py::gil_scoped_acquire gil;
   py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
   py_executor_ =
-      executor_module.attr("ModelExecutor")(py_causal_lm_->python_model(),
-                                            py_causal_lm_->config_dict(),
+      executor_module.attr("ModelExecutor")(py_model_bridge_->python_model(),
+                                            py_model_bridge_->config_dict(),
                                             options_.max_seqs_per_batch());
 }
 
@@ -190,8 +191,13 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object py_metadata = py::cast(AttentionMetadataView(attn_metadata));
 
   // Execute: one C++ -> Python call per step.
+  py::object input_embedding = params.embedding.input_embedding.defined()
+                                   ? py::object(
+                                         py::cast(params.embedding.input_embedding))
+                                   : py::object(py::none());
   py::object hidden_obj =
-      py_executor_.attr("execute")(tokens, positions, py_metadata);
+      py_executor_.attr("execute")(
+          tokens, positions, py_metadata, input_embedding);
   return ModelOutput(hidden_obj.cast<torch::Tensor>());
 }
 

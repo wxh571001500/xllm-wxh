@@ -76,3 +76,19 @@ class PyModelBase(nn.Module):
         concatenation, format conversion, etc.
         """
         raise NotImplementedError
+
+
+class PyCausalVLMBase(nn.Module):
+    """Base class for Python VLMs composed around a causal language model."""
+
+    language_model: PyModelBase
+
+    @property
+    def model(self) -> nn.Module:
+        """Expose the language-model body to ``ModelExecutor``."""
+        return self.language_model.model
+
+    def compute_logits(
+        self, hidden: torch.Tensor, selected_idxes: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        return self.language_model.compute_logits(hidden, selected_idxes)

@@ -162,9 +162,18 @@ class ModelExecutor:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
+
+        # Multimodal prefill supplies already-merged embeddings from the C++
+        # VLM data path. Graph runners only accept token ids, so execute this
+        # path eagerly until they grow an inputs_embeds input contract.
+        if inputs_embeds is not None:
+            return self.eager_runner.execute(
+                input_ids, positions, metadata, inputs_embeds
+            )
 
         graph_runner = self.decode_graph_runner
         if graph_runner is not None:
