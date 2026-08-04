@@ -1,4 +1,4 @@
-/* Copyright 2025-2026 The xLLM Authors.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ limitations under the License.
 #include <memory>
 #include <vector>
 
-#include "core/framework/model/causal_lm.h"
+#include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model_context.h"
 #include "models/py_model_bridge.h"
@@ -30,11 +30,18 @@ namespace xllm {
 
 class ProcessGroup;
 
-class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM,
-                                                          public PyModelBridge {
+class __attribute__((visibility("hidden"))) PyCausalVLM final
+    : public CausalVLM,
+      public PyModelBridge {
  public:
-  explicit PyCausalLM(const ModelContext& context);
-  ~PyCausalLM() override;
+  explicit PyCausalVLM(const ModelContext& context);
+  ~PyCausalVLM() override;
+
+  MMDict encode(const ModelInputParams& parameters) override;
+
+  torch::Tensor get_input_embeddings(
+      const torch::Tensor& input_ids,
+      const ModelInputParams& input_params) override;
 
   ModelOutput forward(const torch::Tensor& tokens,
                       const torch::Tensor& positions,
@@ -61,7 +68,6 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM,
   ModelArgs model_args_;
   torch::TensorOptions options_;
   torch::Device device_;
-  bool enable_mla_ = false;
 
   int64_t tp_size_ = 1;
   int64_t tp_rank_ = 0;

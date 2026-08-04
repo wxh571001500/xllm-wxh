@@ -15,6 +15,8 @@ cc_library(
     model_registry.h
     models.h
     dit/utils/lanczos_resample.h
+    py_model_bridge.h
+    vlm/py_causal_vlm.h
     $<$<BOOL:${USE_NPU}>:dit/utils/dit_block_weight_manager.h>
     py_model_helper.h
   SRCS
@@ -23,6 +25,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:dit/utils/dit_block_weight_manager.cpp>
     vlm/utils/multimodal_utils.cpp
     llm/py_causal_lm.cpp
+    vlm/py_causal_vlm.cpp
     py_model_helper.cpp
   DEPS
     :model

@@ -95,6 +95,9 @@ class ModelRegistry {
   static void register_causalvlm_factory(const std::string& name,
                                          CausalVLMFactory factory);
 
+  static void register_model_backend(const std::string& name,
+                                     const std::string& backend);
+
   static void register_dit_model_factory(const std::string& name,
                                          DiTModelFactory factory);
 

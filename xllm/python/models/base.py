@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,7 +24,7 @@ PyCausalLM no longer calls model.forward() directly.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn as nn
@@ -55,7 +55,9 @@ class PyModelBase(nn.Module):
             raise ValueError(f"Unknown dtype: {dtype!r}")
         return resolved
 
-    def compute_logits(self, hidden: torch.Tensor, selected_idxes: torch.Tensor | None) -> torch.Tensor:
+    def compute_logits(
+        self, hidden: torch.Tensor, selected_idxes: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         if selected_idxes is not None and selected_idxes.numel() > 0:
             hidden = hidden.index_select(0, selected_idxes)
         return self.lm_head(hidden)
@@ -63,7 +65,7 @@ class PyModelBase(nn.Module):
     # -- weight loading -------------------------------------------------------
     def load_weights(
         self,
-        state_dicts: list[StateDict],
+        state_dicts: List["StateDict"],
         tp_rank: int,
         tp_size: int,
     ) -> None:
@@ -75,9 +77,18 @@ class PyModelBase(nn.Module):
         """
         raise NotImplementedError
 
-    def adapt_weights_for_reference_model(
-        self,
-        reference_model_path: str,
-    ) -> None:
-        """Adapt loaded draft weights to the reference model's runtime basis."""
-        del reference_model_path
+
+class PyCausalVLMBase(nn.Module):
+    """Base class for Python VLMs composed around a causal language model."""
+
+    language_model: PyModelBase
+
+    @property
+    def model(self) -> nn.Module:
+        """Expose the language-model body to ``ModelExecutor``."""
+        return self.language_model.model
+
+    def compute_logits(
+        self, hidden: torch.Tensor, selected_idxes: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        return self.language_model.compute_logits(hidden, selected_idxes)

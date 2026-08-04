@@ -21,12 +21,19 @@ limitations under the License.
 #include "framework/chat_template/deepseek_v32_cpp_template.h"
 #include "framework/chat_template/deepseek_v4_cpp_template.h"
 #include "framework/chat_template/jinja_chat_template.h"
+#include "framework/chat_template/kimi_k3_chat_template.h"
 
 namespace xllm {
 
 std::unique_ptr<ChatTemplate> ChatTemplate::create(
     const TokenizerArgs& tokenizer_args,
     const std::string& model_type) {
+  if (model_type == "kimi_k3") {
+    LOG(INFO) << "Using native XTML chat template for model_type: "
+              << model_type;
+    return std::make_unique<KimiK3ChatTemplate>();
+  }
+
   if (::xllm::ModelConfig::get_instance().use_cpp_chat_template()) {
     if (model_type == "deepseek_v32") {
       LOG(INFO) << "Using native C++ chat template for "
