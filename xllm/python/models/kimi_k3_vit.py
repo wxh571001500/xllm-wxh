@@ -31,7 +31,11 @@ from xllm.python.layers import ColumnParallelLinear, RowParallelLinear
 def _grid_thw_list(
     grid_thws: torch.Tensor | Sequence[Sequence[int]],
 ) -> list[tuple[int, int, int]]:
-    values = grid_thws.tolist() if isinstance(grid_thws, torch.Tensor) else grid_thws
+    values = (
+        grid_thws.detach().cpu().tolist()
+        if isinstance(grid_thws, torch.Tensor)
+        else grid_thws
+    )
     grids: list[tuple[int, int, int]] = []
     for grid in values:
         if len(grid) != 3:
@@ -115,6 +119,9 @@ class KimiK3VisionConfig:
         if len(merge_kernel_size) != 2:
             raise ValueError("Kimi K3 merge_kernel_size must contain two values")
         hidden_size = int(raw.get("vt_hidden_size", raw.get("hidden_size", 1024)))
+        text_config = config.get("text_config", {})
+        if not isinstance(text_config, dict):
+            text_config = {}
         mm_hidden_size = raw.get("mm_hidden_size")
         return cls(
             patch_size=int(raw.get("patch_size", 14)),
@@ -151,7 +158,9 @@ class KimiK3VisionConfig:
             mm_hidden_size=(
                 hidden_size if mm_hidden_size is None else int(mm_hidden_size)
             ),
-            text_hidden_size=int(raw.get("text_hidden_size", 7168)),
+            text_hidden_size=int(
+                raw.get("text_hidden_size", text_config.get("hidden_size", 7168))
+            ),
             mm_projector_type=str(raw.get("mm_projector_type", "patchmergerv2")),
             projector_hidden_act=str(raw.get("projector_hidden_act", "gelu")),
             projector_ln_eps=float(raw.get("projector_ln_eps", 1e-5)),
@@ -444,7 +453,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        sequence_lengths: Sequence[int],
+        cu_seqlens: Sequence[int],
         frequencies: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -461,7 +470,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
             query,
             key,
             value,
-            sequence_lengths,
+            cu_seqlens,
         )
         hidden_states = residual + self.wo(attended.flatten(1))
         return hidden_states + self.mlp(self.norm1(hidden_states))
@@ -497,9 +506,12 @@ class KimiK3VisionEncoder(nn.Module):
     ) -> torch.Tensor:
         grids = _grid_thw_list(grid_thws)
         sequence_lengths = [time * height * width for time, height, width in grids]
+        cu_seqlens = [0]
+        for sequence_length in sequence_lengths:
+            cu_seqlens.append(cu_seqlens[-1] + sequence_length)
         frequencies = self.rope_2d(grids, hidden_states.device)
         for block in self.blocks:
-            hidden_states = block(hidden_states, sequence_lengths, frequencies)
+            hidden_states = block(hidden_states, cu_seqlens, frequencies)
         return self.final_layernorm(hidden_states)
 
 
@@ -644,6 +656,11 @@ class KimiK3VisionModel(nn.Module):
         pixel_values: torch.Tensor,
         grid_thws: torch.Tensor | Sequence[Sequence[int]],
     ) -> list[torch.Tensor]:
+        reference = next(self.parameters())
+        pixel_values = pixel_values.to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
         tower_outputs = self.vision_tower(pixel_values, grid_thws)
         if not tower_outputs:
             return []
