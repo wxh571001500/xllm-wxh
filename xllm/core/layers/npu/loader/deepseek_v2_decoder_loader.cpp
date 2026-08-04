@@ -30,7 +30,7 @@ namespace layer {
 using namespace deepseek_v2_decoder_constants;
 
 namespace {
-std::string TensorShapeString(const torch::Tensor& tensor) {
+std::string tensor_shape_string(const torch::Tensor& tensor) {
   std::ostringstream oss;
   oss << "[";
   for (int64_t i = 0; i < tensor.dim(); ++i) {
@@ -43,67 +43,67 @@ std::string TensorShapeString(const torch::Tensor& tensor) {
   return oss.str();
 }
 
-std::string TensorDebugString(const torch::Tensor& tensor) {
+std::string tensor_debug_string(const torch::Tensor& tensor) {
   if (!tensor.defined()) {
     return "undefined";
   }
   std::ostringstream oss;
-  oss << "shape=" << TensorShapeString(tensor)
+  oss << "shape=" << tensor_shape_string(tensor)
       << ", dtype=" << tensor.scalar_type() << ", device=" << tensor.device()
       << ", contiguous=" << tensor.is_contiguous();
   return oss.str();
 }
 
-bool IsPlaceholderTensor(const torch::Tensor& tensor) {
+bool is_placeholder_tensor(const torch::Tensor& tensor) {
   return !tensor.defined() || (tensor.dim() == 1 && tensor.size(0) == 1);
 }
 
-bool HasAnyDefinedExpert(const std::vector<torch::Tensor>& experts) {
+bool has_any_defined_expert(const std::vector<torch::Tensor>& experts) {
   return std::any_of(experts.begin(), experts.end(), [](const auto& tensor) {
     return tensor.defined();
   });
 }
 
-void CheckCatInputTensor(const torch::Tensor& tensor,
-                         const std::string& name,
-                         const std::string& cat_name,
-                         int32_t layer_id) {
+void check_cat_input_tensor(const torch::Tensor& tensor,
+                            const std::string& name,
+                            const std::string& cat_name,
+                            int32_t layer_id) {
   CHECK(tensor.defined()) << "Kimi/DeepSeekV2 layer " << layer_id
                           << " missing tensor before cat " << cat_name << ": "
                           << name;
-  CHECK(!IsPlaceholderTensor(tensor))
+  CHECK(!is_placeholder_tensor(tensor))
       << "Kimi/DeepSeekV2 layer " << layer_id
       << " placeholder tensor before cat " << cat_name << ": " << name
-      << ", tensor=" << TensorDebugString(tensor);
+      << ", tensor=" << tensor_debug_string(tensor);
 }
 
-torch::Tensor CatWithDebug(const std::vector<torch::Tensor>& tensors,
-                           int64_t dim,
-                           const std::vector<std::string>& names,
-                           const std::string& cat_name,
-                           int32_t layer_id) {
+torch::Tensor cat_with_debug(const std::vector<torch::Tensor>& tensors,
+                             int64_t dim,
+                             const std::vector<std::string>& names,
+                             const std::string& cat_name,
+                             int32_t layer_id) {
   CHECK_EQ(tensors.size(), names.size())
       << "Kimi/DeepSeekV2 layer " << layer_id
       << " internal cat debug size mismatch for " << cat_name;
   for (size_t i = 0; i < tensors.size(); ++i) {
-    CheckCatInputTensor(tensors[i], names[i], cat_name, layer_id);
+    check_cat_input_tensor(tensors[i], names[i], cat_name, layer_id);
   }
   const int64_t rank = tensors[0].dim();
   const int64_t normalized_dim = dim < 0 ? dim + rank : dim;
   CHECK_GE(normalized_dim, 0)
       << "Kimi/DeepSeekV2 layer " << layer_id << " invalid cat dim for "
       << cat_name << ": dim=" << dim
-      << ", tensor=" << TensorDebugString(tensors[0]);
+      << ", tensor=" << tensor_debug_string(tensors[0]);
   CHECK_LT(normalized_dim, rank)
       << "Kimi/DeepSeekV2 layer " << layer_id << " invalid cat dim for "
       << cat_name << ": dim=" << dim
-      << ", tensor=" << TensorDebugString(tensors[0]);
+      << ", tensor=" << tensor_debug_string(tensors[0]);
   for (size_t i = 1; i < tensors.size(); ++i) {
     CHECK_EQ(tensors[i].dim(), rank)
         << "Kimi/DeepSeekV2 layer " << layer_id
         << " tensor rank mismatch before cat " << cat_name << ": " << names[0]
-        << "=" << TensorDebugString(tensors[0]) << ", " << names[i] << "="
-        << TensorDebugString(tensors[i]);
+        << "=" << tensor_debug_string(tensors[0]) << ", " << names[i] << "="
+        << tensor_debug_string(tensors[i]);
     for (int64_t axis = 0; axis < rank; ++axis) {
       if (axis == normalized_dim) {
         continue;
@@ -111,28 +111,28 @@ torch::Tensor CatWithDebug(const std::vector<torch::Tensor>& tensors,
       CHECK_EQ(tensors[i].size(axis), tensors[0].size(axis))
           << "Kimi/DeepSeekV2 layer " << layer_id
           << " tensor shape mismatch before cat " << cat_name << ": "
-          << names[0] << "=" << TensorDebugString(tensors[0]) << ", "
-          << names[i] << "=" << TensorDebugString(tensors[i])
+          << names[0] << "=" << tensor_debug_string(tensors[0]) << ", "
+          << names[i] << "=" << tensor_debug_string(tensors[i])
           << ", dim=" << dim;
     }
   }
   return torch::cat(tensors, dim);
 }
 
-void CheckRequiredW4A8Tensor(const torch::Tensor& tensor,
-                             const std::string& name,
-                             int32_t layer_id) {
+void check_required_w4a8_tensor(const torch::Tensor& tensor,
+                                const std::string& name,
+                                int32_t layer_id) {
   CHECK(tensor.defined()) << "Kimi/DeepSeekV2 W4A8 layer " << layer_id
                           << " missing required tensor " << name;
-  CHECK(!IsPlaceholderTensor(tensor))
+  CHECK(!is_placeholder_tensor(tensor))
       << "Kimi/DeepSeekV2 W4A8 layer " << layer_id
       << " required tensor still placeholder: " << name
-      << ", tensor=" << TensorDebugString(tensor);
+      << ", tensor=" << tensor_debug_string(tensor);
 }
 
-void CheckExpertVector(const std::vector<torch::Tensor>& experts,
-                       const std::string& name,
-                       int32_t layer_id) {
+void check_expert_vector(const std::vector<torch::Tensor>& experts,
+                         const std::string& name,
+                         int32_t layer_id) {
   CHECK(!experts.empty()) << "Kimi/DeepSeekV2 W4A8 layer " << layer_id
                           << " expert vector is empty: " << name;
   size_t missing_count = 0;
@@ -157,16 +157,16 @@ void CheckExpertVector(const std::vector<torch::Tensor>& experts,
                                           : std::to_string(first_defined));
 }
 
-void CheckExpertVectorPair(const std::vector<torch::Tensor>& experts_gate,
-                           const std::vector<torch::Tensor>& experts_up,
-                           const std::string& name,
-                           int32_t layer_id) {
+void check_expert_vector_pair(const std::vector<torch::Tensor>& experts_gate,
+                              const std::vector<torch::Tensor>& experts_up,
+                              const std::string& name,
+                              int32_t layer_id) {
   CHECK_EQ(experts_gate.size(), experts_up.size())
       << "Kimi/DeepSeekV2 W4A8 layer " << layer_id
       << " expert vector size mismatch for " << name
       << ": gate=" << experts_gate.size() << ", up=" << experts_up.size();
-  CheckExpertVector(experts_gate, name + ".gate", layer_id);
-  CheckExpertVector(experts_up, name + ".up", layer_id);
+  check_expert_vector(experts_gate, name + ".gate", layer_id);
+  check_expert_vector(experts_up, name + ".up", layer_id);
 }
 }  // namespace
 
@@ -324,6 +324,7 @@ void DeekseekV2DecoderLoader::process_expert_weights(
   const std::string suffix = extract_endswith(name);
   const bool is_w4a8_extra = quantize_type_ == "w4a8_dynamic" &&
                              (absl::EndsWith(suffix, "weight_offset") ||
+                              absl::EndsWith(suffix, "weight_scale_second") ||
                               absl::EndsWith(suffix, "scale_bias"));
   int index = -1;
   int shard_dim = -1;
@@ -402,7 +403,7 @@ void DeekseekV2DecoderLoader::process_expert_weights(
       CHECK(experts_it != experts_weights_.end())
           << "Kimi/DeepSeekV2 W4A8 layer " << layer_id_
           << " routed expert suffix is not reserved: " << suffix
-          << ", tensor=" << TensorDebugString(processed_tensor);
+          << ", tensor=" << tensor_debug_string(processed_tensor);
       for (auto pos : matches_pos) {
         CHECK_LT(pos, experts_it->second.size())
             << "Kimi/DeepSeekV2 W4A8 layer " << layer_id_
@@ -579,7 +580,7 @@ void DeekseekV2DecoderLoader::merge_experts_weights() {
              const std::string& offset_key) -> std::vector<torch::Tensor>& {
     auto scale_second_it = experts_weights_.find(scale_second_key);
     if (scale_second_it != experts_weights_.end() &&
-        HasAnyDefinedExpert(scale_second_it->second)) {
+        has_any_defined_expert(scale_second_it->second)) {
       return scale_second_it->second;
     }
     auto offset_it = experts_weights_.find(offset_key);
@@ -590,10 +591,10 @@ void DeekseekV2DecoderLoader::merge_experts_weights() {
     return offset_it->second;
   };
   if (is_w4a8_dynamic) {
-    CheckExpertVectorPair(experts_weights_["gate_proj.weight"],
-                          experts_weights_["up_proj.weight"],
-                          "gateup.weight",
-                          layer_id_);
+    check_expert_vector_pair(experts_weights_["gate_proj.weight"],
+                             experts_weights_["up_proj.weight"],
+                             "gateup.weight",
+                             layer_id_);
   }
   torch::Tensor mlp_gateup_weight =
       merge_experts_weights(experts_weights_["gate_proj.weight"],
@@ -614,17 +615,17 @@ void DeekseekV2DecoderLoader::merge_experts_weights() {
         merge_experts_weights(experts_weights_["gate_proj.weight_scale"],
                               experts_weights_["up_proj.weight_scale"]);
   } else if (is_w4a8_dynamic) {
-    CheckExpertVectorPair(experts_weights_["gate_proj.weight_scale"],
-                          experts_weights_["up_proj.weight_scale"],
-                          "gateup.weight_scale",
-                          layer_id_);
+    check_expert_vector_pair(experts_weights_["gate_proj.weight_scale"],
+                             experts_weights_["up_proj.weight_scale"],
+                             "gateup.weight_scale",
+                             layer_id_);
     t[IN_MLP_GATEUP_SCALE_EXPERT] =
         merge_experts_weights(experts_weights_["gate_proj.weight_scale"],
                               experts_weights_["up_proj.weight_scale"]);
-    CheckExpertVectorPair(experts_weights_["gate_proj.scale_bias"],
-                          experts_weights_["up_proj.scale_bias"],
-                          "gateup.scale_bias",
-                          layer_id_);
+    check_expert_vector_pair(experts_weights_["gate_proj.scale_bias"],
+                             experts_weights_["up_proj.scale_bias"],
+                             "gateup.scale_bias",
+                             layer_id_);
     t[IN_MLP_GATEUP_BIAS_EXPERT] =
         merge_experts_weights(experts_weights_["gate_proj.scale_bias"],
                               experts_weights_["up_proj.scale_bias"]);
@@ -633,7 +634,7 @@ void DeekseekV2DecoderLoader::merge_experts_weights() {
           "gate_proj.weight_scale_second", "gate_proj.weight_offset");
       auto& up_second_scale = select_w4a8_second_scale(
           "up_proj.weight_scale_second", "up_proj.weight_offset");
-      CheckExpertVectorPair(
+      check_expert_vector_pair(
           gate_second_scale, up_second_scale, "gateup.second_scale", layer_id_);
       t[IN_MLP_GATEUP_OFFSET_EXPERT] =
           merge_experts_weights(gate_second_scale, up_second_scale);
@@ -644,7 +645,7 @@ void DeekseekV2DecoderLoader::merge_experts_weights() {
   //   eager: NZ when not quantized, else ND;
   //   manual: NZ when decode is BF16, else ND.
   if (is_w4a8_dynamic) {
-    CheckExpertVector(
+    check_expert_vector(
         experts_weights_["down_proj.weight"], "down.weight", layer_id_);
   }
   torch::Tensor mlp_down_weight = merge_experts_weights(
@@ -680,19 +681,19 @@ void DeekseekV2DecoderLoader::merge_experts_weights() {
     t[IN_MLP_DOWN_SCALE_EXPERT] =
         merge_experts_weights(experts_weights_["down_proj.weight_scale"]);
   } else if (is_w4a8_dynamic) {
-    CheckExpertVector(experts_weights_["down_proj.weight_scale"],
-                      "down.weight_scale",
-                      layer_id_);
+    check_expert_vector(experts_weights_["down_proj.weight_scale"],
+                        "down.weight_scale",
+                        layer_id_);
     t[IN_MLP_DOWN_SCALE_EXPERT] =
         merge_experts_weights(experts_weights_["down_proj.weight_scale"]);
-    CheckExpertVector(
+    check_expert_vector(
         experts_weights_["down_proj.scale_bias"], "down.scale_bias", layer_id_);
     t[IN_MLP_DOWN_BIAS_EXPERT] =
         merge_experts_weights(experts_weights_["down_proj.scale_bias"]);
     if (quant_group_size_ > 0) {
       auto& down_second_scale = select_w4a8_second_scale(
           "down_proj.weight_scale_second", "down_proj.weight_offset");
-      CheckExpertVector(down_second_scale, "down.second_scale", layer_id_);
+      check_expert_vector(down_second_scale, "down.second_scale", layer_id_);
       t[IN_MLP_DOWN_OFFSET_EXPERT] = merge_experts_weights(down_second_scale);
     }
   }
@@ -717,7 +718,7 @@ torch::Tensor DeekseekV2DecoderLoader::merge_experts_weights(
     std::vector<torch::Tensor>& experts_up,
     bool transpose) {
   for (size_t i = 0; i < experts_up.size(); ++i) {
-    experts_gate[i] = CatWithDebug(
+    experts_gate[i] = cat_with_debug(
         {experts_gate[i], experts_up[i]},
         0,
         {"gate expert " + std::to_string(i), "up expert " + std::to_string(i)},
@@ -749,23 +750,23 @@ void DeekseekV2DecoderLoader::preprocess_w4a8_dynamic_experts_weights() {
   }
 
   auto& t = working_tensors();
-  CheckRequiredW4A8Tensor(
+  check_required_w4a8_tensor(
       t[IN_MLP_GATEUP_WEIGHT_EXPERT], "IN_MLP_GATEUP_WEIGHT_EXPERT", layer_id_);
-  CheckRequiredW4A8Tensor(
+  check_required_w4a8_tensor(
       t[IN_MLP_DOWN_WEIGHT_EXPERT], "IN_MLP_DOWN_WEIGHT_EXPERT", layer_id_);
-  CheckRequiredW4A8Tensor(
+  check_required_w4a8_tensor(
       t[IN_MLP_GATEUP_SCALE_EXPERT], "IN_MLP_GATEUP_SCALE_EXPERT", layer_id_);
-  CheckRequiredW4A8Tensor(
+  check_required_w4a8_tensor(
       t[IN_MLP_DOWN_SCALE_EXPERT], "IN_MLP_DOWN_SCALE_EXPERT", layer_id_);
-  CheckRequiredW4A8Tensor(
+  check_required_w4a8_tensor(
       t[IN_MLP_GATEUP_BIAS_EXPERT], "IN_MLP_GATEUP_BIAS_EXPERT", layer_id_);
-  CheckRequiredW4A8Tensor(
+  check_required_w4a8_tensor(
       t[IN_MLP_DOWN_BIAS_EXPERT], "IN_MLP_DOWN_BIAS_EXPERT", layer_id_);
   if (quant_group_size_ > 0) {
-    CheckRequiredW4A8Tensor(t[IN_MLP_GATEUP_OFFSET_EXPERT],
-                            "IN_MLP_GATEUP_OFFSET_EXPERT",
-                            layer_id_);
-    CheckRequiredW4A8Tensor(
+    check_required_w4a8_tensor(t[IN_MLP_GATEUP_OFFSET_EXPERT],
+                               "IN_MLP_GATEUP_OFFSET_EXPERT",
+                               layer_id_);
+    check_required_w4a8_tensor(
         t[IN_MLP_DOWN_OFFSET_EXPERT], "IN_MLP_DOWN_OFFSET_EXPERT", layer_id_);
   }
 
@@ -991,6 +992,9 @@ void DeekseekV2DecoderLoader::reserve_experts_weights(
     weight_names.emplace_back("up_proj.weight_scale");
     weight_names.emplace_back("down_proj.weight_scale");
     if (quantize_type_ == "w4a8_dynamic") {
+      weight_names.emplace_back("gate_proj.weight_scale_second");
+      weight_names.emplace_back("up_proj.weight_scale_second");
+      weight_names.emplace_back("down_proj.weight_scale_second");
       weight_names.emplace_back("gate_proj.scale_bias");
       weight_names.emplace_back("up_proj.scale_bias");
       weight_names.emplace_back("down_proj.scale_bias");

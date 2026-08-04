@@ -109,8 +109,8 @@ void load_layernorm_if_defined(const StateDict& state_dict,
 }
 
 bool is_w8a8_dynamic_quant(const QuantArgs& quant_args,
-                           const std::string& tensor_name) {
-  auto quant = quant_args.get_quant_method(tensor_name);
+                           const std::string& module_prefix) {
+  auto quant = quant_args.get_quant_method(module_prefix, "weight");
   return quant.has_value() &&
          (*quant == "W8A8_DYNAMIC" || *quant == "w8a8_dynamic");
 }
@@ -119,9 +119,9 @@ ModelContext make_kimi_k25_vision_context(const ModelContext& context) {
   const auto& quant_args = context.get_quant_args();
   const bool vision_mlp_is_w8a8_dynamic =
       is_w8a8_dynamic_quant(quant_args,
-                            "vision_tower.encoder.blocks.0.mlp.fc0.weight") &&
+                            "vision_tower.encoder.blocks.0.mlp.fc0") &&
       is_w8a8_dynamic_quant(quant_args,
-                            "vision_tower.encoder.blocks.0.mlp.fc1.weight");
+                            "vision_tower.encoder.blocks.0.mlp.fc1");
   if (!vision_mlp_is_w8a8_dynamic) {
     return context;
   }
@@ -999,6 +999,8 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
                       const ModelInputParams& input_params) {
     return language_model_(tokens, positions, kv_caches, input_params);
   }
+
+  bool supports_mla_graph_kv_bucketing() const { return true; }
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) {

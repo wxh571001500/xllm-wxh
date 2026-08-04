@@ -27,7 +27,6 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
-#include "core/util/utils.h"
 #include "layers/common/rotary_embedding_util.h"
 #include "loader/deepseek_v2_decoder_loader.h"
 
@@ -41,8 +40,7 @@ bool is_kimi_text_model(const ModelArgs& args) {
 }
 
 bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
-  return args.enable_mla() &&
-         util::is_deepseek_v2_family_model_type(args.model_type());
+  return args.enable_mla() && args.model_type() == "kimi_k25";
 }
 
 }  // namespace

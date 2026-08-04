@@ -54,8 +54,6 @@ constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
 constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
-constexpr int32_t kMlaGraphKvLenBucket = 2048;
-
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
                                         int64_t block_size) {
@@ -225,42 +223,12 @@ ModelOutput forward_eager(CausalLM* model,
   return model->forward(materialized_tokens, positions, kv_cache, params);
 }
 
-bool uses_deepseek_v2_mla_graph(const ModelArgs& args) {
-  return args.enable_mla() &&
-         util::is_deepseek_v2_family_model_type(args.model_type());
-}
-
 void hash_graph_key_value(uint64_t& hash, uint64_t value) {
   constexpr uint64_t kFnvPrime = 1099511628211ull;
   for (int32_t i = 0; i < 8; ++i) {
     hash ^= (value >> (i * 8)) & 0xffull;
     hash *= kFnvPrime;
   }
-}
-
-int32_t round_up_positive(int32_t value, int32_t bucket) {
-  const int32_t safe_value = std::max<int32_t>(value, 1);
-  return ((safe_value + bucket - 1) / bucket) * bucket;
-}
-
-int32_t get_mla_capture_kv_seq_len_bucket(const ModelInputParams& params,
-                                          const runtime::Options& options) {
-  const int32_t block_size = std::max<int32_t>(options.block_size(), 1);
-  int32_t capture_kv_len =
-      std::max<int32_t>(params.meta.kv_max_seq_len, block_size);
-  if (!params.parallel.dp_global_kv_max_seq_lens.empty()) {
-    capture_kv_len = std::max<int32_t>(
-        capture_kv_len, util::max(params.parallel.dp_global_kv_max_seq_lens));
-    return round_up_positive(capture_kv_len, kMlaGraphKvLenBucket);
-  }
-  const auto& block_tables = params.attention.device.block_tables;
-  if (block_tables.defined() && block_tables.dim() >= 2 &&
-      block_tables.size(1) > 0) {
-    capture_kv_len = std::max<int32_t>(
-        capture_kv_len,
-        static_cast<int32_t>(block_tables.size(1)) * block_size);
-  }
-  return round_up_positive(capture_kv_len, kMlaGraphKvLenBucket);
 }
 
 uint64_t get_mla_graph_key(uint32_t bucket_num_tokens,
@@ -828,11 +796,13 @@ AclGraphExecutorImpl::AclGraphExecutorImpl(CausalLM* model,
                                                                            : 1;
   for (int32_t slot_idx = 0; slot_idx < graph_slot_count_; ++slot_idx) {
     graph_slots_[slot_idx].persistent_param =
-        std::make_unique<GraphPersistentParam>(args_,
-                                               device_,
-                                               options_,
-                                               need_update_attn_mask,
-                                               is_hybrid_linear_attn);
+        std::make_unique<GraphPersistentParam>(
+            args_,
+            device_,
+            options_,
+            need_update_attn_mask,
+            is_hybrid_linear_attn,
+            model_->supports_mla_graph_kv_bucketing());
   }
 }
 
@@ -1088,7 +1058,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   } catch (const std::exception& e) {
     LOG(ERROR) << "ACL graph capture threw exception for bucket num_tokens="
                << bucket_num_tokens << ": " << e.what();
-    if (uses_deepseek_v2_mla_graph(args_)) {
+    if (model_->supports_mla_graph_kv_bucketing()) {
       throw;
     }
     LOG(ERROR) << "Falling back to eager mode.";
@@ -1352,7 +1322,7 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
     return static_cast<uint64_t>(bucket_num_tokens) | kSpecVerifyGraphKeyMask |
            (q_max_seq_len << kSpecVerifyQMaxSeqLenShift);
   }
-  if (uses_deepseek_v2_mla_graph(args_)) {
+  if (model_->supports_mla_graph_kv_bucketing()) {
     const int32_t capture_kv_seq_len_bucket =
         get_mla_capture_kv_seq_len_bucket(params, options_);
     return get_mla_graph_key(bucket_num_tokens, capture_kv_seq_len_bucket);

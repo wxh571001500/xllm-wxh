@@ -39,6 +39,9 @@ struct TilingBufferInfo;
 
 namespace xllm::npu {
 
+int32_t get_mla_capture_kv_seq_len_bucket(const ModelInputParams& params,
+                                          const runtime::Options& options);
+
 struct PagedAttentionPlanDescriptor {
   std::vector<uint32_t> normalized_tiling;
   uint64_t workspace_size = 0;
@@ -64,7 +67,8 @@ class GraphPersistentParam final {
                        const torch::Device& device,
                        const runtime::Options& options,
                        bool need_update_attn_mask = false,
-                       bool is_hybrid_linear_attention = false);
+                       bool is_hybrid_linear_attention = false,
+                       bool supports_mla_graph_kv_bucketing = false);
 
   ~GraphPersistentParam();
 
@@ -279,7 +283,6 @@ class GraphPersistentParam final {
   torch::Tensor expanded_kv_seq_lens_;
   std::vector<int32_t> persistent_host_q_seq_lens_;
   std::vector<int32_t> persistent_host_kv_seq_lens_;
-  std::vector<int32_t> persistent_host_expanded_kv_seq_lens_;
   std::vector<int32_t> capture_host_q_seq_lens_;
   std::vector<int32_t> capture_host_kv_seq_lens_;
 
@@ -318,6 +321,8 @@ class GraphPersistentParam final {
   // Flag indicating whether the model uses hybrid linear attention
   // (e.g., Qwen3.5/Next with gated delta net layers)
   bool is_hybrid_linear_attention_;
+  // Flag indicating whether MLA graph capture uses KV length bucketing.
+  bool supports_mla_graph_kv_bucketing_;
   // Flag indicating whether attention plan needs to be updated based on model
   // type
   bool need_update_attention_plan_;
