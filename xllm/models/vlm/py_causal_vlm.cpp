@@ -60,7 +60,7 @@ PyCausalVLM::PyCausalVLM(const ModelContext& context)
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(
       py::str(context.get_model_args().model_type()));
-  config_dict_ = build_config_dict(parallel_args);
+  config_dict_ = build_config_dict(parallel_args, context.get_quant_args());
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();
 }
@@ -71,8 +71,8 @@ PyCausalVLM::~PyCausalVLM() {
   config_dict_ = py::object();
 }
 
-py::dict PyCausalVLM::build_config_dict(
-    const ParallelArgs& parallel_args) const {
+py::dict PyCausalVLM::build_config_dict(const ParallelArgs& parallel_args,
+                                        const QuantArgs& quant_args) const {
   py::dict config;
   py::module_ json = py::module_::import("json");
   py::module_ builtins = py::module_::import("builtins");
@@ -85,6 +85,12 @@ py::dict PyCausalVLM::build_config_dict(
   PyDictVisitor visitor(config);
   visit_properties(model_args_, visitor);
   visit_properties(parallel_args, visitor);
+  if (model_args_.model_type() == "kimi_k3") {
+    config["quantize_type"] = quant_args.quantize_type();
+    config["quant_method"] = quant_args.quant_method();
+    config["quant_group_size"] = quant_args.group_size();
+    config["quant_version"] = quant_args.quant_version();
+  }
   config["dtype"] = dtype_to_string(options_);
   config["device"] = c10::str(device_);
   config["tp_size"] = tp_size_;
@@ -104,11 +110,10 @@ MMDict PyCausalVLM::encode(const ModelInputParams& parameters) {
   }
 
   py::gil_scoped_acquire gil;
-  py::object result = py_model_.attr("encode_multimodal")(
-      pixel_values.value(), grid_thws.value());
+  py::object result = py_model_.attr("encode_multimodal")(pixel_values.value(),
+                                                          grid_thws.value());
   MMDict output;
-  output["image|embedding"] =
-      result.cast<std::vector<torch::Tensor>>();
+  output["image|embedding"] = result.cast<std::vector<torch::Tensor>>();
   return output;
 }
 
@@ -116,8 +121,7 @@ torch::Tensor PyCausalVLM::get_input_embeddings(
     const torch::Tensor& input_ids,
     const ModelInputParams& input_params) {
   const auto& mm_data = input_params.multimodal.mm_data;
-  const auto multimodal_embeds =
-      mm_data.get<torch::Tensor>("image|embedding");
+  const auto multimodal_embeds = mm_data.get<torch::Tensor>("image|embedding");
   const auto multimodal_mask = mm_data.get<torch::Tensor>("image|mask");
   py::gil_scoped_acquire gil;
   py::object embeddings = multimodal_embeds.has_value()
@@ -126,8 +130,8 @@ torch::Tensor PyCausalVLM::get_input_embeddings(
   py::object mask = multimodal_mask.has_value()
                         ? py::object(py::cast(multimodal_mask.value()))
                         : py::object(py::none());
-  py::object output = py_model_.attr("get_input_embeddings")(
-      input_ids, embeddings, mask);
+  py::object output =
+      py_model_.attr("get_input_embeddings")(input_ids, embeddings, mask);
   return output.cast<torch::Tensor>();
 }
 
@@ -147,8 +151,7 @@ torch::Tensor PyCausalVLM::logits(const torch::Tensor& hidden_states,
   py::object selected = seleted_idxes.defined()
                             ? py::object(py::cast(seleted_idxes))
                             : py::object(py::none());
-  py::object output =
-      py_model_.attr("compute_logits")(hidden_states, selected);
+  py::object output = py_model_.attr("compute_logits")(hidden_states, selected);
   return output.cast<torch::Tensor>();
 }
 

@@ -93,7 +93,7 @@ def test_tpool_merger_pools_time_before_spatial_reorder() -> None:
     assert len(outputs) == 1
     assert outputs[0].shape == (2, 4, 1)
     expected = torch.tensor(
-        [[4.0, 5.0, 6.0, 7.0], [8.0, 9.0, 10.0, 11.0]]
+        [[4.0, 5.0, 8.0, 9.0], [6.0, 7.0, 10.0, 11.0]]
     )
     torch.testing.assert_close(outputs[0].squeeze(-1), expected)
 

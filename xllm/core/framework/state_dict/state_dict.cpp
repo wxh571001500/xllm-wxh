@@ -140,7 +140,6 @@ torch::Tensor StateDict::get_sharded_tensor(const std::string& tensor_name,
                                             int64_t dim,
                                             int rank,
                                             int world_size) const {
-  CHECK(dim == 0 || dim == 1) << "Only support 1D or 2D sharding";
   CHECK(rank >= 0 && rank < world_size)
       << "Invalid rank " << rank << " for " << world_size << " shards";
 
@@ -148,6 +147,9 @@ torch::Tensor StateDict::get_sharded_tensor(const std::string& tensor_name,
   if (!tensor.defined()) {
     return tensor;
   }
+  CHECK(dim >= 0 && dim < tensor.dim())
+      << "Invalid sharding dimension " << dim << " for tensor with "
+      << tensor.dim() << " dimensions";
   // chunk tensor along the dim
   const int64_t dim_size = tensor.size(dim);
   if (dim_size < world_size) {

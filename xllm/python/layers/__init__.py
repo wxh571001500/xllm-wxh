@@ -25,6 +25,7 @@ from xllm.python.layers.fused_moe import FusedMoE
 from xllm.python.layers.gated_mlp import GatedMLP
 from xllm.python.layers.layernorm import GemmaRMSNorm, RMSNorm
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
+from xllm.python.layers.moe import KimiK3MoE, KimiK3RoutedExperts
 from xllm.python.layers.rotary_embedding import RotaryEmbedding
 
 __all__ = [
@@ -37,4 +38,6 @@ __all__ = [
     "ColumnParallelLinear",
     "RowParallelLinear",
     "HiddenParallelEmbedding",
+    "KimiK3MoE",
+    "KimiK3RoutedExperts",
 ]
