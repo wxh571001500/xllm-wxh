@@ -42,7 +42,8 @@ namespace xllm {
 
 namespace py = pybind11;
 
-class KimiK3ForConditionalGenerationImpl final : public torch::nn::Module {
+class __attribute__((visibility("hidden")))
+    KimiK3ForConditionalGenerationImpl final : public torch::nn::Module {
  public:
   explicit KimiK3ForConditionalGenerationImpl(const ModelContext& context)
       : model_args_(context.get_model_args()),
@@ -178,7 +179,12 @@ class KimiK3ForConditionalGenerationImpl final : public torch::nn::Module {
   int32_t tp_size_ = 1;
 };
 
-TORCH_MODULE(KimiK3ForConditionalGeneration);
+class __attribute__((visibility("hidden"))) KimiK3ForConditionalGeneration
+    : public torch::nn::ModuleHolder<KimiK3ForConditionalGenerationImpl> {
+ public:
+  using torch::nn::ModuleHolder<KimiK3ForConditionalGenerationImpl>::
+      ModuleHolder;
+};
 
 using KimiK3MultimodalProcessor =
     MultimodalProcessor<KimiK25PromptProcessor, KimiK25ImageProcessor>;
