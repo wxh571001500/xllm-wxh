@@ -26,50 +26,56 @@ def encoder_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    sequence_lengths: Sequence[int],
+    cu_seqlens: Sequence[int],
 ) -> torch.Tensor:
-    """Run non-causal packed vision attention for independent media items."""
+    """Run vLLM-compatible packed attention for independent media items."""
     if query.ndim != 3 or key.shape != query.shape or value.shape != query.shape:
         raise ValueError("vision attention expects equal [tokens, heads, dim] tensors")
+    if not cu_seqlens or cu_seqlens[0] != 0:
+        raise ValueError("vision cu_seqlens must start with zero")
+    if cu_seqlens[-1] != query.shape[0]:
+        raise ValueError(
+            f"vision cu_seqlens cover {cu_seqlens[-1]} tokens, "
+            f"got {query.shape[0]}"
+        )
+
+    actual_seq_lengths = list(cu_seqlens[1:])
+    if query.device.type in ("npu", "privateuseone"):
+        import torch_npu
+
+        return torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key.contiguous(),
+            value=value.contiguous(),
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths,
+            num_heads=query.shape[1],
+            num_key_value_heads=key.shape[1],
+            scale=query.shape[2] ** -0.5,
+            input_layout="TND",
+            block_size=128,
+            sparse_mode=0,
+            pre_tokens=2147483647,
+            next_tokens=2147483647,
+        )[0]
 
     outputs: list[torch.Tensor] = []
-    start = 0
-    for length in sequence_lengths:
-        if length <= 0:
-            raise ValueError(f"vision sequence length must be positive, got {length}")
-        end = start + length
+    for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+        if end <= start:
+            raise ValueError(
+                f"vision cu_seqlens must increase, got boundary {start}, {end}"
+            )
         q = query[start:end].transpose(0, 1).unsqueeze(0).contiguous()
         k = key[start:end].transpose(0, 1).unsqueeze(0).contiguous()
         v = value[start:end].transpose(0, 1).unsqueeze(0).contiguous()
-        if query.device.type in ("npu", "privateuseone"):
-            import torch_npu
-
-            attended = torch_npu.npu_fusion_attention(
-                q,
-                k,
-                v,
-                head_num=query.shape[1],
-                input_layout="BNSD",
-                scale=query.shape[2] ** -0.5,
-                keep_prob=1.0,
-                pre_tockens=65535,
-                next_tockens=65535,
-            )[0]
-        else:
-            attended = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=0.0,
-                is_causal=False,
-            )
-        outputs.append(attended.squeeze(0).transpose(0, 1))
-        start = end
-
-    if start != query.shape[0]:
-        raise ValueError(
-            f"vision sequence lengths cover {start} tokens, got {query.shape[0]}"
+        attended = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
         )
+        outputs.append(attended.squeeze(0).transpose(0, 1))
     if not outputs:
         return torch.empty_like(query)
     return torch.cat(outputs, dim=0)

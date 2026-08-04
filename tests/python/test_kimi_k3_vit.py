@@ -28,18 +28,15 @@ def _encoder_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    sequence_lengths: Sequence[int],
+    cu_seqlens: Sequence[int],
 ) -> torch.Tensor:
     outputs: list[torch.Tensor] = []
-    start = 0
-    for length in sequence_lengths:
-        end = start + length
+    for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
         q = query[start:end].transpose(0, 1).unsqueeze(0)
         k = key[start:end].transpose(0, 1).unsqueeze(0)
         v = value[start:end].transpose(0, 1).unsqueeze(0)
         attended = F.scaled_dot_product_attention(q, k, v)
         outputs.append(attended.squeeze(0).transpose(0, 1))
-        start = end
     return torch.cat(outputs, dim=0)
 
 
@@ -114,6 +111,33 @@ def test_tiny_vision_model_projects_each_media_item() -> None:
     assert len(outputs) == 1
     assert outputs[0].shape == (1, 8)
     assert torch.isfinite(outputs[0]).all()
+
+
+def test_encoder_uses_vllm_cumulative_media_boundaries(monkeypatch) -> None:
+    captured_boundaries: list[list[int]] = []
+
+    def capture_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: Sequence[int],
+    ) -> torch.Tensor:
+        captured_boundaries.append(list(cu_seqlens))
+        return _encoder_attention(query, key, value, cu_seqlens)
+
+    monkeypatch.setattr(_mock_ops, "encoder_attention", capture_attention)
+    config = _tiny_config()
+    config["vision_config"]["merge_kernel_size"] = [1, 1]
+    model = KimiK3VisionModel(config)
+    for parameter in model.parameters():
+        torch.nn.init.uniform_(parameter, -0.1, 0.1)
+    pixel_values = torch.randn(3, 3, 2, 2)
+    grid_thws = torch.tensor([[1, 1, 1], [1, 1, 2]], dtype=torch.int64)
+
+    outputs = model(pixel_values, grid_thws)
+
+    assert captured_boundaries == [[0, 1, 3]]
+    assert [output.shape[0] for output in outputs] == [1, 2]
 
 
 def test_qkv_weight_sharding_preserves_qkv_order() -> None:
