@@ -33,7 +33,8 @@ class StateDict {
   // get the tensor with the given name. return nullptr if not found.
   virtual torch::Tensor get_tensor(const std::string& tensor_name) const;
 
-  // get the sharded tensor with the given name for the given rank.
+  // Get the sharded tensor with the given name for the given rank. Sharding
+  // can be applied along any valid tensor dimension.
   virtual torch::Tensor get_sharded_tensor(const std::string& tensor_name,
                                            int64_t dim,
                                            int rank,

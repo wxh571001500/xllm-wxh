@@ -24,6 +24,7 @@ from xllm.python.layers.attention import Attention
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.layernorm import RMSNorm
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
+from xllm.python.layers.moe import KimiK3MoE, KimiK3RoutedExperts
 from xllm.python.layers.rotary_embedding import RotaryEmbedding
 
 __all__ = [
@@ -33,4 +34,6 @@ __all__ = [
     "ColumnParallelLinear",
     "RowParallelLinear",
     "HiddenParallelEmbedding",
+    "KimiK3MoE",
+    "KimiK3RoutedExperts",
 ]

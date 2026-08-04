@@ -133,6 +133,14 @@ torch::Tensor PyStateDict::get_tensor(const std::string& name) const {
   return sd_->get_tensor(name);
 }
 
+torch::Tensor PyStateDict::get_sharded_tensor(const std::string& name,
+                                              int64_t dim,
+                                              int32_t rank,
+                                              int32_t world_size) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return sd_->get_sharded_tensor(name, dim, rank, world_size);
+}
+
 bool PyStateDict::has(const std::string& name) const {
   CHECK(sd_ != nullptr) << "PyStateDict: access after release";
   return sd_->has(name);
@@ -147,11 +155,43 @@ py::list PyStateDict::keys() const {
   return result;
 }
 
+PyStateDict PyStateDict::get_dict_with_prefix(
+    const std::string& prefix) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return PyStateDict(std::make_unique<StateDict>(
+      sd_->get_dict_with_prefix(prefix)));
+}
+
+PyStateDict PyStateDict::get_dict_with_prefixes(
+    const std::vector<std::string>& prefixes) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return PyStateDict(std::make_unique<StateDict>(
+      sd_->get_dict_with_prefix(prefixes)));
+}
+
+size_t PyStateDict::size() const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return sd_->size();
+}
+
 PYBIND11_EMBEDDED_MODULE(xllm_weight_loader, m) {
   py::class_<PyStateDict>(m, "StateDict")
       .def("get_tensor", &PyStateDict::get_tensor, py::arg("name"))
+      .def("get_sharded_tensor",
+           &PyStateDict::get_sharded_tensor,
+           py::arg("name"),
+           py::arg("dim"),
+           py::arg("rank"),
+           py::arg("world_size"))
       .def("has", &PyStateDict::has, py::arg("name"))
-      .def("keys", &PyStateDict::keys);
+      .def("keys", &PyStateDict::keys)
+      .def("get_dict_with_prefix",
+           &PyStateDict::get_dict_with_prefix,
+           py::arg("prefix"))
+      .def("get_dict_with_prefixes",
+           &PyStateDict::get_dict_with_prefixes,
+           py::arg("prefixes"))
+      .def("size", &PyStateDict::size);
 }
 
 }  // namespace xllm
