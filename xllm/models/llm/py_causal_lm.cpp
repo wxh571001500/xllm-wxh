@@ -24,6 +24,7 @@ limitations under the License.
 #include <utility>
 
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
 #include "core/framework/state_dict/state_dict.h"
@@ -62,7 +63,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
 
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(py::str(module_name));
-  config_dict_ = build_config_dict(parallel_args);
+  config_dict_ = build_config_dict(parallel_args, context.get_quant_args());
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();
 }
@@ -74,8 +75,22 @@ PyCausalLM::~PyCausalLM() {
 }
 
 py::dict PyCausalLM::build_config_dict(
-    const ParallelArgs& parallel_args) const {
+    const ParallelArgs& parallel_args,
+    const QuantArgs& quant_args) const {
   py::dict d;
+  if (model_args_.model_type() == "kimi_k3") {
+    py::module_ json = py::module_::import("json");
+    py::module_ builtins = py::module_::import("builtins");
+    const std::string config_path =
+        ModelConfig::get_instance().model() + "/config.json";
+    py::object config_file = builtins.attr("open")(config_path, "r");
+    d = json.attr("load")(config_file).cast<py::dict>();
+    config_file.attr("close")();
+    d["quantize_type"] = quant_args.quantize_type();
+    d["quant_method"] = quant_args.quant_method();
+    d["quant_group_size"] = quant_args.group_size();
+    d["quant_version"] = quant_args.quant_version();
+  }
   PyDictVisitor visitor(d);
   visit_properties(model_args_, visitor);
   visit_properties(parallel_args, visitor);

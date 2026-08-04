@@ -12,111 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Python entry point for Kimi K3 multimodal generation.
-
-The vision tower is implemented in :mod:`kimi_k3_vit`.  The language side is
-intentionally a small executor-compatible shell while the K3 decoder is being
-ported; it preserves the real C++ VLM/mm_data/PyExecutor control flow so the
-vision output can be compared independently.
-"""
+"""Python entry point for Kimi K3 multimodal generation."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import torch
-import torch.nn as nn
 
-from xllm.python.layers.attention import Attention
-from xllm.python.models.base import PyCausalVLMBase, PyModelBase
+from xllm.python.models.base import PyCausalVLMBase
+from xllm.python.models.kimi_k3_text import KimiK3ForCausalLM
 from xllm.python.models.kimi_k3_vit import KimiK3VisionModel
 
 
-class _ZeroLMHead(nn.Module):
-    def __init__(self, vocab_size: int, dtype: torch.dtype, device: torch.device):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.dtype = dtype
-        self.device = device
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(
-            (hidden_states.shape[0], self.vocab_size),
-            dtype=self.dtype,
-            device=hidden_states.device,
-        )
-
-
-class _KimiK3TextShell(nn.Module):
-    """Executor contract for the temporary language-model placeholder."""
-
-    def __init__(
-        self, config: dict[str, Any], dtype: torch.dtype, device: torch.device
-    ):
-        super().__init__()
-        self.hidden_size = int(config.get("hidden_size", 7168))
-        num_layers = int(config.get("n_layers", 93))
-        head_dim = int(config.get("head_dim", 1))
-        self.dummy_attentions = nn.ModuleList(
-            [
-                Attention(
-                    num_heads=int(config.get("n_heads", 1)),
-                    num_kv_heads=int(config.get("n_kv_heads", 1) or 1),
-                    head_dim=head_dim,
-                    scale=head_dim**-0.5,
-                    sliding_window=int(config.get("sliding_window", -1)),
-                    layer_id=layer_id,
-                )
-                for layer_id in range(num_layers)
-            ]
-        )
-        self.dtype = dtype
-        self.device = device
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        del positions
-        if inputs_embeds is not None:
-            return inputs_embeds
-        return torch.zeros(
-            (input_ids.shape[0], self.hidden_size),
-            dtype=self.dtype,
-            device=input_ids.device,
-        )
-
-
-class KimiK3ForCausalLM(PyModelBase):
-    """Temporary K3 language-model shell driven by ``PyExecutorImpl``."""
-
-    def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__()
-        dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
-        device = torch.device(config.get("device", "cuda"))
-        self.model = _KimiK3TextShell(config, dtype, device)
-        self.lm_head = _ZeroLMHead(
-            int(config.get("vocab_size", 163840)), dtype, device
-        )
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(
-            (input_ids.shape[0], self.model.hidden_size),
-            dtype=self.model.dtype,
-            device=input_ids.device,
-        )
-
-    def load_weights(
-        self, state_dicts: list[Any], tp_rank: int, tp_size: int
-    ) -> set[str]:
-        del state_dicts, tp_rank, tp_size
-        return set()
-
-
 class KimiK3ForConditionalGeneration(PyCausalVLMBase):
-    """K3 CausalVLM composed from the vision path and causal LM."""
+    """K3 CausalVLM composed from the vision encoder and text model."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()

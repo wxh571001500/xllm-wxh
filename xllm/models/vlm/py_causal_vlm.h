@@ -63,7 +63,8 @@ class __attribute__((visibility("hidden"))) PyCausalVLM final
   const pybind11::object& config_dict() const override { return config_dict_; }
 
  private:
-  pybind11::dict build_config_dict(const ParallelArgs& parallel_args) const;
+  pybind11::dict build_config_dict(const ParallelArgs& parallel_args,
+                                   const QuantArgs& quant_args) const;
 
   ModelArgs model_args_;
   torch::TensorOptions options_;

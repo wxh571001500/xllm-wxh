@@ -62,5 +62,11 @@ def _register_builtin_models() -> None:
         KimiK3ForConditionalGeneration
     )
 
+    from xllm.python.models.kimi_k3_text import KimiK3ForCausalLM
+
+    register_model("KimiK3ForCausalLM", "kimi_k3_text")(
+        KimiK3ForCausalLM
+    )
+
 
 _register_builtin_models()
