@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -26,6 +26,7 @@ _mock_ops = MagicMock()
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
+from xllm.python.layers.moe import KimiK3RoutedExperts  # noqa: E402
 from xllm.python.models.kimi_k3 import (  # noqa: E402
     KimiK3ForConditionalGeneration,
 )
@@ -437,6 +438,105 @@ def test_quantized_weight_loading_shards_tp_dimensions() -> None:
     assert experts.w13_weight.shape == (2, 2, 4)
     assert experts.w2_weight.shape == (2, 2, 2)
     assert experts.w2_scale_bias.shape == (2, 4, 8)
+
+
+def test_quantized_experts_prepare_runtime_layout() -> None:
+    experts = KimiK3RoutedExperts(
+        num_experts=2,
+        hidden_size=8,
+        intermediate_size=8,
+        tp_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        quantized=True,
+    )
+    experts.w13_weight.data.fill_(1)
+    experts.w2_weight.data.fill_(2)
+    experts.w13_weight_scale.data.fill_(1.0)
+    experts.w2_weight_scale.data.fill_(2.0)
+    experts.w13_scale_bias.data.fill_(3.0)
+    experts.w2_scale_bias.data.fill_(4.0)
+
+    experts._process_quantized_weights()
+
+    assert experts.w13_weight.shape == (2, 8, 2)
+    assert experts.w13_weight.dtype == torch.int32
+    assert experts.w2_weight.shape == (2, 8, 1)
+    assert experts.w2_weight.dtype == torch.int32
+    assert experts.w13_weight_scale.shape == (2, 16)
+    assert experts.w13_weight_scale.dtype == torch.int64
+    assert experts.w2_weight_scale.shape == (2, 1, 8)
+    assert experts.w2_weight_scale.dtype == torch.int64
+    assert experts.w13_scale_bias.shape == (2, 16)
+    assert experts.w2_scale_bias.shape == (2, 8)
+    torch.testing.assert_close(
+        experts.w2_scale_bias,
+        torch.full((2, 8), 64.0),
+    )
+
+
+def test_quantized_experts_execute_situ_pipeline() -> None:
+    experts = KimiK3RoutedExperts(
+        num_experts=2,
+        hidden_size=8,
+        intermediate_size=8,
+        tp_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        quantized=True,
+    )
+    experts._runtime_weights_ready = True
+    hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0], [1]], dtype=torch.int64)
+    topk_weights = torch.ones(2, 1, dtype=torch.bfloat16)
+    sorted_hidden_states = torch.ones(2, 8, dtype=torch.int8)
+    expanded_row_indices = torch.tensor([0, 1], dtype=torch.int32)
+    expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
+    input_scale = torch.ones(2, dtype=torch.float32)
+    gate_up = torch.randn(2, 16, dtype=torch.bfloat16)
+    activated = torch.ones(2, 8, dtype=torch.int8)
+    activated_scale = torch.ones(2, dtype=torch.float32)
+    expert_output = torch.randn(2, 8, dtype=torch.bfloat16)
+    expected = torch.randn(2, 8, dtype=torch.bfloat16)
+
+    with (
+        patch(
+            "xllm.python.layers.moe.torch_npu.npu_moe_init_routing_v2",
+            return_value=(
+                sorted_hidden_states,
+                expanded_row_indices,
+                expert_tokens,
+                input_scale,
+            ),
+        ) as mock_routing,
+        patch(
+            "xllm.python.layers.moe.torch_npu.npu_grouped_matmul",
+            side_effect=([gate_up], [expert_output]),
+        ) as mock_grouped_matmul,
+        patch(
+            "xllm.python.layers.moe._dequant_situ_quant",
+            return_value=(activated, activated_scale),
+        ) as mock_situ,
+        patch(
+            "xllm.python.layers.moe.torch_npu.npu_moe_token_unpermute",
+            return_value=expected,
+        ) as mock_unpermute,
+    ):
+        output = experts(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            beta=4.0,
+            linear_beta=25.0,
+        )
+
+    assert output is expected
+    assert mock_grouped_matmul.call_count == 2
+    assert mock_grouped_matmul.call_args_list[0].kwargs["group_list_type"] == 1
+    assert mock_grouped_matmul.call_args_list[1].kwargs["group_list_type"] == 1
+    mock_routing.assert_called_once()
+    mock_situ.assert_called_once_with(gate_up, 4.0, 25.0)
+    mock_unpermute.assert_called_once()
 
 
 def test_weight_loading_accumulates_across_state_dict_shards() -> None:
