@@ -23,13 +23,90 @@ weights to the owning layer instead of maintaining a model-wide parameter map.
 
 from __future__ import annotations
 
+import ctypes
+import importlib.metadata
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_npu
 
 from xllm.python import ops
+
+
+_ACL_FORMAT_FRACTAL_NZ = 29
+_KIMI_K3_CUSTOM_OP_HANDLES: list[Any] = []
+
+
+def _prepend_env_path(name: str, path: str) -> None:
+    entries = [entry for entry in os.environ.get(name, "").split(":") if entry]
+    if path not in entries:
+        entries.insert(0, path)
+        os.environ[name] = ":".join(entries)
+
+
+def _ensure_kimi_k3_w4a8_custom_op() -> None:
+    if hasattr(torch.ops._C_ascend, "dequant_situ_quant"):
+        return
+    try:
+        distribution = importlib.metadata.distribution("vllm-ascend")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError(
+            "Kimi K3 W4A8 execution requires the vllm-ascend package"
+        ) from error
+
+    package_dir = Path(distribution.locate_file("vllm_ascend"))
+    vendor_dir = (
+        package_dir
+        / "_cann_ops_custom"
+        / "vendors"
+        / "custom_transformer"
+    )
+    vendor_library = vendor_dir / "op_api" / "lib" / "libcust_opapi.so"
+    kernels_library = package_dir / "libvllm_ascend_kernels.so"
+    extension_paths = sorted(package_dir.glob("vllm_ascend_C.*.so"))
+    required_paths = [vendor_library, kernels_library]
+    if not extension_paths or any(not path.is_file() for path in required_paths):
+        raise RuntimeError(
+            "Installed vllm-ascend does not contain the Kimi K3 custom op libraries"
+        )
+
+    _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", str(vendor_dir))
+    _KIMI_K3_CUSTOM_OP_HANDLES.extend(
+        [
+            ctypes.CDLL(str(vendor_library), mode=ctypes.RTLD_GLOBAL),
+            ctypes.CDLL(str(kernels_library), mode=ctypes.RTLD_GLOBAL),
+        ]
+    )
+    torch.ops.load_library(str(extension_paths[0]))
+    if not hasattr(torch.ops._C_ascend, "dequant_situ_quant"):
+        raise RuntimeError(
+            "vllm-ascend did not register _C_ascend.dequant_situ_quant"
+        )
+
+
+def _dequant_situ_quant(
+    hidden_states: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _ensure_kimi_k3_w4a8_custom_op()
+    return torch.ops._C_ascend.dequant_situ_quant(
+        x=hidden_states,
+        weight_scale=None,
+        activation_scale=None,
+        bias=None,
+        quant_scale=None,
+        quant_offset=None,
+        group_index=None,
+        beta=beta,
+        linear_beta=linear_beta,
+        activate_left=True,
+        quant_mode="dynamic",
+    )
 
 
 def _state_dict_tensor(state_dict: Any, name: str) -> torch.Tensor | None:
@@ -116,6 +193,9 @@ class KimiK3RoutedExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.tp_size = tp_size
         self.quantized = quantized
+        self._runtime_weights_ready = False
+        if quantized and device.type in ("npu", "privateuseone"):
+            _ensure_kimi_k3_w4a8_custom_op()
         self._loaded_mask = torch.zeros(
             (num_experts, 3, 4), dtype=torch.bool, device="cpu"
         )
@@ -199,8 +279,12 @@ class KimiK3RoutedExperts(nn.Module):
         linear_beta: float | None,
     ) -> torch.Tensor:
         if self.quantized:
-            raise NotImplementedError(
-                "Kimi K3 W4A8 routed-expert execution is not implemented"
+            return self._forward_quantized(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                beta,
+                linear_beta,
             )
         output = torch.zeros_like(hidden_states)
         for expert_id in range(self.num_experts):
@@ -216,6 +300,116 @@ class KimiK3RoutedExperts(nn.Module):
         if self.tp_size > 1:
             ops.all_reduce_(output)
         return output
+
+    def _forward_quantized(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        beta: float,
+        linear_beta: float | None,
+    ) -> torch.Tensor:
+        if not self._runtime_weights_ready:
+            raise RuntimeError("Kimi K3 W4A8 expert weights are not ready")
+        if hidden_states.shape[0] == 0:
+            return torch.zeros_like(hidden_states)
+
+        num_tokens = hidden_states.shape[0]
+        (
+            sorted_hidden_states,
+            expanded_row_indices,
+            expert_tokens,
+            per_token_scale,
+        ) = torch_npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids.to(torch.int32),
+            scale=None,
+            active_num=num_tokens * topk_ids.shape[1],
+            expert_num=self.num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, self.num_experts],
+            quant_mode=1,
+        )
+        group_list = expert_tokens.to(torch.int64)
+        gate_up = torch_npu.npu_grouped_matmul(
+            x=[sorted_hidden_states],
+            weight=[self.w13_weight],
+            scale=[self.w13_weight_scale.unsqueeze(-2)],
+            bias=[self.w13_scale_bias],
+            per_token_scale=[per_token_scale],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=torch.bfloat16,
+        )[0]
+        activated, activated_scale = _dequant_situ_quant(
+            gate_up,
+            beta,
+            linear_beta,
+        )
+        expert_output = torch_npu.npu_grouped_matmul(
+            x=[activated],
+            weight=[self.w2_weight],
+            scale=[self.w2_weight_scale],
+            bias=[self.w2_scale_bias],
+            per_token_scale=[activated_scale],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=hidden_states.dtype,
+        )[0]
+        output = torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=expert_output,
+            sorted_indices=expanded_row_indices.abs(),
+            probs=topk_weights.to(expert_output.dtype),
+        )
+        if self.tp_size > 1:
+            ops.all_reduce_(output)
+        return output
+
+    @staticmethod
+    def _encode_per_channel_scale(scale: torch.Tensor) -> torch.Tensor:
+        transposed = scale.transpose(1, 2).contiguous()
+        encoded = transposed.cpu().view(torch.int32).to(torch.int64)
+        return encoded.to(device=scale.device)
+
+    def _process_quantized_weights(self) -> None:
+        if self._runtime_weights_ready:
+            return
+        if self.w13_weight.shape[-2] % 4 != 0:
+            raise ValueError("Kimi K3 W4A8 w13 packed dimension must divide 4")
+        if self.w2_weight.shape[-2] % 4 != 0:
+            raise ValueError("Kimi K3 W4A8 w2 packed dimension must divide 4")
+
+        self.w13_weight.data = self.w13_weight.data.transpose(1, 2).contiguous()
+        self.w2_weight.data = self.w2_weight.data.transpose(1, 2).contiguous()
+        if self.w13_weight.device.type in ("npu", "privateuseone"):
+            self.w13_weight.data = torch_npu.npu_format_cast(
+                self.w13_weight.data,
+                _ACL_FORMAT_FRACTAL_NZ,
+            )
+            self.w2_weight.data = torch_npu.npu_format_cast(
+                self.w2_weight.data,
+                _ACL_FORMAT_FRACTAL_NZ,
+            )
+        self.w13_weight.data = self.w13_weight.data.view(torch.int32).contiguous()
+        self.w2_weight.data = self.w2_weight.data.view(torch.int32).contiguous()
+        self.w13_weight_scale.data = self._encode_per_channel_scale(
+            self.w13_weight_scale.data
+        ).squeeze(1)
+        self.w2_weight_scale.data = self._encode_per_channel_scale(
+            self.w2_weight_scale.data
+        )
+        self.w13_scale_bias.data = (
+            self.w13_scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
+        )
+        self.w2_scale_bias.data = (
+            self.w2_scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
+        )
+        self._runtime_weights_ready = True
 
     def load_weight(
         self,
@@ -400,9 +594,19 @@ class KimiK3RoutedExperts(nn.Module):
                 raise KeyError(
                     f"Kimi K3 packed expert weights are missing: {sorted(missing)}"
                 )
+            if self.quantized and self.w13_weight.device.type in (
+                "npu",
+                "privateuseone",
+            ):
+                self._process_quantized_weights()
             return
         if not bool(self._loaded_mask[:, :, :suffix_count].all()):
             raise KeyError("Kimi K3 routed expert weights are incomplete")
+        if self.quantized and self.w13_weight.device.type in (
+            "npu",
+            "privateuseone",
+        ):
+            self._process_quantized_weights()
 
 
 class KimiK3MoE(nn.Module):
