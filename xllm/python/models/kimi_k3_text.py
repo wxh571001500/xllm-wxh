@@ -38,7 +38,13 @@ from xllm.python.layers import (
     RMSNorm,
     RowParallelLinear,
 )
+from xllm.python.layers.attention import AttentionRuntimeLayer
+from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.models.base import PyModelBase
+from xllm.python.models.kimi_k3_gated_mla import (
+    KimiK3GatedMLA,
+    KimiK3GatedMLAConfig,
+)
 
 
 def _tp_rank_from_device(device: object) -> int:
@@ -143,6 +149,16 @@ class KimiK3TextConfig:
     activation_situ_beta: float | None = 4.0
     activation_situ_linear_beta: float | None = 25.0
     attn_res_block_size: int = 12
+    q_lora_rank: int = 1536
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+    mla_use_nope: bool = True
+    mla_use_rope: bool = False
+    mla_use_output_gate: bool = True
+    kda_layers: tuple[int, ...] = ()
+    full_attn_layers: tuple[int, ...] = ()
     quantize_type: str = ""
     quant_method: str = ""
     quant_version: str = ""
@@ -230,6 +246,18 @@ class KimiK3TextConfig:
                 else float(pick("activation_situ_linear_beta", default=25.0))
             ),
             attn_res_block_size=int(pick("attn_res_block_size", default=12)),
+            q_lora_rank=int(pick("q_lora_rank", default=1536)),
+            kv_lora_rank=int(pick("kv_lora_rank", default=512)),
+            qk_nope_head_dim=int(pick("qk_nope_head_dim", default=128)),
+            qk_rope_head_dim=int(pick("qk_rope_head_dim", default=64)),
+            v_head_dim=int(pick("v_head_dim", default=128)),
+            mla_use_nope=bool(pick("mla_use_nope", default=True)),
+            mla_use_rope=bool(pick("mla_use_rope", default=False)),
+            mla_use_output_gate=bool(pick("mla_use_output_gate", default=True)),
+            kda_layers=tuple(int(layer) for layer in linear_attention.get("kda_layers", ())),
+            full_attn_layers=tuple(
+                int(layer) for layer in linear_attention.get("full_attn_layers", ())
+            ),
             quantize_type=str(config.get("quantize_type", "")),
             quant_method=str(config.get("quant_method", "")),
             quant_version=str(config.get("quant_version", "")),
@@ -283,6 +311,29 @@ class KimiK3TextConfig:
                 raise ValueError(
                     "Kimi K3 num_experts_per_token must be within num_experts"
                 )
+        mla_dimensions = {
+            "q_lora_rank": self.q_lora_rank,
+            "kv_lora_rank": self.kv_lora_rank,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "v_head_dim": self.v_head_dim,
+        }
+        invalid_mla = [name for name, value in mla_dimensions.items() if value <= 0]
+        if invalid_mla:
+            raise ValueError(f"Kimi K3 MLA dimensions must be positive: {invalid_mla}")
+        if not self.mla_use_nope:
+            raise ValueError("Kimi K3 MLA requires mla_use_nope")
+        if self.mla_use_rope:
+            raise ValueError("Kimi K3 MLA does not apply RoPE")
+        if not self.mla_use_output_gate:
+            raise ValueError("Kimi K3 MLA requires output gating")
+        layer_numbers = self.kda_layers + self.full_attn_layers
+        if len(set(layer_numbers)) != len(layer_numbers):
+            raise ValueError("Kimi K3 attention layer lists must not overlap or repeat")
+        if any(layer < 1 or layer > self.n_layers for layer in layer_numbers):
+            raise ValueError("Kimi K3 attention layer numbers must be within [1, n_layers]")
+        if self.full_attn_layers and len(layer_numbers) != self.n_layers:
+            raise ValueError("Kimi K3 kda_layers and full_attn_layers must cover all layers")
         if self.uses_quantized_weights:
             if self.quant_version != "1.0.0":
                 raise ValueError(
@@ -314,6 +365,17 @@ class KimiK3TextConfig:
         quantize_type = self.quantize_type.lower()
         quant_method = self.quant_method.lower()
         return quantize_type == "w4a8_dynamic" or quant_method == "ascend_int4"
+
+    def is_kda_layer(self, layer_id: int) -> bool:
+        """Checkpoint layer lists are one-based; runtime layer ids are zero-based."""
+        return layer_id + 1 in self.kda_layers
+
+    def is_mla_layer(self, layer_id: int) -> bool:
+        if not 0 <= layer_id < self.n_layers:
+            raise ValueError(f"Kimi K3 layer id is out of range: {layer_id}")
+        if self.full_attn_layers:
+            return layer_id + 1 in self.full_attn_layers
+        return not self.is_kda_layer(layer_id)
 
     def is_moe_layer(self, layer_id: int) -> bool:
         return (
@@ -606,6 +668,201 @@ class KimiK3MLP(nn.Module):
         self.down_proj.finish_weight_loading()
 
 
+class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
+    """xLLM TP/backend adapter for the shared Kimi K3 Gated-MLA core."""
+
+    attention_kind = "mla"
+
+    _REPLICATED = (
+        "q_a_proj.weight",
+        "q_a_layernorm.weight",
+        "kv_a_proj_with_mqa.weight",
+        "kv_a_layernorm.weight",
+    )
+    _COLUMN_SHARDED = (
+        "q_b_proj.weight",
+        "kv_b_proj.weight",
+        "g_proj.weight",
+    )
+
+    def __init__(
+        self,
+        config: KimiK3TextConfig,
+        layer_id: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        num_heads = config.n_heads // config.tp_size
+        query_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        scale = query_head_dim**-0.5
+        super().__init__(
+            KimiK3GatedMLAConfig(
+                hidden_size=config.hidden_size,
+                num_attention_heads=num_heads,
+                q_lora_rank=config.q_lora_rank,
+                kv_lora_rank=config.kv_lora_rank,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                rms_norm_eps=config.rms_norm_eps,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+        # Attention backends consume these layer-local runtime attributes.
+        self.num_heads = num_heads
+        self.num_kv_heads = 1
+        self.head_dim = config.kv_lora_rank
+        self.scale = scale
+        self.sliding_window = 0
+        self.layer_id = layer_id
+        self.num_heads_local = num_heads
+        self.query_head_dim = query_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        output_size = num_heads * config.v_head_dim
+
+        self.q_a_proj = nn.Linear(
+            config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype, device=device
+        )
+        self.q_a_layernorm = RMSNorm(
+            config.q_lora_rank, config.rms_norm_eps, dtype=dtype, device=device
+        )
+        self.q_b_proj = ColumnParallelLinear(
+            config.q_lora_rank,
+            num_heads * query_head_dim,
+            config.tp_size,
+            dtype=dtype,
+            device=device,
+        )
+        self.kv_a_proj_with_mqa = nn.Linear(
+            config.hidden_size,
+            config.kv_lora_rank + config.qk_rope_head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.kv_a_layernorm = RMSNorm(
+            config.kv_lora_rank, config.rms_norm_eps, dtype=dtype, device=device
+        )
+        self.kv_b_proj = ColumnParallelLinear(
+            config.kv_lora_rank,
+            num_heads * (config.qk_nope_head_dim + config.v_head_dim),
+            config.tp_size,
+            dtype=dtype,
+            device=device,
+        )
+        self.g_proj = ColumnParallelLinear(
+            config.hidden_size,
+            output_size,
+            config.tp_size,
+            dtype=dtype,
+            device=device,
+        )
+        self.o_proj = RowParallelLinear(
+            output_size,
+            config.hidden_size,
+            config.tp_size,
+            dtype=dtype,
+            device=device,
+        )
+        self.register_buffer(
+            "W_UK",
+            torch.empty(
+                num_heads,
+                config.qk_nope_head_dim,
+                config.kv_lora_rank,
+                dtype=dtype,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "W_UV",
+            torch.empty(
+                num_heads,
+                config.kv_lora_rank,
+                config.v_head_dim,
+                dtype=dtype,
+                device=device,
+            ),
+          persistent=False,
+        )
+        self._loaded_components: set[str] = set()
+
+    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        del positions  # Kimi K3 retains the positional slice but does not rotate it.
+        num_tokens = hidden_states.shape[0]
+        q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        q = self.q_b_proj(q_c).view(
+            num_tokens, self.num_heads_local, self.query_head_dim
+        )
+        q_nope, q_pe = q.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK).transpose(0, 1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        k_latent_raw, k_pe = compressed_kv.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        k_latent = self.kv_a_layernorm(k_latent_raw).view(
+            num_tokens, 1, self.kv_lora_rank
+        )
+        attn_out = get_forward_context().attention_backend.execute_mla(
+            q_latent,
+            q_pe,
+            k_latent,
+            k_pe.view(num_tokens, 1, self.qk_rope_head_dim),
+            self,
+            topk=None,
+        )
+        values = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
+        values = values.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
+        return self.apply_output_gate(values, hidden_states)
+
+    def load_weights(self, state_dict: Any, tp_rank: int, tp_size: int) -> set[str]:
+        loaded: set[str] = set()
+        parameters = dict(self.named_parameters())
+        for name in self._REPLICATED:
+            tensor = _state_dict_tensor(state_dict, name)
+            if tensor is not None:
+                _copy_parameter(parameters[name], tensor)
+                loaded.add(name)
+        for name in self._COLUMN_SHARDED:
+            tensor = _state_dict_sharded_tensor(state_dict, name, 0, tp_rank, tp_size)
+            if tensor is not None:
+                _copy_parameter(parameters[name], tensor)
+                loaded.add(name)
+        tensor = _state_dict_sharded_tensor(
+            state_dict, "o_proj.weight", 1, tp_rank, tp_size
+        )
+        if tensor is not None:
+            _copy_parameter(self.o_proj.weight, tensor)
+            loaded.add("o_proj.weight")
+        self._loaded_components.update(loaded)
+        return loaded
+
+    def finish_weight_loading(self) -> None:
+        required = set(self._REPLICATED + self._COLUMN_SHARDED + ("o_proj.weight",))
+        missing = required.difference(self._loaded_components)
+        if missing:
+            raise KeyError(f"Kimi K3 MLA weights are missing: {sorted(missing)}")
+        weight = self.kv_b_proj.weight.data.view(
+            self.num_heads_local,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        w_uk, w_uv = weight.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=1
+        )
+        self.W_UK.copy_(w_uk.contiguous())
+        self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
+        self.o_proj.format_npu_weight_()
+
+
 class KimiK3AttentionPlaceholder(Attention):
     """Shape-compatible attention shell until KDA/MLA are implemented."""
 
@@ -658,7 +915,11 @@ class KimiK3DecoderLayer(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.self_attn = KimiK3AttentionPlaceholder(config, layer_id)
+        self.self_attn = (
+            KimiK3MLAAttention(config, layer_id, dtype, device)
+            if config.is_mla_layer(layer_id)
+            else KimiK3AttentionPlaceholder(config, layer_id)
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -801,6 +1062,18 @@ class KimiK3DecoderLayer(nn.Module):
                 self._loaded_components.add(name)
                 loaded.add(name)
 
+        if isinstance(self.self_attn, KimiK3MLAAttention):
+            child_state_dict = _state_dict_with_prefix(state_dict, "self_attn.")
+            if _state_dict_size(child_state_dict) > 0:
+                loaded.update(
+                    f"self_attn.{name}"
+                    for name in self.self_attn.load_weights(
+                        child_state_dict,
+                        tp_rank,
+                        tp_size,
+                    )
+                )
+
         if hasattr(self, "mlp"):
             child_state_dict = _state_dict_with_prefix(state_dict, "mlp.")
             if _state_dict_size(child_state_dict) > 0:
@@ -843,6 +1116,8 @@ class KimiK3DecoderLayer(nn.Module):
                 f"Kimi K3 decoder layer {self.layer_id} weights are missing: "
                 f"{sorted(missing)}"
             )
+        if isinstance(self.self_attn, KimiK3MLAAttention):
+            self.self_attn.finish_weight_loading()
         if hasattr(self, "mlp"):
             self.mlp.finish_weight_loading()
         else:

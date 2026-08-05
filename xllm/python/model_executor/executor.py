@@ -18,7 +18,10 @@ import torch
 import torch.nn as nn
 
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, KVCache
-from xllm.python.layers.attention import Attention
+from xllm.python.layers.attention import (
+    AttentionLayerSpec,
+    AttentionRuntimeLayer,
+)
 from xllm.python.model_executor.runners.eager import EagerRunner
 
 
@@ -36,7 +39,7 @@ def _resolve_graph_backend(config: dict, device: torch.device) -> str:
 
 
 def _create_attention_backend(
-    first_attention: Attention,
+    first_attention: AttentionLayerSpec,
     device: torch.device,
     dtype: torch.dtype,
 ) -> AttentionBackend:
@@ -55,6 +58,8 @@ def _create_attention_backend(
         )
     if device.type == "cuda":
         from xllm.python.attention.flashinfer import FlashInferBackend
+        if first_attention.kind != "mha":
+            raise NotImplementedError("CUDA Python backend does not support MLA")
         return FlashInferBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -79,26 +84,34 @@ class ModelExecutor:
         self.model = model
         self._kv_bound = False
 
-        attention_layers = [
-            module for module in model.modules() if isinstance(module, Attention)
-        ]
+        attention_layers = sorted(
+            (
+                module
+                for module in model.modules()
+                if isinstance(module, AttentionRuntimeLayer)
+            ),
+            key=lambda layer: layer.layer_id,
+        )
         if not attention_layers:
-            raise ValueError("Python model does not contain an Attention layer")
+            raise ValueError(
+                "Python model does not contain a runtime attention layer"
+            )
 
-        first_attention = attention_layers[0]
-        expected_config = self._attention_config(first_attention)
-        for layer in attention_layers[1:]:
-            if self._attention_config(layer) != expected_config:
-                raise ValueError(
-                    "Attention backend requires identical attention configuration "
-                    "across all layers"
-                )
+        layer_specs = [layer.attention_layer_spec() for layer in attention_layers]
+        layer_ids = [spec.layer_id for spec in layer_specs]
+        expected_layer_ids = list(range(len(layer_specs)))
+        if layer_ids != expected_layer_ids:
+            raise ValueError(
+                "Runtime attention layer ids must be unique and contiguous from zero: "
+                f"got {layer_ids}"
+            )
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
-        self._num_attention_layers = len(attention_layers)
+        self._attention_layer_specs = layer_specs
+        self._num_attention_layers = len(layer_specs)
         self.attention_backend = _create_attention_backend(
-            first_attention, device, first_parameter.dtype
+            layer_specs[0], device, first_parameter.dtype
         )
 
         execution_model = model.model
@@ -138,7 +151,9 @@ class ModelExecutor:
             )
 
     @staticmethod
-    def _attention_config(layer: Attention) -> tuple[int, int, int, float, int]:
+    def _attention_config(
+        layer: AttentionRuntimeLayer,
+    ) -> tuple[int, int, int, float, int]:
         return (
             layer.num_heads,
             layer.num_kv_heads,
