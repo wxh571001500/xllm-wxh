@@ -26,7 +26,7 @@ _mock_ops = MagicMock()
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
-from xllm.python.layers.moe import KimiK3RoutedExperts  # noqa: E402
+from xllm.python.layers.moe import KimiK3MoE, KimiK3RoutedExperts  # noqa: E402
 from xllm.python.models.kimi_k3 import (  # noqa: E402
     KimiK3ForConditionalGeneration,
 )
@@ -83,6 +83,15 @@ class _StateDict:
         return list(self._tensors)
 
 
+class _FixedOutput(torch.nn.Module):
+    def __init__(self, output: torch.Tensor) -> None:
+        super().__init__()
+        self.output = output
+
+    def forward(self, *args: object) -> torch.Tensor:
+        return self.output.clone()
+
+
 def _tiny_config() -> dict:
     return {
         "device": "cpu",
@@ -113,8 +122,8 @@ def _tiny_config() -> dict:
             "routed_scaling_factor": 1.0,
             "linear_attn_config": {
                 "head_dim": 4,
-                "kda_layers": [1],
-                "full_attn_layers": [2],
+                "kda_layers": [],
+                "full_attn_layers": [1, 2],
             },
         },
     }
@@ -537,6 +546,71 @@ def test_quantized_experts_execute_situ_pipeline() -> None:
     mock_routing.assert_called_once()
     mock_situ.assert_called_once_with(gate_up, 4.0, 25.0)
     mock_unpermute.assert_called_once()
+
+
+def test_moe_uses_ascend_fused_topk_contract() -> None:
+    config = KimiK3TextConfig.from_dict(_tiny_config())
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=1,
+        tp_rank=0,
+        routed_expert_down_proj=torch.nn.Identity(),
+        routed_expert_up_proj=torch.nn.Identity(),
+    )
+    router_logits = torch.randn(2, 2)
+    expected_weights = torch.tensor([[0.25], [0.75]])
+    expected_ids = torch.tensor([[1], [0]], dtype=torch.int64)
+
+    with patch.object(
+        torch.ops._C_ascend,
+        "moe_gating_top_k",
+        return_value=(expected_weights, expected_ids, torch.empty(0)),
+        create=True,
+    ) as mock_topk:
+        topk_ids, topk_weights = moe._ascend_topk(router_logits)
+
+    torch.testing.assert_close(topk_weights, expected_weights)
+    torch.testing.assert_close(topk_ids, expected_ids.to(torch.int32))
+    assert mock_topk.call_args.kwargs["renorm"] == 1
+    assert mock_topk.call_args.kwargs["norm_type"] == 1
+    assert mock_topk.call_args.kwargs["group_count"] == 1
+
+
+def test_moe_reduces_shared_expert_output_for_tp() -> None:
+    config = KimiK3TextConfig.from_dict(_tiny_config())
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=2,
+        tp_rank=0,
+        routed_expert_down_proj=torch.nn.Identity(),
+        routed_expert_up_proj=torch.nn.Identity(),
+        shared_experts=_FixedOutput(torch.full((2, 8), 2.0)),
+    )
+    moe.experts = _FixedOutput(torch.ones(2, 8))
+    moe.routed_expert_norm = None
+    hidden_states = torch.zeros(2, 8)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int64)
+    topk_weights = torch.ones(2, 1)
+
+    with (
+        patch.object(
+            moe,
+            "_topk",
+            return_value=(topk_ids, topk_weights),
+        ),
+        patch(
+            "xllm.python.layers.moe.ops.all_reduce_",
+            side_effect=lambda tensor: tensor.mul_(2),
+        ) as mock_all_reduce,
+    ):
+        output = moe(hidden_states)
+
+    torch.testing.assert_close(output, torch.full((2, 8), 5.0))
+    mock_all_reduce.assert_called_once()
 
 
 def test_weight_loading_accumulates_across_state_dict_shards() -> None:
