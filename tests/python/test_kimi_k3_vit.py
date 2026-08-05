@@ -124,7 +124,7 @@ def test_tiny_vision_model_projects_each_media_item() -> None:
     outputs = model(pixel_values, grid_thws)
 
     assert len(outputs) == 1
-    assert outputs[0].shape == (1, 8)
+    assert outputs[0].shape == (2, 8)
     assert torch.isfinite(outputs[0]).all()
 
 

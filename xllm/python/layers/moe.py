@@ -640,6 +640,9 @@ class KimiK3MoE(nn.Module):
         self.renormalize = bool(config.moe_renormalize)
         self.router_activation = str(config.moe_router_activation_func)
         self.routed_scaling_factor = float(config.routed_scaling_factor)
+        self.use_grouped_topk = bool(getattr(config, "use_grouped_topk", True))
+        self.num_expert_group = int(getattr(config, "num_expert_group", 1))
+        self.topk_group = int(getattr(config, "topk_group", 1))
         self.situ_beta = float(getattr(config, "activation_situ_beta", None) or 1.0)
         self.situ_linear_beta = getattr(config, "activation_situ_linear_beta", None)
         self.quantized = quantized
@@ -678,6 +681,11 @@ class KimiK3MoE(nn.Module):
         self.shared_experts = shared_experts
 
     def _topk(self, router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if router_logits.device.type in ("npu", "privateuseone") and hasattr(
+            torch.ops._C_ascend,
+            "moe_gating_top_k",
+        ):
+            return self._ascend_topk(router_logits)
         if self.router_activation == "softmax":
             scores = torch.softmax(router_logits, dim=-1)
         elif self.router_activation == "sigmoid":
@@ -691,6 +699,34 @@ class KimiK3MoE(nn.Module):
         if self.renormalize:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
         return topk_ids, topk_weights * self.routed_scaling_factor
+
+    def _ascend_topk(
+        self,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.router_activation == "softmax":
+            norm_type = 0
+        elif self.router_activation == "sigmoid":
+            norm_type = 1
+        else:
+            raise ValueError(
+                "Unsupported Kimi K3 router activation: "
+                f"{self.router_activation}"
+            )
+        topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
+            router_logits,
+            k=self.top_k,
+            k_group=self.topk_group if self.use_grouped_topk else 1,
+            group_count=self.num_expert_group if self.use_grouped_topk else 1,
+            group_select_mode=1,
+            renorm=int(self.renormalize),
+            norm_type=norm_type,
+            out_flag=False,
+            routed_scaling_factor=self.routed_scaling_factor,
+            eps=1e-20,
+            bias_opt=self.gate.e_score_correction_bias.to(router_logits),
+        )
+        return topk_ids.to(torch.int32), topk_weights
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
@@ -708,7 +744,10 @@ class KimiK3MoE(nn.Module):
             routed_output = self.routed_expert_norm(routed_output)
         output = self.routed_expert_up_proj(routed_output)
         if self.shared_experts is not None:
-            output = output + self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(hidden_states)
+            if self.tp_size > 1:
+                ops.all_reduce_(shared_output)
+            output = output + shared_output
         return output.reshape(original_shape)
 
     def load_weight(
