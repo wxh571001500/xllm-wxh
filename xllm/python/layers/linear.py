@@ -133,3 +133,105 @@ class RowParallelLinear(nn.Module):
         if self.bias is not None:
             out = out + self.bias
         return out
+
+
+def _copy_parameter(parameter: torch.Tensor, tensor: torch.Tensor) -> None:
+    if parameter.shape != tensor.shape:
+        raise ValueError(
+            f"Kimi K3 parameter expects {parameter.shape}, got {tensor.shape}"
+        )
+    parameter.data.copy_(tensor.to(dtype=parameter.dtype, device=parameter.device))
+
+
+class KimiK3W8A8DynamicLinear(nn.Module):
+    """Kimi dynamic W8A8 linear (int8 weight + int8 dynamic-quant activation).
+
+    The Kimi-K3 ``w8a8_dynamic`` checkpoint stores the weight as int8
+    ``[out, in]`` with a per-output-channel float32 ``weight_scale`` /
+    ``weight_offset``. At runtime the activation is dynamically quantized per
+    token to int8 (``npu_dynamic_quant``) and the matmul is an int8 x int8
+    ``quant_matmul`` dequantized back to the activation dtype. This mirrors
+    vllm-ascend's ``AscendW8A8DynamicLinearMethod`` and backs the dense MLP, the
+    routed latent projections, and the KDA q/k/v projections.
+
+    Callers hand ``load_weight`` already-sharded tensors and must invoke
+    ``finish_weight_loading`` before the first forward.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        device: torch.device,
+        tp_size: int = 1,
+        reduce_results: bool = False,
+        gather_output: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.tp_size = tp_size
+        self.reduce_results = reduce_results
+        self.gather_output = gather_output
+        self._processed = False
+        self.weight = nn.Parameter(
+            torch.empty(
+                out_features,
+                in_features,
+                dtype=torch.int8,
+                device=device,
+            ),
+            requires_grad=False,
+        )
+        self.register_buffer(
+            "weight_scale",
+            torch.empty(out_features, 1, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "weight_offset",
+            torch.empty(out_features, 1, dtype=torch.float32, device=device),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._processed:
+            raise RuntimeError("Kimi K3 W8A8 weights have not finished loading")
+        quantized, per_token_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        output = ops.quant_matmul(
+            quantized,
+            self.weight,
+            False,
+            self.weight_scale,
+            None,
+            per_token_scale,
+            None,
+            hidden_states.dtype,
+        )
+        if self.reduce_results and self.tp_size > 1:
+            ops.all_reduce_(output)
+        if self.gather_output and self.tp_size > 1:
+            output = ops.all_gather(output, dim=-1, world_size=self.tp_size)
+        return output
+
+    def load_weight(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+    ) -> bool:
+        targets = {
+            "weight": self.weight,
+            "weight_scale": self.weight_scale,
+            "weight_offset": self.weight_offset,
+        }
+        target = targets.get(name)
+        if target is None:
+            return False
+        _copy_parameter(target, tensor)
+        return True
+
+    def finish_weight_loading(self) -> None:
+        if self._processed:
+            return
+        self.weight.data = self.weight.data.transpose(0, 1).contiguous()
+        self.weight_scale.data = self.weight_scale.data.flatten().contiguous()
+        self.weight_offset.data = self.weight_offset.data.flatten().contiguous()
+        self._processed = True
