@@ -52,6 +52,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from xllm.python.layers.attention import AttentionRuntimeLayer
 from xllm.python.layers.linear import (
     ColumnParallelLinear,
     KimiK3W8A8DynamicLinear,
@@ -104,14 +105,23 @@ def _build_chunk_indices(cu_seqlens: list[int], chunk_size: int) -> list[int]:
     return indices
 
 
-class KimiK3DeltaAttention(nn.Module):
+class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
     """Kimi-K3 KDA layer with a full-rank per-channel decay gate.
+
+    A runtime attention layer (``attention_kind="linear"``) so the executor
+    collects it alongside MLA/MHA layers and the decoder layer ids stay
+    contiguous. Unlike paged-attention layers it reads its conv/recurrent state
+    from ``kda_runtime`` rather than the attention backend, so its
+    ``attention_layer_spec`` is only used for identity/ordering, not paged-KV
+    geometry.
 
     Args:
         hidden_size: model hidden size.
         linear_attn_config: the HF config's ``linear_attn_config`` dict; must
             contain ``num_heads``, ``head_dim``, ``short_conv_kernel_size`` and
             ``use_full_rank_gate=True``. ``gate_lower_bound`` is optional.
+        layer_id: global 0-based decoder layer index (used by the executor for
+            runtime-layer ordering and KDA cache/metadata routing).
         tp_size / tp_rank: tensor-parallel world size and rank. Heads (and the
             tied projections / conv / biases) are head-sharded per rank; the
             low-rank ``f_a`` projection is replicated on every rank.
@@ -120,11 +130,14 @@ class KimiK3DeltaAttention(nn.Module):
         dtype / device: parameter dtype and device.
     """
 
+    attention_kind = "linear"
+
     def __init__(
         self,
         hidden_size: int,
         linear_attn_config: dict,
         *,
+        layer_id: int = 0,
         tp_size: int = 1,
         tp_rank: int = 0,
         rms_norm_eps: float = 1e-6,
@@ -137,6 +150,7 @@ class KimiK3DeltaAttention(nn.Module):
             "KimiK3DeltaAttention requires a full-rank gate"
         )
         self.hidden_size = hidden_size
+        self.layer_id = layer_id
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.quantized = quantized
@@ -147,6 +161,11 @@ class KimiK3DeltaAttention(nn.Module):
         self.projection_size = self.head_dim * self.num_heads
         self.local_projection_size = self.projection_size // tp_size
         self.conv_size = linear_attn_config["short_conv_kernel_size"]
+        # Runtime-layer spec fields (see AttentionRuntimeLayer). KDA does not use
+        # the paged-KV backend, so num_kv_heads/sliding_window are nominal.
+        self.num_kv_heads = self.local_num_heads
+        self.scale = self.head_dim**-0.5
+        self.sliding_window = 0
         self.gate_lower_bound: float | None = linear_attn_config.get(
             "gate_lower_bound", None
         )
@@ -155,7 +174,6 @@ class KimiK3DeltaAttention(nn.Module):
                 "KDA gate lower bound must be in [-5, 0), "
                 f"got {self.gate_lower_bound}."
             )
-        self.scale = self.head_dim**-0.5
         self.o_norm_eps = rms_norm_eps
 
         local_proj = self.local_projection_size

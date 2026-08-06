@@ -66,6 +66,12 @@ struct KVCacheCreateOptions {
   // region so it can be released/re-acquired by sleep()/wake_up().
   PROPERTY(bool, enable_sleep_mode) = false;
   PROPERTY(bool, enable_linear_attention) = false;
+  // Per-layer linear-attention mask. Empty keeps the legacy behavior of
+  // classifying layers via full_attention_interval; otherwise each entry
+  // decides whether that layer owns conv/ssm (linear) cache. Needed by models
+  // whose linear layers are an arbitrary set rather than an even interval
+  // (e.g. Kimi-K3's kda_layers).
+  PROPERTY(std::vector<bool>, linear_attention_layers);
   PROPERTY(bool, enable_lighting_indexer) = false;
   // Empty keeps the legacy all-layer behavior. Otherwise each entry controls
   // whether that layer owns indexer cache tensors.

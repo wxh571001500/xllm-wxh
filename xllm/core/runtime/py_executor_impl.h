@@ -59,6 +59,9 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   pybind11::object py_executor_;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;
+  // True when the model has linear-attention (KDA) layers; gates KDA cache
+  // binding and per-step metadata push.
+  bool has_kda_layers_ = false;
 };
 
 REGISTER_EXECUTOR("python", PyExecutorImpl);
