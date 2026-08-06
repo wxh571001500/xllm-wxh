@@ -40,10 +40,24 @@ _mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
-from xllm.python.layers.moe import KimiK3MoE, KimiK3RoutedExperts  # noqa: E402
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     ForwardContext,
     forward_context,
+from xllm.python.layers.moe import (  # noqa: E402
+    FusedAllGatherTokenDispatcher,
+    FusedQuantizedSituAndMul,
+    FusedW4A8RoutedExperts,
+    GroupedTopKRouter,
+    KimiK3MoE,
+    MoE,
+    MoEExpertsConfig,
+    MoERouterConfig,
+    MoERoutingResult,
+    MoETokenDispatchInput,
+    MoETokenDispatchOutput,
+    NativeTokenDispatcher,
+    TensorParallelCommMethod,
+    UnquantizedRoutedExperts,
 )
 from xllm.python.models.kimi_k3 import (  # noqa: E402
     KimiK3ForConditionalGeneration,
@@ -110,6 +124,21 @@ class _FixedOutput(torch.nn.Module):
 
     def forward(self, *args: object) -> torch.Tensor:
         return self.output.clone()
+
+
+class _FixedExperts(torch.nn.Module):
+    def __init__(self, output: torch.Tensor) -> None:
+        super().__init__()
+        self.output = output
+
+    def forward(self, dispatch_output: MoETokenDispatchOutput) -> torch.Tensor:
+        del dispatch_output
+        return self.output.clone()
+
+
+class _FirstHalf(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states.chunk(2, dim=-1)[0]
 
 
 def _tiny_config() -> dict:
@@ -631,14 +660,20 @@ def test_quantized_mla_weight_requires_scale_and_offset(companion: str) -> None:
 
 
 def test_quantized_experts_prepare_runtime_layout() -> None:
-    experts = KimiK3RoutedExperts(
-        num_experts=2,
-        hidden_size=8,
-        intermediate_size=8,
-        tp_size=1,
+    experts = FusedW4A8RoutedExperts(
+        config=MoEExpertsConfig(
+            num_experts=2,
+            hidden_size=8,
+            intermediate_size=8,
+            tp_size=1,
+            tp_rank=0,
+        ),
+        activation=FusedQuantizedSituAndMul(
+            beta=4.0,
+            linear_beta=25.0,
+        ),
         dtype=torch.float32,
         device=torch.device("cpu"),
-        quantized=True,
     )
     experts.w13_weight.data.fill_(1)
     experts.w2_weight.data.fill_(2)
@@ -666,16 +701,63 @@ def test_quantized_experts_prepare_runtime_layout() -> None:
 
 
 def test_quantized_experts_execute_situ_pipeline() -> None:
-    experts = KimiK3RoutedExperts(
-        num_experts=2,
-        hidden_size=8,
-        intermediate_size=8,
-        tp_size=1,
+    experts = FusedW4A8RoutedExperts(
+        config=MoEExpertsConfig(
+            num_experts=2,
+            hidden_size=8,
+            intermediate_size=8,
+            tp_size=1,
+            tp_rank=0,
+        ),
+        activation=FusedQuantizedSituAndMul(
+            beta=4.0,
+            linear_beta=25.0,
+        ),
         dtype=torch.bfloat16,
         device=torch.device("cpu"),
-        quantized=True,
     )
     experts._runtime_weights_ready = True
+    sorted_hidden_states = torch.ones(2, 8, dtype=torch.int8)
+    expert_tokens = torch.tensor([1, 1], dtype=torch.int64)
+    input_scale = torch.ones(2, dtype=torch.float32)
+    gate_up = torch.randn(2, 16, dtype=torch.bfloat16)
+    activated = torch.ones(2, 8, dtype=torch.int8)
+    activated_scale = torch.ones(2, dtype=torch.float32)
+    expert_output = torch.randn(2, 8, dtype=torch.bfloat16)
+
+    with (
+        patch(
+            "xllm.python.layers.moe.experts.torch_npu.npu_grouped_matmul",
+            side_effect=([gate_up], [expert_output]),
+        ) as mock_grouped_matmul,
+        patch(
+            "xllm.python.layers.moe.experts._dequant_situ_quant",
+            return_value=(activated, activated_scale),
+        ) as mock_situ,
+    ):
+        output = experts(
+            MoETokenDispatchOutput(
+                hidden_states=sorted_hidden_states,
+                group_list=expert_tokens,
+                group_list_type=1,
+                combine_metadata=object(),
+                dynamic_scale=input_scale,
+            ),
+        )
+
+    assert output is expert_output
+    assert mock_grouped_matmul.call_count == 2
+    assert mock_grouped_matmul.call_args_list[0].kwargs["group_list_type"] == 1
+    assert mock_grouped_matmul.call_args_list[1].kwargs["group_list_type"] == 1
+    mock_situ.assert_called_once_with(gate_up, 4.0, 25.0)
+
+
+def test_fused_all_gather_dispatcher_routes_and_combines() -> None:
+    dispatcher = FusedAllGatherTokenDispatcher(
+        num_experts=2,
+        top_k=1,
+        quantized=True,
+    )
     hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
     topk_ids = torch.tensor([[0], [1]], dtype=torch.int64)
     topk_weights = torch.ones(2, 1, dtype=torch.bfloat16)
@@ -683,15 +765,13 @@ def test_quantized_experts_execute_situ_pipeline() -> None:
     expanded_row_indices = torch.tensor([0, 1], dtype=torch.int32)
     expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
     input_scale = torch.ones(2, dtype=torch.float32)
-    gate_up = torch.randn(2, 16, dtype=torch.bfloat16)
-    activated = torch.ones(2, 8, dtype=torch.int8)
-    activated_scale = torch.ones(2, dtype=torch.float32)
     expert_output = torch.randn(2, 8, dtype=torch.bfloat16)
     expected = torch.randn(2, 8, dtype=torch.bfloat16)
 
     with (
         patch(
-            "xllm.python.layers.moe.torch_npu.npu_moe_init_routing_v2",
+            "xllm.python.layers.moe.token_dispatcher."
+            "torch_npu.npu_moe_init_routing_v2",
             return_value=(
                 sorted_hidden_states,
                 expanded_row_indices,
@@ -700,36 +780,37 @@ def test_quantized_experts_execute_situ_pipeline() -> None:
             ),
         ) as mock_routing,
         patch(
-            "xllm.python.layers.moe.torch_npu.npu_grouped_matmul",
-            side_effect=([gate_up], [expert_output]),
-        ) as mock_grouped_matmul,
-        patch(
-            "xllm.python.layers.moe._dequant_situ_quant",
-            return_value=(activated, activated_scale),
-        ) as mock_situ,
-        patch(
-            "xllm.python.layers.moe.torch_npu.npu_moe_token_unpermute",
+            "xllm.python.layers.moe.token_dispatcher."
+            "torch_npu.npu_moe_token_unpermute",
             return_value=expected,
         ) as mock_unpermute,
     ):
-        output = experts(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            beta=4.0,
-            linear_beta=25.0,
+        dispatch_output = dispatcher.token_dispatch(
+            MoETokenDispatchInput(
+                hidden_states=hidden_states,
+                routing=MoERoutingResult(
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                ),
+            )
+        )
+        output = dispatcher.token_combine(
+            expert_output,
+            dispatch_output.combine_metadata,
         )
 
+    assert dispatch_output.hidden_states is sorted_hidden_states
+    assert dispatch_output.dynamic_scale is input_scale
+    torch.testing.assert_close(
+        dispatch_output.group_list,
+        expert_tokens.to(torch.int64),
+    )
     assert output is expected
-    assert mock_grouped_matmul.call_count == 2
-    assert mock_grouped_matmul.call_args_list[0].kwargs["group_list_type"] == 1
-    assert mock_grouped_matmul.call_args_list[1].kwargs["group_list_type"] == 1
-    mock_routing.assert_called_once()
-    mock_situ.assert_called_once_with(gate_up, 4.0, 25.0)
+    assert mock_routing.call_args.kwargs["quant_mode"] == 1
     mock_unpermute.assert_called_once()
 
 
-def test_moe_uses_ascend_fused_topk_contract() -> None:
+def test_moe_uses_fused_topk_contract() -> None:
     config = KimiK3TextConfig.from_dict(_tiny_config())
     moe = KimiK3MoE(
         config,
@@ -750,13 +831,67 @@ def test_moe_uses_ascend_fused_topk_contract() -> None:
         return_value=(expected_weights, expected_ids, torch.empty(0)),
         create=True,
     ) as mock_topk:
-        topk_ids, topk_weights = moe._ascend_topk(router_logits)
+        topk_ids, topk_weights = moe._fused_topk(router_logits)
 
     torch.testing.assert_close(topk_weights, expected_weights)
     torch.testing.assert_close(topk_ids, expected_ids.to(torch.int32))
     assert mock_topk.call_args.kwargs["renorm"] == 1
     assert mock_topk.call_args.kwargs["norm_type"] == 1
     assert mock_topk.call_args.kwargs["group_count"] == 1
+
+
+def test_moe_refactor_preserves_checkpoint_parameter_paths() -> None:
+    config = KimiK3TextConfig.from_dict(_tiny_config())
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=1,
+        tp_rank=0,
+        routed_expert_down_proj=torch.nn.Linear(8, 4, bias=False),
+        routed_expert_up_proj=torch.nn.Linear(4, 8, bias=False),
+    )
+
+    parameter_names = set(dict(moe.named_parameters()))
+
+    assert isinstance(moe, MoE)
+    assert "gate.weight" in parameter_names
+    assert "gate.e_score_correction_bias" in parameter_names
+    assert "routed_expert_down_proj.weight" in parameter_names
+    assert "routed_expert_up_proj.weight" in parameter_names
+    assert "experts.w13_weight" in parameter_names
+    assert "experts.w2_weight" in parameter_names
+    assert not any(name.startswith("_runner.") for name in parameter_names)
+
+
+def test_generic_moe_runs_without_kimi_transforms() -> None:
+    moe = MoE(
+        hidden_size=2,
+        num_experts=1,
+        router_config=MoERouterConfig(
+            num_experts=1,
+            top_k=1,
+            scoring_func="sigmoid",
+            renormalize=True,
+            routed_scaling_factor=1.0,
+        ),
+        experts=_FixedExperts(torch.ones(2, 2)),
+        comm_method=TensorParallelCommMethod(
+            tp_size=1,
+            token_dispatcher=NativeTokenDispatcher(num_experts=1),
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    routing = MoERoutingResult(
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+        topk_weights=torch.ones(2, 1),
+    )
+
+    with patch.object(moe._router, "select_experts", return_value=routing):
+        output = moe(torch.zeros(2, 2))
+
+    torch.testing.assert_close(output, torch.ones(2, 2))
 
 
 def test_moe_reduces_shared_expert_output_for_tp() -> None:
@@ -771,7 +906,7 @@ def test_moe_reduces_shared_expert_output_for_tp() -> None:
         routed_expert_up_proj=torch.nn.Identity(),
         shared_experts=_FixedOutput(torch.full((2, 8), 2.0)),
     )
-    moe.experts = _FixedOutput(torch.ones(2, 8))
+    moe.experts = _FixedExperts(torch.ones(2, 8))
     moe.routed_expert_norm = None
     hidden_states = torch.zeros(2, 8)
     topk_ids = torch.zeros(2, 1, dtype=torch.int64)
@@ -779,19 +914,123 @@ def test_moe_reduces_shared_expert_output_for_tp() -> None:
 
     with (
         patch.object(
-            moe,
-            "_topk",
-            return_value=(topk_ids, topk_weights),
+            moe._router,
+            "select_experts",
+            return_value=MoERoutingResult(
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            ),
         ),
         patch(
-            "xllm.python.layers.moe.ops.all_reduce_",
+            "xllm.python.layers.moe.prepare_finalize.ops.all_reduce_",
             side_effect=lambda tensor: tensor.mul_(2),
         ) as mock_all_reduce,
     ):
         output = moe(hidden_states)
 
-    torch.testing.assert_close(output, torch.full((2, 8), 5.0))
+    torch.testing.assert_close(output, torch.full((2, 8), 6.0))
+    assert mock_all_reduce.call_count == 2
+
+
+def test_grouped_topk_router_native_uses_top2_group_score() -> None:
+    router = GroupedTopKRouter(
+        MoERouterConfig(
+            num_experts=4,
+            top_k=1,
+            scoring_func="sigmoid",
+            renormalize=False,
+            routed_scaling_factor=1.0,
+            use_grouped_topk=True,
+            num_expert_group=2,
+            topk_group=1,
+        )
+    )
+    probabilities = torch.tensor([[0.9, 0.1, 0.6, 0.6]])
+    router_logits = torch.logit(probabilities)
+
+    routing = router.select_experts(
+        hidden_states=torch.empty(1, 1),
+        router_logits=router_logits,
+    )
+
+    assert routing.topk_ids.item() in (2, 3)
+    torch.testing.assert_close(
+        routing.topk_weights,
+        torch.tensor([[0.6]]),
+    )
+
+
+def test_tensor_parallel_comm_method_runs_staged_pipeline() -> None:
+    comm_method = TensorParallelCommMethod(
+        tp_size=2,
+        token_dispatcher=NativeTokenDispatcher(num_experts=1),
+    )
+    prepare_output = comm_method.prepare(
+        hidden_states=torch.zeros(2, 4),
+        router_logits=torch.zeros(2, 1),
+    )
+    fused_result = comm_method.fused_experts(
+        experts=_FixedExperts(torch.ones(2, 4)),
+        prepare_output=prepare_output,
+        routing=MoERoutingResult(
+            topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+            topk_weights=torch.ones(2, 1),
+        ),
+    )
+
+    with patch(
+        "xllm.python.layers.moe.prepare_finalize.ops.all_reduce_",
+        side_effect=lambda tensor: tensor.mul_(2),
+    ) as mock_all_reduce:
+        output = comm_method.finalize(
+            fused_result.routed_out,
+            reduce_results=True,
+        )
+
+    torch.testing.assert_close(output, torch.full((2, 4), 2.0))
     mock_all_reduce.assert_called_once()
+
+
+def test_native_pipeline_dispatches_computes_and_combines() -> None:
+    experts = UnquantizedRoutedExperts(
+        config=MoEExpertsConfig(
+            num_experts=2,
+            hidden_size=2,
+            intermediate_size=2,
+            tp_size=1,
+            tp_rank=0,
+        ),
+        activation=_FirstHalf(),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    with torch.no_grad():
+        experts.w13_weight.zero_()
+        experts.w13_weight[0, :2].copy_(torch.eye(2))
+        experts.w13_weight[1, :2].copy_(2 * torch.eye(2))
+        experts.w2_weight.copy_(torch.eye(2).expand(2, -1, -1))
+
+    comm_method = TensorParallelCommMethod(
+        tp_size=1,
+        token_dispatcher=NativeTokenDispatcher(num_experts=2),
+    )
+    prepare_output = comm_method.prepare(
+        hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        router_logits=torch.zeros(2, 2),
+    )
+    fused_result = comm_method.fused_experts(
+        experts=experts,
+        prepare_output=prepare_output,
+        routing=MoERoutingResult(
+            topk_ids=torch.tensor([[1], [0]], dtype=torch.int64),
+            topk_weights=torch.tensor([[0.5], [0.25]]),
+        ),
+    )
+
+    torch.testing.assert_close(
+        fused_result.routed_out,
+        torch.tensor([[1.0, 2.0], [0.75, 1.0]]),
+    )
 
 
 def test_weight_loading_accumulates_across_state_dict_shards() -> None:
