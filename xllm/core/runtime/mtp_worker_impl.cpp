@@ -2170,7 +2170,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   COUNTER_ADD(speculative_execution_latency_seconds_validation,
               timer.elapsed_seconds());
 
-  if (pruned_prefix_lengths != nullptr) {
+  if (pruned_prefix_lengths != nullptr || is_kimi_k25_eagle3_pair()) {
     // Adaptive pruning path: per-seq validate width is variable, which is
     // incompatible with the async handoff's fixed-width base-state derivation.
     // Use the synchronous tail: unify tokens, then write target context inline.
