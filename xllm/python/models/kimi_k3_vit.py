@@ -16,8 +16,12 @@
 
 from __future__ import annotations
 
+import itertools
+import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -26,6 +30,128 @@ import torch.nn.functional as F
 
 from xllm.python import ops
 from xllm.python.layers import ColumnParallelLinear, RowParallelLinear
+
+
+_DUMP_CALL_INDEX = 0
+
+
+def _dump_enabled() -> bool:
+    return os.getenv("KIMI_K3_VIT_DUMP", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+class _KimiK3VitDump:
+    def __init__(self, rank: int, world_size: int) -> None:
+        global _DUMP_CALL_INDEX
+
+        self.enabled = _dump_enabled()
+        self.rank = rank
+        self.world_size = world_size
+        self.call_index = _DUMP_CALL_INDEX
+        _DUMP_CALL_INDEX += 1
+        self._hooks: list[Any] = []
+        self._payload: dict[str, Any] = {
+            "framework": "xllm",
+            "rank": rank,
+            "world_size": world_size,
+            "call_index": self.call_index,
+            "tensors": {},
+        }
+
+    def record(self, name: str, tensor: torch.Tensor, full: bool = False) -> None:
+        if not self.enabled:
+            return
+        detached = tensor.detach()
+        row_count = detached.shape[0] if detached.ndim > 0 else 1
+        if full or row_count <= 3:
+            row_indices = torch.arange(row_count, dtype=torch.int64)
+            values = detached
+        else:
+            indices = sorted({0, row_count // 2, row_count - 1})
+            device_indices = torch.tensor(
+                indices,
+                dtype=torch.int64,
+                device=detached.device,
+            )
+            row_indices = torch.tensor(indices, dtype=torch.int64)
+            values = detached.index_select(0, device_indices)
+        if values.is_floating_point():
+            values = values.float()
+        self._payload["tensors"][name] = {
+            "shape": list(detached.shape),
+            "dtype": str(detached.dtype),
+            "row_indices": row_indices,
+            "values": values.cpu(),
+        }
+
+    def install_hooks(self, vision_tower: nn.Module) -> None:
+        if not self.enabled:
+            return
+
+        def _register(module: nn.Module, name: str) -> None:
+            def _hook(
+                unused_module: nn.Module,
+                unused_inputs: tuple[Any, ...],
+                output: torch.Tensor,
+            ) -> None:
+                del unused_module, unused_inputs
+                self.record(name, output)
+
+            self._hooks.append(module.register_forward_hook(_hook))
+
+        def _register_input(module: nn.Module, name: str) -> None:
+            def _pre_hook(
+                unused_module: nn.Module,
+                inputs: tuple[Any, ...],
+            ) -> None:
+                del unused_module
+                self.record(name, inputs[0])
+
+            self._hooks.append(module.register_forward_pre_hook(_pre_hook))
+
+        _register(vision_tower.patch_embed, "patch_embed")
+        for layer_index, block in enumerate(vision_tower.encoder.blocks):
+            _register(block, f"encoder.block.{layer_index}")
+        first_block = vision_tower.encoder.blocks[0]
+        self.record("encoder.block.0.weight.norm0", first_block.norm0.weight)
+        self.record("encoder.block.0.weight.qkv", first_block.wqkv.weight)
+        self.record("encoder.block.0.weight.wo", first_block.wo.weight)
+        self.record("encoder.block.0.weight.norm1", first_block.norm1.weight)
+        self.record("encoder.block.0.weight.fc0", first_block.mlp.fc0.weight)
+        self.record("encoder.block.0.weight.fc1", first_block.mlp.fc1.weight)
+        _register(first_block.norm0, "encoder.block.0.norm0")
+        _register(first_block.wqkv, "encoder.block.0.qkv")
+        _register_input(first_block.wo, "encoder.block.0.attention_output")
+        _register(first_block.wo, "encoder.block.0.wo")
+        _register(first_block.norm1, "encoder.block.0.norm1")
+        _register(first_block.mlp.fc0, "encoder.block.0.fc0")
+        _register_input(first_block.mlp.fc1, "encoder.block.0.activation")
+        _register(first_block.mlp.fc1, "encoder.block.0.fc1")
+        _register(vision_tower.encoder.final_layernorm, "encoder.final_layernorm")
+
+    def remove_hooks(self) -> None:
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+
+    def save(self) -> None:
+        if not self.enabled:
+            return
+        dump_dir = Path(
+            os.getenv(
+                "KIMI_K3_VIT_DUMP_DIR",
+                "/export/home/wangxiaohan17/wangxiaohan/xllm-k3-dump",
+            )
+        )
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = dump_dir / (
+            f"call_{self.call_index:04d}_rank_{self.rank:03d}.pt"
+        )
+        torch.save(self._payload, dump_path)
 
 
 def _grid_thw_list(
@@ -45,13 +171,6 @@ def _grid_thw_list(
             raise ValueError(f"Kimi K3 grid dimensions must be positive, got {grid}")
         grids.append((time, height, width))
     return grids
-
-
-def _dtype_rms_norm_eps(dtype: torch.dtype) -> float:
-    try:
-        return torch.finfo(dtype).eps
-    except TypeError as error:
-        raise ValueError(f"Kimi K3 vision RMSNorm does not support {dtype}") from error
 
 
 def _apply_rope(
@@ -104,6 +223,8 @@ class KimiK3VisionConfig:
     projector_ln_eps: float = 1e-5
     tp_size: int = 1
     tp_rank: int = 0
+    encoder_dp_size: int = 1
+    encoder_dp_rank: int = 0
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "KimiK3VisionConfig":
@@ -123,6 +244,8 @@ class KimiK3VisionConfig:
         if not isinstance(text_config, dict):
             text_config = {}
         mm_hidden_size = raw.get("mm_hidden_size")
+        encoder_dp_size = int(config.get("tp_size", raw.get("tp_size", 1)))
+        encoder_dp_rank = int(config.get("tp_rank", raw.get("tp_rank", 0)))
         return cls(
             patch_size=int(raw.get("patch_size", 14)),
             in_channels=int(raw.get("in_chans", raw.get("in_channels", 3))),
@@ -164,8 +287,10 @@ class KimiK3VisionConfig:
             mm_projector_type=str(raw.get("mm_projector_type", "patchmergerv2")),
             projector_hidden_act=str(raw.get("projector_hidden_act", "gelu")),
             projector_ln_eps=float(raw.get("projector_ln_eps", 1e-5)),
-            tp_size=int(config.get("tp_size", raw.get("tp_size", 1))),
-            tp_rank=int(config.get("tp_rank", raw.get("tp_rank", 0))),
+            tp_size=1,
+            tp_rank=0,
+            encoder_dp_size=encoder_dp_size,
+            encoder_dp_rank=encoder_dp_rank,
         )
 
     def validate(self) -> None:
@@ -185,6 +310,11 @@ class KimiK3VisionConfig:
             raise ValueError("Kimi K3 initial position dimensions must be positive")
         if self.tp_size <= 0 or not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("Kimi K3 TP rank and size are invalid")
+        if (
+            self.encoder_dp_size <= 0
+            or not 0 <= self.encoder_dp_rank < self.encoder_dp_size
+        ):
+            raise ValueError("Kimi K3 encoder DP rank and size are invalid")
         if self.num_attention_heads <= 0:
             raise ValueError("Kimi K3 vision head count must be positive")
         if self.qkv_hidden_size % self.num_attention_heads != 0:
@@ -419,16 +549,13 @@ class KimiK3VisionEncoderLayer(nn.Module):
         self.num_heads = config.num_attention_heads // config.tp_size
         self.head_dim = config.qkv_hidden_size // config.num_attention_heads
         qkv_hidden_per_rank = self.num_heads * self.head_dim
-        norm_eps = _dtype_rms_norm_eps(dtype)
         self.norm0 = nn.RMSNorm(
             config.hidden_size,
-            eps=norm_eps,
             dtype=dtype,
             device=device,
         )
         self.norm1 = nn.RMSNorm(
             config.hidden_size,
-            eps=norm_eps,
             dtype=dtype,
             device=device,
         )
@@ -494,7 +621,6 @@ class KimiK3VisionEncoder(nn.Module):
         )
         self.final_layernorm = nn.RMSNorm(
             config.hidden_size,
-            eps=_dtype_rms_norm_eps(dtype),
             dtype=dtype,
             device=device,
         )
@@ -563,6 +689,7 @@ class KimiK3VisionTower(nn.Module):
     ) -> None:
         super().__init__()
         config.validate()
+        self.config = config
         self.merge_kernel_size = config.merge_kernel_size
         self.patch_embed = KimiK3VisionPatchEmbed(config, dtype, device)
         self.encoder = KimiK3VisionEncoder(config, dtype, device)
@@ -579,6 +706,136 @@ class KimiK3VisionTower(nn.Module):
             grid_thws,
             self.merge_kernel_size,
         )
+
+
+def _get_load_balance_assignment(
+    sizes: list[int],
+    num_ranks: int,
+) -> tuple[list[int], list[int], list[int]]:
+    assignments: list[list[int]] = [[] for _ in range(num_ranks)]
+    loads = [0] * num_ranks
+    for image_index in sorted(
+        range(len(sizes)),
+        key=lambda index: sizes[index],
+        reverse=True,
+    ):
+        target_rank = min(range(num_ranks), key=lambda rank: loads[rank])
+        assignments[target_rank].append(image_index)
+        loads[target_rank] += sizes[image_index]
+
+    image_to_rank: list[int] = []
+    image_counts: list[int] = []
+    for rank_assignment in assignments:
+        image_to_rank.extend(rank_assignment)
+        image_counts.append(len(rank_assignment))
+    return image_to_rank, image_counts, loads
+
+
+def _run_data_parallel_vision_tower(
+    vision_tower: KimiK3VisionTower,
+    pixel_values: torch.Tensor,
+    grid_thws: torch.Tensor | Sequence[Sequence[int]],
+    rank: int,
+    world_size: int,
+    dump: _KimiK3VitDump,
+) -> list[torch.Tensor]:
+    grids = _grid_thw_list(grid_thws)
+    if not grids:
+        return []
+
+    patches_per_image = [math.prod(grid) for grid in grids]
+    cumulative_patches = [0, *itertools.accumulate(patches_per_image)]
+    image_to_rank, image_counts, grouped_patch_counts = (
+        _get_load_balance_assignment(patches_per_image, world_size)
+    )
+    cumulative_image_counts = [0, *itertools.accumulate(image_counts)]
+    local_image_indices = image_to_rank[
+        cumulative_image_counts[rank] : cumulative_image_counts[rank + 1]
+    ]
+    local_grids = [grids[index] for index in local_image_indices]
+
+    if local_image_indices:
+        local_pixel_values = torch.cat(
+            [
+                pixel_values[
+                    cumulative_patches[index] : cumulative_patches[index + 1]
+                ]
+                for index in local_image_indices
+            ],
+            dim=0,
+        )
+    else:
+        local_pixel_values = pixel_values.new_empty((0, *pixel_values.shape[1:]))
+
+    dump.record(
+        "distribution.image_to_rank",
+        torch.tensor(image_to_rank, dtype=torch.int64),
+        full=True,
+    )
+    dump.record(
+        "distribution.local_image_indices",
+        torch.tensor(local_image_indices, dtype=torch.int64),
+        full=True,
+    )
+    dump.record(
+        "distribution.local_grid_thws",
+        torch.tensor(local_grids, dtype=torch.int64).reshape(-1, 3),
+        full=True,
+    )
+    dump.record("local_pixel_values", local_pixel_values, full=True)
+
+    merge_size = math.prod(vision_tower.merge_kernel_size)
+    if local_image_indices:
+        local_outputs = vision_tower(local_pixel_values, local_grids)
+        local_embeddings = torch.cat(local_outputs, dim=0)
+    else:
+        local_embeddings = pixel_values.new_empty(
+            (0, merge_size, vision_tower.config.hidden_size)
+        )
+    dump.record("local_tower_output", local_embeddings, full=True)
+
+    max_embeddings_per_rank = max(grouped_patch_counts) // merge_size
+    padding_size = max_embeddings_per_rank - local_embeddings.shape[0]
+    if padding_size > 0:
+        padding = local_embeddings.new_empty(
+            (
+                padding_size,
+                local_embeddings.shape[1],
+                local_embeddings.shape[2],
+            )
+        )
+        local_embeddings = torch.cat([local_embeddings, padding], dim=0)
+
+    gathered = (
+        ops.all_gather(local_embeddings.contiguous(), dim=0, world_size=world_size)
+        if world_size > 1
+        else local_embeddings
+    )
+    rank_embeddings: list[torch.Tensor] = []
+    for source_rank in range(world_size):
+        start = source_rank * max_embeddings_per_rank
+        length = grouped_patch_counts[source_rank] // merge_size
+        rank_embeddings.append(gathered[start : start + length])
+
+    output_lengths = [patch_count // merge_size for patch_count in patches_per_image]
+    outputs: list[torch.Tensor | None] = [None] * len(grids)
+    assignment_offset = 0
+    for source_rank in range(world_size):
+        rank_image_indices = image_to_rank[
+            assignment_offset : assignment_offset + image_counts[source_rank]
+        ]
+        embedding_offset = 0
+        for image_index in rank_image_indices:
+            output_length = output_lengths[image_index]
+            outputs[image_index] = rank_embeddings[source_rank][
+                embedding_offset : embedding_offset + output_length
+            ]
+            embedding_offset += output_length
+        assignment_offset += image_counts[source_rank]
+
+    if any(output is None for output in outputs):
+        raise RuntimeError("Kimi K3 encoder DP left an image output unassigned")
+    return [output for output in outputs if output is not None]
 
 
 class KimiK3MultiModalProjector(nn.Module):
@@ -656,17 +913,44 @@ class KimiK3VisionModel(nn.Module):
         pixel_values: torch.Tensor,
         grid_thws: torch.Tensor | Sequence[Sequence[int]],
     ) -> list[torch.Tensor]:
+        dump = _KimiK3VitDump(
+            self.config.encoder_dp_rank,
+            self.config.encoder_dp_size,
+        )
         reference = next(self.parameters())
         pixel_values = pixel_values.to(
             device=reference.device,
             dtype=reference.dtype,
         )
-        tower_outputs = self.vision_tower(pixel_values, grid_thws)
+        dump.record("vit_input.pixel_values", pixel_values, full=True)
+        dump.record(
+            "vit_input.grid_thws",
+            torch.as_tensor(grid_thws),
+            full=True,
+        )
+        dump.install_hooks(self.vision_tower)
+        try:
+            tower_outputs = _run_data_parallel_vision_tower(
+                self.vision_tower,
+                pixel_values,
+                grid_thws,
+                self.config.encoder_dp_rank,
+                self.config.encoder_dp_size,
+                dump,
+            )
+        finally:
+            dump.remove_hooks()
         if not tower_outputs:
+            dump.save()
             return []
         lengths = [output.shape[0] for output in tower_outputs]
-        projected = self.mm_projector(torch.cat(tower_outputs, dim=0))
-        return list(projected.split(lengths, dim=0))
+        gathered_tower_output = torch.cat(tower_outputs, dim=0)
+        dump.record("gathered_tower_output", gathered_tower_output, full=True)
+        projected = self.mm_projector(gathered_tower_output)
+        outputs = list(projected.split(lengths, dim=0))
+        dump.record("vit_output", torch.cat(outputs, dim=0), full=True)
+        dump.save()
+        return outputs
 
     def load_weights(
         self,
@@ -674,9 +958,12 @@ class KimiK3VisionModel(nn.Module):
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
-        if tp_rank != self.config.tp_rank or tp_size != self.config.tp_size:
+        if (
+            tp_rank != self.config.encoder_dp_rank
+            or tp_size != self.config.encoder_dp_size
+        ):
             raise ValueError(
-                "Kimi K3 loader TP rank/size must match model construction"
+                "Kimi K3 loader rank/size must match encoder DP construction"
             )
         rot_proj_name = "mm_projector.rot_proj.weight"
         if (
@@ -696,7 +983,6 @@ class KimiK3VisionModel(nn.Module):
                 raise KeyError(
                     f"Kimi K3 checkpoint tensor not found: {checkpoint_names[0]}"
                 )
-            tensor = _shard_vision_weight(name, tensor, tp_rank, tp_size)
             if tensor.shape != parameter.shape:
                 raise ValueError(
                     f"Kimi K3 weight {name} expects {parameter.shape}, "
@@ -755,6 +1041,7 @@ def _shard_vision_weight(
     rank: int,
     world_size: int,
 ) -> torch.Tensor:
+    """Return a legacy weight-TP shard for checkpoint tooling and tests."""
     if ".wqkv." in name:
         chunks = tensor.chunk(3, dim=0)
         return torch.cat(

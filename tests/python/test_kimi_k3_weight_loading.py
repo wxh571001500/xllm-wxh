@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -40,6 +40,7 @@ _mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
+from xllm.python.layers.moe import KimiK3MoE, KimiK3RoutedExperts  # noqa: E402
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     ForwardContext,
     forward_context,
@@ -49,7 +50,6 @@ from xllm.python.models.kimi_k3 import (  # noqa: E402
 )
 from xllm.python.models.kimi_k3_gated_mla import KimiK3GatedMLA  # noqa: E402
 from xllm.python.models.kimi_k3_text import (  # noqa: E402
-    KimiK3AttentionPlaceholder,
     KimiK3ForCausalLM,
     KimiK3MLAAttention,
     KimiK3TextConfig,
@@ -103,6 +103,15 @@ class _StateDict:
         return list(self._tensors)
 
 
+class _FixedOutput(torch.nn.Module):
+    def __init__(self, output: torch.Tensor) -> None:
+        super().__init__()
+        self.output = output
+
+    def forward(self, *args: object) -> torch.Tensor:
+        return self.output.clone()
+
+
 def _tiny_config() -> dict:
     return {
         "device": "cpu",
@@ -141,8 +150,8 @@ def _tiny_config() -> dict:
             "mla_use_output_gate": True,
             "linear_attn_config": {
                 "head_dim": 4,
-                "kda_layers": [1],
-                "full_attn_layers": [2],
+                "kda_layers": [],
+                "full_attn_layers": [1, 2],
             },
         },
     }
@@ -226,21 +235,35 @@ def _checkpoint() -> dict[str, torch.Tensor]:
                 expert_prefix + "w2.weight": _weight((4, 4), 54 + expert_id),
             }
         )
-    mla_prefix = "language_model.model.layers.1.self_attn."
-    weights.update(
-        {
-            mla_prefix + "q_a_proj.weight": _weight((4, 8), 60),
-            mla_prefix + "q_a_layernorm.weight": _weight((4,), 61),
-            mla_prefix + "q_b_proj.weight": _weight((8, 4), 62),
-            mla_prefix + "kv_a_proj_with_mqa.weight": _weight((6, 8), 63),
-            mla_prefix + "kv_a_layernorm.weight": _weight((4,), 64),
-            mla_prefix + "kv_b_proj.weight": torch.arange(
-                8 * 4, dtype=torch.float32
-            ).reshape(8, 4),
-            mla_prefix + "g_proj.weight": _weight((4, 8), 66),
-            mla_prefix + "o_proj.weight": _weight((8, 4), 67),
-        }
-    )
+    for layer_id, value_offset in ((0, 70), (1, 60)):
+        mla_prefix = f"language_model.model.layers.{layer_id}.self_attn."
+        kv_b_weight = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)
+        if layer_id == 0:
+            kv_b_weight = kv_b_weight + value_offset
+        weights.update(
+            {
+                mla_prefix + "q_a_proj.weight": _weight((4, 8), value_offset),
+                mla_prefix + "q_a_layernorm.weight": _weight(
+                    (4,), value_offset + 1
+                ),
+                mla_prefix + "q_b_proj.weight": _weight(
+                    (8, 4), value_offset + 2
+                ),
+                mla_prefix + "kv_a_proj_with_mqa.weight": _weight(
+                    (6, 8), value_offset + 3
+                ),
+                mla_prefix + "kv_a_layernorm.weight": _weight(
+                    (4,), value_offset + 4
+                ),
+                mla_prefix + "kv_b_proj.weight": kv_b_weight,
+                mla_prefix + "g_proj.weight": _weight(
+                    (4, 8), value_offset + 6
+                ),
+                mla_prefix + "o_proj.weight": _weight(
+                    (8, 4), value_offset + 7
+                ),
+            }
+        )
     return weights
 
 
@@ -349,8 +372,8 @@ def test_config_reads_head_dim_from_linear_attention() -> None:
     assert config.qk_nope_head_dim == 2
     assert config.qk_rope_head_dim == 2
     assert config.v_head_dim == 2
-    assert config.is_kda_layer(0)
-    assert not config.is_mla_layer(0)
+    assert not config.is_kda_layer(0)
+    assert config.is_mla_layer(0)
     assert config.is_mla_layer(1)
 
 
@@ -438,7 +461,7 @@ def test_model_dispatches_language_model_weights_to_owners() -> None:
     dense_mlp = model.model.layers[0].mlp
     mla = model.model.layers[1].self_attn
     routed_experts = model.model.layers[1].block_sparse_moe.experts
-    assert isinstance(model.model.layers[0].self_attn, KimiK3AttentionPlaceholder)
+    assert isinstance(model.model.layers[0].self_attn, KimiK3MLAAttention)
     assert isinstance(mla, KimiK3MLAAttention)
     assert isinstance(mla, KimiK3GatedMLA)
     torch.testing.assert_close(dense_mlp.gate_up_proj.weight[:16], _weight((16, 8), 30))
@@ -605,6 +628,170 @@ def test_quantized_mla_weight_requires_scale_and_offset(companion: str) -> None:
 
     with pytest.raises(KeyError, match=f"q_a_proj.{companion}"):
         model.load_weights([_StateDict(checkpoint)], tp_rank=0, tp_size=1)
+
+
+def test_quantized_experts_prepare_runtime_layout() -> None:
+    experts = KimiK3RoutedExperts(
+        num_experts=2,
+        hidden_size=8,
+        intermediate_size=8,
+        tp_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        quantized=True,
+    )
+    experts.w13_weight.data.fill_(1)
+    experts.w2_weight.data.fill_(2)
+    experts.w13_weight_scale.data.fill_(1.0)
+    experts.w2_weight_scale.data.fill_(2.0)
+    experts.w13_scale_bias.data.fill_(3.0)
+    experts.w2_scale_bias.data.fill_(4.0)
+
+    experts._process_quantized_weights()
+
+    assert experts.w13_weight.shape == (2, 8, 2)
+    assert experts.w13_weight.dtype == torch.int32
+    assert experts.w2_weight.shape == (2, 8, 1)
+    assert experts.w2_weight.dtype == torch.int32
+    assert experts.w13_weight_scale.shape == (2, 16)
+    assert experts.w13_weight_scale.dtype == torch.int64
+    assert experts.w2_weight_scale.shape == (2, 1, 8)
+    assert experts.w2_weight_scale.dtype == torch.int64
+    assert experts.w13_scale_bias.shape == (2, 16)
+    assert experts.w2_scale_bias.shape == (2, 8)
+    torch.testing.assert_close(
+        experts.w2_scale_bias,
+        torch.full((2, 8), 64.0),
+    )
+
+
+def test_quantized_experts_execute_situ_pipeline() -> None:
+    experts = KimiK3RoutedExperts(
+        num_experts=2,
+        hidden_size=8,
+        intermediate_size=8,
+        tp_size=1,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        quantized=True,
+    )
+    experts._runtime_weights_ready = True
+    hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0], [1]], dtype=torch.int64)
+    topk_weights = torch.ones(2, 1, dtype=torch.bfloat16)
+    sorted_hidden_states = torch.ones(2, 8, dtype=torch.int8)
+    expanded_row_indices = torch.tensor([0, 1], dtype=torch.int32)
+    expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
+    input_scale = torch.ones(2, dtype=torch.float32)
+    gate_up = torch.randn(2, 16, dtype=torch.bfloat16)
+    activated = torch.ones(2, 8, dtype=torch.int8)
+    activated_scale = torch.ones(2, dtype=torch.float32)
+    expert_output = torch.randn(2, 8, dtype=torch.bfloat16)
+    expected = torch.randn(2, 8, dtype=torch.bfloat16)
+
+    with (
+        patch(
+            "xllm.python.layers.moe.torch_npu.npu_moe_init_routing_v2",
+            return_value=(
+                sorted_hidden_states,
+                expanded_row_indices,
+                expert_tokens,
+                input_scale,
+            ),
+        ) as mock_routing,
+        patch(
+            "xllm.python.layers.moe.torch_npu.npu_grouped_matmul",
+            side_effect=([gate_up], [expert_output]),
+        ) as mock_grouped_matmul,
+        patch(
+            "xllm.python.layers.moe._dequant_situ_quant",
+            return_value=(activated, activated_scale),
+        ) as mock_situ,
+        patch(
+            "xllm.python.layers.moe.torch_npu.npu_moe_token_unpermute",
+            return_value=expected,
+        ) as mock_unpermute,
+    ):
+        output = experts(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            beta=4.0,
+            linear_beta=25.0,
+        )
+
+    assert output is expected
+    assert mock_grouped_matmul.call_count == 2
+    assert mock_grouped_matmul.call_args_list[0].kwargs["group_list_type"] == 1
+    assert mock_grouped_matmul.call_args_list[1].kwargs["group_list_type"] == 1
+    mock_routing.assert_called_once()
+    mock_situ.assert_called_once_with(gate_up, 4.0, 25.0)
+    mock_unpermute.assert_called_once()
+
+
+def test_moe_uses_ascend_fused_topk_contract() -> None:
+    config = KimiK3TextConfig.from_dict(_tiny_config())
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=1,
+        tp_rank=0,
+        routed_expert_down_proj=torch.nn.Identity(),
+        routed_expert_up_proj=torch.nn.Identity(),
+    )
+    router_logits = torch.randn(2, 2)
+    expected_weights = torch.tensor([[0.25], [0.75]])
+    expected_ids = torch.tensor([[1], [0]], dtype=torch.int64)
+
+    with patch.object(
+        torch.ops._C_ascend,
+        "moe_gating_top_k",
+        return_value=(expected_weights, expected_ids, torch.empty(0)),
+        create=True,
+    ) as mock_topk:
+        topk_ids, topk_weights = moe._ascend_topk(router_logits)
+
+    torch.testing.assert_close(topk_weights, expected_weights)
+    torch.testing.assert_close(topk_ids, expected_ids.to(torch.int32))
+    assert mock_topk.call_args.kwargs["renorm"] == 1
+    assert mock_topk.call_args.kwargs["norm_type"] == 1
+    assert mock_topk.call_args.kwargs["group_count"] == 1
+
+
+def test_moe_reduces_shared_expert_output_for_tp() -> None:
+    config = KimiK3TextConfig.from_dict(_tiny_config())
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=2,
+        tp_rank=0,
+        routed_expert_down_proj=torch.nn.Identity(),
+        routed_expert_up_proj=torch.nn.Identity(),
+        shared_experts=_FixedOutput(torch.full((2, 8), 2.0)),
+    )
+    moe.experts = _FixedOutput(torch.ones(2, 8))
+    moe.routed_expert_norm = None
+    hidden_states = torch.zeros(2, 8)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int64)
+    topk_weights = torch.ones(2, 1)
+
+    with (
+        patch.object(
+            moe,
+            "_topk",
+            return_value=(topk_ids, topk_weights),
+        ),
+        patch(
+            "xllm.python.layers.moe.ops.all_reduce_",
+            side_effect=lambda tensor: tensor.mul_(2),
+        ) as mock_all_reduce,
+    ):
+        output = moe(hidden_states)
+
+    torch.testing.assert_close(output, torch.full((2, 8), 5.0))
+    mock_all_reduce.assert_called_once()
 
 
 def test_weight_loading_accumulates_across_state_dict_shards() -> None:

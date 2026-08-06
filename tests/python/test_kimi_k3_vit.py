@@ -49,6 +49,7 @@ sys.modules.setdefault("torch_npu", MagicMock())
 from xllm.python.models.kimi_k3_vit import (  # noqa: E402
     KimiK3VisionConfig,
     KimiK3VisionModel,
+    _get_load_balance_assignment,
     _shard_vision_weight,
     tpool_patch_merger,
 )
@@ -85,6 +86,20 @@ def test_config_reads_nested_k3_vision_fields() -> None:
     config.validate()
 
 
+def test_config_replicates_vision_weights_across_runtime_tp_ranks() -> None:
+    raw_config = _tiny_config()
+    raw_config["tp_size"] = 4
+    raw_config["tp_rank"] = 2
+
+    config = KimiK3VisionConfig.from_dict(raw_config)
+
+    assert config.tp_size == 1
+    assert config.tp_rank == 0
+    assert config.encoder_dp_size == 4
+    assert config.encoder_dp_rank == 2
+    config.validate()
+
+
 def test_tpool_merger_pools_time_before_spatial_reorder() -> None:
     hidden_states = torch.arange(16, dtype=torch.float32).reshape(16, 1)
 
@@ -109,11 +124,11 @@ def test_tiny_vision_model_projects_each_media_item() -> None:
     outputs = model(pixel_values, grid_thws)
 
     assert len(outputs) == 1
-    assert outputs[0].shape == (1, 8)
+    assert outputs[0].shape == (2, 8)
     assert torch.isfinite(outputs[0]).all()
 
 
-def test_encoder_uses_vllm_cumulative_media_boundaries(monkeypatch) -> None:
+def test_encoder_data_mode_uses_vllm_load_balanced_media_order(monkeypatch) -> None:
     captured_boundaries: list[list[int]] = []
 
     def capture_attention(
@@ -136,8 +151,19 @@ def test_encoder_uses_vllm_cumulative_media_boundaries(monkeypatch) -> None:
 
     outputs = model(pixel_values, grid_thws)
 
-    assert captured_boundaries == [[0, 1, 3]]
+    assert captured_boundaries == [[0, 2, 3]]
     assert [output.shape[0] for output in outputs] == [1, 2]
+
+
+def test_encoder_data_mode_matches_vllm_greedy_assignment() -> None:
+    assignment, image_counts, rank_loads = _get_load_balance_assignment(
+        [1000, 100, 200, 50],
+        num_ranks=2,
+    )
+
+    assert assignment == [0, 2, 1, 3]
+    assert image_counts == [1, 3]
+    assert rank_loads == [1000, 350]
 
 
 def test_qkv_weight_sharding_preserves_qkv_order() -> None:

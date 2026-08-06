@@ -22,7 +22,7 @@ shapes until those two attention implementations are added.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -39,6 +39,7 @@ from xllm.python.layers import (
     RowParallelLinear,
 )
 from xllm.python.layers.attention import AttentionRuntimeLayer
+from xllm.python.layers.kda import KimiK3DeltaAttention, KimiK3KDAMetadata
 from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.kimi_k3_gated_mla import (
@@ -157,8 +158,7 @@ class KimiK3TextConfig:
     mla_use_nope: bool = True
     mla_use_rope: bool = False
     mla_use_output_gate: bool = True
-    kda_layers: tuple[int, ...] = ()
-    full_attn_layers: tuple[int, ...] = ()
+    linear_attn_config: dict = field(default_factory=dict)
     quantize_type: str = ""
     quant_method: str = ""
     quant_version: str = ""
@@ -254,10 +254,7 @@ class KimiK3TextConfig:
             mla_use_nope=bool(pick("mla_use_nope", default=True)),
             mla_use_rope=bool(pick("mla_use_rope", default=False)),
             mla_use_output_gate=bool(pick("mla_use_output_gate", default=True)),
-            kda_layers=tuple(int(layer) for layer in linear_attention.get("kda_layers", ())),
-            full_attn_layers=tuple(
-                int(layer) for layer in linear_attention.get("full_attn_layers", ())
-            ),
+            linear_attn_config=dict(linear_attention),
             quantize_type=str(config.get("quantize_type", "")),
             quant_method=str(config.get("quant_method", "")),
             quant_version=str(config.get("quant_version", "")),
@@ -327,12 +324,19 @@ class KimiK3TextConfig:
             raise ValueError("Kimi K3 MLA does not apply RoPE")
         if not self.mla_use_output_gate:
             raise ValueError("Kimi K3 MLA requires output gating")
-        layer_numbers = self.kda_layers + self.full_attn_layers
+        kda_layers = tuple(
+            int(layer) for layer in self.linear_attn_config.get("kda_layers", ())
+        )
+        full_attn_layers = tuple(
+            int(layer)
+            for layer in self.linear_attn_config.get("full_attn_layers", ())
+        )
+        layer_numbers = kda_layers + full_attn_layers
         if len(set(layer_numbers)) != len(layer_numbers):
             raise ValueError("Kimi K3 attention layer lists must not overlap or repeat")
         if any(layer < 1 or layer > self.n_layers for layer in layer_numbers):
             raise ValueError("Kimi K3 attention layer numbers must be within [1, n_layers]")
-        if self.full_attn_layers and len(layer_numbers) != self.n_layers:
+        if full_attn_layers and len(layer_numbers) != self.n_layers:
             raise ValueError("Kimi K3 kda_layers and full_attn_layers must cover all layers")
         if self.uses_quantized_weights:
             if self.quant_version != "1.0.0":
@@ -366,23 +370,25 @@ class KimiK3TextConfig:
         quant_method = self.quant_method.lower()
         return quantize_type == "w4a8_dynamic" or quant_method == "ascend_int4"
 
-    def is_kda_layer(self, layer_id: int) -> bool:
-        """Checkpoint layer lists are one-based; runtime layer ids are zero-based."""
-        return layer_id + 1 in self.kda_layers
-
-    def is_mla_layer(self, layer_id: int) -> bool:
-        if not 0 <= layer_id < self.n_layers:
-            raise ValueError(f"Kimi K3 layer id is out of range: {layer_id}")
-        if self.full_attn_layers:
-            return layer_id + 1 in self.full_attn_layers
-        return not self.is_kda_layer(layer_id)
-
     def is_moe_layer(self, layer_id: int) -> bool:
         return (
             self.num_experts is not None
             and layer_id >= self.first_k_dense_replace
             and layer_id % self.moe_layer_freq == 0
         )
+
+    def is_kda_layer(self, layer_id: int) -> bool:
+        """``layer_id`` is 0-based; the config's ``kda_layers`` is 1-based."""
+        kda_layers = self.linear_attn_config.get("kda_layers") or []
+        return (layer_id + 1) in kda_layers
+
+    def is_mla_layer(self, layer_id: int) -> bool:
+        if not 0 <= layer_id < self.n_layers:
+            raise ValueError(f"Kimi K3 layer id is out of range: {layer_id}")
+        full_attn_layers = self.linear_attn_config.get("full_attn_layers") or []
+        if full_attn_layers:
+            return (layer_id + 1) in full_attn_layers
+        return not self.is_kda_layer(layer_id)
 
 
 class KimiK3W8A8DynamicLinear(nn.Module):
@@ -934,8 +940,44 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         self.o_proj.format_npu_weight_()
 
 
+class KimiK3KDARuntime:
+    """Per-step execution context for KDA layers.
+
+    The C++ executor must, before every model forward:
+      1. set ``metadata`` to a :class:`KimiK3KDAMetadata` for the batch;
+      2. populate ``caches[layer_id] = (conv_state, recurrent_state)`` for
+         every KDA layer, with shapes / dtypes per
+         :meth:`KimiK3DeltaAttention.conv_state_shape` /
+         :meth:`KimiK3DeltaAttention.recurrent_state_shape` /
+         :meth:`KimiK3DeltaAttention.state_dtypes`.
+
+    This plumbing is not wired on the C++ side yet; the layers read from here so
+    the integration surface is a single object.
+    """
+
+    def __init__(self) -> None:
+        self.metadata: KimiK3KDAMetadata | None = None
+        self.caches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def require(self, layer_id: int) -> tuple[
+        KimiK3KDAMetadata, torch.Tensor, torch.Tensor
+    ]:
+        if self.metadata is None or layer_id not in self.caches:
+            raise RuntimeError(
+                "KDA runtime is not initialized: the executor must set "
+                "metadata and per-layer state caches before the forward pass "
+                f"(layer {layer_id})."
+            )
+        conv_state, recurrent_state = self.caches[layer_id]
+        return self.metadata, conv_state, recurrent_state
+
+
 class KimiK3AttentionPlaceholder(Attention):
-    """Shape-compatible attention shell until KDA/MLA are implemented."""
+    """Shape-compatible attention shell until MLA is implemented.
+
+    Used for the full-attention (non-KDA) layers. KDA layers use
+    :class:`KimiK3DeltaAttention` instead.
+    """
 
     def __init__(self, config: KimiK3TextConfig, layer_id: int) -> None:
         super().__init__(
@@ -976,21 +1018,33 @@ class KimiK3DecoderLayer(nn.Module):
         layer_id: int,
         dtype: torch.dtype,
         device: torch.device,
+        kda_runtime: KimiK3KDARuntime,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.config = config
+        self.kda_runtime = kda_runtime
+        self.is_kda = config.is_kda_layer(layer_id)
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
             dtype=dtype,
             device=device,
         )
-        self.self_attn = (
-            KimiK3MLAAttention(config, layer_id, dtype, device)
-            if config.is_mla_layer(layer_id)
-            else KimiK3AttentionPlaceholder(config, layer_id)
-        )
+        if self.is_kda:
+            self.self_attn = KimiK3DeltaAttention(
+                config.hidden_size,
+                config.linear_attn_config,
+                tp_size=config.tp_size,
+                tp_rank=config.tp_rank,
+                rms_norm_eps=config.rms_norm_eps,
+                dtype=dtype,
+                device=device,
+            )
+        elif config.is_mla_layer(layer_id):
+            self.self_attn = KimiK3MLAAttention(config, layer_id, dtype, device)
+        else:
+            self.self_attn = KimiK3AttentionPlaceholder(config, layer_id)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -1095,7 +1149,15 @@ class KimiK3DecoderLayer(nn.Module):
             block_residual = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
             prefix_sum = None
         hidden_states = self.input_layernorm(hidden_states)
-        attention_output = self.self_attn(hidden_states, positions)
+        if self.is_kda:
+            metadata, conv_state, recurrent_state = self.kda_runtime.require(
+                self.layer_id
+            )
+            attention_output = self.self_attn(
+                hidden_states, metadata, conv_state, recurrent_state
+            )
+        else:
+            attention_output = self.self_attn(hidden_states, positions)
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         hidden_states = _apply_attention_residual(
             prefix_sum,
@@ -1133,7 +1195,16 @@ class KimiK3DecoderLayer(nn.Module):
                 self._loaded_components.add(name)
                 loaded.add(name)
 
-        if isinstance(self.self_attn, KimiK3MLAAttention):
+        if self.is_kda:
+            # KDA applies its own TP sharding, so hand it the full tensors.
+            consumed = self.self_attn.load_weights(
+                "self_attn", lambda n: _state_dict_tensor(state_dict, n)
+            )
+            self.self_attn.process_weights_after_loading()
+            for name in consumed:
+                self._loaded_components.add(f"self_attn.{name}")
+                loaded.add(f"self_attn.{name}")
+        elif isinstance(self.self_attn, KimiK3MLAAttention):
             child_state_dict = _state_dict_with_prefix(state_dict, "self_attn.")
             if _state_dict_size(child_state_dict) > 0:
                 loaded.update(
@@ -1206,8 +1277,12 @@ class KimiK3TextModel(nn.Module):
             dtype=dtype,
             device=device,
         )
+        self.kda_runtime = KimiK3KDARuntime()
         self.layers = nn.ModuleList(
-            [KimiK3DecoderLayer(config, i, dtype, device) for i in range(config.n_layers)]
+            [
+                KimiK3DecoderLayer(config, i, dtype, device, self.kda_runtime)
+                for i in range(config.n_layers)
+            ]
         )
         self.output_attn_res_norm = RMSNorm(
             config.hidden_size,
@@ -1401,6 +1476,8 @@ __all__ = [
     "KimiK3AttentionPlaceholder",
     "KimiK3DecoderLayer",
     "KimiK3ForCausalLM",
+    "KimiK3KDARuntime",
+    "KimiK3MLAAttention",
     "KimiK3MLP",
     "KimiK3TextConfig",
     "KimiK3TextModel",
