@@ -123,6 +123,83 @@ def _layer_ids(state_dict: Any) -> list[int]:
     return sorted(layer_ids)
 
 
+class _MergedStateDict:
+    """Cross-shard view over several per-file ``StateDict`` objects.
+
+    The checkpoint splits a single layer's tensors across many safetensors
+    shards (e.g. KDA ``self_attn.q_proj`` and ``o_proj`` live in different
+    files). Loaders such as KDA require every tensor of a layer in one pass,
+    so we expose the union of all shards behind the same interface a single
+    ``StateDict`` provides and load each weight exactly once.
+
+    A name -> (shard, full_name) index is built once and filtered per prefix
+    view, so lookups stay O(1) instead of scanning every shard per access.
+    """
+
+    def __init__(
+        self,
+        shards: list[Any] | None = None,
+        index: dict[str, tuple[Any, str]] | None = None,
+    ) -> None:
+        self._shards = shards or []
+        # Maps the exposed (prefix-stripped) name to (shard, full name).
+        self._index = index
+
+    def _ensure_index(self) -> dict[str, tuple[Any, str]]:
+        if self._index is None:
+            self._index = {}
+            for shard in self._shards:
+                for name in shard.keys():
+                    self._index.setdefault(name, (shard, name))
+        return self._index
+
+    def has(self, name: str) -> bool:
+        return name in self._ensure_index()
+
+    def _resolve(self, name: str) -> tuple[Any, str]:
+        entry = self._ensure_index().get(name)
+        if entry is None:
+            raise KeyError(f"missing checkpoint weight: {name}")
+        return entry
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        shard, full_name = self._resolve(name)
+        return shard.get_tensor(full_name)
+
+    def get_sharded_tensor(
+        self,
+        name: str,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> torch.Tensor:
+        shard, full_name = self._resolve(name)
+        return shard.get_sharded_tensor(full_name, dim, rank, world_size)
+
+    def keys(self) -> list[str]:
+        return list(self._ensure_index())
+
+    def size(self) -> int:
+        return len(self._ensure_index())
+
+    def get_dict_with_prefix(self, prefix: str) -> "_MergedStateDict":
+        if not prefix:
+            return _MergedStateDict(index=dict(self._ensure_index()))
+        index = {
+            name[len(prefix):]: entry
+            for name, entry in self._ensure_index().items()
+            if name.startswith(prefix)
+        }
+        return _MergedStateDict(index=index)
+
+    def get_dict_with_prefixes(self, prefixes: list[str]) -> "_MergedStateDict":
+        for prefix in prefixes:
+            merged = self.get_dict_with_prefix(prefix)
+            if merged.size() > 0:
+                return merged
+        return _MergedStateDict(index={})
+
+
 @dataclass
 class KimiK3TextConfig:
     hidden_size: int = 7168
@@ -1349,42 +1426,39 @@ class KimiK3ForCausalLM(PyModelBase):
         if tp_rank != self.cfg.tp_rank or tp_size != self.cfg.tp_size:
             raise ValueError("Kimi K3 loader TP rank/size must match model construction")
         loaded: set[str] = set()
-        model_prefixes = ["language_model.model.", "model.", ""]
-        for state_dict in state_dicts:
-            model_state_dict = _state_dict_with_prefix(
-                state_dict,
-                model_prefixes,
-            )
-            loaded.update(
-                self.model.load_weights(model_state_dict, tp_rank, tp_size)
-            )
+        # A single layer's tensors are spread across shards, so merge every
+        # shard into one cross-shard view and load each weight exactly once.
+        merged = _MergedStateDict(list(state_dicts))
+        model_state_dict = merged.get_dict_with_prefixes(
+            ["language_model.model.", "model.", ""]
+        )
+        loaded.update(self.model.load_weights(model_state_dict, tp_rank, tp_size))
 
-            if self.cfg.tie_word_embeddings:
-                lm_state_dict = model_state_dict
-                lm_weight_name = "embed_tokens.weight"
-            else:
-                lm_state_dict = _state_dict_with_prefix(
-                    state_dict,
-                    [
-                        "language_model.lm_head.",
-                        "lm_head.",
-                        "model.lm_head.",
-                        "head.",
-                        "",
-                    ],
-                )
-                lm_weight_name = "weight"
-            tensor = _state_dict_sharded_tensor(
-                lm_state_dict,
-                lm_weight_name,
-                0,
-                tp_rank,
-                tp_size,
+        if self.cfg.tie_word_embeddings:
+            lm_state_dict = model_state_dict
+            lm_weight_name = "embed_tokens.weight"
+        else:
+            lm_state_dict = merged.get_dict_with_prefixes(
+                [
+                    "language_model.lm_head.",
+                    "lm_head.",
+                    "model.lm_head.",
+                    "head.",
+                    "",
+                ],
             )
-            if tensor is not None:
-                _copy_parameter(self.lm_head.weight, tensor)
-                self._lm_head_loaded = True
-                loaded.add("lm_head.weight")
+            lm_weight_name = "weight"
+        tensor = _state_dict_sharded_tensor(
+            lm_state_dict,
+            lm_weight_name,
+            0,
+            tp_rank,
+            tp_size,
+        )
+        if tensor is not None:
+            _copy_parameter(self.lm_head.weight, tensor)
+            self._lm_head_loaded = True
+            loaded.add("lm_head.weight")
 
         self.model.finish_weight_loading()
         if not self._lm_head_loaded:
