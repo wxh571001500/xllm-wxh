@@ -99,10 +99,9 @@ class ModelExecutor:
 
         layer_specs = [layer.attention_layer_spec() for layer in attention_layers]
         layer_ids = [spec.layer_id for spec in layer_specs]
-        expected_layer_ids = list(range(len(layer_specs)))
-        if layer_ids != expected_layer_ids:
+        if len(set(layer_ids)) != len(layer_ids):
             raise ValueError(
-                "Runtime attention layer ids must be unique and contiguous from zero: "
+                "Runtime attention layer ids must be unique: "
                 f"got {layer_ids}"
             )
 
@@ -176,14 +175,17 @@ class ModelExecutor:
         )
 
     def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
-        # Every runtime layer (MLA/MHA and KDA) owns one cache slot and layer
-        # ids are contiguous from zero, so the bound list has exactly one entry
-        # per runtime layer, indexed by global layer_id. KDA slots hold conv/ssm
-        # tensors and are never indexed through the paged-KV backend.
-        if len(kv_caches) != self._num_attention_layers:
+        # Runtime layers are indexed by physical decoder layer id. The cache
+        # list may therefore contain slots for layers not present in a truncated
+        # runtime model, including KDA conv/SSM slots that the paged-KV backend
+        # never indexes directly.
+        highest_layer_id = max(
+            spec.layer_id for spec in self._attention_layer_specs
+        )
+        if len(kv_caches) <= highest_layer_id:
             raise ValueError(
-                "KV cache layer count does not match runtime attention layer "
-                f"count: got {len(kv_caches)}, expected {self._num_attention_layers}"
+                "KV cache list does not cover runtime physical-layer KV caches: "
+                f"highest layer id is {highest_layer_id}, got {len(kv_caches)} caches"
             )
         if self._kv_bound:
             return

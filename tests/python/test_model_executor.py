@@ -271,8 +271,20 @@ class TestModelExecutorConstruction:
     def test_duplicate_layer_ids_raise(self, _mock_backend):
         model = _FakeModel(num_layers=2)
         model.layers[1].layer_id = 0
-        with pytest.raises(ValueError, match="unique and contiguous"):
+        with pytest.raises(ValueError, match="must be unique"):
             ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+        return_value=StubAttentionBackend(),
+    )
+    def test_sparse_physical_layer_id_is_registered(self, _mock_backend):
+        model = _FakeModel(num_layers=1)
+        model.layers[0].layer_id = 3
+
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+        assert [spec.layer_id for spec in executor._attention_layer_specs] == [3]
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
@@ -866,8 +878,52 @@ class TestBindKvCaches:
         executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
 
         kv = (torch.zeros(1), torch.zeros(1))
-        with pytest.raises(ValueError, match="layer count does not match"):
+        with pytest.raises(ValueError, match="does not cover"):
             executor.bind_kv_caches([kv])
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+    )
+    def test_sparse_layer_binds_physical_cache_list(self, mock_create):
+        backend = StubAttentionBackend()
+        mock_create.return_value = backend
+        model = _FakeModel(num_layers=1)
+        model.layers[0].layer_id = 3
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+        kv = (torch.zeros(1), torch.zeros(1))
+        kv_caches = [kv, kv, kv, kv]
+        executor.bind_kv_caches(kv_caches)
+
+        assert backend._kv_caches is kv_caches
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+    )
+    def test_sparse_layer_rejects_runtime_only_cache_list(self, mock_create):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+        model.layers[0].layer_id = 3
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+        kv = (torch.zeros(1), torch.zeros(1))
+        with pytest.raises(ValueError, match="does not cover"):
+            executor.bind_kv_caches([kv])
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+    )
+    def test_contiguous_layers_accept_extra_physical_caches(self, mock_create):
+        backend = StubAttentionBackend()
+        mock_create.return_value = backend
+        model = _FakeModel(num_layers=2)
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+        kv = (torch.zeros(1), torch.zeros(1))
+        kv_caches = [kv, kv, kv]
+        executor.bind_kv_caches(kv_caches)
+
+        assert backend._kv_caches is kv_caches
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
