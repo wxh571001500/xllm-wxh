@@ -108,6 +108,7 @@ class ModelExecutor:
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
+        self._device = device
         self._attention_layer_specs = layer_specs
         self._num_attention_layers = len(layer_specs)
         # The paged-KV backend geometry (heads/dims) must come from a real
@@ -215,12 +216,22 @@ class ModelExecutor:
             return
         from xllm.python.layers.kda import KimiK3KDAMetadata
 
+        # The C++ view builds query_start_loc / has_initial_state as host
+        # tensors (state_indices is already moved to device). KDA feeds all of
+        # them to the AscendC operators, which require device tensors, so move
+        # the host ones here to honor the on-device contract of
+        # KimiK3KDAMetadata.
+        def _to_device(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None or tensor.device == self._device:
+                return tensor
+            return tensor.to(self._device, non_blocking=True)
+
         kda_runtime.metadata = KimiK3KDAMetadata(
-            query_start_loc=view.query_start_loc,
-            state_indices=view.state_indices,
+            query_start_loc=_to_device(view.query_start_loc),
+            state_indices=_to_device(view.state_indices),
             num_decode_seqs=view.num_decode_seqs,
             num_prefill_seqs=view.num_prefill_seqs,
-            has_initial_state=view.has_initial_state,
+            has_initial_state=_to_device(view.has_initial_state),
         )
 
     def execute(
