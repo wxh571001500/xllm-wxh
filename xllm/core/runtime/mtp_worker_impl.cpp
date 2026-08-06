@@ -337,6 +337,12 @@ void clear_ready_events(ForwardInput& input) {
   input.metadata_ready_event.reset();
 }
 
+void clear_mla_prefixcache_workspace(ForwardInput& input) {
+  auto& attention = input.input_params.attention.device;
+  attention.history_compressed_kv = torch::Tensor();
+  attention.history_k_rope = torch::Tensor();
+}
+
 std::optional<ForwardOutput> run_worker_no_sync_impl(
     WorkerImpl& worker,
     const ForwardInput& input,
@@ -815,6 +821,32 @@ bool MTPWorkerImpl::use_kimi_eagle3_step_major_validate_layout() const {
   return is_kimi_k25_eagle3_pair() && !use_chunked_prefill_spec_verify_path();
 }
 
+void MTPWorkerImpl::synchronize_kimi_eagle3_npu_forward() {
+#if defined(USE_NPU)
+  if (is_kimi_k25_eagle3_pair()) {
+    const int32_t ret = compute_stream_->synchronize();
+    CHECK_EQ(ret, 0) << "failed to synchronize Kimi Eagle3 forward, ret="
+                     << ret;
+  }
+#endif
+}
+
+std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
+    WorkerImpl& worker,
+    const ForwardInput& input,
+    ForwardInput& processed_input) {
+  std::optional<ForwardOutput> output = run_worker_no_sync_impl(
+      worker, input, *prepare_stream_, *compute_stream_, processed_input);
+  synchronize_kimi_eagle3_npu_forward();
+  if (is_kimi_k25_eagle3_pair()) {
+    clear_mla_prefixcache_workspace(processed_input);
+    if (output.has_value() && output->retained_input != nullptr) {
+      clear_mla_prefixcache_workspace(*output->retained_input);
+    }
+  }
+  return output;
+}
+
 bool MTPWorkerImpl::supports_explicit_spec_verify_replay_update() const {
   if (target_spec_verify_mode_ ==
       mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY) {
@@ -1084,16 +1116,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
   if (!input.input_params.meta.batch_forward_type.is_decode()) {
     ForwardInput target_prepared;
     ForwardInput draft_prepared;
-    auto output = run_worker_no_sync_impl(*target_impl_,
-                                          input,
-                                          *prepare_stream_,
-                                          *compute_stream_,
-                                          target_prepared);
-    auto draft_output = run_worker_no_sync_impl(*draft_impl_,
-                                                input,
-                                                *prepare_stream_,
-                                                *compute_stream_,
-                                                draft_prepared);
+    auto output = run_worker_no_sync(*target_impl_, input, target_prepared);
+    auto draft_output = run_worker_no_sync(*draft_impl_, input, draft_prepared);
     if (draft_output.has_value()) {
       transfer_retained_inputs(*output, draft_output.value());
     }
@@ -1133,12 +1157,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     }
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
-      draft_outputs.emplace_back(run_worker_no_sync_impl(*draft_impl_,
-                                                         input,
-                                                         *prepare_stream_,
-                                                         *compute_stream_,
-                                                         draft_step_prepared[i])
-                                     .value());
+      draft_outputs.emplace_back(
+          run_worker_no_sync(*draft_impl_, input, draft_step_prepared[i])
+              .value());
     }
 
     new_input = input;
@@ -1150,12 +1171,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
          new_input.input_params.parallel.raw_dp_global_token_nums) {
       token_num *= options_.num_speculative_tokens() + 1;
     }
-    ForwardOutput output = run_worker_no_sync_impl(*target_impl_,
-                                                   new_input,
-                                                   *prepare_stream_,
-                                                   *compute_stream_,
-                                                   target_prepared)
-                               .value();
+    ForwardOutput output =
+        run_worker_no_sync(*target_impl_, new_input, target_prepared).value();
     for (ForwardOutput& draft_output : draft_outputs) {
       transfer_retained_inputs(output, draft_output);
     }
@@ -1188,9 +1205,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
 
   // run the target model to get first token and hidden states
   ForwardOutput output =
-      run_worker_no_sync_impl(
-          *target_impl_, input, *prepare_stream_, *compute_stream_, target_prepared)
-          .value();
+      run_worker_no_sync(*target_impl_, input, target_prepared).value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
@@ -1229,12 +1244,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   }
   // generate kv cache for draft model
   timer.reset();
-  ForwardOutput draft_output = run_worker_no_sync_impl(*draft_impl_,
-                                                       prefill_input,
-                                                       *prepare_stream_,
-                                                       *compute_stream_,
-                                                       draft_prepared)
-                                   .value();
+  ForwardOutput draft_output =
+      run_worker_no_sync(*draft_impl_, prefill_input, draft_prepared).value();
   {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     process_draft_sample_output(draft_output.sample_output);
@@ -1582,11 +1593,16 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
           std::move(pending_draft_context_.prepared_input);
       pending_draft_context_ = PendingDraftContext();
     } else {
-      draft_output_opt = run_worker_no_sync_impl(*draft_impl_,
-                                                 current_draft_input,
-                                                 *compute_stream_,
-                                                 *compute_stream_,
-                                                 draft_prepared[draft_idx]);
+      if (is_kimi_k25_eagle3_pair()) {
+        draft_output_opt = run_worker_no_sync(
+            *draft_impl_, current_draft_input, draft_prepared[draft_idx]);
+      } else {
+        draft_output_opt = run_worker_no_sync_impl(*draft_impl_,
+                                                   current_draft_input,
+                                                   *compute_stream_,
+                                                   *compute_stream_,
+                                                   draft_prepared[draft_idx]);
+      }
     }
 
     if ((use_device_target_context || use_prelaunched_first_draft) &&
@@ -1991,12 +2007,19 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   ForwardInput target_prepared;
   fill_validate_input_from_draft_outputs(
       draft_outputs, validate_input, per_seq_val_tokens, *compute_stream_);
-  ForwardOutput target_output = run_worker_no_sync_impl(*target_impl_,
-                                                        validate_input,
-                                                        *compute_stream_,
-                                                        *compute_stream_,
-                                                        target_prepared)
-                                    .value();
+  ForwardOutput target_output;
+  if (is_kimi_k25_eagle3_pair()) {
+    target_output =
+        run_worker_no_sync(*target_impl_, validate_input, target_prepared)
+            .value();
+  } else {
+    target_output = run_worker_no_sync_impl(*target_impl_,
+                                            validate_input,
+                                            *compute_stream_,
+                                            *compute_stream_,
+                                            target_prepared)
+                        .value();
+  }
   const double target_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               target_latency_ms / 1000.0);
@@ -2612,10 +2635,8 @@ void MTPWorkerImpl::update_decode_step_input(
   const bool enable_cache_correction = enable_schedule_overlap();
 
   std::vector<int32_t> token_ids_vec;
-  std::vector<int32_t> positions_vec;
   std::vector<int32_t> kv_seq_lens_vec;
   token_ids_vec.reserve(num_sequences);
-  positions_vec.reserve(num_sequences);
 #if defined(USE_NPU)
   kv_seq_lens_vec.reserve(num_sequences);
 #else
@@ -2624,10 +2645,13 @@ void MTPWorkerImpl::update_decode_step_input(
 
   const torch::Tensor& token_ids_cpu = input.token_ids_host;
   const torch::Tensor& positions_cpu = input.positions_host;
+  specBuilder::PositionBuildHelper position_helper(positions_cpu);
+  position_helper.use_mrope_positions =
+      positions_cpu.dim() == 2 && positions_cpu.size(0) == 3;
+  position_helper.reserve_out_position_id(num_sequences);
   Slice<int32_t> input_token_ids = {token_ids_cpu.data_ptr<int32_t>(),
                                     static_cast<size_t>(token_ids_cpu.numel())};
-  Slice<int32_t> input_positions = {positions_cpu.data_ptr<int32_t>(),
-                                    static_cast<size_t>(positions_cpu.numel())};
+  Slice<int32_t> input_positions = position_helper.get_input_positions();
 
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     CHECK_LT(static_cast<size_t>(seq_id), input_token_ids.size())
@@ -2646,7 +2670,9 @@ void MTPWorkerImpl::update_decode_step_input(
     int32_t current_position = input_positions[seq_id] + position_offset;
     int32_t current_kv_len = specBuilder::calc_kv_len(
         input.input_params.attention.host.kv_seq_lens, seq_id, position_offset);
-    int32_t expected_kv_len = current_position + 1;
+    int32_t expected_kv_len = position_helper.use_mrope_positions
+                                  ? current_kv_len
+                                  : current_position + 1;
     if (use_chunked_prefill_spec_verify_path()) {
       const torch::Tensor& block_tables =
           input.input_params.attention.host.block_tables;
@@ -2706,12 +2732,12 @@ void MTPWorkerImpl::update_decode_step_input(
     token_ids_vec.emplace_back((use_cache_correction || use_fake_context)
                                    ? state.token_id
                                    : input_token_id);
-    positions_vec.emplace_back(current_position);
+    position_helper.append_out_position_id(current_position);
     specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
   input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.positions_host = position_helper.make_cpu_position_tensor();
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.device_tensors_ready = false;
 }
@@ -2755,7 +2781,9 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
        use_chunked_prefill_spec_verify_path());
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(total_num_val_tokens);
-  buf.out_positions.reserve(total_num_val_tokens);
+  buf.position_helper.use_mrope_positions =
+      input.positions_host.dim() == 2 && input.positions_host.size(0) == 3;
+  buf.position_helper.reserve_out_position_id(total_num_val_tokens);
   buf.out_new_cache_slots.reserve(total_num_val_tokens);
   if (!use_atb_spec_kernel) {
     buf.out_kv_seq_lens.reserve(total_num_val_tokens);
@@ -2818,15 +2846,16 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_token_ids.size())
       << "validate kv slots/tokens mismatch";
-  CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
+  CHECK_EQ(buf.position_helper.out_position_columns, buf.out_token_ids.size())
       << "validate positions/tokens mismatch";
 
   if (!use_explicit_spec_verify_replay_update) {
-    specBuilder::set_token_position_tensors(validate_input,
-                                            buf.out_token_ids,
-                                            buf.out_positions,
-                                            token_options,
-                                            position_options);
+    specBuilder::set_token_position_tensors(
+        validate_input,
+        buf.out_token_ids,
+        buf.position_helper.make_cpu_position_tensor(),
+        token_options,
+        position_options);
   }
   if (!use_atb_spec_kernel) {
     input_params.meta.num_sequences = total_num_val_tokens;
@@ -2997,9 +3026,10 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     extra_int_inputs.push_back({&buf.out_token_ids,
                                 &validate_input.token_ids_host,
                                 &validate_input.token_ids});
-    extra_int_inputs.push_back({&buf.out_positions,
-                                &validate_input.positions_host,
-                                &validate_input.positions});
+    extra_int_inputs.push_back(
+        {&buf.position_helper.out_position_id_vec,
+         &validate_input.positions_host,
+         &validate_input.positions});
     if (!input_params.embedding.linear_state_ids.empty()) {
       extra_int_inputs.push_back(
           {&input_params.embedding.linear_state_ids,
@@ -3170,7 +3200,9 @@ void MTPWorkerImpl::prepare_validate_inputs(
       use_chunked_prefill_spec_verify_path();
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(total_num_val_tokens);
-  buf.out_positions.reserve(total_num_val_tokens);
+  buf.position_helper.use_mrope_positions =
+      input.positions_host.dim() == 2 && input.positions_host.size(0) == 3;
+  buf.position_helper.reserve_out_position_id(total_num_val_tokens);
   buf.out_new_cache_slots.reserve(total_num_val_tokens);
   if (!use_atb_spec_kernel) {
     buf.out_kv_seq_lens.reserve(total_num_val_tokens);
@@ -3216,14 +3248,15 @@ void MTPWorkerImpl::prepare_validate_inputs(
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_token_ids.size())
       << "validate kv slots/tokens mismatch";
-  CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
+  CHECK_EQ(buf.position_helper.out_position_columns, buf.out_token_ids.size())
       << "validate positions/tokens mismatch";
 
-  specBuilder::set_token_position_tensors(validate_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          token_options,
-                                          position_options);
+  specBuilder::set_token_position_tensors(
+      validate_input,
+      buf.out_token_ids,
+      buf.position_helper.make_cpu_position_tensor(),
+      token_options,
+      position_options);
   if (!use_atb_spec_kernel) {
     input_params.meta.num_sequences = total_num_val_tokens;
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
@@ -3382,7 +3415,10 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
 
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(num_sequences * 2);
-  buf.out_positions.reserve(num_sequences * 2);
+  buf.position_helper.use_mrope_positions =
+      base_input.positions_host.dim() == 2 &&
+      base_input.positions_host.size(0) == 3;
+  buf.position_helper.reserve_out_position_id(num_sequences * 2);
   buf.out_new_cache_slots.reserve(num_sequences * 2);
   buf.out_kv_seq_lens.reserve(num_sequences * (use_chunked_prefill ? 1 : 2));
   buf.out_q_seq_lens.reserve(num_sequences * (use_chunked_prefill ? 1 : 2));
@@ -3490,16 +3526,19 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     add_row(state.token_id, /*position_offset=*/0, state.embedding);
   }
 
-  CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())
+  CHECK_EQ(buf.out_new_cache_slots.size(),
+           static_cast<size_t>(buf.position_helper.out_position_columns))
       << "draft extend slots/positions mismatch";
-  CHECK_EQ(expanded_embeddings.size(), buf.out_positions.size())
+  CHECK_EQ(expanded_embeddings.size(),
+           static_cast<size_t>(buf.position_helper.out_position_columns))
       << "draft extend embeddings/positions mismatch";
 
-  specBuilder::set_token_position_tensors(extend_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          token_options,
-                                          position_options);
+  specBuilder::set_token_position_tensors(
+      extend_input,
+      buf.out_token_ids,
+      buf.position_helper.make_cpu_position_tensor(),
+      token_options,
+      position_options);
   if (use_chunked_prefill) {
     input_params.meta.num_sequences = num_sequences;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
@@ -3519,8 +3558,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                      std::move(buf.out_kv_seq_lens),
                                      /*update_block_tables=*/false);
   } else {
-    input_params.meta.num_sequences =
-        static_cast<int32_t>(buf.out_positions.size());
+    input_params.meta.num_sequences = buf.position_helper.out_position_columns;
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
     specBuilder::update_input_params(input_params,
                                      buf,
@@ -3619,7 +3657,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       // row-count collective is needed.
     } else if (input_params.parallel.dp_global_token_nums.size() == 1) {
       input_params.parallel.dp_global_token_nums[0] =
-          static_cast<int32_t>(buf.out_positions.size());
+          buf.position_helper.out_position_columns;
     }
   }
 
@@ -3682,7 +3720,9 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);
   specBuilder::DecodeBuildBuffers buf;
-  buf.out_positions.reserve(num_sequences);
+  buf.position_helper.use_mrope_positions =
+      input.positions_host.dim() == 2 && input.positions_host.size(0) == 3;
+  buf.position_helper.reserve_out_position_id(num_sequences);
   buf.out_kv_seq_lens.reserve(num_sequences);
   buf.out_new_cache_slots.reserve(num_sequences);
 
@@ -3694,11 +3734,14 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
     specBuilder::append_decode_row(row_ctx, row, block_size, buf);
   }
 
-  CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())
+  CHECK_EQ(buf.out_new_cache_slots.size(),
+           static_cast<size_t>(buf.position_helper.out_position_columns))
       << "draft kv slots/positions mismatch";
 
   torch::TensorOptions position_options = input.positions.options();
-  set_positions_tensor(draft_input, buf.out_positions, position_options);
+  set_positions_tensor(draft_input,
+                       buf.position_helper.make_cpu_position_tensor(),
+                       position_options);
   specBuilder::update_input_params(
       input_params,
       buf,
