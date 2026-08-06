@@ -817,6 +817,11 @@ bool MTPWorkerImpl::is_kimi_k25_eagle3_pair() const {
       draft_impl_->context_.get_model_args().model_type());
 }
 
+bool MTPWorkerImpl::requires_probability_based_validation() const {
+  // Keep validation independent of graph/eager sampled-token layouts.
+  return is_kimi_k25_eagle3_pair();
+}
+
 bool MTPWorkerImpl::use_kimi_eagle3_step_major_validate_layout() const {
   return is_kimi_k25_eagle3_pair() && !use_chunked_prefill_spec_verify_path();
 }
@@ -3352,8 +3357,13 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   // routing; on Qwen3.5 the controller falls back to computing probs from
   // logits (see adaptive_pruning_helpers.cpp).
   extend_input.sampling_params.return_probs =
+<<<<<<< HEAD
       !extend_input.sampling_params.all_greedy_sample ||
       (adaptive_enabled() && !supports_explicit_spec_verify_replay_update());
+=======
+      requires_probability_based_validation() ||
+      !extend_input.sampling_params.all_greedy_sample;
+>>>>>>> 67c2f1e7 (bugfix: restore kimi eagle3 probability validation.)
   clear_ready_events(extend_input);
   extend_input.device_tensors_ready = false;
   auto& input_params = extend_input.input_params;
@@ -3708,8 +3718,13 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
   // routing; on Qwen3.5 the controller falls back to computing probs from
   // logits (see adaptive_pruning_helpers.cpp).
   draft_input.sampling_params.return_probs =
+<<<<<<< HEAD
       !draft_input.sampling_params.all_greedy_sample ||
       (adaptive_enabled() && !supports_explicit_spec_verify_replay_update());
+=======
+      requires_probability_based_validation() ||
+      !draft_input.sampling_params.all_greedy_sample;
+>>>>>>> 67c2f1e7 (bugfix: restore kimi eagle3 probability validation.)
   clear_ready_events(draft_input);
   draft_input.device_tensors_ready = false;
 
@@ -3787,6 +3802,44 @@ SampleOutput MTPWorkerImpl::validate(
   const int32_t batch_size = num_target_tokens / num_val_tokens;
   const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
 
+<<<<<<< HEAD
+=======
+  std::vector<torch::Tensor> draft_token_ids_steps;
+  std::vector<torch::Tensor> draft_probs_steps;
+  draft_token_ids_steps.reserve(draft_outputs.size());
+  draft_probs_steps.reserve(draft_outputs.size());
+  for (const auto& draft_output : draft_outputs) {
+    draft_token_ids_steps.emplace_back(draft_output.sample_output.next_tokens);
+    draft_probs_steps.emplace_back(draft_output.sample_output.probs);
+  }
+
+  auto [draft_token_ids, draft_probs] =
+      specBuilder::draftProbs::build_validate_tensors(
+          draft_token_ids_steps,
+          draft_probs_steps,
+          batch_size,
+          vocab_size,
+          enable_opt_validate_probs_,
+          /*draft_probs_required=*/
+          requires_probability_based_validation() ||
+              !sampling_params.all_greedy_sample);
+  return validate(sampling_params, draft_token_ids, draft_probs, target_output);
+}
+
+SampleOutput MTPWorkerImpl::validate(const SamplingParameters& sampling_params,
+                                     const torch::Tensor& draft_token_ids,
+                                     const torch::Tensor& draft_probs,
+                                     const ForwardOutput& target_output) {
+  const int32_t num_target_tokens =
+      target_output.sample_output.next_tokens.numel();
+  const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  CHECK_EQ(num_target_tokens % num_val_tokens, 0);
+  const int32_t batch_size = num_target_tokens / num_val_tokens;
+  const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
+
+  using torch::indexing::None;
+  using ISlice = torch::indexing::Slice;
+>>>>>>> 67c2f1e7 (bugfix: restore kimi eagle3 probability validation.)
   const bool step_major_validate_layout =
       use_kimi_eagle3_step_major_validate_layout();
   torch::Tensor target_next_tokens = target_output.sample_output.next_tokens;
@@ -3863,8 +3916,13 @@ SampleOutput MTPWorkerImpl::validate(
           .index({"...", ISlice(num_val_tokens - 1, None, num_val_tokens)})
           .view({-1, 1});
 
+<<<<<<< HEAD
   SampleOutput sample_output;
   if (sampling_params.all_greedy_sample && !target_output.logprobs) {
+=======
+  if (!requires_probability_based_validation() &&
+      sampling_params.all_greedy_sample && !target_output.logprobs) {
+>>>>>>> 67c2f1e7 (bugfix: restore kimi eagle3 probability validation.)
     torch::Tensor target_token_ids =
         target_next_tokens.view({batch_size, num_val_tokens});
     torch::Tensor target_draft_token_ids = target_token_ids.slice(
