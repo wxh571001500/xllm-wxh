@@ -52,7 +52,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
+from xllm.python.layers.linear import (
+    ColumnParallelLinear,
+    KimiK3W8A8DynamicLinear,
+    RowParallelLinear,
+)
 
 KDA_CHUNK_SIZE = 64
 # Padding slot convention of the AscendC causal-conv operator.
@@ -124,6 +128,7 @@ class KimiK3DeltaAttention(nn.Module):
         tp_size: int = 1,
         tp_rank: int = 0,
         rms_norm_eps: float = 1e-6,
+        quantized: bool = False,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
@@ -134,6 +139,7 @@ class KimiK3DeltaAttention(nn.Module):
         self.hidden_size = hidden_size
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.quantized = quantized
         self.head_dim = linear_attn_config["head_dim"]
         self.num_heads = linear_attn_config["num_heads"]
         assert self.num_heads % tp_size == 0
@@ -153,15 +159,30 @@ class KimiK3DeltaAttention(nn.Module):
         self.o_norm_eps = rms_norm_eps
 
         local_proj = self.local_projection_size
-        self.q_proj = ColumnParallelLinear(
-            hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
-        )
-        self.k_proj = ColumnParallelLinear(
-            hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
-        )
-        self.v_proj = ColumnParallelLinear(
-            hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
-        )
+        if quantized:
+            # q/k/v are W8A8_DYNAMIC in the Kimi-K3 checkpoint (int8 weight +
+            # per-token int8 activation quant); the gate/output/low-rank/beta
+            # projections stay bf16. Each rank owns its head shard and feeds the
+            # per-rank conv/recurrent kernels, so no output gather/reduce.
+            self.q_proj = KimiK3W8A8DynamicLinear(
+                hidden_size, local_proj, device, tp_size=tp_size
+            )
+            self.k_proj = KimiK3W8A8DynamicLinear(
+                hidden_size, local_proj, device, tp_size=tp_size
+            )
+            self.v_proj = KimiK3W8A8DynamicLinear(
+                hidden_size, local_proj, device, tp_size=tp_size
+            )
+        else:
+            self.q_proj = ColumnParallelLinear(
+                hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
+            )
+            self.k_proj = ColumnParallelLinear(
+                hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
+            )
+            self.v_proj = ColumnParallelLinear(
+                hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
+            )
         # Full-rank output gate (sigmoid), applied by the gated output norm.
         self.g_proj = ColumnParallelLinear(
             hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
@@ -257,7 +278,16 @@ class KimiK3DeltaAttention(nn.Module):
             return t.narrow(dim, self.tp_rank * size, size).contiguous()
 
         # Head-tied rows are laid out head-major, so equal splits shard heads.
-        for name in ("q_proj", "k_proj", "v_proj", "g_proj", "b_proj", "f_b_proj"):
+        for name in ("q_proj", "k_proj", "v_proj"):
+            proj = getattr(self, name)
+            if self.quantized:
+                # W8A8_DYNAMIC: int8 weight + per-output-channel fp32
+                # scale/offset, all sharded on the (head-major) output dim.
+                for suffix in ("weight", "weight_scale", "weight_offset"):
+                    proj.load_weight(suffix, shard(get(f"{name}.{suffix}")))
+            else:
+                proj.weight.data.copy_(shard(get(f"{name}.weight")))
+        for name in ("g_proj", "b_proj", "f_b_proj"):
             proj = getattr(self, name)
             proj.weight.data.copy_(shard(get(f"{name}.weight")))
         self.f_a_proj.weight.data.copy_(get("f_a_proj.weight"))  # replicated
@@ -292,6 +322,11 @@ class KimiK3DeltaAttention(nn.Module):
             .contiguous()
             .to(self.o_norm_weight.dtype)
         )
+        if self.quantized:
+            # Transpose the int8 q/k/v weights into the matmul's [in, out]
+            # layout and flatten their per-channel scale/offset.
+            for name in ("q_proj", "k_proj", "v_proj"):
+                getattr(self, name).finish_weight_loading()
 
     # -- forward -----------------------------------------------------------------
 
