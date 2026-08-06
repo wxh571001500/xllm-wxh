@@ -19,11 +19,24 @@ from __future__ import annotations
 import sys
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 
 _mock_ops = MagicMock()
+
+
+def _rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+
+
+_mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
@@ -305,6 +318,23 @@ def _quantized_checkpoint() -> dict[str, torch.Tensor]:
                 scale_bias_shape,
                 value + expert_id + 2,
             )
+    mla_prefix = "language_model.model.layers.1.self_attn."
+    for projection in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa"):
+        weights.pop(mla_prefix + projection + ".weight")
+    for projection, shape, weight_value, scale_value, offset_value in (
+        ("q_a_proj", (4, 8), 7, 2, 1),
+        ("q_b_proj", (8, 4), 9, 3, 2),
+        ("kv_a_proj_with_mqa", (6, 8), 11, 4, 3),
+    ):
+        weights[mla_prefix + projection + ".weight"] = _int8_weight(
+            shape, weight_value
+        )
+        weights[mla_prefix + projection + ".weight_scale"] = _weight(
+            (shape[0], 1), scale_value
+        )
+        weights[mla_prefix + projection + ".weight_offset"] = _weight(
+            (shape[0], 1), offset_value
+        )
     return weights
 
 
@@ -518,6 +548,15 @@ def test_quantized_model_loads_w8_and_packed_w4_tensors() -> None:
         "model.layers.1.block_sparse_moe.experts.1.w2.scale_bias"
         in loaded
     )
+    mla = model.model.layers[1].self_attn
+    assert isinstance(mla, KimiK3MLAAttention)
+    torch.testing.assert_close(mla.q_a_proj.weight, _weight((4, 8), 12))
+    torch.testing.assert_close(mla.q_b_proj.weight, _weight((8, 4), 21))
+    torch.testing.assert_close(
+        mla.kv_a_proj_with_mqa.weight,
+        _weight((6, 8), 32),
+    )
+    assert "model.layers.1.self_attn.q_b_proj.weight_scale" in loaded
 
 
 def test_quantized_weight_loading_shards_tp_dimensions() -> None:
@@ -549,6 +588,23 @@ def test_quantized_weight_loading_shards_tp_dimensions() -> None:
     expected_kv_b = expected_kv_b.reshape(1, 4, 4)
     torch.testing.assert_close(mla.W_UK, expected_kv_b[:, :2])
     torch.testing.assert_close(mla.W_UV, expected_kv_b[:, 2:].transpose(1, 2))
+    torch.testing.assert_close(mla.q_a_proj.weight, _weight((4, 8), 12))
+    torch.testing.assert_close(mla.q_b_proj.weight, _weight((4, 4), 21))
+    torch.testing.assert_close(
+        mla.kv_a_proj_with_mqa.weight,
+        _weight((6, 8), 32),
+    )
+
+
+@pytest.mark.parametrize("companion", ("weight_scale", "weight_offset"))
+def test_quantized_mla_weight_requires_scale_and_offset(companion: str) -> None:
+    checkpoint = _quantized_checkpoint()
+    mla_prefix = "language_model.model.layers.1.self_attn."
+    checkpoint.pop(mla_prefix + "q_a_proj." + companion)
+    model = KimiK3ForCausalLM(_quantized_tiny_config())
+
+    with pytest.raises(KeyError, match=f"q_a_proj.{companion}"):
+        model.load_weights([_StateDict(checkpoint)], tp_rank=0, tp_size=1)
 
 
 def test_weight_loading_accumulates_across_state_dict_shards() -> None:

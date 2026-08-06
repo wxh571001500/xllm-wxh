@@ -823,25 +823,96 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         values = values.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
         return self.apply_output_gate(values, hidden_states)
 
+    def _load_projection_weight(
+        self,
+        state_dict: Any,
+        name: str,
+        parameter: torch.Tensor,
+        tp_rank: int,
+        tp_size: int,
+        shard_dim: int | None = None,
+    ) -> set[str]:
+        tensor = (
+            _state_dict_tensor(state_dict, name)
+            if shard_dim is None
+            else _state_dict_sharded_tensor(
+                state_dict, name, shard_dim, tp_rank, tp_size
+            )
+        )
+        if tensor is None:
+            return set()
+
+        loaded = {name}
+        if not tensor.is_floating_point():
+            scale_name = f"{name}_scale"
+            offset_name = f"{name}_offset"
+            scale = (
+                _state_dict_tensor(state_dict, scale_name)
+                if shard_dim is None
+                else _state_dict_sharded_tensor(
+                    state_dict, scale_name, 0, tp_rank, tp_size
+                )
+            )
+            offset = (
+                _state_dict_tensor(state_dict, offset_name)
+                if shard_dim is None
+                else _state_dict_sharded_tensor(
+                    state_dict, offset_name, 0, tp_rank, tp_size
+                )
+            )
+            missing = [
+                companion_name
+                for companion_name, companion in (
+                    (scale_name, scale),
+                    (offset_name, offset),
+                )
+                if companion is None
+            ]
+            if missing:
+                raise KeyError(
+                    f"Kimi K3 quantized MLA weight {name} is missing "
+                    f"companions: {missing}"
+                )
+            tensor = (tensor.float() - offset.float()) * scale.float()
+            loaded.update((scale_name, offset_name))
+
+        _copy_parameter(parameter, tensor)
+        return loaded
+
     def load_weights(self, state_dict: Any, tp_rank: int, tp_size: int) -> set[str]:
         loaded: set[str] = set()
         parameters = dict(self.named_parameters())
         for name in self._REPLICATED:
-            tensor = _state_dict_tensor(state_dict, name)
-            if tensor is not None:
-                _copy_parameter(parameters[name], tensor)
-                loaded.add(name)
+            loaded.update(
+                self._load_projection_weight(
+                    state_dict,
+                    name,
+                    parameters[name],
+                    tp_rank,
+                    tp_size,
+                )
+            )
         for name in self._COLUMN_SHARDED:
-            tensor = _state_dict_sharded_tensor(state_dict, name, 0, tp_rank, tp_size)
-            if tensor is not None:
-                _copy_parameter(parameters[name], tensor)
-                loaded.add(name)
-        tensor = _state_dict_sharded_tensor(
-            state_dict, "o_proj.weight", 1, tp_rank, tp_size
+            loaded.update(
+                self._load_projection_weight(
+                    state_dict,
+                    name,
+                    parameters[name],
+                    tp_rank,
+                    tp_size,
+                    shard_dim=0,
+                )
+            )
+        loaded.update(
+            self._load_projection_weight(
+                state_dict,
+                "o_proj.weight",
+                self.o_proj.weight,
+                tp_rank,
+                tp_size,
+                shard_dim=1,
+            )
         )
-        if tensor is not None:
-            _copy_parameter(self.o_proj.weight, tensor)
-            loaded.add("o_proj.weight")
         self._loaded_components.update(loaded)
         return loaded
 
