@@ -251,16 +251,27 @@ class TestModelExecutorConstruction:
     )
     def test_no_attention_layers_raises(self, _mock_backend):
         model = _FakeModelNoAttention()
-        with pytest.raises(ValueError, match="does not contain an Attention layer"):
+        with pytest.raises(ValueError, match="runtime attention layer"):
             ModelExecutor(model, {}, max_seqs_per_batch=4)
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
         return_value=StubAttentionBackend(),
     )
-    def test_heterogeneous_attention_raises(self, _mock_backend):
+    def test_heterogeneous_attention_is_registered(self, _mock_backend):
         model = _FakeModelHeterogeneous()
-        with pytest.raises(ValueError, match="identical attention configuration"):
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+        assert [spec.num_heads for spec in executor._attention_layer_specs] == [8, 4]
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+        return_value=StubAttentionBackend(),
+    )
+    def test_duplicate_layer_ids_raise(self, _mock_backend):
+        model = _FakeModel(num_layers=2)
+        model.layers[1].layer_id = 0
+        with pytest.raises(ValueError, match="unique and contiguous"):
             ModelExecutor(model, {}, max_seqs_per_batch=4)
 
     @patch(

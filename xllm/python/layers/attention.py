@@ -20,13 +20,45 @@ and KV cache reside in the FlashInferBackend, accessed via ForwardContext.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 
 from xllm.python.model_executor.forward_context import get_forward_context
 
 
-class Attention(nn.Module):
+@dataclass(frozen=True, slots=True)
+class AttentionLayerSpec:
+    """Layer-local runtime contract used for cache and backend dispatch."""
+
+    layer_id: int
+    kind: str
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    scale: float
+    sliding_window: int
+
+
+class AttentionRuntimeLayer:
+    """Mixin implemented by every layer that owns a runtime KV cache."""
+
+    attention_kind = "mha"
+
+    def attention_layer_spec(self) -> AttentionLayerSpec:
+        return AttentionLayerSpec(
+            layer_id=self.layer_id,
+            kind=self.attention_kind,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            scale=self.scale,
+            sliding_window=self.sliding_window,
+        )
+
+
+class Attention(AttentionRuntimeLayer, nn.Module):
     """Thin attention layer that dispatches to the current backend."""
 
     def __init__(
