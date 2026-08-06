@@ -28,7 +28,14 @@ from xllm.python.layers.linear import (
     KimiK3W8A8DynamicLinear,
     RowParallelLinear,
 )
-from xllm.python.layers.moe import KimiK3MoE, KimiK3RoutedExperts
+from xllm.python.layers.moe import (
+    GroupedTopKRouter,
+    KimiK3MoE,
+    MoE,
+    MoERunner,
+    RoutedExperts,
+    TensorParallelCommMethod,
+)
 from xllm.python.layers.rotary_embedding import RotaryEmbedding
 
 __all__ = [
@@ -39,6 +46,10 @@ __all__ = [
     "RowParallelLinear",
     "KimiK3W8A8DynamicLinear",
     "HiddenParallelEmbedding",
+    "GroupedTopKRouter",
     "KimiK3MoE",
-    "KimiK3RoutedExperts",
+    "MoE",
+    "MoERunner",
+    "RoutedExperts",
+    "TensorParallelCommMethod",
 ]

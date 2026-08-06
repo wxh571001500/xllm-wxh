@@ -22,7 +22,7 @@ a placeholder remains only as a defensive fallback for incomplete layer maps.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -47,6 +47,9 @@ from xllm.python.models.kimi_k3_gated_mla import (
     KimiK3GatedMLAConfig,
 )
 
+if TYPE_CHECKING:
+    from xllm_weight_loader import StateDict
+
 
 def _tp_rank_from_device(device: object) -> int:
     value = str(device)
@@ -64,21 +67,6 @@ def _copy_parameter(parameter: torch.Tensor, tensor: torch.Tensor) -> None:
             f"Kimi K3 parameter expects {parameter.shape}, got {tensor.shape}"
         )
     parameter.data.copy_(tensor.to(dtype=parameter.dtype, device=parameter.device))
-
-
-def _state_dict_size(state_dict: Any) -> int:
-    if hasattr(state_dict, "size"):
-        return int(state_dict.size())
-    return len(state_dict.keys())
-
-
-def _state_dict_with_prefix(
-    state_dict: Any,
-    prefix: str | list[str],
-) -> Any:
-    if isinstance(prefix, list):
-        return state_dict.get_dict_with_prefixes(prefix)
-    return state_dict.get_dict_with_prefix(prefix)
 
 
 def _state_dict_tensor(state_dict: Any, name: str) -> torch.Tensor | None:
@@ -110,7 +98,7 @@ def _state_dict_sharded_tensor(
     return tensor.narrow(dim, tp_rank * shard_size, shard_size).contiguous()
 
 
-def _layer_ids(state_dict: Any) -> list[int]:
+def _layer_ids(state_dict: "StateDict") -> list[int]:
     layer_ids: set[int] = set()
     for name in state_dict.keys():
         parts = name.split(".", 2)
@@ -597,7 +585,7 @@ class KimiK3MLP(nn.Module):
 
     def load_weights(
         self,
-        state_dict: Any,
+        state_dict: "StateDict",
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -608,39 +596,40 @@ class KimiK3MLP(nn.Module):
         for projection in ("gate_proj", "up_proj"):
             for suffix in suffixes:
                 name = f"{projection}.{suffix}"
-                tensor = _state_dict_sharded_tensor(
-                    state_dict,
+                if not state_dict.has(name):
+                    continue
+                tensor = state_dict.get_sharded_tensor(
                     name,
                     0,
                     tp_rank,
                     tp_size,
                 )
-                if tensor is not None and self.load_weight(name, tensor):
+                if self.load_weight(name, tensor):
                     loaded.add(name)
         for suffix in suffixes:
             name = f"down_proj.{suffix}"
+            if not state_dict.has(name):
+                continue
             tensor = (
-                _state_dict_sharded_tensor(
-                    state_dict,
+                state_dict.get_sharded_tensor(
                     name,
                     1,
                     tp_rank,
                     tp_size,
                 )
                 if suffix == "weight"
-                else _state_dict_tensor(state_dict, name)
+                else state_dict.get_tensor(name)
             )
-            if tensor is not None and self.load_weight(name, tensor):
+            if self.load_weight(name, tensor):
                 loaded.add(name)
         if state_dict.has("gate_up_proj.weight"):
-            tensor = _state_dict_sharded_tensor(
-                state_dict,
+            tensor = state_dict.get_sharded_tensor(
                 "gate_up_proj.weight",
                 0,
                 tp_rank,
                 tp_size,
             )
-            if tensor is not None and self.load_weight("gate_up_proj.weight", tensor):
+            if self.load_weight("gate_up_proj.weight", tensor):
                 loaded.add("gate_up_proj.weight")
         return loaded
 
@@ -1172,7 +1161,7 @@ class KimiK3DecoderLayer(nn.Module):
 
     def load_weights(
         self,
-        state_dict: Any,
+        state_dict: "StateDict",
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -1186,16 +1175,21 @@ class KimiK3DecoderLayer(nn.Module):
             "mlp_res_proj.weight": self.mlp_res_proj.weight,
         }
         for name, target in targets.items():
-            tensor = _state_dict_tensor(state_dict, name)
-            if tensor is not None:
-                _copy_parameter(target, tensor)
-                self._loaded_components.add(name)
-                loaded.add(name)
+            if not state_dict.has(name):
+                continue
+            _copy_parameter(target, state_dict.get_tensor(name))
+            self._loaded_components.add(name)
+            loaded.add(name)
 
         if self.is_kda:
             # KDA applies its own TP sharding, so hand it the full tensors.
             consumed = self.self_attn.load_weights(
-                "self_attn", lambda n: _state_dict_tensor(state_dict, n)
+                "self_attn",
+                lambda name: (
+                    state_dict.get_tensor(name)
+                    if state_dict.has(name)
+                    else None
+                ),
             )
             self.self_attn.process_weights_after_loading()
             for name in consumed:
@@ -1214,8 +1208,8 @@ class KimiK3DecoderLayer(nn.Module):
                 )
 
         if hasattr(self, "mlp"):
-            child_state_dict = _state_dict_with_prefix(state_dict, "mlp.")
-            if _state_dict_size(child_state_dict) > 0:
+            child_state_dict = state_dict.get_dict_with_prefix("mlp.")
+            if child_state_dict.size() > 0:
                 loaded.update(
                     f"mlp.{name}"
                     for name in self.mlp.load_weights(
@@ -1225,11 +1219,10 @@ class KimiK3DecoderLayer(nn.Module):
                     )
                 )
         else:
-            child_state_dict = _state_dict_with_prefix(
-                state_dict,
+            child_state_dict = state_dict.get_dict_with_prefix(
                 "block_sparse_moe.",
             )
-            if _state_dict_size(child_state_dict) > 0:
+            if child_state_dict.size() > 0:
                 loaded.update(
                     f"block_sparse_moe.{name}"
                     for name in self.block_sparse_moe.load_weights(
@@ -1326,7 +1319,7 @@ class KimiK3TextModel(nn.Module):
 
     def load_weights(
         self,
-        state_dict: Any,
+        state_dict: "StateDict",
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -1338,30 +1331,29 @@ class KimiK3TextModel(nn.Module):
             "norm.weight": self.norm.weight,
         }
         for name, target in direct_targets.items():
+            if not state_dict.has(name):
+                continue
             tensor = (
-                _state_dict_sharded_tensor(
-                    state_dict,
+                state_dict.get_sharded_tensor(
                     name,
                     1,
                     tp_rank,
                     tp_size,
                 )
                 if name == "embed_tokens.weight"
-                else _state_dict_tensor(state_dict, name)
+                else state_dict.get_tensor(name)
             )
-            if tensor is not None:
-                _copy_parameter(target, tensor)
-                self._loaded_weights.add(name)
-                loaded.add(f"model.{name}")
+            _copy_parameter(target, tensor)
+            self._loaded_weights.add(name)
+            loaded.add(f"model.{name}")
 
         for layer_id in _layer_ids(state_dict):
             if not 0 <= layer_id < len(self.layers):
                 continue
-            layer_state_dict = _state_dict_with_prefix(
-                state_dict,
+            layer_state_dict = state_dict.get_dict_with_prefix(
                 f"layers.{layer_id}.",
             )
-            if _state_dict_size(layer_state_dict) == 0:
+            if layer_state_dict.size() == 0:
                 continue
             loaded.update(
                 f"model.layers.{layer_id}.{name}"
@@ -1422,10 +1414,16 @@ class KimiK3ForCausalLM(PyModelBase):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
 
-    def load_weights(self, state_dicts: list[Any], tp_rank: int, tp_size: int) -> set[str]:
+    def load_weights(
+        self,
+        state_dicts: list["StateDict"],
+        tp_rank: int,
+        tp_size: int,
+    ) -> set[str]:
         if tp_rank != self.cfg.tp_rank or tp_size != self.cfg.tp_size:
             raise ValueError("Kimi K3 loader TP rank/size must match model construction")
         loaded: set[str] = set()
+        
         # A single layer's tensors are spread across shards, so merge every
         # shard into one cross-shard view and load each weight exactly once.
         merged = _MergedStateDict(list(state_dicts))
