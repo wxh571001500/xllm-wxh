@@ -14,10 +14,9 @@
 
 """Kimi K3 text graph for xLLM's Python model executor.
 
-KDA, MLA and vision execution are intentionally left outside this first text
-graph.  The decoder still exposes an ``Attention`` layer so the executor can
-construct its normal runtime contract; the placeholder preserves tensor
-shapes until those two attention implementations are added.
+The decoder supports heterogeneous KDA and Gated-MLA layers. Full-attention
+layers use the shared Gated-MLA math through the runtime attention backend;
+a placeholder remains only as a defensive fallback for incomplete layer maps.
 """
 
 from __future__ import annotations
