@@ -19,19 +19,39 @@ from __future__ import annotations
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
+import torch.nn.functional as F
 
 
 _mock_ops = MagicMock()
+
+
+def _rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+
+
+_mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
 from xllm.python.layers.moe import KimiK3MoE, KimiK3RoutedExperts  # noqa: E402
+from xllm.python.model_executor.forward_context import (  # noqa: E402
+    ForwardContext,
+    forward_context,
+)
 from xllm.python.models.kimi_k3 import (  # noqa: E402
     KimiK3ForConditionalGeneration,
 )
+from xllm.python.models.kimi_k3_gated_mla import KimiK3GatedMLA  # noqa: E402
 from xllm.python.models.kimi_k3_text import (  # noqa: E402
     KimiK3ForCausalLM,
+    KimiK3MLAAttention,
     KimiK3TextConfig,
 )
 from xllm.python.models.kimi_k3_vit import KimiK3VisionModel  # noqa: E402
@@ -120,6 +140,14 @@ def _tiny_config() -> dict:
             "moe_renormalize": True,
             "moe_router_activation_func": "sigmoid",
             "routed_scaling_factor": 1.0,
+            "q_lora_rank": 4,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 2,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 2,
+            "mla_use_nope": True,
+            "mla_use_rope": False,
+            "mla_use_output_gate": True,
             "linear_attn_config": {
                 "head_dim": 4,
                 "kda_layers": [],
@@ -207,6 +235,35 @@ def _checkpoint() -> dict[str, torch.Tensor]:
                 expert_prefix + "w2.weight": _weight((4, 4), 54 + expert_id),
             }
         )
+    for layer_id, value_offset in ((0, 70), (1, 60)):
+        mla_prefix = f"language_model.model.layers.{layer_id}.self_attn."
+        kv_b_weight = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)
+        if layer_id == 0:
+            kv_b_weight = kv_b_weight + value_offset
+        weights.update(
+            {
+                mla_prefix + "q_a_proj.weight": _weight((4, 8), value_offset),
+                mla_prefix + "q_a_layernorm.weight": _weight(
+                    (4,), value_offset + 1
+                ),
+                mla_prefix + "q_b_proj.weight": _weight(
+                    (8, 4), value_offset + 2
+                ),
+                mla_prefix + "kv_a_proj_with_mqa.weight": _weight(
+                    (6, 8), value_offset + 3
+                ),
+                mla_prefix + "kv_a_layernorm.weight": _weight(
+                    (4,), value_offset + 4
+                ),
+                mla_prefix + "kv_b_proj.weight": kv_b_weight,
+                mla_prefix + "g_proj.weight": _weight(
+                    (4, 8), value_offset + 6
+                ),
+                mla_prefix + "o_proj.weight": _weight(
+                    (8, 4), value_offset + 7
+                ),
+            }
+        )
     return weights
 
 
@@ -284,6 +341,23 @@ def _quantized_checkpoint() -> dict[str, torch.Tensor]:
                 scale_bias_shape,
                 value + expert_id + 2,
             )
+    mla_prefix = "language_model.model.layers.1.self_attn."
+    for projection in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa"):
+        weights.pop(mla_prefix + projection + ".weight")
+    for projection, shape, weight_value, scale_value, offset_value in (
+        ("q_a_proj", (4, 8), 7, 2, 1),
+        ("q_b_proj", (8, 4), 9, 3, 2),
+        ("kv_a_proj_with_mqa", (6, 8), 11, 4, 3),
+    ):
+        weights[mla_prefix + projection + ".weight"] = _int8_weight(
+            shape, weight_value
+        )
+        weights[mla_prefix + projection + ".weight_scale"] = _weight(
+            (shape[0], 1), scale_value
+        )
+        weights[mla_prefix + projection + ".weight_offset"] = _weight(
+            (shape[0], 1), offset_value
+        )
     return weights
 
 
@@ -293,6 +367,14 @@ def test_config_reads_head_dim_from_linear_attention() -> None:
     assert config.n_layers == 2
     assert config.head_dim == 4
     assert config.num_experts == 2
+    assert config.q_lora_rank == 4
+    assert config.kv_lora_rank == 4
+    assert config.qk_nope_head_dim == 2
+    assert config.qk_rope_head_dim == 2
+    assert config.v_head_dim == 2
+    assert not config.is_kda_layer(0)
+    assert config.is_mla_layer(0)
+    assert config.is_mla_layer(1)
 
 
 def test_decoder_registers_moe_under_checkpoint_name() -> None:
@@ -377,13 +459,75 @@ def test_model_dispatches_language_model_weights_to_owners() -> None:
     loaded = model.load_weights([_StateDict(_checkpoint())], tp_rank=0, tp_size=1)
 
     dense_mlp = model.model.layers[0].mlp
+    mla = model.model.layers[1].self_attn
     routed_experts = model.model.layers[1].block_sparse_moe.experts
+    assert isinstance(model.model.layers[0].self_attn, KimiK3MLAAttention)
+    assert isinstance(mla, KimiK3MLAAttention)
+    assert isinstance(mla, KimiK3GatedMLA)
     torch.testing.assert_close(dense_mlp.gate_up_proj.weight[:16], _weight((16, 8), 30))
     torch.testing.assert_close(dense_mlp.gate_up_proj.weight[16:], _weight((16, 8), 31))
     torch.testing.assert_close(routed_experts.w13_weight[0, :4], _weight((4, 4), 50))
     torch.testing.assert_close(routed_experts.w13_weight[0, 4:], _weight((4, 4), 52))
     torch.testing.assert_close(model.lm_head.weight, _weight((16, 8), 5))
+    kv_b = torch.arange(8 * 4, dtype=torch.float32).reshape(2, 4, 4)
+    torch.testing.assert_close(mla.W_UK, kv_b[:, :2])
+    torch.testing.assert_close(mla.W_UV, kv_b[:, 2:].transpose(1, 2))
+    assert "model.layers.1.self_attn.kv_b_proj.weight" in loaded
     assert "model.layers.1.block_sparse_moe.experts.1.w2.weight" in loaded
+
+
+def test_text_mla_adapter_matches_shared_eager_math() -> None:
+    model = KimiK3ForCausalLM(_tiny_config())
+    checkpoint = _checkpoint()
+    model.load_weights([_StateDict(checkpoint)], tp_rank=0, tp_size=1)
+    mla = model.model.layers[1].self_attn
+    assert isinstance(mla, KimiK3MLAAttention)
+
+    prefix = "language_model.model.layers.1.self_attn."
+    eager = KimiK3GatedMLA(mla.config, dtype=torch.float32)
+    eager.load_checkpoint_weights(
+        {
+            name[len(prefix) :]: tensor
+            for name, tensor in checkpoint.items()
+            if name.startswith(prefix)
+        }
+    )
+
+    class _DenseMlaBackend:
+        def __init__(self) -> None:
+            self.topk = object()
+
+        def execute_mla(
+            self,
+            q_latent: torch.Tensor,
+            q_pe: torch.Tensor,
+            k_latent: torch.Tensor,
+            k_pe: torch.Tensor,
+            layer: KimiK3MLAAttention,
+            topk: int | None,
+        ) -> torch.Tensor:
+            self.topk = topk
+            num_heads = q_latent.shape[1]
+            key_latent = k_latent.expand(-1, num_heads, -1)
+            key_pe = k_pe.expand(-1, num_heads, -1)
+            query = torch.cat((q_latent, q_pe), dim=-1).transpose(0, 1).unsqueeze(0)
+            key = torch.cat((key_latent, key_pe), dim=-1).transpose(0, 1).unsqueeze(0)
+            value = key_latent.transpose(0, 1).unsqueeze(0)
+            return F.scaled_dot_product_attention(
+                query, key, value, is_causal=True, scale=layer.scale
+            ).squeeze(0).transpose(0, 1)
+
+    backend = _DenseMlaBackend()
+    hidden_states = torch.randn(
+        5, model.cfg.hidden_size, generator=torch.Generator().manual_seed(17)
+    )
+    positions = torch.arange(hidden_states.shape[0])
+    with forward_context(ForwardContext(backend, torch.device("cpu"))):
+        actual = mla(hidden_states, positions)
+    expected = eager(hidden_states, sequence_lengths=[hidden_states.shape[0]])
+
+    assert backend.topk is None
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
 
 def test_quantized_model_loads_w8_and_packed_w4_tensors() -> None:
@@ -427,6 +571,15 @@ def test_quantized_model_loads_w8_and_packed_w4_tensors() -> None:
         "model.layers.1.block_sparse_moe.experts.1.w2.scale_bias"
         in loaded
     )
+    mla = model.model.layers[1].self_attn
+    assert isinstance(mla, KimiK3MLAAttention)
+    torch.testing.assert_close(mla.q_a_proj.weight, _weight((4, 8), 12))
+    torch.testing.assert_close(mla.q_b_proj.weight, _weight((8, 4), 21))
+    torch.testing.assert_close(
+        mla.kv_a_proj_with_mqa.weight,
+        _weight((6, 8), 32),
+    )
+    assert "model.layers.1.self_attn.q_b_proj.weight_scale" in loaded
 
 
 def test_quantized_weight_loading_shards_tp_dimensions() -> None:
@@ -447,6 +600,34 @@ def test_quantized_weight_loading_shards_tp_dimensions() -> None:
     assert experts.w13_weight.shape == (2, 2, 4)
     assert experts.w2_weight.shape == (2, 2, 2)
     assert experts.w2_scale_bias.shape == (2, 4, 8)
+    mla = model.model.layers[1].self_attn
+    assert isinstance(mla, KimiK3MLAAttention)
+    assert isinstance(mla, KimiK3GatedMLA)
+    assert mla.q_b_proj.weight.shape == (4, 4)
+    assert mla.kv_b_proj.weight.shape == (4, 4)
+    assert mla.g_proj.weight.shape == (2, 8)
+    assert mla.o_proj.weight.shape == (8, 2)
+    expected_kv_b = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)[4:]
+    expected_kv_b = expected_kv_b.reshape(1, 4, 4)
+    torch.testing.assert_close(mla.W_UK, expected_kv_b[:, :2])
+    torch.testing.assert_close(mla.W_UV, expected_kv_b[:, 2:].transpose(1, 2))
+    torch.testing.assert_close(mla.q_a_proj.weight, _weight((4, 8), 12))
+    torch.testing.assert_close(mla.q_b_proj.weight, _weight((4, 4), 21))
+    torch.testing.assert_close(
+        mla.kv_a_proj_with_mqa.weight,
+        _weight((6, 8), 32),
+    )
+
+
+@pytest.mark.parametrize("companion", ("weight_scale", "weight_offset"))
+def test_quantized_mla_weight_requires_scale_and_offset(companion: str) -> None:
+    checkpoint = _quantized_checkpoint()
+    mla_prefix = "language_model.model.layers.1.self_attn."
+    checkpoint.pop(mla_prefix + "q_a_proj." + companion)
+    model = KimiK3ForCausalLM(_quantized_tiny_config())
+
+    with pytest.raises(KeyError, match=f"q_a_proj.{companion}"):
+        model.load_weights([_StateDict(checkpoint)], tp_rank=0, tp_size=1)
 
 
 def test_quantized_experts_prepare_runtime_layout() -> None:

@@ -231,17 +231,24 @@ class NpuPagedAttentionBackend(AttentionBackend):
         """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
         metadata = self._metadata
         assert metadata is not None, "execute_mla called before prepare()"
-        if topk is None:
-            raise NotImplementedError(
-                "dense MLA (topk=None) is not yet supported on "
-                "NpuPagedAttentionBackend"
-            )
         layer_id = layer.layer_id
         nope_cache, rope_cache, _ = self._kv_caches[layer_id]
 
         torch.ops.xllm_ops.reshape_paged_cache(
             metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
         )
+        if topk is None:
+            if metadata.is_chunked_prefill:
+                return self._mla_dense_chunked_prefill(
+                    q_latent, q_pe, nope_cache, rope_cache, metadata, layer
+                )
+            if metadata.is_prefill:
+                return self._mla_dense_prefill(
+                    q_latent, q_pe, k_latent_3d, k_pe_3d, metadata, layer
+                )
+            return self._mla_dense_decode(
+                q_latent, q_pe, nope_cache, rope_cache, layer
+            )
         return self._mla_sparse(
             q_latent, q_pe, nope_cache, rope_cache, topk, metadata.block_table
         )
@@ -276,6 +283,157 @@ class NpuPagedAttentionBackend(AttentionBackend):
             "TND", "PA_BSND", 3,
         )
         return out  # [T, H, kv_lora]
+
+    def _mla_dense_prefill(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_latent: torch.Tensor,
+        k_pe: torch.Tensor,
+        metadata: AttentionMetadata,
+        layer: "Attention",
+    ) -> torch.Tensor:
+        """Dense absorbed MLA prefill with separate latent and positional scores."""
+        num_tokens = q_latent.shape[0]
+        actual_seq = self._cumulative_seq_lens(metadata, num_tokens)
+
+        # FIA's packed TND path accepts BF16 inputs only. Preserve the caller's
+        # dtype at the backend boundary so the absorbed W_UV projection sees the
+        # same dtype as q_latent.
+        original_dtype = q_latent.dtype
+        if original_dtype != torch.bfloat16:
+            q_latent = q_latent.to(torch.bfloat16)
+            q_pe = q_pe.to(torch.bfloat16)
+            k_latent = k_latent.to(torch.bfloat16)
+            k_pe = k_pe.to(torch.bfloat16)
+
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_latent.contiguous(),
+            k_latent.contiguous(),
+            k_latent.contiguous(),
+            query_rope=q_pe.contiguous(),
+            key_rope=k_pe.contiguous(),
+            pse_shift=None,
+            atten_mask=self._causal_mask,
+            actual_seq_lengths=actual_seq,
+            actual_seq_lengths_kv=actual_seq,
+            num_heads=layer.num_heads,
+            scale=layer.scale,
+            input_layout="TND",
+            num_key_value_heads=layer.num_kv_heads,
+            sparse_mode=3,
+            softmax_lse_flag=False,
+        )
+        output = output.view(num_tokens, layer.num_heads, q_latent.shape[-1])
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
+        return output
+
+    def _mla_dense_chunked_prefill(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        nope_cache: torch.Tensor,
+        rope_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+        layer: "Attention",
+    ) -> torch.Tensor:
+        """Dense absorbed MLA chunked prefill over the updated paged caches."""
+        num_tokens = q_latent.shape[0]
+        if self._block_table_i32 is None:
+            raise RuntimeError("dense MLA chunked prefill requires a block table")
+
+        actual_seq_q = self._cumulative_seq_lens(metadata, num_tokens)
+        actual_seq_kv = self._chunked_kv_seq_lens(metadata)
+        if len(actual_seq_q) != len(actual_seq_kv):
+            raise RuntimeError(
+                "dense MLA chunked prefill requires matching query and KV batches"
+            )
+
+        block_size = nope_cache.size(1)
+        nope_flat = nope_cache.view(nope_cache.size(0), block_size, -1)
+        rope_flat = rope_cache.view(rope_cache.size(0), block_size, -1)
+        original_dtype = q_latent.dtype
+        if original_dtype != torch.bfloat16:
+            q_latent = q_latent.to(torch.bfloat16)
+            q_pe = q_pe.to(torch.bfloat16)
+        if nope_flat.dtype != torch.bfloat16 or rope_flat.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "dense MLA paged caches must use BF16 for NPU FIA chunked prefill"
+            )
+
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_latent.contiguous(),
+            nope_flat.contiguous(),
+            nope_flat.contiguous(),
+            query_rope=q_pe.contiguous(),
+            key_rope=rope_flat.contiguous(),
+            pse_shift=None,
+            atten_mask=self._causal_mask,
+            actual_seq_lengths=actual_seq_q,
+            actual_seq_lengths_kv=actual_seq_kv,
+            block_table=self._block_table_i32[: len(actual_seq_kv)],
+            num_heads=layer.num_heads,
+            scale=layer.scale,
+            input_layout="TND",
+            num_key_value_heads=layer.num_kv_heads,
+            sparse_mode=3,
+            block_size=block_size,
+            softmax_lse_flag=False,
+        )
+        output = output.view(num_tokens, layer.num_heads, q_latent.shape[-1])
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
+        return output
+
+    def _mla_dense_decode(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        nope_cache: torch.Tensor,
+        rope_cache: torch.Tensor,
+        layer: "Attention",
+    ) -> torch.Tensor:
+        """Dense absorbed MLA decode directly over paged latent caches."""
+        num_tokens = q_latent.shape[0]
+        if self._block_table_i32 is None:
+            raise RuntimeError("dense MLA decode requires a block table")
+
+        block_size = nope_cache.size(1)
+        nope_flat = nope_cache.view(nope_cache.size(0), block_size, -1)
+        rope_flat = rope_cache.view(rope_cache.size(0), block_size, -1)
+        original_dtype = q_latent.dtype
+        if original_dtype != torch.bfloat16:
+            q_latent = q_latent.to(torch.bfloat16)
+            q_pe = q_pe.to(torch.bfloat16)
+        if nope_flat.dtype != torch.bfloat16 or rope_flat.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "dense MLA paged caches must use BF16 for NPU FIA decode"
+            )
+
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_latent.contiguous(),
+            nope_flat.contiguous(),
+            nope_flat.contiguous(),
+            query_rope=q_pe.contiguous(),
+            key_rope=rope_flat.contiguous(),
+            pse_shift=None,
+            atten_mask=None,
+            actual_seq_lengths=self._actual_seq_q[:num_tokens],
+            actual_seq_lengths_kv=self._actual_seq_kv[:num_tokens],
+            block_table=self._block_table_i32[:num_tokens],
+            num_heads=layer.num_heads,
+            scale=layer.scale,
+            input_layout="TND",
+            num_key_value_heads=layer.num_kv_heads,
+            sparse_mode=0,
+            block_size=block_size,
+            softmax_lse_flag=False,
+        )
+        output = output.view(num_tokens, layer.num_heads, q_latent.shape[-1])
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
+        return output
 
     # ------------------------------------------------------------------
     # Prefill: packed TND with causal mask
@@ -382,6 +540,30 @@ class NpuPagedAttentionBackend(AttentionBackend):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _chunked_kv_seq_lens(metadata: AttentionMetadata) -> list[int]:
+        kv_host = metadata.kv_seq_lens_host
+        if kv_host is None:
+            raise RuntimeError(
+                "dense MLA chunked prefill requires host KV sequence lengths"
+            )
+        kv_host = kv_host.cpu()
+        batch_size = (
+            metadata.q_cu_seq_lens.numel() - 1
+            if metadata.q_cu_seq_lens is not None
+            else metadata.block_table.shape[0]
+        )
+        # NPU metadata stores one total KV length per sequence. Keep support for
+        # the cumulative layout used by non-NPU builders so contract tests and
+        # metadata adapters fail safely instead of silently changing semantics.
+        if kv_host.numel() == batch_size:
+            return kv_host.tolist()
+        if kv_host.numel() == batch_size + 1 and kv_host[0].item() == 0:
+            return (kv_host[1:] - kv_host[:-1]).tolist()
+        raise RuntimeError(
+            "dense MLA chunked prefill received invalid host KV sequence lengths"
+        )
 
     def _cumulative_seq_lens(
         self, metadata: AttentionMetadata, num_tokens: int,

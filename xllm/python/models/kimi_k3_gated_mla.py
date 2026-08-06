@@ -243,6 +243,15 @@ class KimiK3GatedMLA(nn.Module):
             start = end
         return torch.cat(outputs, dim=0)
 
+    def apply_output_gate(
+        self,
+        attention_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply Kimi K3's output gate before the output projection."""
+        gate = torch.sigmoid(self.g_proj(hidden_states))
+        return self.o_proj(attention_output * gate)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -263,5 +272,4 @@ class KimiK3GatedMLA(nn.Module):
         query, key, value = self._project_qkv(hidden_states)
         attended = self._causal_attention(query, key, value, lengths)
         attended = attended.reshape(num_tokens, -1)
-        gate = torch.sigmoid(self.g_proj(hidden_states))
-        return self.o_proj(attended * gate)
+        return self.apply_output_gate(attended, hidden_states)
