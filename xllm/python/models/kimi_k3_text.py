@@ -953,6 +953,7 @@ class KimiK3DecoderLayer(nn.Module):
             self.self_attn = KimiK3DeltaAttention(
                 config.hidden_size,
                 config.linear_attn_config,
+                layer_id=layer_id,
                 tp_size=config.tp_size,
                 tp_rank=config.tp_rank,
                 rms_norm_eps=config.rms_norm_eps,
