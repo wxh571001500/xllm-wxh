@@ -110,11 +110,23 @@ class ModelExecutor:
         device = first_parameter.device
         self._attention_layer_specs = layer_specs
         self._num_attention_layers = len(layer_specs)
+        # The paged-KV backend geometry (heads/dims) must come from a real
+        # paged-attention layer. KDA ("linear") layers are runtime layers for
+        # ordering only and carry no paged-KV geometry, so build the backend
+        # from the first non-linear spec.
+        backend_spec = next(
+            (spec for spec in layer_specs if spec.kind != "linear"),
+            layer_specs[0],
+        )
         self.attention_backend = _create_attention_backend(
-            layer_specs[0], device, first_parameter.dtype
+            backend_spec, device, first_parameter.dtype
         )
 
         execution_model = model.model
+        # The execution model (e.g. KimiK3TextModel) owns the KDA runtime when
+        # the model has linear-attention (KDA) layers; other models leave it
+        # unset and the KDA bind/metadata calls below become no-ops.
+        self._execution_model = execution_model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
         self.decode_graph_runner = None
         self.inductor_runner = None
@@ -163,14 +175,53 @@ class ModelExecutor:
         )
 
     def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
+        # Every runtime layer (MLA/MHA and KDA) owns one cache slot and layer
+        # ids are contiguous from zero, so the bound list has exactly one entry
+        # per runtime layer, indexed by global layer_id. KDA slots hold conv/ssm
+        # tensors and are never indexed through the paged-KV backend.
         if len(kv_caches) != self._num_attention_layers:
             raise ValueError(
-                "KV cache layer count does not match model attention layer count"
+                "KV cache layer count does not match runtime attention layer "
+                f"count: got {len(kv_caches)}, expected {self._num_attention_layers}"
             )
         if self._kv_bound:
             return
         self.attention_backend.bind_kv_caches(kv_caches)
         self._kv_bound = True
+
+    def bind_kda_caches(
+        self, kda_caches: list[tuple[int, torch.Tensor, torch.Tensor]]
+    ) -> None:
+        """Bind linear-attention (KDA) conv/recurrent caches by decoder layer id.
+
+        Each entry is ``(layer_id, conv_state, recurrent_state)``. No-op for
+        models without a KDA runtime (i.e. non-Kimi-K3 models).
+        """
+        kda_runtime = getattr(self._execution_model, "kda_runtime", None)
+        if kda_runtime is None:
+            return
+        for layer_id, conv_state, recurrent_state in kda_caches:
+            kda_runtime.caches[int(layer_id)] = (conv_state, recurrent_state)
+
+    def set_kda_metadata(self, view: object) -> None:
+        """Populate the KDA runtime metadata for the current step.
+
+        ``view`` exposes the per-step linear-attention scheduling info the C++
+        runtime already computes for GDN layers. No-op for models without a KDA
+        runtime.
+        """
+        kda_runtime = getattr(self._execution_model, "kda_runtime", None)
+        if kda_runtime is None:
+            return
+        from xllm.python.layers.kda import KimiK3KDAMetadata
+
+        kda_runtime.metadata = KimiK3KDAMetadata(
+            query_start_loc=view.query_start_loc,
+            state_indices=view.state_indices,
+            num_decode_seqs=view.num_decode_seqs,
+            num_prefill_seqs=view.num_prefill_seqs,
+            has_initial_state=view.has_initial_state,
+        )
 
     def execute(
         self,
@@ -178,9 +229,15 @@ class ModelExecutor:
         positions: torch.Tensor,
         metadata: AttentionMetadata,
         inputs_embeds: torch.Tensor | None = None,
+        kda_metadata: object | None = None,
     ) -> torch.Tensor:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
+
+        # Push per-step KDA scheduling info into the runtime before forward so
+        # KDA layers can read it via kda_runtime.require(). No-op without KDA.
+        if kda_metadata is not None:
+            self.set_kda_metadata(kda_metadata)
 
         # Multimodal prefill supplies already-merged embeddings from the C++
         # VLM data path. Graph runners only accept token ids, so execute this

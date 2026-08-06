@@ -568,6 +568,21 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .index_head_dim(std::max(args.index_head_dim(), 1))
       .window_size(std::max(args.window_size(), 1))
       .compress_ratios(args.compress_ratios());
+
+  // Build a per-layer linear-attention mask from explicit layer_types so models
+  // whose linear layers form an arbitrary set (e.g. Kimi-K3's kda_layers)
+  // dispatch correctly and stay consistent with the layer_types-based capacity
+  // estimation. Left empty for interval-only models, which preserves the legacy
+  // interval-based dispatch path byte-for-byte.
+  if (enable_linear_attention && !args.layer_types().empty()) {
+    std::vector<bool> linear_attention_layers;
+    linear_attention_layers.reserve(num_layers);
+    for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      linear_attention_layers.emplace_back(
+          !is_full_attention_layer(args, layer_id));
+    }
+    create_options.linear_attention_layers(std::move(linear_attention_layers));
+  }
 #if defined(USE_NPU)
   create_options.enable_kv_cache_huge_page_allocator(use_huge_page_allocator);
 #endif

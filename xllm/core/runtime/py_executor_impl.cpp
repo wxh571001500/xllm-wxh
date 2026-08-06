@@ -98,6 +98,85 @@ class AttentionMetadataView final {
   torch::Tensor kv_seq_lens_host_;
 };
 
+// Read-only per-step view of the linear-attention (KDA) scheduling info the C++
+// runtime already computes for GDN/linear layers. Mirrors the fields of the
+// Python KimiK3KDAMetadata (xllm/python/layers/kda.py). Tensors are
+// materialized in the constructor so the view does not outlive `params`.
+class KimiK3KDAMetadataView final {
+ public:
+  explicit KimiK3KDAMetadataView(const ModelInputParams& params) {
+    // state_indices: per-sequence linear-state slot id, [num_seqs] int64.
+    state_indices_ = params.embedding.linear_state_indices;
+    if (state_indices_.defined()) {
+      state_indices_ = state_indices_.to(torch::kInt64);
+    }
+
+#if defined(USE_NPU)
+    // query_start_loc / has_initial_state are host-side vectors populated by
+    // WorkerImpl::prepare_input_params_for_linear_attention on the NPU path.
+    const std::vector<int64_t>& qsl = params.parallel.query_start_loc;
+    if (!qsl.empty()) {
+      query_start_loc_ =
+          torch::tensor(qsl, torch::TensorOptions().dtype(torch::kInt64))
+              .to(torch::kInt32);
+    }
+    const std::vector<int64_t>& his = params.parallel.has_initial_state;
+    if (!his.empty()) {
+      has_initial_state_ =
+          torch::tensor(his, torch::TensorOptions().dtype(torch::kInt64))
+              .to(torch::kBool);
+    }
+#endif
+
+    // Decode/prefill sequence split. Decodes are ordered before prefills, and
+    // pure batches (the only supported paths) map directly from the batch type.
+    const int32_t num_sequences = params.meta.num_sequences;
+    const BatchForwardType batch_type = params.meta.batch_forward_type;
+    if (batch_type.is_decode()) {
+      num_decode_seqs_ = num_sequences;
+      num_prefill_seqs_ = 0;
+    } else if (batch_type.no_decode()) {
+      num_decode_seqs_ = 0;
+      num_prefill_seqs_ = num_sequences;
+    } else {
+      // MIXED: decodes lead the batch as single-token sequences. Count them via
+      // query_start_loc deltas of 1; the remainder are prefills.
+      int32_t num_decode = 0;
+#if defined(USE_NPU)
+      const std::vector<int64_t>& qsl = params.parallel.query_start_loc;
+      for (size_t i = 1; i < qsl.size(); ++i) {
+        if (qsl[i] - qsl[i - 1] != 1) {
+          break;
+        }
+        ++num_decode;
+      }
+#endif
+      num_decode_seqs_ = num_decode;
+      num_prefill_seqs_ = num_sequences - num_decode;
+    }
+  }
+
+  py::object query_start_loc() const {
+    return query_start_loc_.defined() ? py::cast(query_start_loc_) : py::none();
+  }
+  py::object state_indices() const {
+    return state_indices_.defined() ? py::cast(state_indices_) : py::none();
+  }
+  py::object has_initial_state() const {
+    return has_initial_state_.defined() ? py::cast(has_initial_state_)
+                                        : py::none();
+  }
+  int32_t num_decode_seqs() const { return num_decode_seqs_; }
+  int32_t num_prefill_seqs() const { return num_prefill_seqs_; }
+
+ private:
+  torch::Tensor query_start_loc_;
+  torch::Tensor state_indices_;
+  torch::Tensor has_initial_state_;
+  int32_t num_decode_seqs_ = 0;
+  int32_t num_prefill_seqs_ = 0;
+};
+
 }  // namespace
 
 PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
@@ -122,6 +201,18 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
       .def_property_readonly("is_prefill", &AttentionMetadataView::is_prefill)
       .def_property_readonly("is_chunked_prefill",
                              &AttentionMetadataView::is_chunked_prefill);
+
+  py::class_<KimiK3KDAMetadataView>(m, "KimiK3KDAMetadataView")
+      .def_property_readonly("query_start_loc",
+                             &KimiK3KDAMetadataView::query_start_loc)
+      .def_property_readonly("state_indices",
+                             &KimiK3KDAMetadataView::state_indices)
+      .def_property_readonly("has_initial_state",
+                             &KimiK3KDAMetadataView::has_initial_state)
+      .def_property_readonly("num_decode_seqs",
+                             &KimiK3KDAMetadataView::num_decode_seqs)
+      .def_property_readonly("num_prefill_seqs",
+                             &KimiK3KDAMetadataView::num_prefill_seqs);
 }
 
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
@@ -131,7 +222,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
     : py_model_bridge_(dynamic_cast<PyModelBridge*>(model)),
       args_(args),
       options_(options),
-      enable_mla_(args.enable_mla()) {
+      enable_mla_(args.enable_mla()),
+      has_kda_layers_(has_linear_attention_layers(args)) {
   CHECK(py_model_bridge_ != nullptr)
       << "PyExecutorImpl requires a Python model bridge";
 
@@ -181,6 +273,23 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
           kv.get_k_cache(), kv.get_v_cache(), kv.get_index_cache()));
     }
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
+
+    // Bind linear-attention (KDA) conv/recurrent caches by global layer id.
+    // Full-attention layers own no conv/ssm tensors, so only linear layers are
+    // forwarded to the Python KDA runtime.
+    if (has_kda_layers_) {
+      py::list kda_caches_py;
+      for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+        if (is_full_attention_layer(args_, layer_id)) {
+          continue;
+        }
+        KVCache& kv = kv_caches[static_cast<size_t>(layer_id)];
+        kda_caches_py.append(
+            py::make_tuple(layer_id, kv.get_conv_cache(), kv.get_ssm_cache()));
+      }
+      py_executor_.attr("bind_kda_caches")(kda_caches_py);
+    }
+
     kv_bound_ = true;
     kv_layer_count_ = num_layers;
   } else {
@@ -190,14 +299,19 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
 
   py::object py_metadata = py::cast(AttentionMetadataView(attn_metadata));
 
+  // Per-step KDA scheduling info (linear-state slots, query_start_loc,
+  // has_initial_state, decode/prefill split). None for non-KDA models.
+  py::object py_kda_metadata =
+      has_kda_layers_ ? py::object(py::cast(KimiK3KDAMetadataView(params)))
+                      : py::object(py::none());
+
   // Execute: one C++ -> Python call per step.
-  py::object input_embedding = params.embedding.input_embedding.defined()
-                                   ? py::object(
-                                         py::cast(params.embedding.input_embedding))
-                                   : py::object(py::none());
-  py::object hidden_obj =
-      py_executor_.attr("execute")(
-          tokens, positions, py_metadata, input_embedding);
+  py::object input_embedding =
+      params.embedding.input_embedding.defined()
+          ? py::object(py::cast(params.embedding.input_embedding))
+          : py::object(py::none());
+  py::object hidden_obj = py_executor_.attr("execute")(
+      tokens, positions, py_metadata, input_embedding, py_kda_metadata);
   return ModelOutput(hidden_obj.cast<torch::Tensor>());
 }
 

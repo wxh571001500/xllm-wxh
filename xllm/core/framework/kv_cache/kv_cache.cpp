@@ -58,10 +58,22 @@ std::unique_ptr<KVCacheImpl> create_kv_cache_impl(
       << "KV cache quantization is only supported on MLU backend.";
 #endif
 
-  const bool is_linear_layer =
-      create_options.enable_linear_attention() &&
-      is_linear_attention_layer(layer_id,
-                                create_options.full_attention_interval());
+  // Prefer the explicit per-layer mask when present (models with an arbitrary
+  // linear-layer set, e.g. Kimi-K3); otherwise fall back to the legacy
+  // even-interval classification (Qwen3.5 GDN).
+  const std::vector<bool>& linear_layers =
+      create_options.linear_attention_layers();
+  bool is_linear_layer = false;
+  if (create_options.enable_linear_attention()) {
+    if (!linear_layers.empty()) {
+      CHECK_LT(layer_id, static_cast<int64_t>(linear_layers.size()))
+          << "linear_attention_layers mask smaller than layer count.";
+      is_linear_layer = linear_layers[static_cast<size_t>(layer_id)];
+    } else {
+      is_linear_layer = is_linear_attention_layer(
+          layer_id, create_options.full_attention_interval());
+    }
+  }
   if (is_linear_layer) {
     return std::make_unique<LinearAttentionKVCacheImpl>(kv_cache_shape,
                                                         create_options);
