@@ -24,6 +24,7 @@ limitations under the License.
 #include <c10/util/Exception.h>
 #include <glog/logging.h>
 #include <pybind11/embed.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <cstdlib>
@@ -31,6 +32,7 @@ limitations under the License.
 #include <string>
 
 #include "core/framework/config/model_config.h"
+#include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/kernels/xllm_torch_ops.h"
 
@@ -73,6 +75,37 @@ std::string dtype_to_string(const torch::TensorOptions& options) {
     default:
       return "bfloat16";
   }
+}
+
+void init_python_process_groups(const ParallelArgs& parallel_args,
+                                const torch::Device& device) {
+  CHECK(!parallel_args.python_rendezvous_host_.empty());
+  CHECK_GT(parallel_args.python_rendezvous_port_, 0);
+  CHECK(!parallel_args.python_process_group_specs_.empty());
+
+  py::list group_specs;
+  for (const PythonProcessGroupSpec& spec :
+       parallel_args.python_process_group_specs_) {
+    py::dict group_spec;
+    group_spec["name"] = spec.name;
+    group_spec["ranks"] = spec.ranks;
+    group_spec["local_rank"] = spec.local_rank;
+    group_spec["group_id"] = spec.group_id;
+    if (spec.alias_of.empty()) {
+      group_spec["alias_of"] = py::none();
+    } else {
+      group_spec["alias_of"] = spec.alias_of;
+    }
+    group_specs.append(std::move(group_spec));
+  }
+
+  py::module_::import("xllm.python.distributed")
+      .attr("init_parallel_groups")(parallel_args.python_rendezvous_host_,
+                                    parallel_args.python_rendezvous_port_,
+                                    parallel_args.rank(),
+                                    parallel_args.world_size(),
+                                    c10::str(device),
+                                    group_specs);
 }
 
 // ---------------------------------------------------------------------------
@@ -155,18 +188,17 @@ py::list PyStateDict::keys() const {
   return result;
 }
 
-PyStateDict PyStateDict::get_dict_with_prefix(
-    const std::string& prefix) const {
+PyStateDict PyStateDict::get_dict_with_prefix(const std::string& prefix) const {
   CHECK(sd_ != nullptr) << "PyStateDict: access after release";
-  return PyStateDict(std::make_unique<StateDict>(
-      sd_->get_dict_with_prefix(prefix)));
+  return PyStateDict(
+      std::make_unique<StateDict>(sd_->get_dict_with_prefix(prefix)));
 }
 
 PyStateDict PyStateDict::get_dict_with_prefixes(
     const std::vector<std::string>& prefixes) const {
   CHECK(sd_ != nullptr) << "PyStateDict: access after release";
-  return PyStateDict(std::make_unique<StateDict>(
-      sd_->get_dict_with_prefix(prefixes)));
+  return PyStateDict(
+      std::make_unique<StateDict>(sd_->get_dict_with_prefix(prefixes)));
 }
 
 size_t PyStateDict::size() const {

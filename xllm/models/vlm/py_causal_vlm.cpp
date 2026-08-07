@@ -46,16 +46,7 @@ PyCausalVLM::PyCausalVLM(const ModelContext& context)
   tp_rank_ = (tp_group_ != nullptr) ? tp_group_->rank() : 0;
 
   py::gil_scoped_acquire gil;
-  if (tp_size_ > 1) {
-    CHECK(!parallel_args.python_tp_rendezvous_host_.empty());
-    CHECK_GT(parallel_args.python_tp_rendezvous_port_, 0);
-    py::module_::import("xllm.python.ops")
-        .attr("init_tp_group")(parallel_args.python_tp_rendezvous_host_,
-                               parallel_args.python_tp_rendezvous_port_,
-                               tp_rank_,
-                               tp_size_,
-                               c10::str(device_));
-  }
+  init_python_process_groups(parallel_args, device_);
 
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(

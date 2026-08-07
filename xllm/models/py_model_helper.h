@@ -29,6 +29,8 @@ limitations under the License.
 
 namespace xllm {
 
+struct ParallelArgs;
+
 // Initializes the embedded CPython interpreter (idempotent, process-wide).
 void ensure_python_interpreter();
 
@@ -38,6 +40,10 @@ void ensure_xllm_weight_loader_module();
 
 // Convert torch dtype to the string form used by Python model config.
 std::string dtype_to_string(const torch::TensorOptions& options);
+
+// Create the embedded Python process groups described by ParallelArgs.
+void init_python_process_groups(const ParallelArgs& parallel_args,
+                                const torch::Device& device);
 
 // PropertyVisitor that writes each field into a pybind11 dict.
 class __attribute__((visibility("hidden"))) PyDictVisitor final

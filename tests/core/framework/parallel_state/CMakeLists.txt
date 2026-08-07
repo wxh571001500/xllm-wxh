@@ -2,11 +2,11 @@ include(cc_test)
 
 cc_test(
   NAME
-    context_parallel_topology_test
+    python_process_group_test
   SRCS
-    context_parallel_topology_test.cpp
+    python_process_group_test.cpp
   DEPS
-    :parallel_state
+    parallel_state
     GTest::gtest_main
 )
 
@@ -50,11 +50,20 @@ if(USE_NPU)
 
   cc_test(
     NAME
+      cp_group_ranks_test
+    SRCS
+      cp_group_ranks_test.cpp
+    DEPS
+      parallel_state
+      GTest::gtest_main
+  )
+
+  cc_test(
+    NAME
       npu_cp_capability_test
     SRCS
       npu_cp_capability_test.cpp
     DEPS
-      master
       models
       parallel_state
       GTest::gtest_main
@@ -78,44 +87,9 @@ if(USE_NPU)
       absl::time
       GTest::gtest_main
   )
-
-  cc_test(
-    NAME
-      process_group_batch_test
-    SRCS
-      process_group_batch_test.cpp
-    DEPS
-      parallel_state
-      torch
-      GTest::gtest_main
-  )
-endif()
-
-if(USE_NPU OR USE_MLU)
-  cc_test(
-    NAME
-      cp_group_ranks_test
-    SRCS
-      cp_group_ranks_test.cpp
-    DEPS
-      parallel_state
-      GTest::gtest_main
-      glog::glog
-  )
 endif()
 
 if(USE_MLU)
-  cc_test(
-    NAME
-      mlu_cp_capability_test
-    SRCS
-      mlu_cp_capability_test.cpp
-    DEPS
-      models
-      parallel_state
-      GTest::gtest_main
-  )
-
   # Add test for reduce_scatter
   # This test must exist individually, because it contains forked processes
   # which does not allow any device init on main process

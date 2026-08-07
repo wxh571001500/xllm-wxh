@@ -1,10 +1,10 @@
-# Copyright 2026 The xLLM Authors.
+# Copyright 2026 The xLLM Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,36 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Distributed execution for the Python model executor."""
-
-from __future__ import annotations
-
-from xllm.python.distributed.collectives import (
-    all_gather,
-    all_gather_variable,
-    all_reduce_,
-    cp_rank,
-    cp_world_size,
-    init_process_group,
-    init_tp_group,
-    moe_ep_all_reduce,
-    moe_tp_all_reduce,
-    tp_all_gather,
-    tp_all_reduce,
-    tp_rank,
+from xllm.python.distributed.parallel_state import (
+    ParallelGroup,
+    get_parallel_group,
+    init_parallel_groups,
+    parallel_group_rank,
+    parallel_group_world_size,
 )
 
 __all__ = [
-    "init_process_group",
-    "init_tp_group",
-    "tp_rank",
-    "cp_rank",
-    "cp_world_size",
-    "tp_all_reduce",
-    "tp_all_gather",
-    "moe_tp_all_reduce",
-    "moe_ep_all_reduce",
-    "all_reduce_",
-    "all_gather",
-    "all_gather_variable",
+    "ParallelGroup",
+    "get_parallel_group",
+    "init_parallel_groups",
+    "parallel_group_rank",
+    "parallel_group_world_size",
 ]
