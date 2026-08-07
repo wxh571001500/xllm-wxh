@@ -23,7 +23,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-
 _mock_ops = MagicMock()
 
 
@@ -40,10 +39,7 @@ _mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
-from xllm.python.model_executor.forward_context import (  # noqa: E402
-    ForwardContext,
-    forward_context,
-from xllm.python.layers.moe import (  # noqa: E402
+from xllm.python.layers.moe import (
     FusedAllGatherTokenDispatcher,
     FusedQuantizedSituAndMul,
     FusedW4A8RoutedExperts,
@@ -59,16 +55,20 @@ from xllm.python.layers.moe import (  # noqa: E402
     TensorParallelCommMethod,
     UnquantizedRoutedExperts,
 )
-from xllm.python.models.kimi_k3 import (  # noqa: E402
+from xllm.python.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+)
+from xllm.python.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
 )
-from xllm.python.models.kimi_k3_gated_mla import KimiK3GatedMLA  # noqa: E402
-from xllm.python.models.kimi_k3_text import (  # noqa: E402
+from xllm.python.models.kimi_k3_gated_mla import KimiK3GatedMLA
+from xllm.python.models.kimi_k3_text import (
     KimiK3ForCausalLM,
     KimiK3MLAAttention,
     KimiK3TextConfig,
 )
-from xllm.python.models.kimi_k3_vit import KimiK3VisionModel  # noqa: E402
+from xllm.python.models.kimi_k3_vit import KimiK3VisionModel
 
 
 class _StateDict:
@@ -94,7 +94,7 @@ class _StateDict:
         shard_size = tensor.shape[dim] // world_size
         return tensor.narrow(dim, rank * shard_size, shard_size).contiguous()
 
-    def get_dict_with_prefix(self, prefix: str) -> "_StateDict":
+    def get_dict_with_prefix(self, prefix: str) -> _StateDict:
         return _StateDict(
             {
                 name[len(prefix) :]: tensor
@@ -103,7 +103,7 @@ class _StateDict:
             }
         )
 
-    def get_dict_with_prefixes(self, prefixes: list[str]) -> "_StateDict":
+    def get_dict_with_prefixes(self, prefixes: list[str]) -> _StateDict:
         for prefix in prefixes:
             state_dict = self.get_dict_with_prefix(prefix)
             if state_dict.size() > 0:
