@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from xllm.python import ops
 from xllm.python.layers import (
@@ -98,9 +98,9 @@ def _state_dict_sharded_tensor(
     return tensor.narrow(dim, tp_rank * shard_size, shard_size).contiguous()
 
 
-def _layer_ids(state_dict: "StateDict") -> list[int]:
+def _layer_ids(state_dict: StateDict) -> list[int]:
     layer_ids: set[int] = set()
-    for name in state_dict.keys():
+    for name in state_dict.keys():  # noqa: SIM118
         parts = name.split(".", 2)
         if len(parts) < 2 or parts[0] != "layers":
             continue
@@ -137,7 +137,7 @@ class _MergedStateDict:
         if self._index is None:
             self._index = {}
             for shard in self._shards:
-                for name in shard.keys():
+                for name in shard.keys():  # noqa: SIM118
                     self._index.setdefault(name, (shard, name))
         return self._index
 
@@ -170,7 +170,7 @@ class _MergedStateDict:
     def size(self) -> int:
         return len(self._ensure_index())
 
-    def get_dict_with_prefix(self, prefix: str) -> "_MergedStateDict":
+    def get_dict_with_prefix(self, prefix: str) -> _MergedStateDict:
         if not prefix:
             return _MergedStateDict(index=dict(self._ensure_index()))
         index = {
@@ -180,7 +180,7 @@ class _MergedStateDict:
         }
         return _MergedStateDict(index=index)
 
-    def get_dict_with_prefixes(self, prefixes: list[str]) -> "_MergedStateDict":
+    def get_dict_with_prefixes(self, prefixes: list[str]) -> _MergedStateDict:
         for prefix in prefixes:
             merged = self.get_dict_with_prefix(prefix)
             if merged.size() > 0:
@@ -232,7 +232,7 @@ class KimiK3TextConfig:
     tp_rank: int = 0
 
     @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> "KimiK3TextConfig":
+    def from_dict(cls, config: dict[str, Any]) -> KimiK3TextConfig:
         raw = config.get("text_config", config)
         if not isinstance(raw, dict):
             raise TypeError("Kimi K3 text_config must be a dictionary")
@@ -585,7 +585,7 @@ class KimiK3MLP(nn.Module):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -1161,7 +1161,7 @@ class KimiK3DecoderLayer(nn.Module):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -1196,8 +1196,8 @@ class KimiK3DecoderLayer(nn.Module):
                 self._loaded_components.add(f"self_attn.{name}")
                 loaded.add(f"self_attn.{name}")
         elif isinstance(self.self_attn, KimiK3MLAAttention):
-            child_state_dict = _state_dict_with_prefix(state_dict, "self_attn.")
-            if _state_dict_size(child_state_dict) > 0:
+            child_state_dict = state_dict.get_dict_with_prefix("self_attn.")
+            if child_state_dict.size() > 0:
                 loaded.update(
                     f"self_attn.{name}"
                     for name in self.self_attn.load_weights(
@@ -1319,7 +1319,7 @@ class KimiK3TextModel(nn.Module):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -1416,7 +1416,7 @@ class KimiK3ForCausalLM(PyModelBase):
 
     def load_weights(
         self,
-        state_dicts: list["StateDict"],
+        state_dicts: list[StateDict],
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:

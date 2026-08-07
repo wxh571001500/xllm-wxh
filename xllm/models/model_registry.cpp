@@ -86,9 +86,15 @@ REGISTER_MODEL_ARGS(kimi_k3, [&] {
 
   LOAD_ARG_OR(n_layers, "text_config.num_hidden_layers", 93);
   LOAD_ARG_OR(hidden_size, "text_config.hidden_size", 7168);
-  SET_ARG(head_dim, 1);
-  SET_ARG(n_heads, 1);
-  SET_ARG(n_kv_heads, std::optional<int64_t>(1));
+  LOAD_ARG_OR(n_heads, "text_config.num_attention_heads", 96);
+  LOAD_ARG_OR(n_kv_heads, "text_config.num_key_value_heads", 96);
+  LOAD_ARG_OR(qk_nope_head_dim, "text_config.qk_nope_head_dim", 128);
+  LOAD_ARG_OR(qk_rope_head_dim, "text_config.qk_rope_head_dim", 64);
+  LOAD_ARG_OR(v_head_dim, "text_config.v_head_dim", 128);
+  LOAD_ARG_OR(q_lora_rank, "text_config.q_lora_rank", 1536);
+  LOAD_ARG_OR(kv_lora_rank, "text_config.kv_lora_rank", 512);
+  SET_ARG(head_dim, args->qk_nope_head_dim() + args->qk_rope_head_dim());
+  SET_ARG(rotary_dim, args->qk_rope_head_dim());
   LOAD_ARG_OR(vocab_size, "text_config.vocab_size", 163840);
   LOAD_ARG_OR(
       max_position_embeddings, "text_config.max_position_embeddings", 1048576);

@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 
 from xllm.python import ops
@@ -39,6 +40,32 @@ from xllm.python.model_executor.forward_context import (
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
+
+
+_FIA_MLA_HEAD_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def _pad_mla_query_heads(
+    q_latent: torch.Tensor,
+    q_pe: torch.Tensor,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad absorbed MLA queries for FIA's 512-dimension head constraint."""
+    if q_latent.shape[-1] != 512 or num_heads in _FIA_MLA_HEAD_COUNTS:
+        return q_latent, q_pe, num_heads
+
+    padded_num_heads = next(
+        (count for count in _FIA_MLA_HEAD_COUNTS if count > num_heads),
+        None,
+    )
+    if padded_num_heads is None:
+        raise RuntimeError(f"FIA does not support {num_heads} absorbed MLA heads")
+    head_padding = padded_num_heads - num_heads
+    return (
+        F.pad(q_latent, (0, 0, 0, head_padding)),
+        F.pad(q_pe, (0, 0, 0, head_padding)),
+        padded_num_heads,
+    )
 
 
 class NpuPagedAttentionBackend(AttentionBackend):
@@ -197,7 +224,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: "Attention",
+        layer: Attention,
     ) -> torch.Tensor:
         metadata = self._metadata
         assert metadata is not None
@@ -225,7 +252,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         q_pe: torch.Tensor,
         k_latent_3d: torch.Tensor,
         k_pe_3d: torch.Tensor,
-        layer: "Attention",
+        layer: Attention,
         topk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
@@ -253,7 +280,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
             q_latent, q_pe, nope_cache, rope_cache, topk, metadata.block_table
         )
 
-    def mla_index_context(self, layer: "Attention") -> MlaIndexContext:
+    def mla_index_context(self, layer: Attention) -> MlaIndexContext:
         metadata = self._metadata
         assert metadata is not None, "mla_index_context called before prepare()"
         _, _, index_cache = self._kv_caches[layer.layer_id]
@@ -291,7 +318,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         k_latent: torch.Tensor,
         k_pe: torch.Tensor,
         metadata: AttentionMetadata,
-        layer: "Attention",
+        layer: Attention,
     ) -> torch.Tensor:
         """Dense absorbed MLA prefill with separate latent and positional scores."""
         num_tokens = q_latent.shape[0]
@@ -306,6 +333,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
             q_pe = q_pe.to(torch.bfloat16)
             k_latent = k_latent.to(torch.bfloat16)
             k_pe = k_pe.to(torch.bfloat16)
+        q_latent, q_pe, fia_num_heads = _pad_mla_query_heads(
+            q_latent, q_pe, layer.num_heads
+        )
 
         output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             q_latent.contiguous(),
@@ -317,14 +347,15 @@ class NpuPagedAttentionBackend(AttentionBackend):
             atten_mask=self._causal_mask,
             actual_seq_lengths=actual_seq,
             actual_seq_lengths_kv=actual_seq,
-            num_heads=layer.num_heads,
+            num_heads=fia_num_heads,
             scale=layer.scale,
             input_layout="TND",
             num_key_value_heads=layer.num_kv_heads,
             sparse_mode=3,
             softmax_lse_flag=False,
         )
-        output = output.view(num_tokens, layer.num_heads, q_latent.shape[-1])
+        output = output.view(num_tokens, fia_num_heads, q_latent.shape[-1])
+        output = output[:, : layer.num_heads]
         if output.dtype != original_dtype:
             output = output.to(original_dtype)
         return output
@@ -336,7 +367,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         nope_cache: torch.Tensor,
         rope_cache: torch.Tensor,
         metadata: AttentionMetadata,
-        layer: "Attention",
+        layer: Attention,
     ) -> torch.Tensor:
         """Dense absorbed MLA chunked prefill over the updated paged caches."""
         num_tokens = q_latent.shape[0]
@@ -357,6 +388,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if original_dtype != torch.bfloat16:
             q_latent = q_latent.to(torch.bfloat16)
             q_pe = q_pe.to(torch.bfloat16)
+        q_latent, q_pe, fia_num_heads = _pad_mla_query_heads(
+            q_latent, q_pe, layer.num_heads
+        )
         if nope_flat.dtype != torch.bfloat16 or rope_flat.dtype != torch.bfloat16:
             raise RuntimeError(
                 "dense MLA paged caches must use BF16 for NPU FIA chunked prefill"
@@ -373,7 +407,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
             actual_seq_lengths=actual_seq_q,
             actual_seq_lengths_kv=actual_seq_kv,
             block_table=self._block_table_i32[: len(actual_seq_kv)],
-            num_heads=layer.num_heads,
+            num_heads=fia_num_heads,
             scale=layer.scale,
             input_layout="TND",
             num_key_value_heads=layer.num_kv_heads,
@@ -381,7 +415,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
             block_size=block_size,
             softmax_lse_flag=False,
         )
-        output = output.view(num_tokens, layer.num_heads, q_latent.shape[-1])
+        output = output.view(num_tokens, fia_num_heads, q_latent.shape[-1])
+        output = output[:, : layer.num_heads]
         if output.dtype != original_dtype:
             output = output.to(original_dtype)
         return output
@@ -392,7 +427,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         q_pe: torch.Tensor,
         nope_cache: torch.Tensor,
         rope_cache: torch.Tensor,
-        layer: "Attention",
+        layer: Attention,
     ) -> torch.Tensor:
         """Dense absorbed MLA decode directly over paged latent caches."""
         num_tokens = q_latent.shape[0]
@@ -406,6 +441,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if original_dtype != torch.bfloat16:
             q_latent = q_latent.to(torch.bfloat16)
             q_pe = q_pe.to(torch.bfloat16)
+        q_latent, q_pe, fia_num_heads = _pad_mla_query_heads(
+            q_latent, q_pe, layer.num_heads
+        )
         if nope_flat.dtype != torch.bfloat16 or rope_flat.dtype != torch.bfloat16:
             raise RuntimeError(
                 "dense MLA paged caches must use BF16 for NPU FIA decode"
@@ -422,7 +460,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
             actual_seq_lengths=self._actual_seq_q[:num_tokens],
             actual_seq_lengths_kv=self._actual_seq_kv[:num_tokens],
             block_table=self._block_table_i32[:num_tokens],
-            num_heads=layer.num_heads,
+            num_heads=fia_num_heads,
             scale=layer.scale,
             input_layout="TND",
             num_key_value_heads=layer.num_kv_heads,
@@ -430,7 +468,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
             block_size=block_size,
             softmax_lse_flag=False,
         )
-        output = output.view(num_tokens, layer.num_heads, q_latent.shape[-1])
+        output = output.view(num_tokens, fia_num_heads, q_latent.shape[-1])
+        output = output[:, : layer.num_heads]
         if output.dtype != original_dtype:
             output = output.to(original_dtype)
         return output
