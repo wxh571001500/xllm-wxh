@@ -136,6 +136,7 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
       "deepseek_v32_mtp",
       "kimi_k2",
       "kimi_k25",
+      "kimi_k3",
       "glm4_moe_lite",
       "glm_moe_dsa",  // glm5 model type
       "glm_moe_dsa_mtp",

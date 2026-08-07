@@ -23,10 +23,24 @@ from unittest.mock import MagicMock
 import torch
 
 _mock_ops = MagicMock()
+
+
+def _rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+
+
+_mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
-from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend  # noqa: E402
+from xllm.python.attention.npu_paged_attention import (
+    NpuPagedAttentionBackend,
+)
 
 
 def test_dense_mla_prefill_uses_split_positional_inputs_and_bf16(monkeypatch):
@@ -106,6 +120,40 @@ def test_dense_mla_prefill_keeps_bf16_without_conversion(monkeypatch):
 
     assert output.dtype == torch.bfloat16
     assert output.shape == (3, 2, 4)
+
+
+def test_dense_mla_prefill_pads_unsupported_512_dim_head_count(monkeypatch):
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._actual_seq_lens = [3]
+    backend._causal_mask = torch.ones(4, 4, dtype=torch.int8)
+    query = torch.randn(3, 24, 512, dtype=torch.bfloat16)
+    query_rope = torch.randn(3, 24, 64, dtype=torch.bfloat16)
+    key = torch.randn(3, 1, 512, dtype=torch.bfloat16)
+    key_rope = torch.randn(3, 1, 64, dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_fia(q, k, v, **kwargs):
+        captured.update(query=q, key=k, value=v, **kwargs)
+        return torch.zeros_like(q), torch.empty(0, dtype=q.dtype)
+
+    monkeypatch.setattr(
+        torch.ops.npu,
+        "npu_fused_infer_attention_score",
+        fake_fia,
+    )
+    output = backend._mla_dense_prefill(
+        query,
+        query_rope,
+        key,
+        key_rope,
+        SimpleNamespace(),
+        SimpleNamespace(num_heads=24, num_kv_heads=1, scale=0.5),
+    )
+
+    assert captured["query"].shape == (3, 32, 512)
+    assert captured["query_rope"].shape == (3, 32, 64)
+    assert captured["num_heads"] == 32
+    assert output.shape == (3, 24, 512)
 
 
 def test_dense_mla_decode_uses_paged_latent_and_positional_caches(monkeypatch):
