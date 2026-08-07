@@ -5,6 +5,13 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
+from xllm.python.distributed import (
+    ParallelGroup,
+    get_parallel_group,
+    parallel_group_rank,
+    parallel_group_world_size,
+)
+
 _tp_groups = {}
 _tp_stores = {}
 
@@ -39,6 +46,23 @@ def init_tp_group(
     world_size: int,
     device: str,
 ):
+    try:
+        registered_group = get_parallel_group("tp", device)
+    except (KeyError, RuntimeError):
+        registered_group = None
+    if registered_group is not None:
+        if (
+            registered_group.local_rank != rank
+            or registered_group.world_size != world_size
+        ):
+            raise RuntimeError(
+                f"TP group for {device} is already initialized as "
+                f"rank {registered_group.local_rank}/"
+                f"{registered_group.world_size}, requested "
+                f"rank {rank}/{world_size}"
+            )
+        return registered_group.process_group
+
     device_key = str(torch.device(device))
     group = _tp_groups.get(device_key)
     if group is not None:
@@ -56,48 +80,90 @@ def init_tp_group(
     return group
 
 
-def _require_tp_group(x: torch.Tensor):
-    group = _tp_groups.get(str(x.device))
-    if group is None:
+def _require_group(x: torch.Tensor, group_name: str) -> ParallelGroup:
+    try:
+        group = get_parallel_group(group_name, x.device)
+    except (KeyError, RuntimeError):
+        group = None
+
+    if group is not None:
+        if group.world_size > 1 and group.process_group is None:
+            raise RuntimeError(
+                f"process group {group_name} for {x.device} has no backend"
+            )
+        return group
+
+    if group_name != "tp":
+        raise RuntimeError(
+            f"parallel group {group_name} was not initialized for {x.device}"
+        )
+
+    legacy_group = _tp_groups.get(str(x.device))
+    if legacy_group is None:
         raise RuntimeError(
             "tensor-parallel collective called before the TP process group "
             f"was initialized for {x.device}"
         )
-    return group
+    return ParallelGroup(
+        name="tp",
+        ranks=tuple(range(legacy_group.size())),
+        local_rank=legacy_group.rank(),
+        process_group=legacy_group,
+    )
 
 
-def tp_rank(device) -> int:
+def tp_rank(device: object) -> int:
     """Rank in the TP group for ``device`` (0 when no TP group exists)."""
+    try:
+        return parallel_group_rank("tp", device)
+    except (KeyError, RuntimeError):
+        pass
     group = _tp_groups.get(str(torch.device(device)))
     return group.rank() if group is not None else 0
 
 
 @torch.library.custom_op("xllm_ops::all_reduce_", mutates_args={"x"})
-def all_reduce_(x: torch.Tensor) -> None:
-    group = _require_tp_group(x)
-    dist.all_reduce(x, group=group)
+def all_reduce_(x: torch.Tensor, group_name: str = "tp") -> None:
+    group = _require_group(x, group_name)
+    if group.world_size == 1:
+        return None
+    dist.all_reduce(x, group=group.process_group)
 
 
 @all_reduce_.register_fake
-def _(x: torch.Tensor) -> None:
+def _(x: torch.Tensor, group_name: str = "tp") -> None:
+    del group_name
     return None
 
 
 @torch.library.custom_op("xllm_ops::all_gather", mutates_args=())
-def all_gather(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
-    group = _require_tp_group(x)
-    if group.size() != world_size:
+def all_gather(
+    x: torch.Tensor,
+    dim: int,
+    world_size: int,
+    group_name: str = "tp",
+) -> torch.Tensor:
+    group = _require_group(x, group_name)
+    if group.world_size != world_size:
         raise RuntimeError(
-            f"TP world-size mismatch: expected {world_size}, "
-            f"got {group.size()}"
+            f"{group_name} world-size mismatch: expected {world_size}, "
+            f"got {group.world_size}"
         )
+    if group.world_size == 1:
+        return x.clone()
     chunks = [torch.empty_like(x) for _ in range(world_size)]
-    dist.all_gather(chunks, x, group=group)
+    dist.all_gather(chunks, x, group=group.process_group)
     return torch.cat(chunks, dim=dim)
 
 
 @all_gather.register_fake
-def _(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+def _(
+    x: torch.Tensor,
+    dim: int,
+    world_size: int,
+    group_name: str = "tp",
+) -> torch.Tensor:
+    del group_name
     shape = list(x.shape)
     shape[dim] *= world_size
     return x.new_empty(shape)

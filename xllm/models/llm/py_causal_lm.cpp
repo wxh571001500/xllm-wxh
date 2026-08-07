@@ -47,16 +47,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
   tp_rank_ = (tp_group_ != nullptr) ? tp_group_->rank() : 0;
 
   py::gil_scoped_acquire gil;
-  if (tp_size_ > 1) {
-    CHECK(!parallel_args.python_tp_rendezvous_host_.empty());
-    CHECK_GT(parallel_args.python_tp_rendezvous_port_, 0);
-    py::module_::import("xllm.python.ops")
-        .attr("init_tp_group")(parallel_args.python_tp_rendezvous_host_,
-                               parallel_args.python_tp_rendezvous_port_,
-                               tp_rank_,
-                               tp_size_,
-                               c10::str(device_));
-  }
+  init_python_process_groups(parallel_args, device_);
   const std::string module_name = context.get_model_args().model_type().empty()
                                       ? std::string("Qwen3ForCausalLM")
                                       : context.get_model_args().model_type();
@@ -74,9 +65,8 @@ PyCausalLM::~PyCausalLM() {
   config_dict_ = py::object();
 }
 
-py::dict PyCausalLM::build_config_dict(
-    const ParallelArgs& parallel_args,
-    const QuantArgs& quant_args) const {
+py::dict PyCausalLM::build_config_dict(const ParallelArgs& parallel_args,
+                                       const QuantArgs& quant_args) const {
   py::dict d;
   if (model_args_.model_type() == "kimi_k3") {
     py::module_ json = py::module_::import("json");

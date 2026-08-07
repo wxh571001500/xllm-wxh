@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include "core/common/macros.h"
+#include "core/framework/parallel_state/python_process_group.h"
 #include "process_group.h"
 
 #if defined(USE_NPU)
@@ -214,10 +215,12 @@ struct ParallelArgs {
   ProcessGroup* moe_ep_group_ = nullptr;
   ProcessGroup* moe_tp_group_ = nullptr;
 
-  // PyTorch creates its own TP process group. These fields only reserve the
-  // TCPStore endpoint after the native process-group port range.
-  std::string python_tp_rendezvous_host_;
-  int32_t python_tp_rendezvous_port_ = 0;
+  // PyTorch creates its own process groups from the native topology. These
+  // fields reserve one world-scoped TCPStore endpoint after the native
+  // process-group port range and describe every group containing this rank.
+  std::string python_rendezvous_host_;
+  int32_t python_rendezvous_port_ = 0;
+  std::vector<PythonProcessGroupSpec> python_process_group_specs_;
 
   // ProcessGroups for DiT models
   ProcessGroup* dit_tp_group_ = nullptr;
