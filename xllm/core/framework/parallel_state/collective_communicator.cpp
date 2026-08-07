@@ -36,6 +36,7 @@ limitations under the License.
 #include "parallel_args.h"
 #include "parallel_state.h"
 #include "process_group.h"
+#include "python_process_group.h"
 #include "util/json_reader.h"
 #include "util/net.h"
 
@@ -306,11 +307,16 @@ void CollectiveCommunicator::create_process_groups(
   net::parse_host_port_from_addr(master_addr, host, port);
 
   int32_t port_offset = 0;
+  const bool enable_encoder_dp =
+      ::xllm::ParallelConfig::get_instance().enable_mm_encoder_dp();
+  parallel_args_
+      ->python_process_group_specs_ = build_python_process_group_specs(
+      global_rank, world_size, dp_size, ep_size, cp_size, enable_encoder_dp);
 
   // Encoder DP is used by multi-modal models to parallelize vision encoder
   // work inside each language-model TP group. The rank set matches the TP
   // group, but each rank runs a full encoder on different multi-modal items.
-  if (::xllm::ParallelConfig::get_instance().enable_mm_encoder_dp()) {
+  if (enable_encoder_dp) {
     const int32_t encoder_dp_size = world_size / dp_size;
     port_offset = global_rank / encoder_dp_size + 1;
     encoder_dp_group_ = create_process_group(global_rank,
@@ -352,6 +358,12 @@ void CollectiveCommunicator::create_process_groups(
                                        device);
       parallel_args_->cp_group_ = cp_group_.get();
     }
+    const int32_t attention_tp_size = world_size / (dp_size * cp_size);
+    parallel_args_->python_rendezvous_host_ = host;
+    parallel_args_->python_rendezvous_port_ =
+        port + (cp_size > 1 ? attention_tp_size : 0) + 1;
+    CHECK_LE(parallel_args_->python_rendezvous_port_, 65535)
+        << "No TCP port remains for the Python process-group rendezvous.";
     return;
   }
 #endif
@@ -468,11 +480,10 @@ void CollectiveCommunicator::create_process_groups(
     port += moe_tp_size;
   }
 
-  const int32_t tp_group_index = global_rank / tp_size;
-  parallel_args_->python_tp_rendezvous_host_ = host;
-  parallel_args_->python_tp_rendezvous_port_ = port + tp_group_index + 1;
-  CHECK_LE(parallel_args_->python_tp_rendezvous_port_, 65535)
-      << "No TCP port remains for the Python TP rendezvous.";
+  parallel_args_->python_rendezvous_host_ = host;
+  parallel_args_->python_rendezvous_port_ = port + 1;
+  CHECK_LE(parallel_args_->python_rendezvous_port_, 65535)
+      << "No TCP port remains for the Python process-group rendezvous.";
 
 #if defined(USE_NPU)
   if (::xllm::KernelConfig::get_instance().npu_kernel_backend() == "TORCH" &&

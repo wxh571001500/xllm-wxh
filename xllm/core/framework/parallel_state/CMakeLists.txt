@@ -10,6 +10,7 @@ cc_library(
     dit_mapping.h
     rank_generator.h
     parallel_args.h
+    python_process_group.h
     parallel_state.h
     process_group.h
     $<$<BOOL:${USE_NPU}>:npu_rank_table_env.h>
@@ -28,6 +29,7 @@ cc_library(
     dit_mapping.cpp
     parallel_state.cpp
     parallel_state_async.cpp
+    python_process_group.cpp
     process_group.cpp
     $<$<BOOL:${USE_NPU}>:npu_rank_table_env.cpp>
     $<$<BOOL:${USE_NPU}>:npu_process_group.cpp>
