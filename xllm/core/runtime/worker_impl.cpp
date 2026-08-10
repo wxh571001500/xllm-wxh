@@ -1539,6 +1539,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   device_.set_seed(random_seed);
 
   auto model_loader = ModelLoader::create(model_weights_path);
+  if (options_.is_draft_engine() && !options_.model_path().empty() &&
+      options_.model_path() != model_weights_path) {
+    model_loader->set_reference_model_weights_path(options_.model_path());
+  }
   model_weights_path_ = std::move(model_weights_path);
 
   auto args = model_loader->model_args();

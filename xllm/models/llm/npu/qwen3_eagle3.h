@@ -425,7 +425,10 @@ class QWen3Eagle3ForCausalLMImpl : public torch::nn::Module {
 
   virtual void load_model(std::unique_ptr<ModelLoader> loader,
                           std::string prefix = "") {
-    const std::filesystem::path model_path(loader->model_weights_path());
+    std::filesystem::path quarot_model_path(loader->model_weights_path());
+    if (!loader->reference_model_weights_path().empty()) {
+      quarot_model_path = loader->reference_model_weights_path();
+    }
     for (const auto& state_dict : loader->get_state_dicts()) {
       auto sub_dict = state_dict->get_dict_with_prefix(prefix + "model.");
       if (sub_dict.size() == 0) {
@@ -453,7 +456,7 @@ class QWen3Eagle3ForCausalLMImpl : public torch::nn::Module {
         npu_lm_head_->verify_loaded_weights("lm_head.");
       }
     }
-    load_optional_quarot_rotation(model_path);
+    load_optional_quarot_rotation(quarot_model_path);
     model_->merge_loaded_weights();
     if (!load_lm_head_from_target_) {
       npu_lm_head_->merge_loaded_weights();
