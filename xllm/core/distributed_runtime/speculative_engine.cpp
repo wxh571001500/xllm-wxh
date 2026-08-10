@@ -202,8 +202,9 @@ bool SpeculativeEngineBase<TargetEngine>::should_skip_external_draft_kv_cache()
 }
 
 template <typename TargetEngine>
-bool SpeculativeEngineBase<TargetEngine>::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+bool SpeculativeEngineBase<TargetEngine>::
+    set_speculative_validate_time_predictor(
+        const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
   return engine_->set_speculative_validate_time_predictor(predictor);
 }
 

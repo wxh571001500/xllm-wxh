@@ -92,10 +92,6 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
         ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch());
   }
 
-  void set_quarot_global_rotation(torch::Tensor global_rotation) {
-    quarot_global_rotation_t_ = global_rotation.transpose(0, 1).contiguous();
-  }
-
   void load_restored_embed_tokens(const StateDict& state_dict,
                                   torch::Tensor global_rotation,
                                   const torch::Device& device) {
@@ -286,9 +282,7 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
       auto& layer = layers_[i];
       const int32_t layer_index = i;
       // ATB keeps `h` as the full residual stream, so no separate residual.
-      torch::Tensor aux_h = restore_quarot_hidden(
-          h.reshape({h.size(0), h.size(-1)}), h.size(-1));
-      aux_capture_.capture_layer(layer_index, aux_h, std::nullopt);
+      aux_capture_.capture_layer(layer_index, h, std::nullopt);
 
       if (layer_forward_interrupted_) {
         LOG(INFO) << "Forward interrupted at layer: " << i;
@@ -326,29 +320,9 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
   }
 
  private:
-  torch::Tensor restore_quarot_hidden(torch::Tensor aux_h,
-                                      int64_t hidden_size) {
-    if (!quarot_global_rotation_t_.defined() ||
-        quarot_global_rotation_t_.numel() == 0) {
-      return aux_h;
-    }
-
-    CHECK_EQ(quarot_global_rotation_t_.dim(), 2)
-        << "QuaRot global_rotation must be a 2D tensor";
-    CHECK_EQ(quarot_global_rotation_t_.size(0), hidden_size)
-        << "QuaRot global_rotation hidden size mismatch, expected "
-        << hidden_size << ", got " << quarot_global_rotation_t_.size(0);
-    CHECK_EQ(quarot_global_rotation_t_.size(1), hidden_size)
-        << "QuaRot global_rotation hidden size mismatch, expected "
-        << hidden_size << ", got " << quarot_global_rotation_t_.size(1);
-
-    return torch::matmul(aux_h, quarot_global_rotation_t_);
-  }
-
   torch::Tensor viusal_pos_mask_;
   AuxHiddenCapture aux_capture_;
   bool has_restored_embed_tokens_ = false;
-  torch::Tensor quarot_global_rotation_t_;
   layer::NpuWordEmbedding restored_embed_tokens_{nullptr};
 };
 TORCH_MODULE(QWen3Model);
@@ -357,8 +331,7 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
  public:
   QWen3ForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<QWen3Model>(context),
-        device_(context.get_tensor_options().device()),
-        dtype_(context.get_tensor_options().dtype().toScalarType()) {}
+        device_(context.get_tensor_options().device()) {}
 
   torch::Tensor pooler(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) {
@@ -498,14 +471,6 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
                                        /*non_blocking=*/false,
                                        /*copy=*/true)
                                    .contiguous();
-    torch::DeviceGuard device_guard(device_);
-    auto global_rotation_device =
-        global_rotation_cpu
-            .to(torch::TensorOptions().dtype(dtype_).device(device_),
-                /*non_blocking=*/false,
-                /*copy=*/true)
-            .contiguous();
-    model_->set_quarot_global_rotation(global_rotation_device);
     LOG(INFO) << "Loaded optional QuaRot global_rotation from "
               << quarot_path.string()
               << ", shape=" << global_rotation_cpu.sizes();
@@ -513,7 +478,6 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
   }
 
   torch::Device device_;
-  torch::Dtype dtype_;
 };
 TORCH_MODULE(QWen3ForCausalLM);
 

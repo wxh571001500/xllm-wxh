@@ -146,10 +146,6 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     return embed_tokens_(input_ids, 0);
   }
 
-  void set_quarot_global_rotation(torch::Tensor global_rotation) {
-    quarot_global_rotation_t_ = global_rotation.transpose(0, 1).contiguous();
-  }
-
   void fuse_fc_quarot_input_rotation(torch::Tensor global_rotation) {
     fc_->fuse_eagle3_quarot_input_rotation(global_rotation);
   }
@@ -170,8 +166,6 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     }
 
     torch::Tensor hidden_states = embed_tokens_(tokens, 0);
-    hidden_states =
-        restore_quarot_hidden(hidden_states, hidden_states.size(-1));
     // Get hidden_states_extra from input_params.embedding.input_embedding
     // In EAGLE-3, hidden_states_extra comes from verifier layers
     // (3 layers concatenated)
@@ -316,29 +310,9 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
   virtual void set_restored_npu_word_embedding(
       layer::NpuWordEmbedding& npu_word_embedding) {
     embed_tokens_ = npu_word_embedding;
-    quarot_global_rotation_t_ = torch::Tensor();
   }
 
  protected:
-  torch::Tensor restore_quarot_hidden(torch::Tensor hidden_states,
-                                      int64_t hidden_size) {
-    if (!quarot_global_rotation_t_.defined() ||
-        quarot_global_rotation_t_.numel() == 0) {
-      return hidden_states;
-    }
-
-    CHECK_EQ(quarot_global_rotation_t_.dim(), 2)
-        << "QuaRot global_rotation must be a 2D tensor";
-    CHECK_EQ(quarot_global_rotation_t_.size(0), hidden_size)
-        << "QuaRot global_rotation hidden size mismatch, expected "
-        << hidden_size << ", got " << quarot_global_rotation_t_.size(0);
-    CHECK_EQ(quarot_global_rotation_t_.size(1), hidden_size)
-        << "QuaRot global_rotation hidden size mismatch, expected "
-        << hidden_size << ", got " << quarot_global_rotation_t_.size(1);
-
-    return torch::matmul(hidden_states, quarot_global_rotation_t_);
-  }
-
   std::string model_type_;
   torch::TensorOptions options_;
 
@@ -352,7 +326,6 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
   layer::AttentionMask attn_mask_;
 
   layer::NpuWordEmbedding embed_tokens_{nullptr};
-  torch::Tensor quarot_global_rotation_t_;
 
   // EAGLE-3 specific modules
   layer::NpuColumnParallelLinear fc_{nullptr};  // fusion layer
@@ -519,7 +492,6 @@ class QWen3Eagle3ForCausalLMImpl : public torch::nn::Module {
                 /*non_blocking=*/false,
                 /*copy=*/true)
             .contiguous();
-    model_->set_quarot_global_rotation(global_rotation);
     model_->fuse_fc_quarot_input_rotation(global_rotation);
     LOG(INFO) << "Loaded optional QuaRot global_rotation for Eagle3 from "
               << quarot_path.string() << ", shape=" << global_rotation.sizes()

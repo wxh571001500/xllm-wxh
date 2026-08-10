@@ -602,8 +602,11 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              WorkerType worker_type,
                              bool enable_opt_validate_probs,
                              bool enable_adaptive_speculative_decode)
-    : SpeculativeWorkerImpl(
-          parallel_args, device, options, target_options, worker_type),
+    : SpeculativeWorkerImpl(parallel_args,
+                            device,
+                            options,
+                            target_options,
+                            worker_type),
       enable_opt_validate_probs_(enable_opt_validate_probs) {
   draft_impl_ = std::make_unique<LLMWorkerImpl>(
       MTPDraftParallelArgs(parallel_args, options),
@@ -1154,10 +1157,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
       pending_draft_context_ = PendingDraftContext();
     } else {
       draft_outputs.emplace_back(run_worker_no_sync_impl(*draft_impl_,
-                                                      new_input,
-                                                      *prepare_stream_,
-                                                      *compute_stream_,
-                                                      draft_extend_prepared)
+                                                         new_input,
+                                                         *prepare_stream_,
+                                                         *compute_stream_,
+                                                         draft_extend_prepared)
                                      .value());
     }
 
@@ -2542,10 +2545,10 @@ void MTPWorkerImpl::submit_pending_first_draft(
       batch_identity_input.input_params.parallel.dp_global_batch_generations;
   pending_draft_context_.output =
       run_worker_no_sync_impl(*draft_impl_,
-                           draft_input,
-                           *compute_stream_,
-                           *compute_stream_,
-                           pending_draft_context_.prepared_input);
+                              draft_input,
+                              *compute_stream_,
+                              *compute_stream_,
+                              pending_draft_context_.prepared_input);
   CHECK(pending_draft_context_.output.has_value())
       << "failed to prelaunch next MTP first draft";
 }
@@ -3037,10 +3040,9 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     extra_int_inputs.push_back({&buf.out_token_ids,
                                 &validate_input.token_ids_host,
                                 &validate_input.token_ids});
-    extra_int_inputs.push_back(
-        {&buf.position_helper.out_position_id_vec,
-         &validate_input.positions_host,
-         &validate_input.positions});
+    extra_int_inputs.push_back({&buf.position_helper.out_position_id_vec,
+                                &validate_input.positions_host,
+                                &validate_input.positions});
     if (!input_params.embedding.linear_state_ids.empty()) {
       extra_int_inputs.push_back(
           {&input_params.embedding.linear_state_ids,
@@ -3871,48 +3873,6 @@ SampleOutput MTPWorkerImpl::validate(
           {batch_size, num_val_tokens, target_embeddings.size(-1)});
     }
   }
-
-  std::vector<torch::Tensor> draft_token_ids_steps;
-  std::vector<torch::Tensor> draft_probs_steps;
-  draft_token_ids_steps.reserve(draft_outputs.size());
-  draft_probs_steps.reserve(draft_outputs.size());
-  for (const ForwardOutput& draft_output : draft_outputs) {
-    draft_token_ids_steps.emplace_back(draft_output.sample_output.next_tokens);
-    draft_probs_steps.emplace_back(draft_output.sample_output.probs);
-  }
-
-  std::pair<torch::Tensor, torch::Tensor> validate_tensors =
-      specBuilder::draftProbs::build_validate_tensors(
-          draft_token_ids_steps,
-          draft_probs_steps,
-          batch_size,
-          vocab_size,
-          enable_opt_validate_probs_,
-          /*draft_probs_required=*/!sampling_params.all_greedy_sample);
-  return validate(sampling_params,
-                  validate_tensors.first,
-                  validate_tensors.second,
-                  target_output,
-                  num_speculative_tokens,
-                  pruned_prefix_lengths);
-}
-
-SampleOutput MTPWorkerImpl::validate(
-    const SamplingParameters& sampling_params,
-    const torch::Tensor& draft_token_ids,
-    const torch::Tensor& draft_probs,
-    const ForwardOutput& target_output,
-    int32_t num_speculative_tokens,
-    const std::vector<int32_t>* pruned_prefix_lengths) {
-  const int32_t num_target_tokens =
-      target_output.sample_output.next_tokens.numel();
-  const int32_t num_val_tokens = num_speculative_tokens + 1;
-  CHECK_EQ(num_target_tokens % num_val_tokens, 0);
-  const int32_t batch_size = num_target_tokens / num_val_tokens;
-  const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
-
-  using torch::indexing::None;
-  using ISlice = torch::indexing::Slice;
   torch::Tensor bonus_token_ids =
       target_next_tokens
           .index({"...", ISlice(num_val_tokens - 1, None, num_val_tokens)})
