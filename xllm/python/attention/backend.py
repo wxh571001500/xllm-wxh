@@ -60,6 +60,15 @@ class MlaIndexContext:
     actual_seq_kv: torch.Tensor
 
 
+@dataclass(frozen=True)
+class MlaUnabsorbedPrefill:
+    """Unabsorbed MLA tensors used by model-specific prefill paths."""
+
+    query_nope: torch.Tensor
+    key_nope: torch.Tensor
+    value: torch.Tensor
+
+
 class AttentionBackend(ABC):
     @abstractmethod
     def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
@@ -102,17 +111,24 @@ class AttentionBackend(ABC):
         k_pe: torch.Tensor,
         layer: "Attention",
         topk: torch.Tensor | None = None,
+        unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
     ) -> torch.Tensor:
         """Absorbed-MLA attention over paged latent (nope) + rope caches.
 
-        Returns ``[T, H, kv_lora]``; caller bmm's ``W_UV``. When ``topk`` is
+        Returns ``[T, H, kv_lora]`` for absorbed MLA. A backend may return
+        ``[T, H, v_head_dim]`` when ``unabsorbed_prefill`` is provided and the
+        current step supports an unabsorbed prefill path. When ``topk`` is
         provided, dispatches to the sparse SFA path driven by an optional
-        LightningIndexer; otherwise a dense MLA path is requested. Backends
-        that do not implement MLA raise.
+        LightningIndexer; otherwise a dense MLA path is requested.
         """
+        del unabsorbed_prefill
         raise NotImplementedError(
             f"{type(self).__name__} does not support MLA"
         )
+
+    def use_unabsorbed_mla_prefill(self) -> bool:
+        """Return whether the current step accepts unabsorbed MLA inputs."""
+        return False
 
     def mla_index_context(self, layer: "Attention") -> MlaIndexContext:
         """Public hook for an optional LightningIndexer.
