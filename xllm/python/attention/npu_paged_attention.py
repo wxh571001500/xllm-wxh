@@ -263,8 +263,12 @@ class NpuPagedAttentionBackend(AttentionBackend):
         layer_id = layer.layer_id
         nope_cache, rope_cache, _ = self._kv_caches[layer_id]
 
-        torch.ops.xllm_ops.reshape_paged_cache(
-            metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
+        torch_npu._npu_reshape_and_cache(
+            key=k_latent_3d,
+            value=k_pe_3d,
+            key_cache=nope_cache,
+            value_cache=rope_cache,
+            slot_indices=metadata.slot_mapping,
         )
         if topk is None:
             if unabsorbed_prefill is not None and self.use_unabsorbed_mla_prefill():

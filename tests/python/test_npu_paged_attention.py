@@ -39,10 +39,63 @@ _mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
+from xllm.python.attention.backend import MlaUnabsorbedPrefill
 from xllm.python.attention.npu_paged_attention import (
     NpuPagedAttentionBackend,
 )
-from xllm.python.attention.backend import MlaUnabsorbedPrefill
+
+
+def test_execute_mla_uses_torch_npu_cache_writer(monkeypatch):
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._metadata = SimpleNamespace(
+        slot_mapping=torch.arange(3, dtype=torch.int32),
+        is_chunked_prefill=False,
+        is_prefill=True,
+    )
+    nope_cache = torch.empty(2, 8, 1, 6)
+    rope_cache = torch.empty(2, 8, 1, 2)
+    backend._kv_caches = [(nope_cache, rope_cache, torch.empty(0))]
+    captured = {}
+    expected = torch.randn(3, 4, 2)
+
+    monkeypatch.setattr(
+        torch_npu,
+        "_npu_reshape_and_cache",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_mla_unabsorbed_prefill",
+        lambda *args: expected,
+    )
+    monkeypatch.setattr(backend, "use_unabsorbed_mla_prefill", lambda: True)
+
+    q_latent = torch.randn(3, 4, 6)
+    q_pe = torch.randn(3, 4, 2)
+    k_latent = torch.randn(3, 1, 6)
+    k_pe = torch.randn(3, 1, 2)
+    unabsorbed = MlaUnabsorbedPrefill(
+        query_nope=torch.randn(3, 4, 2),
+        key_nope=torch.randn(3, 4, 2),
+        value=torch.randn(3, 4, 2),
+    )
+    output = backend.execute_mla(
+        q_latent,
+        q_pe,
+        k_latent,
+        k_pe,
+        SimpleNamespace(layer_id=0),
+        unabsorbed_prefill=unabsorbed,
+    )
+
+    assert output is expected
+    assert captured == {
+        "key": k_latent,
+        "value": k_pe,
+        "key_cache": nope_cache,
+        "value_cache": rope_cache,
+        "slot_indices": backend._metadata.slot_mapping,
+    }
 
 
 def test_dense_mla_prefill_uses_split_positional_inputs_and_bf16(monkeypatch):
