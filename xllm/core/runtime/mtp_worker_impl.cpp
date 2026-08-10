@@ -2208,7 +2208,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   }
 
   const int64_t num_val_tokens = options_.num_speculative_tokens() + 1;
-  CHECK_EQ(validate_input.positions.numel(), batch_size * num_val_tokens)
+  torch::Tensor validate_positions = validate_input.positions;
+  if (validate_positions.dim() == 2) {
+    CHECK_EQ(validate_positions.size(0), 3)
+        << "mRoPE validate positions must have shape [3, num_tokens]";
+    validate_positions = validate_positions.select(/*dim=*/0, /*index=*/0);
+  }
+  CHECK_EQ(validate_positions.numel(), batch_size * num_val_tokens)
       << "validate positions must contain one row per speculative token";
   const torch::Tensor& validate_kv_seq_lens =
       validate_input.input_params.attention.device.kv_seq_lens;
@@ -2232,7 +2238,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
       broadcast_spec_tokens(val_output.next_tokens, parallel_args_);
     }
 
-    base_positions = validate_input.positions.view({batch_size, num_val_tokens})
+    base_positions = validate_positions.view({batch_size, num_val_tokens})
                          .select(/*dim=*/1, /*index=*/0)
                          .contiguous();
     base_kv_seq_lens = mtp_async::extract_target_base_kv_seq_lens(
