@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
+import torch_npu
 
 _mock_ops = MagicMock()
 
@@ -41,6 +42,7 @@ sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 from xllm.python.attention.npu_paged_attention import (
     NpuPagedAttentionBackend,
 )
+from xllm.python.attention.backend import MlaUnabsorbedPrefill
 
 
 def test_dense_mla_prefill_uses_split_positional_inputs_and_bf16(monkeypatch):
@@ -156,6 +158,69 @@ def test_dense_mla_prefill_pads_unsupported_512_dim_head_count(monkeypatch):
     assert output.shape == (3, 24, 512)
 
 
+def test_unabsorbed_mla_prefill_matches_kimi_fia_contract(monkeypatch):
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._actual_seq_lens = [2, 5]
+    backend._causal_mask = torch.ones(8, 8, dtype=torch.int8)
+    query_nope = torch.randn(5, 48, 128, dtype=torch.bfloat16)
+    query_position = torch.randn(5, 48, 64, dtype=torch.bfloat16)
+    key_nope = torch.randn(5, 48, 128, dtype=torch.bfloat16)
+    key_position = torch.randn(5, 1, 64, dtype=torch.bfloat16)
+    value = torch.randn(5, 48, 128, dtype=torch.bfloat16)
+    layer = SimpleNamespace(num_heads=48, scale=192**-0.5)
+    captured = {}
+
+    def fake_fia(query, key, input_value, **kwargs):
+        captured.update(
+            query=query,
+            key=key,
+            value=input_value,
+            **kwargs,
+        )
+        return torch.zeros_like(input_value), torch.empty(0, dtype=query.dtype)
+
+    monkeypatch.setattr(
+        torch_npu,
+        "npu_fused_infer_attention_score",
+        fake_fia,
+    )
+    output = backend._mla_unabsorbed_prefill(
+        MlaUnabsorbedPrefill(
+            query_nope=query_nope,
+            key_nope=key_nope,
+            value=value,
+        ),
+        query_position,
+        key_position,
+        SimpleNamespace(),
+        layer,
+    )
+
+    assert output.shape == (5, 48, 128)
+    torch.testing.assert_close(
+        captured["query"],
+        torch.cat((query_nope, query_position), dim=-1),
+    )
+    torch.testing.assert_close(
+        captured["key"],
+        torch.cat((key_nope, key_position.expand(-1, 48, -1)), dim=-1),
+    )
+    assert captured["value"] is value
+    assert captured["num_heads"] == 48
+    assert captured["num_key_value_heads"] == 48
+    assert captured["input_layout"] == "TND"
+    assert captured["atten_mask"] is backend._causal_mask
+    assert captured["sparse_mode"] == 3
+    assert captured["scale"] == layer.scale
+    assert captured["antiquant_mode"] == 0
+    assert captured["antiquant_scale"] is None
+    assert captured["block_table"] is None
+    assert captured["block_size"] == 0
+    assert captured["softmax_lse_flag"]
+    assert captured["actual_seq_lengths"] == [2, 5]
+    assert captured["actual_seq_lengths_kv"] == [2, 5]
+
+
 def test_dense_mla_decode_uses_paged_latent_and_positional_caches(monkeypatch):
     backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
     backend._block_table_i32 = torch.tensor([[2, 1], [0, 3]], dtype=torch.int32)
@@ -202,6 +267,65 @@ def test_dense_mla_decode_uses_paged_latent_and_positional_caches(monkeypatch):
     assert captured["input_layout"] == "TND"
     assert captured["sparse_mode"] == 0
     assert captured["atten_mask"] is None
+
+
+def test_dense_mla_decode_v2_matches_kimi_fia_contract(monkeypatch):
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._block_table_i32 = torch.tensor([[2, 1], [0, 3]], dtype=torch.int32)
+    backend._actual_seq_kv = [7, 5]
+    q_latent = torch.randn(2, 48, 512, dtype=torch.bfloat16)
+    q_position = torch.randn(2, 48, 64, dtype=torch.bfloat16)
+    nope_cache = torch.randn(4, 8, 1, 512, dtype=torch.bfloat16)
+    rope_cache = torch.randn(4, 8, 1, 64, dtype=torch.bfloat16)
+    layer = SimpleNamespace(num_heads=48, num_kv_heads=1, scale=576**-0.5)
+    captured = {}
+    operator_output = torch.arange(
+        64 * 2 * 512,
+        dtype=torch.float32,
+    ).reshape(64, 2, 1, 512).to(torch.bfloat16)
+
+    def fake_fia_v2(query, key, value, **kwargs):
+        captured.update(query=query, key=key, value=value, **kwargs)
+        return operator_output, torch.empty(0, dtype=query.dtype)
+
+    monkeypatch.setattr(
+        torch_npu,
+        "npu_fused_infer_attention_score_v2",
+        fake_fia_v2,
+    )
+    output = backend._mla_dense_decode_v2(
+        q_latent,
+        q_position,
+        nope_cache,
+        rope_cache,
+        layer,
+    )
+
+    assert captured["query"].shape == (2, 64, 1, 512)
+    assert captured["query_rope"].shape == (2, 64, 1, 64)
+    assert captured["key"].shape == (4, 1, 8, 512)
+    assert captured["value"].shape == (4, 1, 8, 512)
+    assert captured["key_rope"].shape == (4, 1, 8, 64)
+    torch.testing.assert_close(captured["query"][:, :48, 0], q_latent)
+    torch.testing.assert_close(captured["query_rope"][:, :48, 0], q_position)
+    assert torch.count_nonzero(captured["query"][:, 48:]) == 0
+    assert torch.count_nonzero(captured["query_rope"][:, 48:]) == 0
+    assert captured["num_query_heads"] == 64
+    assert captured["num_key_value_heads"] == 1
+    assert captured["input_layout"] == "BNSD_NBSD"
+    assert captured["atten_mask"] is None
+    assert captured["sparse_mode"] == 0
+    assert captured["softmax_scale"] == layer.scale
+    assert torch.equal(
+        captured["block_table"],
+        backend._block_table_i32,
+    )
+    assert captured["block_size"] == 8
+    assert captured["actual_seq_qlen"] is None
+    assert captured["actual_seq_kvlen"] == [7, 5]
+    assert not captured["return_softmax_lse"]
+    expected = operator_output[:48].view(48, 2, 512).transpose(0, 1)
+    torch.testing.assert_close(output, expected)
 
 
 def test_dense_mla_chunked_prefill_uses_paged_caches_and_total_kv_lens(
