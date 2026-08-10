@@ -26,9 +26,11 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from torch import nn
 
 from xllm.python import ops
+from xllm.python.attention.backend import MlaUnabsorbedPrefill
 from xllm.python.layers import (
     Attention,
     ColumnParallelLinear,
@@ -206,6 +208,10 @@ class KimiK3TextConfig:
     num_experts: int | None = 896
     num_experts_per_token: int | None = 16
     num_shared_experts: int = 2
+    use_grouped_topk: bool = True
+    num_expert_group: int = 1
+    topk_group: int = 1
+    topk_method: str = "noaux_tc"
     moe_intermediate_size: int | None = 3072
     routed_expert_hidden_size: int | None = 3584
     moe_renormalize: bool = True
@@ -223,6 +229,8 @@ class KimiK3TextConfig:
     mla_use_nope: bool = True
     mla_use_rope: bool = False
     mla_use_output_gate: bool = True
+    num_nextn_predict_layers: int = 0
+    logit_scale: float | None = None
     linear_attn_config: dict = field(default_factory=dict)
     quantize_type: str = ""
     quant_method: str = ""
@@ -284,6 +292,10 @@ class KimiK3TextConfig:
                 else int(pick("num_experts_per_token", "num_experts_per_tok", default=16))
             ),
             num_shared_experts=int(pick("num_shared_experts", "n_shared_experts", default=2)),
+            use_grouped_topk=bool(pick("use_grouped_topk", default=True)),
+            num_expert_group=int(pick("num_expert_group", "n_group", default=1)),
+            topk_group=int(pick("topk_group", default=1)),
+            topk_method=str(pick("topk_method", default="noaux_tc")),
             moe_intermediate_size=(
                 None
                 if pick("moe_intermediate_size", default=3072) is None
@@ -319,6 +331,14 @@ class KimiK3TextConfig:
             mla_use_nope=bool(pick("mla_use_nope", default=True)),
             mla_use_rope=bool(pick("mla_use_rope", default=False)),
             mla_use_output_gate=bool(pick("mla_use_output_gate", default=True)),
+            num_nextn_predict_layers=int(
+                pick("num_nextn_predict_layers", default=0)
+            ),
+            logit_scale=(
+                None
+                if pick("logit_scale", default=None) is None
+                else float(pick("logit_scale", default=None))
+            ),
             linear_attn_config=dict(linear_attention),
             quantize_type=str(config.get("quantize_type", "")),
             quant_method=str(config.get("quant_method", "")),
@@ -373,6 +393,21 @@ class KimiK3TextConfig:
                 raise ValueError(
                     "Kimi K3 num_experts_per_token must be within num_experts"
                 )
+            if self.use_grouped_topk:
+                if self.num_expert_group <= 0:
+                    raise ValueError("Kimi K3 num_expert_group must be positive")
+                if self.num_experts % self.num_expert_group != 0:
+                    raise ValueError(
+                        "Kimi K3 experts must divide evenly into expert groups"
+                    )
+                if not 0 < self.topk_group <= self.num_expert_group:
+                    raise ValueError(
+                        "Kimi K3 topk_group must be within expert groups"
+                    )
+        if self.num_nextn_predict_layers < 0:
+            raise ValueError("Kimi K3 num_nextn_predict_layers must be non-negative")
+        if self.logit_scale is not None and self.logit_scale <= 0:
+            raise ValueError("Kimi K3 logit_scale must be positive")
         mla_dimensions = {
             "q_lora_rank": self.q_lora_rank,
             "kv_lora_rank": self.kv_lora_rank,
@@ -658,15 +693,112 @@ class KimiK3MLP(nn.Module):
         self.down_proj.finish_weight_loading()
 
 
+class KimiK3FusedQKVAProjection(nn.Module):
+    """Merged Kimi K3 q/kv A projection with checkpoint-local loading."""
+
+    def __init__(
+        self,
+        config: KimiK3TextConfig,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        self.query_size = config.q_lora_rank
+        self.key_value_size = config.kv_lora_rank + config.qk_rope_head_dim
+        self.output_size = self.query_size + self.key_value_size
+        self.quantized = config.uses_quantized_weights
+        if self.quantized:
+            self.projection = KimiK3W8A8DynamicLinear(
+                config.hidden_size,
+                self.output_size,
+                device,
+            )
+        else:
+            self.projection = nn.Linear(
+                config.hidden_size,
+                self.output_size,
+                bias=False,
+                dtype=dtype,
+                device=device,
+            )
+        self._loaded_components: set[str] = set()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.projection(hidden_states)
+
+    def _load_component(
+        self,
+        projection_name: str,
+        suffix: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        if projection_name == "q_a_proj":
+            offset = 0
+            size = self.query_size
+        elif projection_name == "kv_a_proj_with_mqa":
+            offset = self.query_size
+            size = self.key_value_size
+        else:
+            raise KeyError(
+                f"Unsupported Kimi K3 fused projection: {projection_name}"
+            )
+
+        target = getattr(self.projection, suffix)
+        target_slice = target.data.narrow(0, offset, size)
+        _copy_parameter(target_slice, tensor)
+        self._loaded_components.add(f"{projection_name}.{suffix}")
+
+    def load_weights(
+        self,
+        state_dict: Any,
+        tp_rank: int,
+        tp_size: int,
+    ) -> set[str]:
+        del tp_rank, tp_size
+        suffixes = ["weight"]
+        if self.quantized:
+            suffixes.extend(("weight_scale", "weight_offset"))
+        loaded: set[str] = set()
+        for projection_name in ("q_a_proj", "kv_a_proj_with_mqa"):
+            for suffix in suffixes:
+                name = f"{projection_name}.{suffix}"
+                if not state_dict.has(name):
+                    continue
+                self._load_component(
+                    projection_name,
+                    suffix,
+                    state_dict.get_tensor(name),
+                )
+                loaded.add(name)
+        return loaded
+
+    def finish_weight_loading(self) -> None:
+        suffixes = ["weight"]
+        if self.quantized:
+            suffixes.extend(("weight_scale", "weight_offset"))
+        required = {
+            f"{projection_name}.{suffix}"
+            for projection_name in ("q_a_proj", "kv_a_proj_with_mqa")
+            for suffix in suffixes
+        }
+        missing = required.difference(self._loaded_components)
+        if missing:
+            raise KeyError(
+                "Kimi K3 fused q/kv A projection weights are missing: "
+                f"{sorted(missing)}"
+            )
+        if self.quantized:
+            self.projection.finish_weight_loading()
+
+
 class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
     """xLLM TP/backend adapter for the shared Kimi K3 Gated-MLA core."""
 
     attention_kind = "mla"
+    use_vllm_fia_v2_decode = True
 
     _REPLICATED = (
-        "q_a_proj.weight",
         "q_a_layernorm.weight",
-        "kv_a_proj_with_mqa.weight",
         "kv_a_layernorm.weight",
     )
     _COLUMN_SHARDED = (
@@ -713,26 +845,30 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         self.v_head_dim = config.v_head_dim
         self.kv_lora_rank = config.kv_lora_rank
         output_size = num_heads * config.v_head_dim
-
-        self.q_a_proj = nn.Linear(
-            config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype, device=device
+        self.quantized = config.uses_quantized_weights
+        self.fused_qkv_a_proj = KimiK3FusedQKVAProjection(
+            config,
+            dtype,
+            device,
         )
+
+        if self.quantized:
+            self.q_b_proj = KimiK3W8A8DynamicLinear(
+                config.q_lora_rank,
+                num_heads * query_head_dim,
+                device,
+                tp_size=config.tp_size,
+            )
+        else:
+            self.q_b_proj = ColumnParallelLinear(
+                config.q_lora_rank,
+                num_heads * query_head_dim,
+                config.tp_size,
+                dtype=dtype,
+                device=device,
+            )
         self.q_a_layernorm = RMSNorm(
             config.q_lora_rank, config.rms_norm_eps, dtype=dtype, device=device
-        )
-        self.q_b_proj = ColumnParallelLinear(
-            config.q_lora_rank,
-            num_heads * query_head_dim,
-            config.tp_size,
-            dtype=dtype,
-            device=device,
-        )
-        self.kv_a_proj_with_mqa = nn.Linear(
-            config.hidden_size,
-            config.kv_lora_rank + config.qk_rope_head_dim,
-            bias=False,
-            dtype=dtype,
-            device=device,
         )
         self.kv_a_layernorm = RMSNorm(
             config.kv_lora_rank, config.rms_norm_eps, dtype=dtype, device=device
@@ -785,7 +921,15 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
     def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         del positions  # Kimi K3 retains the positional slice but does not rotate it.
         num_tokens = hidden_states.shape[0]
-        q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)
+        q_lora, compressed_kv = qkv_lora.split(
+            [
+                self.config.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_lora)
         q = self.q_b_proj(q_c).view(
             num_tokens, self.num_heads_local, self.query_head_dim
         )
@@ -794,22 +938,51 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         )
         q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK).transpose(0, 1)
 
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_latent_raw, k_pe = compressed_kv.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         k_latent = self.kv_a_layernorm(k_latent_raw).view(
             num_tokens, 1, self.kv_lora_rank
         )
-        attn_out = get_forward_context().attention_backend.execute_mla(
+        backend = get_forward_context().attention_backend
+        unabsorbed_prefill = None
+        if backend.use_unabsorbed_mla_prefill():
+            kv_projection = self.kv_b_proj(k_latent.squeeze(1)).view(
+                num_tokens,
+                self.num_heads_local,
+                self.qk_nope_head_dim + self.v_head_dim,
+            )
+            k_nope, value = kv_projection.split(
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=-1,
+            )
+            unabsorbed_prefill = MlaUnabsorbedPrefill(
+                query_nope=q_nope,
+                key_nope=k_nope,
+                value=value,
+            )
+        attn_out = backend.execute_mla(
             q_latent,
             q_pe,
             k_latent,
             k_pe.view(num_tokens, 1, self.qk_rope_head_dim),
             self,
             topk=None,
+            unabsorbed_prefill=unabsorbed_prefill,
         )
-        values = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
+        if attn_out.shape[-1] == self.v_head_dim:
+            values = attn_out
+        elif attn_out.device.type in ("npu", "privateuseone"):
+            values = torch_npu.npu_transpose_batchmatmul(
+                attn_out.transpose(0, 1).contiguous(),
+                self.W_UV,
+                perm_y=(1, 0, 2),
+            )
+        else:
+            values = torch.bmm(
+                attn_out.transpose(0, 1),
+                self.W_UV,
+            ).transpose(0, 1)
         values = values.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
         return self.apply_output_gate(values, hidden_states)
 
@@ -869,10 +1042,69 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         _copy_parameter(parameter, tensor)
         return loaded
 
+    def _load_w8a8_projection(
+        self,
+        state_dict: Any,
+        projection: str,
+        module: KimiK3W8A8DynamicLinear,
+        tp_rank: int,
+        tp_size: int,
+        shard_output: bool = False,
+    ) -> set[str]:
+        weight_name = f"{projection}.weight"
+        if not state_dict.has(weight_name):
+            return set()
+
+        loaded: set[str] = set()
+        for suffix in ("weight", "weight_scale", "weight_offset"):
+            name = f"{projection}.{suffix}"
+            if not state_dict.has(name):
+                raise KeyError(
+                    f"Kimi K3 quantized MLA weight {weight_name} is missing "
+                    f"companion: {name}"
+                )
+            tensor = (
+                state_dict.get_sharded_tensor(name, 0, tp_rank, tp_size)
+                if shard_output
+                else state_dict.get_tensor(name)
+            )
+            if not module.load_weight(suffix, tensor):
+                raise KeyError(f"Unsupported Kimi K3 MLA weight: {name}")
+            loaded.add(name)
+        return loaded
+
     def load_weights(self, state_dict: Any, tp_rank: int, tp_size: int) -> set[str]:
         loaded: set[str] = set()
         parameters = dict(self.named_parameters())
-        for name in self._REPLICATED:
+        loaded.update(
+            self.fused_qkv_a_proj.load_weights(
+                state_dict,
+                tp_rank,
+                tp_size,
+            )
+        )
+        replicated = self._REPLICATED
+        column_sharded = self._COLUMN_SHARDED
+        if self.quantized:
+            loaded.update(
+                self._load_w8a8_projection(
+                    state_dict,
+                    "q_b_proj",
+                    self.q_b_proj,
+                    tp_rank,
+                    tp_size,
+                    shard_output=True,
+                )
+            )
+            replicated = (
+                "q_a_layernorm.weight",
+                "kv_a_layernorm.weight",
+            )
+            column_sharded = (
+                "kv_b_proj.weight",
+                "g_proj.weight",
+            )
+        for name in replicated:
             loaded.update(
                 self._load_projection_weight(
                     state_dict,
@@ -882,7 +1114,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
                     tp_size,
                 )
             )
-        for name in self._COLUMN_SHARDED:
+        for name in column_sharded:
             loaded.update(
                 self._load_projection_weight(
                     state_dict,
@@ -908,9 +1140,18 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
 
     def finish_weight_loading(self) -> None:
         required = set(self._REPLICATED + self._COLUMN_SHARDED + ("o_proj.weight",))
+        if self.quantized:
+            required.update(
+                f"{projection}.{suffix}"
+                for projection in ("q_b_proj",)
+                for suffix in ("weight_scale", "weight_offset")
+            )
         missing = required.difference(self._loaded_components)
         if missing:
             raise KeyError(f"Kimi K3 MLA weights are missing: {sorted(missing)}")
+        self.fused_qkv_a_proj.finish_weight_loading()
+        if self.quantized:
+            self.q_b_proj.finish_weight_loading()
         weight = self.kv_b_proj.weight.data.view(
             self.num_heads_local,
             self.qk_nope_head_dim + self.v_head_dim,
@@ -1413,6 +1654,16 @@ class KimiK3ForCausalLM(PyModelBase):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
+
+    def compute_logits(
+        self,
+        hidden: torch.Tensor,
+        selected_idxes: torch.Tensor | None,
+    ) -> torch.Tensor:
+        logits = super().compute_logits(hidden, selected_idxes)
+        if self.cfg.logit_scale is not None:
+            logits = logits * self.cfg.logit_scale
+        return logits
 
     def load_weights(
         self,

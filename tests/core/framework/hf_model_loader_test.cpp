@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #include "core/util/model_config_utils.h"
+#include "core/util/utils.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -38,6 +39,54 @@ static_assert(std::is_same_v<RecModelFactory, ExpectedRecModelFactory>,
               "RecModelFactory must return std::unique_ptr<RecCausalLM>.");
 static_assert(std::is_base_of_v<CausalLM, RecCausalLM>,
               "RecCausalLM must derive from CausalLM.");
+
+TEST(HFModelLoaderTest, KimiK3ModelArgsExposeHybridMlaDimensions) {
+  auto loader = ModelRegistry::get_model_args_loader("kimi_k3");
+  ASSERT_NE(loader, nullptr);
+
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "kimi_k3",
+      "text_config": {
+        "num_hidden_layers": 5,
+        "hidden_size": 7168,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "linear_attn_config": {
+          "head_dim": 128,
+          "num_heads": 96,
+          "short_conv_kernel_size": 4,
+          "kda_layers": [1, 2, 3, 5],
+          "full_attn_layers": [4]
+        }
+      }
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_TRUE(util::is_mla_model_type(args.model_type()));
+  EXPECT_EQ(args.n_heads(), 96);
+  EXPECT_EQ(args.n_kv_heads(), std::optional<int64_t>(96));
+  EXPECT_EQ(args.head_dim(), 192);
+  EXPECT_EQ(args.q_lora_rank(), 1536);
+  EXPECT_EQ(args.kv_lora_rank(), 512);
+  EXPECT_EQ(args.qk_nope_head_dim(), 128);
+  EXPECT_EQ(args.qk_rope_head_dim(), 64);
+  EXPECT_EQ(args.v_head_dim(), 128);
+  EXPECT_EQ(args.layer_types(),
+            (std::vector<std::string>{"linear_attention",
+                                      "linear_attention",
+                                      "linear_attention",
+                                      "full_attention",
+                                      "linear_attention"}));
+}
 
 class DummyRecCausalLM final : public RecCausalLM {
  public:

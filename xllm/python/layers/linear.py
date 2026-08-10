@@ -152,7 +152,8 @@ class KimiK3W8A8DynamicLinear(nn.Module):
     token to int8 (``npu_dynamic_quant``) and the matmul is an int8 x int8
     ``quant_matmul`` dequantized back to the activation dtype. This mirrors
     vllm-ascend's ``AscendW8A8DynamicLinearMethod`` and backs the dense MLP, the
-    routed latent projections, and the KDA q/k/v projections.
+    routed latent projections, KDA q/k/v projections, and MLA latent
+    projections.
 
     Callers hand ``load_weight`` already-sharded tensors and must invoke
     ``finish_weight_loading`` before the first forward.

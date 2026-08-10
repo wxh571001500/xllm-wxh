@@ -32,6 +32,7 @@ from xllm.python.attention.backend import (
     AttentionMetadata,
     KVCache,
     MlaIndexContext,
+    MlaUnabsorbedPrefill,
 )
 from xllm.python.model_executor.forward_context import (
     AclGraphTask,
@@ -254,6 +255,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         k_pe_3d: torch.Tensor,
         layer: Attention,
         topk: torch.Tensor | None = None,
+        unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
     ) -> torch.Tensor:
         """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
         metadata = self._metadata
@@ -265,6 +267,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
             metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
         )
         if topk is None:
+            if unabsorbed_prefill is not None and self.use_unabsorbed_mla_prefill():
+                return self._mla_unabsorbed_prefill(
+                    unabsorbed_prefill,
+                    q_pe,
+                    k_pe_3d,
+                    metadata,
+                    layer,
+                )
             if metadata.is_chunked_prefill:
                 return self._mla_dense_chunked_prefill(
                     q_latent, q_pe, nope_cache, rope_cache, metadata, layer
@@ -273,11 +283,25 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 return self._mla_dense_prefill(
                     q_latent, q_pe, k_latent_3d, k_pe_3d, metadata, layer
                 )
-            return self._mla_dense_decode(
-                q_latent, q_pe, nope_cache, rope_cache, layer
-            )
+            if getattr(layer, "use_vllm_fia_v2_decode", False):
+                return self._mla_dense_decode_v2(
+                    q_latent,
+                    q_pe,
+                    nope_cache,
+                    rope_cache,
+                    layer,
+                )
+            return self._mla_dense_decode(q_latent, q_pe, nope_cache, rope_cache, layer)
         return self._mla_sparse(
             q_latent, q_pe, nope_cache, rope_cache, topk, metadata.block_table
+        )
+
+    def use_unabsorbed_mla_prefill(self) -> bool:
+        metadata = self._metadata
+        return bool(
+            metadata is not None
+            and metadata.is_prefill
+            and not metadata.is_chunked_prefill
         )
 
     def mla_index_context(self, layer: Attention) -> MlaIndexContext:
@@ -359,6 +383,44 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if output.dtype != original_dtype:
             output = output.to(original_dtype)
         return output
+
+    def _mla_unabsorbed_prefill(
+        self,
+        inputs: MlaUnabsorbedPrefill,
+        query_position: torch.Tensor,
+        key_position: torch.Tensor,
+        metadata: AttentionMetadata,
+        layer: Attention,
+    ) -> torch.Tensor:
+        """Kimi-style no-RoPE prefill matching vLLM-Ascend's FIA path."""
+        num_tokens = inputs.query_nope.shape[0]
+        actual_seq = self._cumulative_seq_lens(metadata, num_tokens)
+        expanded_key_position = key_position.expand(
+            -1,
+            layer.num_heads,
+            -1,
+        )
+        query = torch.cat((inputs.query_nope, query_position), dim=-1)
+        key = torch.cat((inputs.key_nope, expanded_key_position), dim=-1)
+        output, _ = torch_npu.npu_fused_infer_attention_score(
+            query.contiguous(),
+            key.contiguous(),
+            inputs.value.contiguous(),
+            num_heads=layer.num_heads,
+            num_key_value_heads=layer.num_heads,
+            input_layout="TND",
+            atten_mask=self._causal_mask,
+            sparse_mode=3,
+            scale=layer.scale,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            block_table=None,
+            block_size=0,
+            softmax_lse_flag=True,
+            actual_seq_lengths=actual_seq,
+            actual_seq_lengths_kv=actual_seq,
+        )
+        return output.reshape(num_tokens, layer.num_heads, -1)
 
     def _mla_dense_chunked_prefill(
         self,
@@ -470,6 +532,81 @@ class NpuPagedAttentionBackend(AttentionBackend):
         )
         output = output.view(num_tokens, fia_num_heads, q_latent.shape[-1])
         output = output[:, : layer.num_heads]
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
+        return output
+
+    def _mla_dense_decode_v2(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        nope_cache: torch.Tensor,
+        rope_cache: torch.Tensor,
+        layer: Attention,
+    ) -> torch.Tensor:
+        """Kimi-style absorbed decode matching vLLM-Ascend's FIA v2 path."""
+        num_tokens = q_latent.shape[0]
+        if self._block_table_i32 is None:
+            raise RuntimeError("dense MLA decode requires a block table")
+
+        block_size = nope_cache.size(1)
+        nope_cache = nope_cache.view(
+            -1,
+            layer.num_kv_heads,
+            block_size,
+            q_latent.shape[-1],
+        )
+        rope_cache = rope_cache.view(
+            -1,
+            layer.num_kv_heads,
+            block_size,
+            q_pe.shape[-1],
+        )
+        original_dtype = q_latent.dtype
+        if original_dtype != torch.bfloat16:
+            q_latent = q_latent.to(torch.bfloat16)
+            q_pe = q_pe.to(torch.bfloat16)
+        q_latent, q_pe, fia_num_heads = _pad_mla_query_heads(
+            q_latent,
+            q_pe,
+            layer.num_heads,
+        )
+        query = q_latent.view(
+            num_tokens,
+            fia_num_heads,
+            1,
+            q_latent.shape[-1],
+        ).contiguous()
+        query_position = q_pe.view(
+            num_tokens,
+            fia_num_heads,
+            1,
+            q_pe.shape[-1],
+        )
+        output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query,
+            nope_cache,
+            nope_cache,
+            query_rope=query_position,
+            key_rope=rope_cache,
+            num_query_heads=fia_num_heads,
+            num_key_value_heads=layer.num_kv_heads,
+            input_layout="BNSD_NBSD",
+            atten_mask=None,
+            sparse_mode=0,
+            softmax_scale=layer.scale,
+            block_table=self._block_table_i32[:num_tokens],
+            block_size=block_size,
+            actual_seq_qlen=None,
+            actual_seq_kvlen=self._actual_seq_kv[:num_tokens],
+            return_softmax_lse=False,
+        )
+        output = output[: layer.num_heads]
+        output = output.view(
+            layer.num_heads,
+            num_tokens,
+            q_latent.shape[-1],
+        ).transpose(0, 1)
         if output.dtype != original_dtype:
             output = output.to(original_dtype)
         return output
