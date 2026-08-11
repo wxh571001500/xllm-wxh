@@ -40,7 +40,11 @@ _mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
-from xllm.python.layers.linear import KimiK3W8A8DynamicLinear
+from xllm.python.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    W8A8DynamicLinearMethod,
+)
 from xllm.python.layers.moe import (
     AllGatherPrepareAndFinalize,
     AllToAllPrepareAndFinalize,
@@ -646,8 +650,16 @@ def test_quantized_model_loads_w8_and_packed_w4_tensors() -> None:
     mla = model.model.layers[1].self_attn
     assert isinstance(mla, KimiK3MLAAttention)
     fused_projection = mla.fused_qkv_a_proj.projection
-    assert isinstance(fused_projection, KimiK3W8A8DynamicLinear)
-    assert isinstance(mla.q_b_proj, KimiK3W8A8DynamicLinear)
+    assert isinstance(fused_projection, ColumnParallelLinear)
+    assert isinstance(
+        fused_projection.quant_method,
+        W8A8DynamicLinearMethod,
+    )
+    assert isinstance(mla.q_b_proj, ColumnParallelLinear)
+    assert isinstance(
+        mla.q_b_proj.quant_method,
+        W8A8DynamicLinearMethod,
+    )
     torch.testing.assert_close(
         fused_projection.weight[:, :4],
         _int8_weight((4, 8), 7).transpose(0, 1),
@@ -703,8 +715,16 @@ def test_quantized_weight_loading_shards_tp_dimensions() -> None:
     assert isinstance(mla, KimiK3MLAAttention)
     assert isinstance(mla, KimiK3GatedMLA)
     fused_projection = mla.fused_qkv_a_proj.projection
-    assert isinstance(fused_projection, KimiK3W8A8DynamicLinear)
-    assert isinstance(mla.q_b_proj, KimiK3W8A8DynamicLinear)
+    assert isinstance(fused_projection, ColumnParallelLinear)
+    assert isinstance(
+        fused_projection.quant_method,
+        W8A8DynamicLinearMethod,
+    )
+    assert isinstance(mla.q_b_proj, ColumnParallelLinear)
+    assert isinstance(
+        mla.q_b_proj.quant_method,
+        W8A8DynamicLinearMethod,
+    )
     assert fused_projection.weight.shape == (8, 10)
     assert mla.q_b_proj.weight.shape == (4, 4)
     assert mla.kv_b_proj.weight.shape == (4, 4)
@@ -775,6 +795,59 @@ def test_quantized_mla_projections_use_dynamic_w8a8_runtime() -> None:
     assert compressed_kv.shape == (3, 6)
     assert dynamic_quant.call_count == 2
     assert quant_matmul.call_count == 2
+
+
+def test_w8a8_row_parallel_reduces_before_adding_bias() -> None:
+    layer = RowParallelLinear(
+        2,
+        3,
+        2,
+        bias=True,
+        dtype=torch.float32,
+        device="cpu",
+        quant_method=W8A8DynamicLinearMethod(),
+    )
+    layer.load_weight(
+        "weight",
+        torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int8),
+    )
+    layer.load_weight("weight_scale", torch.ones(3, 1))
+    layer.load_weight("weight_offset", torch.zeros(3, 1))
+    layer.load_weight("bias", torch.tensor([1.0, 2.0, 3.0]))
+    layer.finish_weight_loading()
+    hidden_states = torch.tensor([[1.0, 2.0]])
+
+    def _dynamic_quant(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return tensor.to(torch.int8), torch.ones(tensor.shape[0])
+
+    def _quant_matmul(
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        transpose_x2: bool,
+        weight_scale: torch.Tensor,
+        *args: object,
+    ) -> torch.Tensor:
+        del transpose_x2, weight_scale
+        assert args[-2] is None
+        return activation.float().matmul(weight.float())
+
+    def _all_reduce(tensor: torch.Tensor) -> None:
+        tensor.mul_(2)
+
+    with (
+        patch.object(
+            torch.ops.npu,
+            "npu_dynamic_quant",
+            side_effect=_dynamic_quant,
+            create=True,
+        ),
+        patch.object(_mock_ops, "quant_matmul", side_effect=_quant_matmul),
+        patch.object(_mock_ops, "all_reduce_", side_effect=_all_reduce),
+    ):
+        output = layer(hidden_states)
+
+    expected = torch.tensor([[11.0, 24.0, 37.0]])
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize("companion", ("weight_scale", "weight_offset"))
