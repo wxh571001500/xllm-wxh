@@ -20,6 +20,7 @@ limitations under the License.
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -154,6 +155,15 @@ class KimiK3KDAMetadataView final {
       num_decode_seqs_ = num_decode;
       num_prefill_seqs_ = num_sequences - num_decode;
     }
+
+    // DP decode gating: the engine host-syncs every DP rank's batch type into
+    // dp_is_decode, so no collective is needed here. The python decode graph
+    // may only run when all DP ranks decode, keeping HCCL usage consistent
+    // across ranks (mirrors AclGraphExecutorImpl's all-ranks-decode gate).
+    const std::vector<int32_t>& dp_is_decode = params.parallel.dp_is_decode;
+    all_dp_decode_ = std::all_of(dp_is_decode.begin(),
+                                 dp_is_decode.end(),
+                                 [](int32_t v) { return v != 0; });
   }
 
   py::object query_start_loc() const {
@@ -168,6 +178,7 @@ class KimiK3KDAMetadataView final {
   }
   int32_t num_decode_seqs() const { return num_decode_seqs_; }
   int32_t num_prefill_seqs() const { return num_prefill_seqs_; }
+  bool all_dp_decode() const { return all_dp_decode_; }
 
  private:
   torch::Tensor query_start_loc_;
@@ -175,6 +186,7 @@ class KimiK3KDAMetadataView final {
   torch::Tensor has_initial_state_;
   int32_t num_decode_seqs_ = 0;
   int32_t num_prefill_seqs_ = 0;
+  bool all_dp_decode_ = true;
 };
 
 }  // namespace
@@ -212,7 +224,9 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
       .def_property_readonly("num_decode_seqs",
                              &KimiK3KDAMetadataView::num_decode_seqs)
       .def_property_readonly("num_prefill_seqs",
-                             &KimiK3KDAMetadataView::num_prefill_seqs);
+                             &KimiK3KDAMetadataView::num_prefill_seqs)
+      .def_property_readonly("all_dp_decode",
+                             &KimiK3KDAMetadataView::all_dp_decode);
 }
 
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
