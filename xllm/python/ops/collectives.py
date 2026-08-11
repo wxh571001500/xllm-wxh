@@ -167,3 +167,78 @@ def _(
     shape = list(x.shape)
     shape[dim] *= world_size
     return x.new_empty(shape)
+
+
+@torch.library.custom_op("xllm_ops::reduce_scatter", mutates_args=())
+def reduce_scatter(
+    x: torch.Tensor,
+    dim: int,
+    world_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    group = _require_group(x, group_name)
+    if group.world_size != world_size:
+        raise RuntimeError(
+            f"{group_name} world-size mismatch: expected {world_size}, "
+            f"got {group.world_size}"
+        )
+    if x.shape[dim] % world_size != 0:
+        raise ValueError("reduce-scatter dimension must divide world size")
+    if group.world_size == 1:
+        return x.clone()
+    moved = x.movedim(dim, 0).contiguous()
+    output = moved.new_empty((moved.shape[0] // world_size, *moved.shape[1:]))
+    dist.reduce_scatter_tensor(output, moved, group=group.process_group)
+    return output.movedim(0, dim)
+
+
+@reduce_scatter.register_fake
+def _(
+    x: torch.Tensor,
+    dim: int,
+    world_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    del group_name
+    shape = list(x.shape)
+    shape[dim] //= world_size
+    return x.new_empty(shape)
+
+
+@torch.library.custom_op("xllm_ops::all_to_all_single", mutates_args=())
+def all_to_all_single(
+    x: torch.Tensor,
+    output_split_sizes: list[int],
+    input_split_sizes: list[int],
+    group_name: str,
+) -> torch.Tensor:
+    group = _require_group(x, group_name)
+    if len(output_split_sizes) != group.world_size:
+        raise ValueError("all-to-all output splits must match group size")
+    if len(input_split_sizes) != group.world_size:
+        raise ValueError("all-to-all input splits must match group size")
+    if sum(input_split_sizes) != x.shape[0]:
+        raise ValueError("all-to-all input splits must match tensor size")
+    output = x.new_empty((sum(output_split_sizes), *x.shape[1:]))
+    if group.world_size == 1:
+        output.copy_(x)
+        return output
+    dist.all_to_all_single(
+        output,
+        x,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=group.process_group,
+    )
+    return output
+
+
+@all_to_all_single.register_fake
+def _(
+    x: torch.Tensor,
+    output_split_sizes: list[int],
+    input_split_sizes: list[int],
+    group_name: str,
+) -> torch.Tensor:
+    del input_split_sizes, group_name
+    return x.new_empty((sum(output_split_sizes), *x.shape[1:]))

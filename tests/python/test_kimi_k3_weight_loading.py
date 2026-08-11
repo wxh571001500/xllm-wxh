@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,13 +42,20 @@ sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
 from xllm.python.layers.linear import KimiK3W8A8DynamicLinear
 from xllm.python.layers.moe import (
+    AllGatherPrepareAndFinalize,
+    AllToAllPrepareAndFinalize,
+    AllToAllTokenDispatcher,
     FusedAllGatherTokenDispatcher,
     FusedQuantizedSituAndMul,
     FusedW4A8RoutedExperts,
     GroupedTopKRouter,
     KimiK3MoE,
+    MC2PrepareAndFinalize,
+    MC2TokenDispatcher,
     MoE,
+    MoECommType,
     MoEExpertsConfig,
+    MoEParallelConfig,
     MoERouterConfig,
     MoERoutingResult,
     MoETokenDispatchInput,
@@ -66,6 +74,7 @@ from xllm.python.models.kimi_k3 import (
 from xllm.python.models.kimi_k3_gated_mla import KimiK3GatedMLA
 from xllm.python.models.kimi_k3_text import (
     KimiK3ForCausalLM,
+    KimiK3MLP,
     KimiK3MLAAttention,
     KimiK3TextConfig,
 )
@@ -1109,6 +1118,593 @@ def test_tensor_parallel_comm_method_runs_staged_pipeline() -> None:
 
     torch.testing.assert_close(output, torch.full((2, 4), 2.0))
     mock_all_reduce.assert_called_once()
+
+
+def test_kimi_config_parses_moe_parallel_options() -> None:
+    raw_config = _tiny_config()
+    raw_config.update(
+        {
+            "world_size": 4,
+            "rank": 3,
+            "ep_size": 2,
+            "dp_size": 2,
+            "moe_comm_type": "all2all",
+            "mc2_tokens_capacity": 256,
+        }
+    )
+
+    config = KimiK3TextConfig.from_dict(raw_config)
+
+    assert config.world_size == 4
+    assert config.rank == 3
+    assert config.ep_size == 2
+    assert config.dp_size == 2
+    assert MoECommType.from_value(config.moe_comm_type) == MoECommType.ALL_TO_ALL
+    assert config.mc2_tokens_capacity == 256
+
+
+def test_kimi_moe_uses_ep_expert_and_moe_tp_shards() -> None:
+    raw_config = _tiny_config()
+    raw_config.update(
+        {
+            "world_size": 4,
+            "rank": 3,
+            "dp_size": 2,
+            "ep_size": 2,
+            "tp_size": 2,
+            "tp_rank": 1,
+        }
+    )
+    config = KimiK3TextConfig.from_dict(raw_config)
+
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=2,
+        tp_rank=1,
+        routed_expert_down_proj=torch.nn.Identity(),
+        routed_expert_up_proj=torch.nn.Identity(),
+    )
+
+    assert moe.ep_size == 2
+    assert moe.ep_rank == 1
+    assert moe.moe_tp_size == 2
+    assert moe.moe_tp_rank == 1
+    assert moe.experts.num_experts == 1
+    assert moe.experts.first_expert_id == 1
+
+
+def test_kimi_moe_supports_attention_tp2_with_ep2() -> None:
+    raw_config = _tiny_config()
+    raw_config.update(
+        {
+            "world_size": 2,
+            "rank": 1,
+            "dp_size": 1,
+            "ep_size": 2,
+            "tp_size": 2,
+            "tp_rank": 1,
+        }
+    )
+    config = KimiK3TextConfig.from_dict(raw_config)
+
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=2,
+        tp_rank=1,
+        routed_expert_down_proj=torch.nn.Identity(),
+        routed_expert_up_proj=torch.nn.Identity(),
+    )
+
+    assert moe.ep_size == 2
+    assert moe.ep_rank == 1
+    assert moe.moe_tp_size == 1
+    assert moe.moe_tp_rank == 0
+    assert moe.experts.num_experts == 1
+    assert moe.experts.first_expert_id == 1
+    assert moe._runner._tp_size == 2
+    assert moe._runner._tp_group_name == "tp"
+
+
+def test_kimi_moe_loads_shared_and_routed_experts_on_own_topologies() -> None:
+    raw_config = _tiny_config()
+    raw_config.update(
+        {
+            "world_size": 2,
+            "rank": 1,
+            "dp_size": 1,
+            "ep_size": 2,
+            "tp_size": 2,
+            "tp_rank": 1,
+        }
+    )
+    config = KimiK3TextConfig.from_dict(raw_config)
+    moe = KimiK3MoE(
+        config,
+        torch.float32,
+        torch.device("cpu"),
+        tp_size=2,
+        tp_rank=1,
+        routed_expert_down_proj=torch.nn.Linear(8, 4, bias=False),
+        routed_expert_up_proj=torch.nn.Linear(4, 8, bias=False),
+        shared_experts=KimiK3MLP(
+            config,
+            torch.float32,
+            torch.device("cpu"),
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=False,
+        ),
+    )
+    prefix = "language_model.model.layers.1.block_sparse_moe."
+    tensors = {
+        name[len(prefix) :]: tensor
+        for name, tensor in _checkpoint().items()
+        if name.startswith(prefix)
+    }
+    gate_weight = torch.arange(32, dtype=torch.float32).view(4, 8)
+    up_weight = gate_weight + 100
+    down_weight = torch.arange(32, dtype=torch.float32).view(8, 4)
+    tensors["shared_experts.gate_proj.weight"] = gate_weight
+    tensors["shared_experts.up_proj.weight"] = up_weight
+    tensors["shared_experts.down_proj.weight"] = down_weight
+
+    loaded = moe.load_weights(_StateDict(tensors), tp_rank=1, tp_size=2)
+    moe.finish_weight_loading()
+
+    shared_experts = moe.shared_experts
+    torch.testing.assert_close(
+        shared_experts.gate_up_proj.weight[:2],
+        gate_weight[2:],
+    )
+    torch.testing.assert_close(
+        shared_experts.gate_up_proj.weight[2:],
+        up_weight[2:],
+    )
+    torch.testing.assert_close(
+        shared_experts.down_proj.weight,
+        down_weight[:, 2:],
+    )
+    assert moe.experts.first_expert_id == 1
+    assert all(
+        not name.startswith("experts.0.")
+        for name in loaded
+    )
+
+
+def test_unquantized_experts_load_only_local_ep_shard() -> None:
+    experts = UnquantizedRoutedExperts(
+        config=MoEExpertsConfig(
+            num_experts=4,
+            hidden_size=4,
+            intermediate_size=8,
+            tp_size=2,
+            tp_rank=1,
+            ep_size=2,
+            ep_rank=1,
+        ),
+        activation=torch.nn.Identity(),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    tensors: dict[str, torch.Tensor] = {}
+    for expert_id in range(4):
+        tensors[f"{expert_id}.w1.weight"] = torch.full(
+            (8, 4),
+            float(expert_id * 10 + 1),
+        )
+        tensors[f"{expert_id}.w3.weight"] = torch.full(
+            (8, 4),
+            float(expert_id * 10 + 3),
+        )
+        tensors[f"{expert_id}.w2.weight"] = torch.full(
+            (4, 8),
+            float(expert_id * 10 + 2),
+        )
+
+    loaded = experts.load_weights(_StateDict(tensors), tp_rank=1, tp_size=2)
+    experts.finish_weight_loading()
+
+    assert experts.w13_weight.shape == (2, 8, 4)
+    assert experts.w2_weight.shape == (2, 4, 4)
+    assert loaded == {
+        "2.w1.weight",
+        "2.w3.weight",
+        "2.w2.weight",
+        "3.w1.weight",
+        "3.w3.weight",
+        "3.w2.weight",
+    }
+    torch.testing.assert_close(
+        experts.w13_weight[0, :4],
+        torch.full((4, 4), 21.0),
+    )
+    torch.testing.assert_close(
+        experts.w13_weight[1, 4:],
+        torch.full((4, 4), 33.0),
+    )
+    torch.testing.assert_close(
+        experts.w2_weight[0],
+        torch.full((4, 4), 22.0),
+    )
+
+
+def test_quantized_experts_load_local_ep_and_owned_tp_shards() -> None:
+    experts = FusedW4A8RoutedExperts(
+        config=MoEExpertsConfig(
+            num_experts=4,
+            hidden_size=4,
+            intermediate_size=8,
+            tp_size=2,
+            tp_rank=1,
+            ep_size=2,
+            ep_rank=1,
+        ),
+        activation=FusedQuantizedSituAndMul(beta=4.0, linear_beta=25.0),
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    tensors: dict[str, torch.Tensor] = {}
+    for expert_id in range(4):
+        for projection, base_value in (("w1", 10), ("w3", 20)):
+            prefix = f"{expert_id}.{projection}."
+            value = base_value + expert_id
+            tensors[prefix + "weight"] = _int8_weight((4, 4), value)
+            tensors[prefix + "weight_scale"] = _weight((8, 1), value + 1)
+            tensors[prefix + "weight_offset"] = _weight((8, 1), 0)
+            tensors[prefix + "scale_bias"] = _weight((8, 1), value + 2)
+        prefix = f"{expert_id}.w2."
+        tensors[prefix + "weight"] = _int8_weight((2, 8), 30 + expert_id)
+        tensors[prefix + "weight_scale"] = _weight((4, 1), 31 + expert_id)
+        tensors[prefix + "weight_offset"] = _weight((4, 1), 0)
+        tensors[prefix + "scale_bias"] = _weight((4, 16), 32 + expert_id)
+
+    loaded = experts.load_weights(_StateDict(tensors), tp_rank=0, tp_size=1)
+    experts.finish_weight_loading()
+
+    assert len(loaded) == 24
+    assert all(name.startswith(("2.", "3.")) for name in loaded)
+    assert experts.w13_weight.shape == (2, 4, 4)
+    assert experts.w2_weight.shape == (2, 2, 4)
+    assert experts.w2_scale_bias.shape == (2, 4, 8)
+    torch.testing.assert_close(
+        experts.w13_weight[0, :2],
+        _int8_weight((2, 4), 12),
+    )
+    torch.testing.assert_close(
+        experts.w13_weight[1, 2:],
+        _int8_weight((2, 4), 23),
+    )
+    torch.testing.assert_close(
+        experts.w2_scale_bias[0],
+        _weight((4, 8), 34),
+    )
+
+
+def test_all_gather_prepare_finalize_handles_uneven_ep_tokens() -> None:
+    config = MoEParallelConfig(
+        tp_size=2,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=0,
+        dp_size=2,
+        dp_rank=0,
+    )
+    stage = AllGatherPrepareAndFinalize(config)
+    hidden_states = torch.arange(6, dtype=torch.float32).view(2, 3)
+    router_logits = torch.ones(2, 4)
+    gather_outputs = [
+        torch.tensor([2, 1], dtype=torch.int64),
+        torch.cat((hidden_states, torch.zeros_like(hidden_states)), dim=0),
+        torch.cat((router_logits, torch.zeros_like(router_logits)), dim=0),
+    ]
+
+    with (
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.all_gather",
+            side_effect=gather_outputs,
+        ) as mock_all_gather,
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.reduce_scatter",
+            side_effect=lambda tensor, **_: tensor[:2],
+        ) as mock_reduce_scatter,
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.all_reduce_",
+            side_effect=lambda tensor, **_: tensor.mul_(2),
+        ) as mock_all_reduce,
+    ):
+        prepared = stage.prepare(hidden_states, router_logits)
+        output = stage.finalize(prepared.hidden_states, reduce_results=True)
+
+    assert prepared.hidden_states.shape == (4, 3)
+    assert prepared.router_logits.shape == (4, 4)
+    torch.testing.assert_close(output, hidden_states * 2)
+    assert mock_all_gather.call_count == 3
+    mock_reduce_scatter.assert_called_once()
+    mock_all_reduce.assert_called_once()
+
+
+def test_all_gather_reduces_replicated_input_over_ep() -> None:
+    config = MoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=0,
+        dp_size=1,
+        dp_rank=0,
+        input_tp_size=2,
+        input_tp_rank=0,
+    )
+    stage = AllGatherPrepareAndFinalize(config)
+    hidden_states = torch.arange(6, dtype=torch.float32).view(2, 3)
+    router_logits = torch.ones(2, 4)
+
+    with (
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.all_gather"
+        ) as mock_all_gather,
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.all_reduce_",
+            side_effect=lambda tensor, **_: tensor.mul_(2),
+        ) as mock_all_reduce,
+    ):
+        prepared = stage.prepare(hidden_states, router_logits)
+        output = stage.finalize(hidden_states.clone(), reduce_results=True)
+
+    assert prepared.hidden_states is hidden_states
+    assert prepared.router_logits is router_logits
+    torch.testing.assert_close(output, hidden_states * 2)
+    mock_all_gather.assert_not_called()
+    assert mock_all_reduce.call_args.kwargs["group_name"] == "moe_ep"
+
+
+def test_all_to_all_partitions_and_restores_replicated_input() -> None:
+    config = MoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=1,
+        dp_size=1,
+        dp_rank=0,
+        input_tp_size=2,
+        input_tp_rank=1,
+        comm_type=MoECommType.ALL_TO_ALL,
+    )
+    stage = AllToAllPrepareAndFinalize(config)
+    hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
+    router_logits = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    prepared = stage.prepare(hidden_states, router_logits)
+
+    torch.testing.assert_close(
+        prepared.hidden_states,
+        torch.tensor([[4.0, 5.0], [0.0, 0.0]]),
+    )
+    torch.testing.assert_close(
+        prepared.router_logits,
+        torch.tensor(
+            [[8.0, 9.0, 10.0, 11.0], [0.0, 0.0, 0.0, 0.0]]
+        ),
+    )
+    with patch(
+        "xllm.python.layers.moe.prepare_finalize.ops.all_gather",
+        return_value=torch.tensor(
+            [[10.0, 11.0], [12.0, 13.0], [20.0, 21.0], [0.0, 0.0]]
+        ),
+    ) as mock_all_gather:
+        output = stage.finalize(
+            torch.tensor([[20.0, 21.0], [0.0, 0.0]]),
+            reduce_results=True,
+            padded_hidden_states_shape=prepared.padded_hidden_states_shape,
+        )
+
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[10.0, 11.0], [12.0, 13.0], [20.0, 21.0]]),
+    )
+    assert mock_all_gather.call_args.kwargs == {
+        "dim": 0,
+        "world_size": 2,
+        "group_name": "tp",
+    }
+
+
+def test_mc2_partitions_active_mask_with_replicated_input() -> None:
+    config = MoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=1,
+        dp_size=1,
+        dp_rank=0,
+        input_tp_size=2,
+        input_tp_rank=1,
+        comm_type=MoECommType.MC2,
+    )
+    stage = MC2PrepareAndFinalize(config)
+
+    prepared = stage.prepare(
+        torch.arange(6, dtype=torch.float32).view(3, 2),
+        torch.arange(12, dtype=torch.float32).view(3, 4),
+    )
+
+    torch.testing.assert_close(
+        prepared.active_mask,
+        torch.tensor([True, False]),
+    )
+    assert prepared.hidden_states.shape == (2, 2)
+    assert prepared.router_logits.shape == (2, 4)
+
+
+def test_all_to_all_dispatcher_restores_local_token_order() -> None:
+    config = MoEParallelConfig(
+        tp_size=2,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=0,
+        dp_size=2,
+        dp_rank=0,
+        comm_type=MoECommType.ALL_TO_ALL,
+    )
+    dispatcher = AllToAllTokenDispatcher(
+        config=config,
+        num_experts=4,
+        quantized=False,
+    )
+    hidden_states = torch.tensor([[1.0]])
+    dispatch_input = MoETokenDispatchInput(
+        hidden_states=hidden_states,
+        routing=MoERoutingResult(
+            topk_ids=torch.tensor([[0, 2]], dtype=torch.int64),
+            topk_weights=torch.tensor([[0.25, 0.75]]),
+        ),
+    )
+    all_to_all_returns = [
+        torch.tensor([[10.0], [20.0]]),
+        torch.tensor([0, 1], dtype=torch.int64),
+    ]
+
+    def _all_to_all_side_effect(
+        tensor: torch.Tensor,
+        **_: object,
+    ) -> torch.Tensor:
+        if all_to_all_returns:
+            return all_to_all_returns.pop(0)
+        return tensor
+
+    with (
+        patch(
+            "xllm.python.layers.moe.token_dispatcher.ops.all_gather",
+            return_value=torch.tensor([1, 0, 1, 0, 1, 0, 1, 0]),
+        ),
+        patch(
+            "xllm.python.layers.moe.token_dispatcher.ops.all_to_all_single",
+            side_effect=_all_to_all_side_effect,
+        ) as mock_all_to_all,
+    ):
+        dispatched = dispatcher.token_dispatch(dispatch_input)
+        output = dispatcher.token_combine(
+            torch.tensor([[4.0], [8.0]]),
+            dispatched.combine_metadata,
+        )
+
+    torch.testing.assert_close(dispatched.group_list, torch.tensor([1, 1]))
+    torch.testing.assert_close(output, torch.tensor([[7.0]]))
+    assert mock_all_to_all.call_count == 3
+
+
+def test_mc2_dispatcher_uses_a3_tp_arguments() -> None:
+    backend = MagicMock()
+    backend.get_hccl_comm_name.return_value = "test_hccl_group"
+    process_group = MagicMock()
+    process_group._get_backend.return_value = backend
+    group = SimpleNamespace(process_group=process_group, local_rank=0)
+    config = MoEParallelConfig(
+        tp_size=2,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=0,
+        dp_size=2,
+        dp_rank=0,
+        comm_type=MoECommType.MC2,
+    )
+    dispatch_result = (
+        torch.ones(2, 4, dtype=torch.int8),
+        torch.ones(2),
+        torch.ones(2, dtype=torch.int32),
+        torch.tensor([1, 1], dtype=torch.int32),
+        torch.ones(2, dtype=torch.int32),
+        torch.ones(2, dtype=torch.int32),
+        torch.ones(2),
+    )
+
+    with (
+        patch(
+            "xllm.python.layers.moe.token_dispatcher.get_parallel_group",
+            return_value=group,
+        ),
+        patch(
+            "xllm.python.layers.moe.token_dispatcher.torch_npu.npu.get_soc_version",
+            return_value=253,
+        ),
+        patch(
+            "xllm.python.layers.moe.token_dispatcher.torch_npu.npu_moe_distribute_dispatch_v2",
+            return_value=dispatch_result,
+        ) as mock_dispatch,
+        patch(
+            "xllm.python.layers.moe.token_dispatcher.torch_npu.npu_moe_distribute_combine_v2",
+            return_value=torch.ones(2, 4),
+        ) as mock_combine,
+    ):
+        dispatcher = MC2TokenDispatcher(
+            config=config,
+            num_experts=4,
+            quantized=True,
+            device=torch.device("npu:0"),
+        )
+        dispatched = dispatcher.token_dispatch(
+            MoETokenDispatchInput(
+                hidden_states=torch.ones(2, 4),
+                routing=MoERoutingResult(
+                    topk_ids=torch.tensor([[0], [1]], dtype=torch.int32),
+                    topk_weights=torch.ones(2, 1),
+                ),
+                active_mask=torch.ones(2, dtype=torch.bool),
+            )
+        )
+        output = dispatcher.token_combine(
+            torch.ones(2, 4),
+            dispatched.combine_metadata,
+        )
+
+    dispatch_kwargs = mock_dispatch.call_args.kwargs
+    assert dispatch_kwargs["group_ep"] == "test_hccl_group"
+    assert dispatch_kwargs["group_tp"] == "test_hccl_group"
+    assert dispatch_kwargs["tp_world_size"] == 1
+    assert dispatch_kwargs["quant_mode"] == 2
+    combine_kwargs = mock_combine.call_args.kwargs
+    assert combine_kwargs["group_tp"] == "test_hccl_group"
+    torch.testing.assert_close(output, torch.ones(2, 4))
+
+
+def test_mc2_dispatcher_accepts_native_hccl_process_group() -> None:
+    process_group = MagicMock(spec=["get_hccl_comm_name"])
+    process_group.get_hccl_comm_name.return_value = "native_hccl_group"
+    group = SimpleNamespace(process_group=process_group, local_rank=1)
+    config = MoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=1,
+        dp_size=1,
+        dp_rank=0,
+        input_tp_size=2,
+        input_tp_rank=1,
+        comm_type=MoECommType.MC2,
+    )
+
+    with (
+        patch(
+            "xllm.python.layers.moe.token_dispatcher.get_parallel_group",
+            return_value=group,
+        ),
+        patch(
+            "xllm.python.layers.moe.token_dispatcher."
+            "torch_npu.npu.get_soc_version",
+            return_value=253,
+        ),
+    ):
+        dispatcher = MC2TokenDispatcher(
+            config=config,
+            num_experts=4,
+            quantized=True,
+            device=torch.device("npu:1"),
+        )
+
+    assert dispatcher._group_name == "native_hccl_group"
+    process_group.get_hccl_comm_name.assert_called_once_with(1)
 
 
 def test_native_pipeline_dispatches_computes_and_combines() -> None:
