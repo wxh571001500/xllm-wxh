@@ -22,10 +22,14 @@ import torch
 import torch.nn as nn
 
 from xllm.python import ops
+from xllm.python.distributed import (
+    parallel_group_rank,
+    parallel_group_world_size,
+)
 from xllm.python.layers.moe.activation import SituAndMul
 from xllm.python.layers.moe.communication import (
     MoECommMethod,
-    TensorParallelCommMethod,
+    build_moe_comm_method,
 )
 from xllm.python.layers.moe.experts import (
     FusedQuantizedSituAndMul,
@@ -35,11 +39,12 @@ from xllm.python.layers.moe.experts import (
 )
 from xllm.python.layers.moe.router import GroupedTopKRouter
 from xllm.python.layers.moe.runner import MoERunner
-from xllm.python.layers.moe.token_dispatcher import (
-    FusedAllGatherTokenDispatcher,
-    NativeTokenDispatcher,
+from xllm.python.layers.moe.types import (
+    MoECommType,
+    MoEExpertsConfig,
+    MoEParallelConfig,
+    MoERouterConfig,
 )
-from xllm.python.layers.moe.types import MoEExpertsConfig, MoERouterConfig
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
@@ -210,9 +215,11 @@ class KimiK3MoERunner(MoERunner):
         router: GroupedTopKRouter,
         comm_method: MoECommMethod,
         tp_size: int,
+        tp_group_name: str,
     ) -> None:
         super().__init__(router, comm_method)
         self._tp_size = tp_size
+        self._tp_group_name = tp_group_name
 
     def _reduce_routed_results(self) -> bool:
         return True
@@ -222,7 +229,13 @@ class KimiK3MoERunner(MoERunner):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         if self._tp_size > 1:
-            ops.all_reduce_(hidden_states)
+            if self._tp_group_name == "tp":
+                ops.all_reduce_(hidden_states)
+            else:
+                ops.all_reduce_(
+                    hidden_states,
+                    group_name=self._tp_group_name,
+                )
         return hidden_states
 
 
@@ -245,12 +258,65 @@ class KimiK3MoE(MoE):
         top_k = int(config.num_experts_per_token)
         hidden_size = int(config.hidden_size)
         routed_hidden_size = int(config.routed_expert_hidden_size)
+        tp_group_name = "moe_tp"
+        try:
+            input_tp_size = parallel_group_world_size("tp", device)
+            input_tp_rank = parallel_group_rank("tp", device)
+            moe_tp_size = parallel_group_world_size("moe_tp", device)
+            moe_tp_rank = parallel_group_rank("moe_tp", device)
+            ep_size = parallel_group_world_size("moe_ep", device)
+            ep_rank = parallel_group_rank("moe_ep", device)
+            dp_size = parallel_group_world_size("dp", device)
+            dp_rank = parallel_group_rank("dp", device)
+        except (KeyError, RuntimeError):
+            input_tp_size = tp_size
+            input_tp_rank = tp_rank
+            ep_size = int(getattr(config, "ep_size", 1))
+            dp_size = int(getattr(config, "dp_size", 1))
+            if ep_size == 1:
+                moe_tp_size = tp_size
+                moe_tp_rank = tp_rank
+                ep_rank = 0
+                dp_rank = int(getattr(config, "rank", tp_rank)) // tp_size
+                tp_group_name = "tp"
+            else:
+                world_size = int(
+                    getattr(config, "world_size", tp_size * ep_size)
+                )
+                global_rank = int(getattr(config, "rank", tp_rank))
+                if world_size % ep_size != 0:
+                    raise ValueError(
+                        "Kimi K3 world size must divide MoE EP size"
+                    )
+                moe_tp_size = world_size // ep_size
+                moe_tp_rank = global_rank % moe_tp_size
+                ep_rank = global_rank // moe_tp_size
+                dp_rank = global_rank // (world_size // dp_size)
+        parallel_config = MoEParallelConfig(
+            tp_size=moe_tp_size,
+            tp_rank=moe_tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            comm_type=MoECommType.from_value(
+                getattr(config, "moe_comm_type", "all_gather")
+            ),
+            mc2_tokens_capacity=int(
+                getattr(config, "mc2_tokens_capacity", 512)
+            ),
+            tp_group_name=tp_group_name,
+            input_tp_size=input_tp_size,
+            input_tp_rank=input_tp_rank,
+        )
         experts_config = MoEExpertsConfig(
             num_experts=num_experts,
             hidden_size=routed_hidden_size,
             intermediate_size=int(config.moe_intermediate_size),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            tp_size=moe_tp_size,
+            tp_rank=moe_tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
         )
         situ_beta = float(getattr(config, "activation_situ_beta", None) or 1.0)
         situ_linear_beta = getattr(config, "activation_situ_linear_beta", None)
@@ -285,17 +351,12 @@ class KimiK3MoE(MoE):
             num_expert_group=int(getattr(config, "num_expert_group", 1)),
             topk_group=int(getattr(config, "topk_group", 1)),
         )
-        if quantized or device.type in ("npu", "privateuseone"):
-            token_dispatcher = FusedAllGatherTokenDispatcher(
-                num_experts=num_experts,
-                top_k=top_k,
-                quantized=quantized,
-            )
-        else:
-            token_dispatcher = NativeTokenDispatcher(num_experts)
-        comm_method = TensorParallelCommMethod(
-            tp_size=tp_size,
-            token_dispatcher=token_dispatcher,
+        comm_method = build_moe_comm_method(
+            config=parallel_config,
+            num_experts=num_experts,
+            top_k=top_k,
+            quantized=quantized,
+            device=device,
         )
         super().__init__(
             hidden_size=hidden_size,
@@ -310,6 +371,10 @@ class KimiK3MoE(MoE):
 
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.moe_tp_size = moe_tp_size
+        self.moe_tp_rank = moe_tp_rank
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
         self.quantized = quantized
         self.routed_expert_down_proj = routed_expert_down_proj
         self.routed_expert_up_proj = routed_expert_up_proj
@@ -326,7 +391,8 @@ class KimiK3MoE(MoE):
         self._runner = KimiK3MoERunner(
             self._router,
             comm_method,
-            tp_size,
+            input_tp_size,
+            parallel_config.input_tp_group_name,
         )
 
     def _routed_input_transform(self) -> TensorTransform:
@@ -390,7 +456,35 @@ class KimiK3MoE(MoE):
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
-        loaded = super().load_weights(state_dict, tp_rank, tp_size)
+        del tp_rank, tp_size
+        loaded: set[str] = set()
+        for name in ("gate.weight", "gate.e_score_correction_bias"):
+            if state_dict.has(name) and self.load_weight(
+                name,
+                state_dict.get_tensor(name),
+            ):
+                loaded.add(name)
+
+        shared_state_dict = state_dict.get_dict_with_prefix("shared_experts.")
+        if self.shared_experts is not None and shared_state_dict.size() > 0:
+            child_loaded = self.shared_experts.load_weights(
+                shared_state_dict,
+                self.tp_rank,
+                self.tp_size,
+            )
+            loaded.update(
+                f"shared_experts.{name}" for name in child_loaded
+            )
+
+        experts_state_dict = state_dict.get_dict_with_prefix("experts.")
+        if experts_state_dict.size() > 0:
+            child_loaded = self.experts.load_weights(
+                experts_state_dict,
+                self.moe_tp_rank,
+                self.moe_tp_size,
+            )
+            loaded.update(f"experts.{name}" for name in child_loaded)
+
         direct_names = [
             "routed_expert_down_proj.weight",
             "routed_expert_up_proj.weight",

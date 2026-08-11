@@ -41,10 +41,12 @@ from xllm.python.ops.attention import (
 from xllm.python.ops.collectives import (
     all_gather,
     all_reduce_,
+    all_to_all_single,
     get_parallel_group,
     init_tp_group,
     parallel_group_rank,
     parallel_group_world_size,
+    reduce_scatter,
     tp_rank,
 )
 from xllm.python.ops.vision import encoder_attention
@@ -64,10 +66,12 @@ __all__ = [
     "update_decode_graph_metadata",
     "all_reduce_",
     "all_gather",
+    "all_to_all_single",
     "init_tp_group",
     "get_parallel_group",
     "parallel_group_rank",
     "parallel_group_world_size",
+    "reduce_scatter",
     "tp_rank",
     "encoder_attention",
 ]
