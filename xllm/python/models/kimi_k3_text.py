@@ -64,6 +64,26 @@ def _tp_rank_from_device(device: object) -> int:
         return 0
 
 
+def _resolve_dp_rank(config: dict[str, Any]) -> int:
+    """Derive the DP rank from the C++ parallel properties in the config dict.
+
+    The C++ side defines the TP group as a contiguous block of
+    ``world_size // dp_size`` ranks, so the DP rank is the global rank divided
+    by that block size. Returns 0 when DP is disabled or the world layout is
+    absent (e.g. CPU test configs).
+    """
+    raw = config.get("text_config", config)
+    dp_size = int(config.get("dp_size", raw.get("dp_size", 1)) or 1)
+    if dp_size <= 1:
+        return 0
+    world_size = int(config.get("world_size", raw.get("world_size", 0)) or 0)
+    global_rank = int(config.get("rank", raw.get("rank", 0)) or 0)
+    tp_block = world_size // dp_size if world_size > 0 else 0
+    if tp_block <= 0:
+        return 0
+    return global_rank // tp_block
+
+
 def _copy_parameter(parameter: torch.Tensor, tensor: torch.Tensor) -> None:
     if parameter.shape != tensor.shape:
         raise ValueError(
@@ -243,6 +263,7 @@ class KimiK3TextConfig:
     rank: int = 0
     ep_size: int = 1
     dp_size: int = 1
+    dp_rank: int = 0
     moe_comm_type: str = "all_gather"
     mc2_tokens_capacity: int = 512
 
@@ -373,6 +394,7 @@ class KimiK3TextConfig:
             ),
             ep_size=int(config.get("ep_size", raw.get("ep_size", 1))),
             dp_size=int(config.get("dp_size", raw.get("dp_size", 1))),
+            dp_rank=_resolve_dp_rank(config),
             moe_comm_type=str(
                 pick("moe_comm_type", "moe_communication", default="all_gather")
             ),
@@ -404,6 +426,8 @@ class KimiK3TextConfig:
             raise ValueError("Kimi K3 EP size must divide world size")
         if self.dp_size <= 0 or self.world_size % self.dp_size != 0:
             raise ValueError("Kimi K3 DP size must divide world size")
+        if not 0 <= self.dp_rank < self.dp_size:
+            raise ValueError("Kimi K3 DP rank and size are invalid")
         if self.ep_size > 1 and self.dp_size != self.ep_size:
             supported = (
                 self.dp_size == 1

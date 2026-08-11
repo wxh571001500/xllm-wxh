@@ -110,6 +110,9 @@ class ModelExecutor:
         self._device = device
         self._attention_layer_specs = layer_specs
         self._num_attention_layers = len(layer_specs)
+        # DP size from the C++ parallel properties (1 when DP is disabled).
+        # Used to gate decode-graph execution on all DP ranks decoding.
+        self._dp_size = int(config.get("dp_size", 1) or 1)
         # The paged-KV backend geometry (heads/dims) must come from a real
         # paged-attention layer. KDA ("linear") layers are runtime layers for
         # ordering only and carry no paged-KV geometry, so build the backend
@@ -206,7 +209,7 @@ class ModelExecutor:
         for layer_id, conv_state, recurrent_state in kda_caches:
             kda_runtime.caches[int(layer_id)] = (conv_state, recurrent_state)
 
-    def set_kda_metadata(self, view: object) -> None:
+    def set_kda_metadata(self, view: object, num_tokens: int) -> None:
         """Populate the KDA runtime metadata for the current step.
 
         ``view`` exposes the per-step linear-attention scheduling info the C++
@@ -216,7 +219,28 @@ class ModelExecutor:
         kda_runtime = getattr(self._execution_model, "kda_runtime", None)
         if kda_runtime is None:
             return
-        from xllm.python.layers.kda import KimiK3KDAMetadata
+        from xllm.python.layers.kda import PAD_SLOT_ID, KimiK3KDAMetadata
+
+        # Empty DP shard: the C++ worker feeds one fake token with zero real
+        # sequences. Synthesize one dummy decode sequence per fake token on the
+        # pad slot so KDA layers run shape-consistent kernels without touching
+        # any real conv/recurrent state slot.
+        if view.num_decode_seqs + view.num_prefill_seqs == 0 and num_tokens > 0:
+            kda_runtime.metadata = KimiK3KDAMetadata(
+                query_start_loc=torch.arange(
+                    num_tokens + 1, dtype=torch.int32, device=self._device
+                ),
+                state_indices=torch.full(
+                    (num_tokens,),
+                    PAD_SLOT_ID,
+                    dtype=torch.int64,
+                    device=self._device,
+                ),
+                num_decode_seqs=num_tokens,
+                num_prefill_seqs=0,
+                has_initial_state=None,
+            )
+            return
 
         # The C++ view builds query_start_loc / has_initial_state as host
         # tensors (state_indices is already moved to device). KDA feeds all of
@@ -250,7 +274,7 @@ class ModelExecutor:
         # Push per-step KDA scheduling info into the runtime before forward so
         # KDA layers can read it via kda_runtime.require(). No-op without KDA.
         if kda_metadata is not None:
-            self.set_kda_metadata(kda_metadata)
+            self.set_kda_metadata(kda_metadata, input_ids.shape[0])
 
         # Multimodal prefill supplies already-merged embeddings from the C++
         # VLM data path. Graph runners only accept token ids, so execute this
@@ -263,8 +287,21 @@ class ModelExecutor:
         graph_runner = self.decode_graph_runner
         if graph_runner is not None:
             graph_runner.warmup(input_ids.device, input_ids.dtype)
-            if graph_runner.can_execute(input_ids, metadata):
+            if graph_runner.can_execute(input_ids, metadata) and self._all_dp_decode(
+                kda_metadata
+            ):
                 return graph_runner.execute(input_ids, positions, metadata)
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(input_ids, positions, metadata)
         return self.eager_runner.execute(input_ids, positions, metadata)
+
+    def _all_dp_decode(self, kda_metadata: object | None) -> bool:
+        """Whether every DP rank runs a decode batch this step.
+
+        The C++ engine host-syncs per-rank batch types (``dp_is_decode``), so
+        this is a plain host-side check. Decode graphs are only entered when
+        all DP ranks decode, mirroring the C++ ACL graph executor gating.
+        """
+        if self._dp_size <= 1 or kda_metadata is None:
+            return True
+        return bool(getattr(kda_metadata, "all_dp_decode", True))
