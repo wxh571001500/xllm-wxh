@@ -55,8 +55,8 @@ import torch.nn.functional as F
 from xllm.python.layers.attention import AttentionRuntimeLayer
 from xllm.python.layers.linear import (
     ColumnParallelLinear,
-    KimiK3W8A8DynamicLinear,
     RowParallelLinear,
+    W8A8DynamicLinearMethod,
 )
 
 KDA_CHUNK_SIZE = 64
@@ -182,14 +182,32 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             # per-token int8 activation quant); the gate/output/low-rank/beta
             # projections stay bf16. Each rank owns its head shard and feeds the
             # per-rank conv/recurrent kernels, so no output gather/reduce.
-            self.q_proj = KimiK3W8A8DynamicLinear(
-                hidden_size, local_proj, device, tp_size=tp_size
+            self.q_proj = ColumnParallelLinear(
+                hidden_size,
+                local_proj,
+                tp_size,
+                bias=False,
+                dtype=dtype,
+                device=device,
+                quant_method=W8A8DynamicLinearMethod(),
             )
-            self.k_proj = KimiK3W8A8DynamicLinear(
-                hidden_size, local_proj, device, tp_size=tp_size
+            self.k_proj = ColumnParallelLinear(
+                hidden_size,
+                local_proj,
+                tp_size,
+                bias=False,
+                dtype=dtype,
+                device=device,
+                quant_method=W8A8DynamicLinearMethod(),
             )
-            self.v_proj = KimiK3W8A8DynamicLinear(
-                hidden_size, local_proj, device, tp_size=tp_size
+            self.v_proj = ColumnParallelLinear(
+                hidden_size,
+                local_proj,
+                tp_size,
+                bias=False,
+                dtype=dtype,
+                device=device,
+                quant_method=W8A8DynamicLinearMethod(),
             )
         else:
             self.q_proj = ColumnParallelLinear(

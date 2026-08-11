@@ -25,8 +25,9 @@ from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.layernorm import RMSNorm
 from xllm.python.layers.linear import (
     ColumnParallelLinear,
-    KimiK3W8A8DynamicLinear,
+    LinearMethod,
     RowParallelLinear,
+    W8A8DynamicLinearMethod,
 )
 from xllm.python.layers.moe import (
     GroupedTopKRouter,
@@ -43,8 +44,9 @@ __all__ = [
     "RMSNorm",
     "RotaryEmbedding",
     "ColumnParallelLinear",
+    "LinearMethod",
     "RowParallelLinear",
-    "KimiK3W8A8DynamicLinear",
+    "W8A8DynamicLinearMethod",
     "HiddenParallelEmbedding",
     "GroupedTopKRouter",
     "KimiK3MoE",

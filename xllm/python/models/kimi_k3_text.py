@@ -36,9 +36,9 @@ from xllm.python.layers import (
     ColumnParallelLinear,
     HiddenParallelEmbedding,
     KimiK3MoE,
-    KimiK3W8A8DynamicLinear,
     RMSNorm,
     RowParallelLinear,
+    W8A8DynamicLinearMethod,
 )
 from xllm.python.layers.attention import AttentionRuntimeLayer
 from xllm.python.layers.kda import KimiK3DeltaAttention, KimiK3KDAMetadata
@@ -560,35 +560,26 @@ class KimiK3MLP(nn.Module):
         intermediate_per_rank = intermediate_size // config.tp_size
         self.tp_size = config.tp_size
         self.quantized = config.uses_quantized_weights
-        if self.quantized:
-            self.gate_up_proj = KimiK3W8A8DynamicLinear(
-                config.hidden_size,
-                2 * intermediate_per_rank,
-                device,
-                tp_size=config.tp_size,
-            )
-            self.down_proj = KimiK3W8A8DynamicLinear(
-                intermediate_per_rank,
-                config.hidden_size,
-                device,
-                tp_size=config.tp_size,
-                reduce_results=reduce_results,
-            )
-        else:
-            self.gate_up_proj = ColumnParallelLinear(
-                config.hidden_size,
-                2 * intermediate_per_rank,
-                config.tp_size,
-                dtype=dtype,
-                device=device,
-            )
-            self.down_proj = RowParallelLinear(
-                intermediate_per_rank,
-                config.hidden_size,
-                config.tp_size,
-                dtype=dtype,
-                device=device,
-            )
+        quant_method = W8A8DynamicLinearMethod() if self.quantized else None
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            2 * intermediate_per_rank,
+            config.tp_size,
+            dtype=dtype,
+            device=device,
+            quant_method=quant_method,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_per_rank,
+            config.hidden_size,
+            config.tp_size,
+            dtype=dtype,
+            device=device,
+            reduce_results=reduce_results,
+            quant_method=(
+                W8A8DynamicLinearMethod() if self.quantized else None
+            ),
+        )
         self.reduce_results = reduce_results
         self.hidden_act = config.hidden_act
         self.situ_beta = float(config.activation_situ_beta or 1.0)
@@ -611,10 +602,7 @@ class KimiK3MLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         activated = self._activation(self.gate_up_proj(hidden_states))
-        if self.quantized or self.reduce_results:
-            return self.down_proj(activated)
-        output = F.linear(activated, self.down_proj.weight, self.down_proj.bias)
-        return output
+        return self.down_proj(activated)
 
     def load_weight(
         self,
@@ -759,10 +747,13 @@ class KimiK3FusedQKVAProjection(nn.Module):
         self.output_size = self.query_size + self.key_value_size
         self.quantized = config.uses_quantized_weights
         if self.quantized:
-            self.projection = KimiK3W8A8DynamicLinear(
+            self.projection = ColumnParallelLinear(
                 config.hidden_size,
                 self.output_size,
-                device,
+                1,
+                dtype=dtype,
+                device=device,
+                quant_method=W8A8DynamicLinearMethod(),
             )
         else:
             self.projection = nn.Linear(
@@ -904,11 +895,13 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         )
 
         if self.quantized:
-            self.q_b_proj = KimiK3W8A8DynamicLinear(
+            self.q_b_proj = ColumnParallelLinear(
                 config.q_lora_rank,
                 num_heads * query_head_dim,
-                device,
-                tp_size=config.tp_size,
+                config.tp_size,
+                dtype=dtype,
+                device=device,
+                quant_method=W8A8DynamicLinearMethod(),
             )
         else:
             self.q_b_proj = ColumnParallelLinear(
@@ -1097,7 +1090,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         self,
         state_dict: Any,
         projection: str,
-        module: KimiK3W8A8DynamicLinear,
+        module: ColumnParallelLinear,
         tp_rank: int,
         tp_size: int,
         shard_output: bool = False,
@@ -1331,15 +1324,21 @@ class KimiK3DecoderLayer(nn.Module):
         )
         if config.is_moe_layer(layer_id):
             if config.uses_quantized_weights:
-                routed_expert_down_proj = KimiK3W8A8DynamicLinear(
+                routed_expert_down_proj = ColumnParallelLinear(
                     config.hidden_size,
                     config.routed_expert_hidden_size,
-                    device,
+                    1,
+                    dtype=dtype,
+                    device=device,
+                    quant_method=W8A8DynamicLinearMethod(),
                 )
-                routed_expert_up_proj = KimiK3W8A8DynamicLinear(
+                routed_expert_up_proj = ColumnParallelLinear(
                     config.routed_expert_hidden_size,
                     config.hidden_size,
-                    device,
+                    1,
+                    dtype=dtype,
+                    device=device,
+                    quant_method=W8A8DynamicLinearMethod(),
                 )
             else:
                 routed_expert_down_proj = nn.Linear(
