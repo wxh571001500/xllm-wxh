@@ -42,6 +42,7 @@ from xllm.python.layers import (
 )
 from xllm.python.layers.attention import AttentionRuntimeLayer
 from xllm.python.layers.kda import KimiK3DeltaAttention, KimiK3KDAMetadata
+from xllm.python.layers.moe.types import MoECommType
 from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.kimi_k3_gated_mla import (
@@ -238,6 +239,12 @@ class KimiK3TextConfig:
     quant_group_size: int = 0
     tp_size: int = 1
     tp_rank: int = 0
+    world_size: int = 1
+    rank: int = 0
+    ep_size: int = 1
+    dp_size: int = 1
+    moe_comm_type: str = "all_gather"
+    mc2_tokens_capacity: int = 512
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> KimiK3TextConfig:
@@ -346,6 +353,32 @@ class KimiK3TextConfig:
             quant_group_size=int(config.get("quant_group_size", 0)),
             tp_size=int(config.get("tp_size", raw.get("tp_size", 1))),
             tp_rank=int(config.get("tp_rank", raw.get("tp_rank", 0))),
+            world_size=int(
+                config.get(
+                    "world_size",
+                    raw.get(
+                        "world_size",
+                        config.get("tp_size", raw.get("tp_size", 1)),
+                    ),
+                )
+            ),
+            rank=int(
+                config.get(
+                    "rank",
+                    raw.get(
+                        "rank",
+                        config.get("tp_rank", raw.get("tp_rank", 0)),
+                    ),
+                )
+            ),
+            ep_size=int(config.get("ep_size", raw.get("ep_size", 1))),
+            dp_size=int(config.get("dp_size", raw.get("dp_size", 1))),
+            moe_comm_type=str(
+                pick("moe_comm_type", "moe_communication", default="all_gather")
+            ),
+            mc2_tokens_capacity=int(
+                pick("mc2_tokens_capacity", default=512)
+            ),
         )
 
     def validate(self) -> None:
@@ -365,6 +398,24 @@ class KimiK3TextConfig:
             raise ValueError("Kimi K3 intermediate_size must be divisible by tp_size")
         if self.tp_size <= 0 or not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("Kimi K3 TP rank and size are invalid")
+        if self.world_size <= 0 or not 0 <= self.rank < self.world_size:
+            raise ValueError("Kimi K3 global rank and size are invalid")
+        if self.ep_size <= 0 or self.world_size % self.ep_size != 0:
+            raise ValueError("Kimi K3 EP size must divide world size")
+        if self.dp_size <= 0 or self.world_size % self.dp_size != 0:
+            raise ValueError("Kimi K3 DP size must divide world size")
+        if self.ep_size > 1 and self.dp_size != self.ep_size:
+            supported = (
+                self.dp_size == 1
+                and self.tp_size == self.ep_size
+                and self.world_size == self.ep_size
+            )
+            if not supported:
+                raise ValueError(
+                    "Kimi K3 supports EP with either dp=ep or "
+                    "dp=1, attention_tp=ep"
+                )
+        MoECommType.from_value(self.moe_comm_type)
         if self.moe_layer_freq <= 0 or self.first_k_dense_replace < 0:
             raise ValueError("Kimi K3 MoE layer placement is invalid")
         if self.attn_res_block_size <= 0:

@@ -41,6 +41,41 @@ _ACL_FORMAT_FRACTAL_NZ = 29
 _ASCEND_W4A8_CUSTOM_OP_HANDLES: list[Any] = []
 
 
+def _select_tensor_shard(
+    tensor: torch.Tensor,
+    dim: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    if world_size == 1:
+        return tensor
+    if tensor.shape[dim] % world_size != 0:
+        raise ValueError("MoE weight dimension must divide parallel size")
+    return torch.tensor_split(tensor, world_size, dim=dim)[rank].contiguous()
+
+
+def _load_packed_expert_shard(
+    state_dict: "StateDict",
+    name: str,
+    config: MoEExpertsConfig,
+    tp_dim: int | None,
+) -> torch.Tensor:
+    tensor = state_dict.get_sharded_tensor(
+        name,
+        0,
+        config.ep_rank,
+        config.ep_size,
+    )
+    if tp_dim is not None:
+        tensor = _select_tensor_shard(
+            tensor,
+            tp_dim,
+            config.tp_rank,
+            config.tp_size,
+        )
+    return tensor
+
+
 class RoutedExperts(nn.Module, ABC):
     """Common interface implemented by all routed-experts backends."""
 
@@ -82,21 +117,26 @@ class UnquantizedRoutedExperts(RoutedExperts):
         super().__init__()
         if config.intermediate_size % config.tp_size != 0:
             raise ValueError("MoE expert intermediate size must divide tp_size")
+        self._config = config
         intermediate_per_rank = config.intermediate_size // config.tp_size
-        self.num_experts = config.num_experts
+        self.global_num_experts = config.num_experts
+        self.num_experts = config.num_local_experts
+        self.first_expert_id = config.first_expert_id
+        self.ep_size = config.ep_size
+        self.ep_rank = config.ep_rank
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.tp_size = config.tp_size
         self.activation = activation
         self._loaded_mask = torch.zeros(
-            (config.num_experts, 3),
+            (config.num_local_experts, 3),
             dtype=torch.bool,
             device="cpu",
         )
         self._packed_loaded: set[str] = set()
         self.w13_weight = nn.Parameter(
             torch.empty(
-                config.num_experts,
+                config.num_local_experts,
                 2 * intermediate_per_rank,
                 config.hidden_size,
                 dtype=dtype,
@@ -105,7 +145,7 @@ class UnquantizedRoutedExperts(RoutedExperts):
         )
         self.w2_weight = nn.Parameter(
             torch.empty(
-                config.num_experts,
+                config.num_local_experts,
                 config.hidden_size,
                 intermediate_per_rank,
                 dtype=dtype,
@@ -174,8 +214,11 @@ class UnquantizedRoutedExperts(RoutedExperts):
             expert_id = int(parts[0])
         except ValueError:
             return False
-        if not 0 <= expert_id < self.num_experts:
+        if not self.first_expert_id <= expert_id < (
+            self.first_expert_id + self.num_experts
+        ):
             return False
+        local_expert_id = expert_id - self.first_expert_id
         projection_group = {
             "w1": "gate",
             "gate_proj": "gate",
@@ -190,16 +233,19 @@ class UnquantizedRoutedExperts(RoutedExperts):
         if projection_group in ("gate", "up"):
             half = self.w13_weight.shape[1] // 2
             start = 0 if projection_group == "gate" else half
-            target = self.w13_weight.data[expert_id, start : start + half]
+            target = self.w13_weight.data[
+                local_expert_id,
+                start : start + half,
+            ]
         else:
-            target = self.w2_weight.data[expert_id]
+            target = self.w2_weight.data[local_expert_id]
         if tensor.shape != target.shape:
             raise ValueError(
                 f"MoE expert {name} expects {target.shape}, got {tensor.shape}"
             )
         target.copy_(tensor.to(target))
         projection_index = {"gate": 0, "up": 1, "down": 2}[projection_group]
-        self._loaded_mask[expert_id, projection_index] = True
+        self._loaded_mask[local_expert_id, projection_index] = True
         return True
 
     def load_weights(
@@ -208,19 +254,28 @@ class UnquantizedRoutedExperts(RoutedExperts):
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
+        del tp_rank, tp_size
         loaded: set[str] = set()
         for name in state_dict.keys():
             packed_name = name.removesuffix(".weight")
             if packed_name in ("w13_weight", "w2_weight"):
-                shard_dim = 1 if packed_name == "w13_weight" else 2
-                tensor = state_dict.get_sharded_tensor(
+                tp_dim = 1 if packed_name == "w13_weight" else 2
+                tensor = _load_packed_expert_shard(
+                    state_dict,
                     name,
-                    shard_dim,
-                    tp_rank,
-                    tp_size,
+                    self._config,
+                    tp_dim,
                 )
             elif len(name.split(".")) == 3:
                 parts = name.split(".")
+                try:
+                    expert_id = int(parts[0])
+                except ValueError:
+                    continue
+                if not self.first_expert_id <= expert_id < (
+                    self.first_expert_id + self.num_experts
+                ):
+                    continue
                 shard_dim = (
                     0
                     if parts[1] in ("w1", "w3", "gate_proj", "up_proj")
@@ -229,8 +284,8 @@ class UnquantizedRoutedExperts(RoutedExperts):
                 tensor = state_dict.get_sharded_tensor(
                     name,
                     shard_dim,
-                    tp_rank,
-                    tp_size,
+                    self._config.tp_rank,
+                    self._config.tp_size,
                 )
             else:
                 tensor = state_dict.get_tensor(name)
@@ -357,6 +412,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         super().__init__()
         if config.intermediate_size % config.tp_size != 0:
             raise ValueError("MoE expert intermediate size must divide tp_size")
+        self._config = config
         intermediate_per_rank = config.intermediate_size // config.tp_size
         if (
             intermediate_per_rank % 2 != 0
@@ -364,7 +420,11 @@ class FusedW4A8RoutedExperts(RoutedExperts):
             or 16 % config.tp_size != 0
         ):
             raise ValueError("Packed W4A8 expert dimensions are invalid")
-        self.num_experts = config.num_experts
+        self.global_num_experts = config.num_experts
+        self.num_experts = config.num_local_experts
+        self.first_expert_id = config.first_expert_id
+        self.ep_size = config.ep_size
+        self.ep_rank = config.ep_rank
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.tp_size = config.tp_size
@@ -374,14 +434,14 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         if device.type in ("npu", "privateuseone"):
             _ensure_fused_w4a8_custom_op()
         self._loaded_mask = torch.zeros(
-            (config.num_experts, 3, 4),
+            (config.num_local_experts, 3, 4),
             dtype=torch.bool,
             device="cpu",
         )
         self._packed_loaded: set[str] = set()
         self.w13_weight = nn.Parameter(
             torch.empty(
-                config.num_experts,
+                config.num_local_experts,
                 intermediate_per_rank,
                 config.hidden_size,
                 dtype=torch.int8,
@@ -391,7 +451,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         )
         self.w2_weight = nn.Parameter(
             torch.empty(
-                config.num_experts,
+                config.num_local_experts,
                 config.hidden_size // 2,
                 intermediate_per_rank,
                 dtype=torch.int8,
@@ -402,7 +462,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         self.register_buffer(
             "w13_weight_scale",
             torch.empty(
-                config.num_experts,
+                config.num_local_experts,
                 2 * intermediate_per_rank,
                 1,
                 dtype=torch.float32,
@@ -420,7 +480,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         self.register_buffer(
             "w2_weight_scale",
             torch.empty(
-                config.num_experts,
+                config.num_local_experts,
                 config.hidden_size,
                 1,
                 dtype=torch.float32,
@@ -434,7 +494,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         self.register_buffer(
             "w2_scale_bias",
             torch.empty(
-                config.num_experts,
+                config.num_local_experts,
                 config.hidden_size,
                 16 // config.tp_size,
                 dtype=torch.float32,
@@ -555,8 +615,11 @@ class FusedW4A8RoutedExperts(RoutedExperts):
             expert_id = int(parts[0])
         except ValueError:
             return False
-        if not 0 <= expert_id < self.num_experts:
+        if not self.first_expert_id <= expert_id < (
+            self.first_expert_id + self.num_experts
+        ):
             return False
+        local_expert_id = expert_id - self.first_expert_id
         projection_group = {
             "w1": "gate",
             "gate_proj": "gate",
@@ -575,12 +638,15 @@ class FusedW4A8RoutedExperts(RoutedExperts):
                 return False
             half = target_tensor.shape[1] // 2
             start = 0 if projection_group == "gate" else half
-            target = target_tensor.data[expert_id, start : start + half]
+            target = target_tensor.data[
+                local_expert_id,
+                start : start + half,
+            ]
         else:
             target_tensor = self._w2_target(suffix)
             if target_tensor is None:
                 return False
-            target = target_tensor.data[expert_id]
+            target = target_tensor.data[local_expert_id]
         if tensor.shape != target.shape:
             raise ValueError(
                 f"MoE expert {name} expects {target.shape}, got {tensor.shape}"
@@ -593,7 +659,11 @@ class FusedW4A8RoutedExperts(RoutedExperts):
             "weight_offset": 2,
             "scale_bias": 3,
         }[suffix]
-        self._loaded_mask[expert_id, projection_index, suffix_index] = True
+        self._loaded_mask[
+            local_expert_id,
+            projection_index,
+            suffix_index,
+        ] = True
         return True
 
     def _w13_target(self, suffix: str) -> torch.Tensor | None:
@@ -618,52 +688,67 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
+        del tp_rank, tp_size
         loaded: set[str] = set()
         for name in state_dict.keys():
             packed_name = name.removesuffix(".weight")
             if packed_name in ("w13_weight", "w2_weight"):
-                shard_dim = 1 if packed_name == "w13_weight" else 2
-                tensor = state_dict.get_sharded_tensor(
+                tensor = _load_packed_expert_shard(
+                    state_dict,
                     name,
-                    shard_dim,
-                    tp_rank,
-                    tp_size,
+                    self._config,
+                    1 if packed_name == "w13_weight" else 2,
                 )
             elif packed_name in (
                 "w13_weight_scale",
                 "w13_weight_offset",
                 "w13_scale_bias",
             ):
-                tensor = state_dict.get_sharded_tensor(
+                tensor = _load_packed_expert_shard(
+                    state_dict,
                     name,
+                    self._config,
                     1,
-                    tp_rank,
-                    tp_size,
                 )
             elif packed_name == "w2_scale_bias":
-                tensor = state_dict.get_sharded_tensor(
+                tensor = _load_packed_expert_shard(
+                    state_dict,
                     name,
+                    self._config,
                     2,
-                    tp_rank,
-                    tp_size,
+                )
+            elif packed_name in ("w2_weight_scale", "w2_weight_offset"):
+                tensor = _load_packed_expert_shard(
+                    state_dict,
+                    name,
+                    self._config,
+                    None,
                 )
             elif len(name.split(".")) == 3:
                 parts = name.split(".")
+                try:
+                    expert_id = int(parts[0])
+                except ValueError:
+                    continue
+                if not self.first_expert_id <= expert_id < (
+                    self.first_expert_id + self.num_experts
+                ):
+                    continue
                 projection = parts[1]
                 suffix = parts[2]
                 if projection in ("w1", "w3", "gate_proj", "up_proj"):
                     tensor = state_dict.get_sharded_tensor(
                         name,
                         0,
-                        tp_rank,
-                        tp_size,
+                        self._config.tp_rank,
+                        self._config.tp_size,
                     )
                 elif suffix in ("weight", "scale_bias"):
                     tensor = state_dict.get_sharded_tensor(
                         name,
                         1,
-                        tp_rank,
-                        tp_size,
+                        self._config.tp_rank,
+                        self._config.tp_size,
                     )
                 else:
                     tensor = state_dict.get_tensor(name)

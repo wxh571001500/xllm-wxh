@@ -16,8 +16,13 @@
 
 from xllm.python.layers.moe.activation import SituAndMul
 from xllm.python.layers.moe.communication import (
+    AdaptiveMoECommMethod,
+    AllGatherCommMethod,
+    AllToAllCommMethod,
+    MC2CommMethod,
     MoECommMethod,
     TensorParallelCommMethod,
+    build_moe_comm_method,
 )
 from xllm.python.layers.moe.experts import (
     FusedQuantizedSituAndMul,
@@ -34,19 +39,26 @@ from xllm.python.layers.moe.moe import (
     MoE,
 )
 from xllm.python.layers.moe.prepare_finalize import (
+    AllGatherPrepareAndFinalize,
+    AllToAllPrepareAndFinalize,
+    MC2PrepareAndFinalize,
     PrepareAndFinalize,
     TensorParallelPrepareAndFinalize,
 )
 from xllm.python.layers.moe.router import GroupedTopKRouter, MoERouter
 from xllm.python.layers.moe.runner import MoERunner
 from xllm.python.layers.moe.token_dispatcher import (
+    AllToAllTokenDispatcher,
     FusedAllGatherTokenDispatcher,
+    MC2TokenDispatcher,
     MoETokenDispatcher,
     NativeTokenDispatcher,
 )
 from xllm.python.layers.moe.types import (
+    MoECommType,
     MoEExpertsConfig,
     MoEFusedExpertsResult,
+    MoEParallelConfig,
     MoEPrepareOutput,
     MoERouterConfig,
     MoERoutingResult,
@@ -58,16 +70,27 @@ from xllm.python.layers.moe.types import (
 _ensure_kimi_k3_w4a8_custom_op = _ensure_fused_w4a8_custom_op
 
 __all__ = [
+    "AdaptiveMoECommMethod",
+    "AllGatherCommMethod",
+    "AllGatherPrepareAndFinalize",
+    "AllToAllCommMethod",
+    "AllToAllPrepareAndFinalize",
+    "AllToAllTokenDispatcher",
     "FusedAllGatherTokenDispatcher",
     "FusedQuantizedSituAndMul",
     "FusedW4A8RoutedExperts",
     "GroupedTopKRouter",
     "KimiK3MoE",
     "KimiK3MoERunner",
+    "MC2CommMethod",
+    "MC2PrepareAndFinalize",
+    "MC2TokenDispatcher",
     "MoE",
+    "MoECommType",
     "MoECommMethod",
     "MoEExpertsConfig",
     "MoEFusedExpertsResult",
+    "MoEParallelConfig",
     "MoEPrepareOutput",
     "MoERouter",
     "MoERouterConfig",
@@ -84,4 +107,5 @@ __all__ = [
     "TensorParallelCommMethod",
     "TensorParallelPrepareAndFinalize",
     "UnquantizedRoutedExperts",
+    "build_moe_comm_method",
 ]
