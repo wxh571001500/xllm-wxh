@@ -46,13 +46,18 @@ sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 sys.modules.setdefault("torch_npu", MagicMock())
 
-from xllm.python.models.kimi_k3_vit import (  # noqa: E402
+from xllm.python.models import kimi_k3_vit as _vit_module
+from xllm.python.models.kimi_k3_vit import (
     KimiK3VisionConfig,
     KimiK3VisionModel,
     _get_load_balance_assignment,
+    _KimiK3VitDump,
+    _run_data_parallel_vision_tower,
     _shard_vision_weight,
     tpool_patch_merger,
 )
+
+_vit_module.ops.encoder_attention = _encoder_attention
 
 
 def _tiny_config() -> dict:
@@ -140,7 +145,7 @@ def test_encoder_data_mode_uses_vllm_load_balanced_media_order(monkeypatch) -> N
         captured_boundaries.append(list(cu_seqlens))
         return _encoder_attention(query, key, value, cu_seqlens)
 
-    monkeypatch.setattr(_mock_ops, "encoder_attention", capture_attention)
+    monkeypatch.setattr(_vit_module.ops, "encoder_attention", capture_attention)
     config = _tiny_config()
     config["vision_config"]["merge_kernel_size"] = [1, 1]
     model = KimiK3VisionModel(config)
@@ -164,6 +169,41 @@ def test_encoder_data_mode_matches_vllm_greedy_assignment() -> None:
     assert assignment == [0, 2, 1, 3]
     assert image_counts == [1, 3]
     assert rank_loads == [1000, 350]
+
+
+def test_encoder_data_parallel_gathers_on_encoder_group(monkeypatch) -> None:
+    class _VisionTower:
+        merge_kernel_size = (1, 1)
+        config = MagicMock(hidden_size=2)
+
+        def __call__(self, pixel_values, _grids):
+            return [pixel_values]
+
+    gathered = torch.tensor(
+        [[10.0, 11.0], [20.0, 21.0]], dtype=torch.float32
+    ).unsqueeze(1)
+
+    def all_gather(tensor, *, dim, world_size, group_name):
+        assert tensor.shape == (1, 1, 2)
+        assert dim == 0
+        assert world_size == 2
+        assert group_name == "encoder_dp"
+        return gathered
+
+    monkeypatch.setattr(_vit_module.ops, "all_gather", all_gather)
+    outputs = _run_data_parallel_vision_tower(
+        _VisionTower(),
+        torch.tensor([[10.0, 11.0], [20.0, 21.0]]).unsqueeze(1),
+        [[1, 1, 1], [1, 1, 1]],
+        rank=0,
+        world_size=2,
+        dump=_KimiK3VitDump(rank=0, world_size=2),
+    )
+
+    assert [output.squeeze(0).tolist() for output in outputs] == [
+        [[10.0, 11.0]],
+        [[20.0, 21.0]],
+    ]
 
 
 def test_qkv_weight_sharding_preserves_qkv_order() -> None:

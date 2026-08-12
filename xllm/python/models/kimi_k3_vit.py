@@ -807,7 +807,12 @@ def _run_data_parallel_vision_tower(
         local_embeddings = torch.cat([local_embeddings, padding], dim=0)
 
     gathered = (
-        ops.all_gather(local_embeddings.contiguous(), dim=0, world_size=world_size)
+        ops.all_gather(
+            local_embeddings.contiguous(),
+            dim=0,
+            world_size=world_size,
+            group_name="encoder_dp",
+        )
         if world_size > 1
         else local_embeddings
     )
