@@ -70,6 +70,7 @@ limitations under the License.
 #include "platform/cuda_profiler.h"
 #endif
 #include "core/distributed_runtime/master.h"
+#include "core/runtime/block_diffusion_model_config.h"
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/linear_state_restore.h"
@@ -85,7 +86,6 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "layers/npu/loader/rolling_weight_buffer.h"
 #endif
-#include "util/json_reader.h"
 #include "util/tensor_helper.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
@@ -142,27 +142,6 @@ class ScopedAtenLoadThreads {
   int32_t prev_threads_ = 0;
   bool active_ = false;
 };
-
-// DFlash draft config lists target_layer_ids as the target-model layer indices
-// (0-based) whose output the draft consumes. xLLM's capture hook fires BEFORE
-// layer i runs, so capturing layer L's output means putting L+1 in the capture
-// set (matched against layer index i in the forward loop). Returns those L+1
-// ids.
-std::vector<int32_t> read_dflash_capture_layer_ids(
-    const std::string& model_weights_path) {
-  JsonReader reader;
-  const std::string config_path = model_weights_path + "/config.json";
-  CHECK(reader.parse(config_path))
-      << "Failed to parse DFlash config: " << config_path;
-  std::vector<int32_t> capture_layer_ids;
-  for (int32_t layer_id : reader.value_or<std::vector<int32_t>>(
-           std::vector<std::string>{"target_layer_ids",
-                                    "dflash_config.target_layer_ids"},
-           std::vector<int32_t>{})) {
-    capture_layer_ids.emplace_back(layer_id + 1);
-  }
-  return capture_layer_ids;
-}
 
 void move_tensor_to_device_if_needed(torch::Tensor& tensor,
                                      const torch::Device& device) {
@@ -1433,6 +1412,12 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     }
   }
 
+  const bool is_block_diffusion =
+      block_diffusion::is_algorithm(options_.speculative_algorithm());
+  if (is_block_diffusion) {
+    block_diffusion::configure_model_args(args, options_, model_weights_path_);
+  }
+
 #if defined(USE_NPU)
   const std::string& speculative_algorithm = options_.speculative_algorithm();
   if (options_.enable_speculative_decode() &&
@@ -1440,35 +1425,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
       util::is_deepseek_v4_model_type(args.model_type())) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
   }
-  if (options_.speculative_algorithm() == "DFlash" ||
-      options_.speculative_algorithm() == "DSpark") {
-    // DSpark is a DFlash variant: same target-layer capture and draft-body
-    // swap, just a different draft model_type ("DSparkDraftModel") carrying the
-    // extra Markov head. Both engines capture the same target layers, whose ids
-    // live in the draft config: the draft engine reads its own weights path,
-    // the target engine reads --draft_model. The draft engine additionally
-    // swaps in the DFlash/DSpark draft body.
-    const bool is_dspark = options_.speculative_algorithm() == "DSpark";
-    const char* draft_model_type =
-        is_dspark ? "DSparkDraftModel" : "DFlashDraftModel";
-    std::string draft_config_path;
-    if (options_.is_draft_engine()) {
-      LOG(INFO) << "Overriding draft model_type from " << args.model_type()
-                << " to " << draft_model_type
-                << " for block-diffusion speculative decoding";
-      args.model_type(draft_model_type);
-      draft_config_path = model_weights_path_;
-    } else {
-      CHECK(options_.draft_model_path().has_value())
-          << "block-diffusion speculative decoding requires --draft_model.";
-      draft_config_path = options_.draft_model_path().value();
-    }
-    args.layers_to_capture(read_dflash_capture_layer_ids(draft_config_path));
-  } else if (options_.enable_speculative_decode() &&
-             ::xllm::SpeculativeConfig::get_instance()
-                 .enable_atb_spec_kernel()) {
+  if (!is_block_diffusion && options_.enable_speculative_decode() &&
+      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
-  } else if (options_.enable_speculative_decode() &&
+  } else if (!is_block_diffusion && options_.enable_speculative_decode() &&
              options_.num_speculative_tokens() == 0 &&
              args.num_nextn_predict_layers() != 0) {
     const std::string& current_type = args.model_type();
@@ -1499,6 +1459,7 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
           options_.speculative_algorithm()) &&
       args.model_type() != "DFlashDraftModel" &&
       args.model_type() != "DSparkDraftModel" &&
+      args.model_type() != "deepseek_v4_dspark" &&
       args.layers_to_capture().empty()) {
     const int32_t num_layers = static_cast<int32_t>(args.n_layers());
     args.layers_to_capture({2, num_layers / 2, num_layers - 3});
@@ -1510,7 +1471,7 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     // checkpoint as the target model. The draft worker needs to instantiate
     // the MTP variant, so override the model_type here without mutating the
     // original config.
-    if (options_.num_speculative_tokens() == 0 &&
+    if (!is_block_diffusion && options_.num_speculative_tokens() == 0 &&
         args.num_nextn_predict_layers() != 0) {
       static const std::unordered_map<std::string, std::string>
           kModelTypeToMtpType = {

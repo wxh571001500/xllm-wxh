@@ -24,9 +24,58 @@ limitations under the License.
 
 #include "framework/kv_cache/embedding_cache.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
+#include "framework/model/model_args.h"
 #include "runtime/speculative_worker_impl.h"
 
 namespace xllm {
+
+namespace dflash_detail {
+
+inline int32_t draft_model_num_speculative_tokens(
+    const runtime::Options& options) {
+  // DeepSeek-V4 uses this value to configure the DSpark attention window.
+  // Other DFlash-style drafts keep the historical single-step model options.
+  return options.speculative_algorithm() == "DSpark"
+             ? options.num_speculative_tokens()
+             : 0;
+}
+
+inline void invalidate_draft_model_geometry(ModelInputParams& input_params) {
+  // Attention metadata is model-owned: DeepSeek-V4 bakes DSA group layout and
+  // sparse tiling values such as ori_win_left into opaque tensors. A draft
+  // input copied from the target must rebuild those tensors for draft geometry.
+  input_params.attn_metadata.reset();
+}
+
+inline bool is_deepseek_v4_dspark_draft(const std::string& model_type) {
+  return model_type == "deepseek_v4_dspark";
+}
+
+inline bool draft_uses_own_head_and_embedding(const std::string& model_type) {
+  // DeepSeek-V4 DSpark checkpoints contain trained mtp.0.embed and
+  // mtp.<last>.head tensors. They are not aliases of the target model's
+  // embedding/head (and may also carry the draft-side QuaRot transform), so
+  // replacing them after load destroys proposal quality.
+  return is_deepseek_v4_dspark_draft(model_type);
+}
+
+enum class DSparkSasMode : uint8_t {
+  NOT_DSPARK,
+  COMPATIBILITY,
+  NATIVE,
+};
+
+inline DSparkSasMode classify_dspark_sas_mode(const ModelArgs& draft_args,
+                                              bool sample_from_anchor) {
+  if (!sample_from_anchor ||
+      !is_deepseek_v4_dspark_draft(draft_args.model_type())) {
+    return DSparkSasMode::NOT_DSPARK;
+  }
+  return draft_args.dspark_use_native_sas() ? DSparkSasMode::NATIVE
+                                            : DSparkSasMode::COMPATIBILITY;
+}
+
+}  // namespace dflash_detail
 
 class DFlashWorkerImpl : public SpeculativeWorkerImpl {
  public:
@@ -93,6 +142,8 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
                                ForwardInput& validate_input);
 
  private:
+  dflash_detail::DSparkSasMode draft_sas_mode() const;
+
   void fill_validate_input_from_draft_outputs(const DraftBlock& draft_block,
                                               ForwardInput& validate_input,
                                               Stream& compute_stream);
