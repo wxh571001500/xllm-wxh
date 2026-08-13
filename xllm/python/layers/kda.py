@@ -58,12 +58,19 @@ from xllm.python.layers.linear import (
     RowParallelLinear,
     W8A8DynamicLinearMethod,
 )
+from xllm.python.ascend_custom_ops import ensure_ascend_custom_ops
 
 KDA_CHUNK_SIZE = 64
 # Padding slot convention of the AscendC causal-conv operator.
 PAD_SLOT_ID = -1
 _L2NORM_EPS = 1e-6
 _SOFTPLUS_THRESHOLD = 20.0
+_KDA_CUSTOM_OPS = (
+    "npu_causal_conv1d_custom",
+    "recurrent_kda",
+    "kda_gate_cumsum",
+    "chunk_kda_fwd",
+)
 
 
 @dataclass
@@ -394,58 +401,61 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             num_tokens, self.local_num_heads, self.head_dim
         )
 
-        mixed_qkv = torch.cat((q, k, v), dim=-1)
-        if metadata.num_prefill_seqs > 0:
-            assert metadata.has_initial_state is not None
-            mixed_qkv = self._causal_conv1d(
-                mixed_qkv,
-                conv_state,
-                query_start_loc=metadata.query_start_loc,
-                cache_indices=metadata.state_indices,
-                initial_state_mode=metadata.has_initial_state,
-                run_mode=0,
-            )
-        else:
-            mixed_qkv = self._causal_conv1d(
-                mixed_qkv,
-                conv_state,
-                query_start_loc=metadata.query_start_loc,
-                cache_indices=metadata.state_indices,
-                initial_state_mode=None,
-                run_mode=1,
-            )
-
-        q, k, v = (
-            x.reshape(1, num_tokens, self.local_num_heads, self.head_dim)
-            for x in mixed_qkv.chunk(3, dim=-1)
-        )
-
-        core_attn_out = torch.empty(
+        core_attn_out = torch.zeros(
             (1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        if num_decode > 0:
-            core_attn_out[:, :num_decode_tokens] = self._recurrent(
-                q[:, :num_decode_tokens],
-                k[:, :num_decode_tokens],
-                v[:, :num_decode_tokens],
-                raw_gate[:, :num_decode_tokens],
-                beta[:, :num_decode_tokens],
-                recurrent_state,
-                cu_seqlens=metadata.query_start_loc[: num_decode + 1],
-                state_indices=metadata.state_indices[:num_decode],
+        if num_decode + metadata.num_prefill_seqs > 0:
+            mixed_qkv = torch.cat((q, k, v), dim=-1)
+            if metadata.num_prefill_seqs > 0:
+                assert metadata.has_initial_state is not None
+                mixed_qkv = self._causal_conv1d(
+                    mixed_qkv,
+                    conv_state,
+                    query_start_loc=metadata.query_start_loc,
+                    cache_indices=metadata.state_indices,
+                    initial_state_mode=metadata.has_initial_state,
+                    run_mode=0,
+                )
+            else:
+                mixed_qkv = self._causal_conv1d(
+                    mixed_qkv,
+                    conv_state,
+                    query_start_loc=metadata.query_start_loc,
+                    cache_indices=metadata.state_indices,
+                    initial_state_mode=None,
+                    run_mode=1,
+                )
+
+            q, k, v = (
+                x.reshape(1, num_tokens, self.local_num_heads, self.head_dim)
+                for x in mixed_qkv.chunk(3, dim=-1)
             )
-        if metadata.num_prefill_seqs > 0:
-            core_attn_out[:, num_decode_tokens:] = self._prefill(
-                q[:, num_decode_tokens:],
-                k[:, num_decode_tokens:],
-                v[:, num_decode_tokens:],
-                raw_gate[:, num_decode_tokens:],
-                beta[:, num_decode_tokens:],
-                recurrent_state,
-                metadata,
-            )
+
+            if num_decode > 0:
+                core_attn_out[:, :num_decode_tokens] = self._recurrent(
+                    q[:, :num_decode_tokens],
+                    k[:, :num_decode_tokens],
+                    v[:, :num_decode_tokens],
+                    raw_gate[:, :num_decode_tokens],
+                    beta[:, :num_decode_tokens],
+                    recurrent_state,
+                    cu_seqlens=metadata.query_start_loc[: num_decode + 1],
+                    state_indices=metadata.state_indices[:num_decode],
+                )
+            if metadata.num_prefill_seqs > 0:
+                core_attn_out[:, num_decode_tokens:] = (
+                    self._prefill(
+                        q[:, num_decode_tokens:],
+                        k[:, num_decode_tokens:],
+                        v[:, num_decode_tokens:],
+                        raw_gate[:, num_decode_tokens:],
+                        beta[:, num_decode_tokens:],
+                        recurrent_state,
+                        metadata,
+                    )
+                )
 
         out = self._gated_rms_norm(core_attn_out, output_gate.unsqueeze(0))
         return self.o_proj(out.reshape(num_tokens, self.local_projection_size))
@@ -462,6 +472,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         initial_state_mode: torch.Tensor | None,
         run_mode: int,
     ) -> torch.Tensor:
+        ensure_ascend_custom_ops(_KDA_CUSTOM_OPS)
         out = torch.empty_like(mixed_qkv)
         torch.ops._C_ascend.npu_causal_conv1d_custom(
             out,

@@ -185,7 +185,8 @@ void ensure_forward_input_device_tensors(ForwardInput& input,
 }
 
 #if defined(USE_NPU)
-void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
+void prepare_input_params_for_linear_attention(ModelInputParams& input_params,
+                                               bool allow_empty_kda_batch) {
   const std::vector<int32_t>& host_q_seq_lens =
       input_params.attention.host.q_seq_lens;
   const bool has_leading_zero =
@@ -199,6 +200,14 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
   }
   if (batch_size == 0 && input_params.attention.device.block_tables.defined()) {
     batch_size = input_params.attention.device.block_tables.size(0);
+  }
+  if (batch_size == 0 && allow_empty_kda_batch) {
+    // Kimi-K3 Python KDA keeps the worker-provided fake token for fixed-shape
+    // DP/EP execution, while zero sequence metadata prevents conv/recurrent
+    // state updates on an empty DP rank.
+    input_params.parallel.query_start_loc = {0};
+    input_params.parallel.has_initial_state.clear();
+    return;
   }
   input_params.parallel.query_start_loc.resize(batch_size + 1, 0);
   for (int64_t i = 0; i < batch_size; ++i) {
@@ -869,7 +878,12 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     }
 
     if (has_linear_attention_layers(context_.get_model_args())) {
-      prepare_input_params_for_linear_attention(processed_input.input_params);
+      const bool allow_empty_kda_batch =
+          context_.get_model_args().model_type() == "kimi_k3" &&
+          ModelConfig::is_python_model_impl(
+              ModelConfig::get_instance().model_impl());
+      prepare_input_params_for_linear_attention(processed_input.input_params,
+                                                allow_empty_kda_batch);
       // Under schedule_overlap chunked prefill the previous chunk's forward
       // runs on compute_stream_ from a worker thread that may not have
       // enqueued its kernels yet when this prepare runs on the main thread.

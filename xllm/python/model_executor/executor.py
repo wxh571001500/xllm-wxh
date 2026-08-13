@@ -221,14 +221,14 @@ class ModelExecutor:
             return
         from xllm.python.layers.kda import PAD_SLOT_ID, KimiK3KDAMetadata
 
-        # Empty DP shard: the C++ worker feeds one fake token with zero real
-        # sequences. Synthesize one dummy decode sequence per fake token on the
-        # pad slot so KDA layers run shape-consistent kernels without touching
-        # any real conv/recurrent state slot.
+        # Empty DP shard: the C++ worker feeds fake token rows with zero real
+        # sequences. Preserve the tensor shape, but describe zero-length
+        # sequences so KDA projections run while stateful operators see no
+        # actual tokens and do not touch conv/recurrent caches.
         if view.num_decode_seqs + view.num_prefill_seqs == 0 and num_tokens > 0:
             kda_runtime.metadata = KimiK3KDAMetadata(
-                query_start_loc=torch.arange(
-                    num_tokens + 1, dtype=torch.int32, device=self._device
+                query_start_loc=torch.zeros(
+                    1, dtype=torch.int64, device=self._device
                 ),
                 state_indices=torch.full(
                     (num_tokens,),
@@ -236,7 +236,7 @@ class ModelExecutor:
                     dtype=torch.int64,
                     device=self._device,
                 ),
-                num_decode_seqs=num_tokens,
+                num_decode_seqs=0,
                 num_prefill_seqs=0,
                 has_initial_state=None,
             )
@@ -247,13 +247,16 @@ class ModelExecutor:
         # them to the AscendC operators, which require device tensors, so move
         # the host ones here to honor the on-device contract of
         # KimiK3KDAMetadata.
-        def _to_device(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        def _to_device(
+            tensor: torch.Tensor | None,
+            dtype: torch.dtype | None = None,
+        ) -> torch.Tensor | None:
             if tensor is None or tensor.device == self._device:
-                return tensor
-            return tensor.to(self._device, non_blocking=True)
+                return tensor if dtype is None else tensor.to(dtype=dtype)
+            return tensor.to(self._device, dtype=dtype, non_blocking=True)
 
         kda_runtime.metadata = KimiK3KDAMetadata(
-            query_start_loc=_to_device(view.query_start_loc),
+            query_start_loc=_to_device(view.query_start_loc, torch.int64),
             state_indices=_to_device(view.state_indices),
             num_decode_seqs=view.num_decode_seqs,
             num_prefill_seqs=view.num_prefill_seqs,
