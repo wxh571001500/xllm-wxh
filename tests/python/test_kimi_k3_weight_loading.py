@@ -850,6 +850,28 @@ def test_w8a8_row_parallel_reduces_before_adding_bias() -> None:
     torch.testing.assert_close(output, expected)
 
 
+def test_w8a8_linear_rejects_large_output_dimension() -> None:
+    layer = ColumnParallelLinear(
+        2,
+        6,
+        1,
+        bias=True,
+        dtype=torch.float32,
+        device="cpu",
+        quant_method=W8A8DynamicLinearMethod(),
+    )
+    layer.load_weight(
+        "weight",
+        torch.arange(12, dtype=torch.int8).reshape(6, 2),
+    )
+    layer.load_weight("weight_scale", torch.ones(6, 1))
+    layer.load_weight("weight_offset", torch.zeros(6, 1))
+    layer.load_weight("bias", torch.arange(6, dtype=torch.float32))
+    layer.quant_method._MAX_OUTPUT_DIM = 4
+    with pytest.raises(ValueError, match="exceeds the Ascend quant_matmul"):
+        layer.finish_weight_loading()
+
+
 @pytest.mark.parametrize("companion", ("weight_scale", "weight_offset"))
 def test_quantized_mla_weight_requires_scale_and_offset(companion: str) -> None:
     checkpoint = _quantized_checkpoint()
