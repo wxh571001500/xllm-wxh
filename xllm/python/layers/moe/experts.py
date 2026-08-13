@@ -17,11 +17,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-import ctypes
-import importlib.metadata
-import os
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -32,13 +28,13 @@ from xllm.python.layers.moe.types import (
     MoEExpertsConfig,
     MoETokenDispatchOutput,
 )
+from xllm.python.ascend_custom_ops import ensure_ascend_custom_ops
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
 
 
 _ACL_FORMAT_FRACTAL_NZ = 29
-_ASCEND_W4A8_CUSTOM_OP_HANDLES: list[Any] = []
 
 
 def _select_tensor_shard(
@@ -306,46 +302,8 @@ class UnquantizedRoutedExperts(RoutedExperts):
             raise KeyError("Routed expert weights are incomplete")
 
 
-def _prepend_env_path(name: str, path: str) -> None:
-    entries = [entry for entry in os.environ.get(name, "").split(":") if entry]
-    if path not in entries:
-        entries.insert(0, path)
-        os.environ[name] = ":".join(entries)
-
-
 def _ensure_fused_w4a8_custom_op() -> None:
-    if hasattr(torch.ops._C_ascend, "dequant_situ_quant"):
-        return
-    try:
-        distribution = importlib.metadata.distribution("vllm-ascend")
-    except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError(
-            "Fused W4A8 SiTU execution requires the vllm-ascend package"
-        ) from error
-
-    package_dir = Path(distribution.locate_file("vllm_ascend"))
-    vendor_dir = package_dir / "_cann_ops_custom" / "vendors" / "custom_transformer"
-    vendor_library = vendor_dir / "op_api" / "lib" / "libcust_opapi.so"
-    kernels_library = package_dir / "libvllm_ascend_kernels.so"
-    extension_paths = sorted(package_dir.glob("vllm_ascend_C.*.so"))
-    required_paths = [vendor_library, kernels_library]
-    if not extension_paths or any(not path.is_file() for path in required_paths):
-        raise RuntimeError(
-            "Installed vllm-ascend does not contain the W4A8 custom op libraries"
-        )
-
-    _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", str(vendor_dir))
-    _ASCEND_W4A8_CUSTOM_OP_HANDLES.extend(
-        [
-            ctypes.CDLL(str(vendor_library), mode=ctypes.RTLD_GLOBAL),
-            ctypes.CDLL(str(kernels_library), mode=ctypes.RTLD_GLOBAL),
-        ]
-    )
-    torch.ops.load_library(str(extension_paths[0]))
-    if not hasattr(torch.ops._C_ascend, "dequant_situ_quant"):
-        raise RuntimeError(
-            "vllm-ascend did not register _C_ascend.dequant_situ_quant"
-        )
+    ensure_ascend_custom_ops(("dequant_situ_quant",))
 
 
 def _dequant_situ_quant(

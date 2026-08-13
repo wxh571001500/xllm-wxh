@@ -80,6 +80,8 @@ class LinearMethod(ABC):
 class W8A8DynamicLinearMethod(LinearMethod):
     """Dynamic per-token W8A8 compute with per-channel weight metadata."""
 
+    _MAX_OUTPUT_DIM = 65535
+
     def create_weights(
         self,
         layer: nn.Module,
@@ -168,6 +170,14 @@ class W8A8DynamicLinearMethod(LinearMethod):
         layer.weight_offset.data = (
             layer.weight_offset.data.flatten().contiguous()
         )
+        # aclnnQuantMatmulV4 currently limits a single output dimension to
+        # 65535. Model-specific splitting should live in the owning module,
+        # rather than changing the behavior of every shared W8A8 linear.
+        if layer.weight.shape[1] > self._MAX_OUTPUT_DIM:
+            raise ValueError(
+                "W8A8 output dimension exceeds the Ascend quant_matmul "
+                f"limit: {layer.weight.shape[1]} > {self._MAX_OUTPUT_DIM}"
+            )
         layer._weights_processed = True
 
 

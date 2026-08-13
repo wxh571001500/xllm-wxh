@@ -273,7 +273,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       params.attn_metadata;
   if (!attn_metadata) {
     attn_metadata = std::make_shared<layer::AttentionMetadata>(
-        layer::AttentionMetadataBuilder::build(params, enable_mla_));
+        layer::AttentionMetadataBuilder::build(
+            params, enable_mla_, std::nullopt, tokens.device()));
   }
 
   py::gil_scoped_acquire gil;
