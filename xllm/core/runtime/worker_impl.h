@@ -254,6 +254,10 @@ class WorkerImpl {
     model_->set_word_embedding(embedding);
   }
 
+  bool share_weights_from(WorkerImpl& source) {
+    return model_->share_weights_from(*source.model_);
+  }
+
   bool enable_schedule_overlap() const {
     return options_.enable_schedule_overlap_;
   }
