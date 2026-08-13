@@ -1253,7 +1253,8 @@ void ProfileManager::warmup_decode_for_graph() {
       static_cast<int32_t>(decode_batch_sizes.size());
 
   LOG(INFO) << "Graph warmup started: bucket_count=" << decode_bucket_count
-            << ", max_decode_batch_size=" << max_decode_batch_size
+            << ", max_decode_batch_size="
+            << (decode_batch_sizes.empty() ? 0 : decode_batch_sizes.back())
             << ", decode_seq_len=" << decode_seq_len;
 
   // Capture from the largest bucket down to the smallest so every smaller
