@@ -487,10 +487,10 @@ void replace_host_token_placeholders(ForwardInput& input,
 }
 
 void set_positions_tensor(ForwardInput& input,
-                          const std::vector<int32_t>& positions,
+                          const torch::Tensor& positions_host,
                           const torch::TensorOptions& device_options) {
   input.device_tensors_ready = false;
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions);
+  input.positions_host = positions_host;
   input.positions =
       safe_to(input.positions_host, device_options, /*non_blocking=*/true);
   input.device_tensors_ready = true;
@@ -3378,11 +3378,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       !is_kimi_k25_eagle3_pair() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
   const bool force_kimi_k25_eagle3_two_rows =
-      target_impl_ != nullptr && draft_impl_ != nullptr &&
-      is_kimi_k25_eagle3_draft(
-          target_impl_->context_.get_model_args().model_type(),
-          draft_impl_->context_.get_model_args().model_type()) &&
-      dp_enabled && !use_chunked_prefill;
+      is_kimi_k25_eagle3_pair() && dp_enabled && !use_chunked_prefill;
   const bool has_dp_token_counts =
       input_params.parallel.dp_global_token_nums.size() ==
       static_cast<size_t>(parallel_args_.dp_size());
