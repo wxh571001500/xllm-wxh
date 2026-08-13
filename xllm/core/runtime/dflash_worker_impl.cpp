@@ -372,7 +372,7 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
         << "Block-diffusion mask_token_id (" << mask_token_id_
         << ") must be < draft vocab_size (" << draft_vocab_size << ").";
     // Context hidden comes from the target.
-    const ModelArgs& target_args = impl_->context_.get_model_args();
+    const ModelArgs& target_args = target_impl_->context_.get_model_args();
     const int64_t num_target_layers =
         static_cast<int64_t>(target_args.layers_to_capture().size());
     CHECK_GT(num_target_layers, 0)
