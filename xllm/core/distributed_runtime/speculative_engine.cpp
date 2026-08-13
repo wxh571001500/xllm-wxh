@@ -135,7 +135,9 @@ bool SpeculativeEngineBase<TargetEngine>::init_model(
     }
   }
 
-  engine_->init_eplb_manager();
+  if constexpr (std::is_same_v<TargetEngine, LLMEngine>) {
+    engine_->init_eplb_manager();
+  }
   dtype_ = util::parse_dtype(model_args_.dtype(), options_.devices()[0]);
   return true;
 }
