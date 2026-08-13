@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 
 #include "core/framework/model/model_args.h"
 #include "core/util/utils.h"
@@ -27,6 +28,13 @@ inline int64_t mtp_hidden_state_width(const ModelArgs& model_args) {
     return model_args.hc_mult() * model_args.hidden_size();
   }
   return model_args.hidden_size();
+}
+
+inline bool uses_embedded_eagle3_draft(std::string_view algorithm,
+                                       const ModelArgs& target_model_args,
+                                       const ModelArgs& draft_model_args) {
+  return algorithm == "Eagle3" && target_model_args.enable_mla() &&
+         !draft_model_args.enable_mla();
 }
 
 }  // namespace xllm

@@ -80,7 +80,7 @@ class TestMTPWorker final : public MTPWorkerImpl {
 
   void replace_transfer_workers(std::unique_ptr<LLMWorkerImpl> target,
                                 std::unique_ptr<LLMWorkerImpl> draft) {
-    target_impl_ = std::move(target);
+    impl_ = std::move(target);
     draft_impl_ = std::move(draft);
   }
 };

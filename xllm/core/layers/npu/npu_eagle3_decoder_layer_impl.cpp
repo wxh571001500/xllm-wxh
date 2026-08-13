@@ -369,22 +369,13 @@ void NpuEagle3DecoderLayerImpl::build_node_variant_pack(
   }
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
       internal_tensors_extra_;
-  int input_idx = WEIGHT_COUNT_PER_LAYER + 12;
   if (is_prefill &&
       ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
-    if (input_idx < static_cast<int>(node.variantPack.inTensors.size())) {
-      node.variantPack.inTensors.at(input_idx) =
-          atb_speed::Utils::AtTensor2Tensor(
-              input_params.attention.device.q_seq_lens);
-      node.variantPack.inTensors.at(input_idx).hostData =
-          input_params.attention.host.q_seq_lens.data();
-    } else {
-      LOG_FIRST_N(WARNING, 1)
-          << "Eagle3 prefill ATB operation does not expose q_seq_lens input; "
-          << "skip optional chunked-prefill input, input_num="
-          << node.variantPack.inTensors.size()
-          << ", required_index=" << input_idx;
-    }
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.q_seq_lens);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12).hostData =
+        input_params.attention.host.q_seq_lens.data();
   }
 
   for (size_t i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {

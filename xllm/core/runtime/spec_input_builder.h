@@ -37,11 +37,11 @@ struct DecodeBuildMeta {
   int32_t kv_max_seq_len = 0;
 };
 
-// A position builder that Compatible with both RoPE and mRoPE. For mRoPE, it
-// emits 3 columns of position ids
+// Builds position ids for RoPE and mRoPE layouts. mRoPE emits three position
+// ids per token.
 struct PositionBuildHelper {
   PositionBuildHelper() = default;
-  PositionBuildHelper(const torch::Tensor& position_ids_tensor)
+  explicit PositionBuildHelper(const torch::Tensor& position_ids_tensor)
       : position_ids(position_ids_tensor) {
     use_mrope_positions =
         position_ids_tensor.dim() == 2 && position_ids_tensor.size(0) == 3;

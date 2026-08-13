@@ -21,6 +21,7 @@ limitations under the License.
 #include <memory>
 #include <type_traits>
 
+#include "framework/model/mtp_utils.h"
 #include "llm_engine.h"
 #include "util/utils.h"
 #include "vlm_engine.h"
@@ -150,9 +151,9 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
     return engine_->allocate_kv_cache(target_kv_cache_cap);
   }
 
-  // Kimi K2.5 Eagle3 keeps the draft worker inside the target engine and
-  // allocates its non-MLA KV cache with a separate shape.  Do not compare it
-  // with the target MLA cache or allocate the external draft engine here.
+  // Some MLA Eagle3 targets keep the draft worker inside the target engine and
+  // allocate its full-attention KV cache with a separate shape. Do not compare
+  // that shape with the target MLA cache or allocate the external draft here.
   if (should_skip_external_draft_kv_cache()) {
     return engine_->allocate_kv_cache(target_kv_cache_cap);
   }
@@ -198,9 +199,9 @@ bool SpeculativeEngineBase<TargetEngine>::should_skip_external_draft_kv_cache()
   if (!use_draft_engine_ || draft_engine_ == nullptr) {
     return false;
   }
-  return options_.speculative_algorithm() == "Eagle3" &&
-         model_args_.model_type() == "kimi_k25" &&
-         draft_engine_->model_args().model_type() == "kimi_k25_eagle3";
+  return uses_embedded_eagle3_draft(options_.speculative_algorithm(),
+                                    model_args_,
+                                    draft_engine_->model_args());
 }
 
 template <typename TargetEngine>

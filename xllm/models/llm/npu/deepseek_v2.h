@@ -209,14 +209,10 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     auto sin_pos = cos_sin_chunks[1].contiguous();
 
     torch::Tensor attn_mask;
-    const bool is_spec_verify_chunked =
-        input_params.is_spec_verify &&
-        input_params.meta.batch_forward_type.is_chunked_prefill();
     if (::xllm::KVCacheConfig::get_instance().enable_prefix_cache() &&
         !input_params.meta.batch_forward_type.is_decode()) {
       attn_mask = attn_mask_.get_attn_mask(512, dtype_, device_);
-    } else if (input_params.meta.batch_forward_type.is_prefill() ||
-               is_spec_verify_chunked) {
+    } else if (input_params.meta.batch_forward_type.is_prefill()) {
       attn_mask = attn_mask_.get_attn_mask(128, dtype_, device_);
     } else if (num_speculative_tokens_ > 0) {
       // TODO :the judgement of gen_free_mask need more check

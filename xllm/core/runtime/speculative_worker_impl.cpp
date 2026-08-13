@@ -70,10 +70,10 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
     WorkerType worker_type)
     : WorkerImpl(parallel_args, device, options) {
   if (worker_type == WorkerType::LLM) {
-    target_impl_ =
+    impl_ =
         std::make_unique<LLMWorkerImpl>(parallel_args, device, target_options);
   } else if (worker_type == WorkerType::VLM) {
-    target_impl_ =
+    impl_ =
         std::make_unique<VLMWorkerImpl>(parallel_args, device, target_options);
   } else {
     LOG(FATAL) << "Unsupported speculative worker type: "
@@ -86,29 +86,29 @@ bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
                                        MasterStatus master_status) {
   // Base class only loads the target model.
   bool result = true;
-  CHECK(target_impl_ != nullptr);
-  if (target_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
-    result = target_impl_->WorkerImpl::init_model(
+  CHECK(impl_ != nullptr);
+  if (impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
+    result = impl_->WorkerImpl::init_model(
         model_weights_path, random_seed, master_status);
     if (result) {
-      dtype_ = target_impl_->dtype();
-      embedding_size_ = target_impl_->hidden_size();
+      dtype_ = impl_->dtype();
+      embedding_size_ = impl_->hidden_size();
     }
   }
   enable_fused_kernel_ =
-      target_impl_->get_optimization_config().enable_fused_spec_kernel;
+      impl_->get_optimization_config().enable_fused_spec_kernel;
   return result;
 }
 
 bool SpeculativeWorkerImpl::allocate_kv_cache(
     const KVCacheShape& kv_cache_shape) {
-  return target_impl_->allocate_kv_cache(kv_cache_shape);
+  return impl_->allocate_kv_cache(kv_cache_shape);
 }
 
 #if defined(USE_NPU)
 bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
-  return target_impl_->allocate_kv_cache_with_transfer(kv_cache_shape);
+  return impl_->allocate_kv_cache_with_transfer(kv_cache_shape);
 }
 #endif
 
