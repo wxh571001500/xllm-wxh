@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from xllm.python import ops
+from xllm.python.layers.moe.runtime import get_moe_batch_metadata
 from xllm.python.layers.moe.types import MoEParallelConfig, MoEPrepareOutput
 
 
@@ -117,6 +118,42 @@ class _ExpertParallelPrepareAndFinalize(PrepareAndFinalize):
                 )
         return hidden_states
 
+    def _runtime_max_tokens(
+        self,
+        local_tokens: int,
+        partitioned_input: bool,
+    ) -> int | None:
+        metadata = get_moe_batch_metadata()
+        if metadata is None:
+            return None
+        if metadata.local_num_tokens != self._num_tokens:
+            raise ValueError(
+                "MoE runtime metadata does not match the input token count: "
+                f"expected {self._num_tokens}, got "
+                f"{metadata.local_num_tokens}"
+            )
+        max_tokens = metadata.max_num_tokens
+        if partitioned_input:
+            max_tokens = (
+                max_tokens + self._config.input_tp_size - 1
+            ) // self._config.input_tp_size
+        if max_tokens < local_tokens:
+            raise ValueError(
+                "MoE runtime padding target is smaller than the local input: "
+                f"target {max_tokens}, local {local_tokens}"
+            )
+        return max_tokens
+
+    def _runtime_actual_tokens(self) -> int:
+        metadata = get_moe_batch_metadata()
+        if metadata is None:
+            return self._num_tokens
+        if metadata.local_num_tokens != self._num_tokens:
+            raise ValueError(
+                "MoE runtime metadata does not match the input token count"
+            )
+        return metadata.local_actual_tokens
+
     def _partition_replicated_input(
         self,
         hidden_states: torch.Tensor,
@@ -174,16 +211,29 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> MoEPrepareOutput:
-        self._num_tokens = hidden_states.shape[0]
-        if (
-            self._config.ep_size == 1
-            or self._config.partitions_replicated_input
-        ):
+        if self._config.partitions_replicated_input:
+            prepared = self._partition_replicated_input(
+                hidden_states,
+                router_logits,
+            )
+            hidden_states = prepared.hidden_states
+            router_logits = prepared.router_logits
+            input_shape = prepared.padded_hidden_states_shape
+        else:
+            self._num_tokens = hidden_states.shape[0]
+            input_shape = None
+        if self._config.ep_size == 1:
             return MoEPrepareOutput(hidden_states, router_logits)
 
-        token_counts = self._gather_token_counts(hidden_states)
-        max_tokens = int(token_counts.max().item())
-        pad_size = max_tokens - self._num_tokens
+        local_tokens = hidden_states.shape[0]
+        max_tokens = self._runtime_max_tokens(
+            local_tokens,
+            self._config.partitions_replicated_input,
+        )
+        if max_tokens is None:
+            token_counts = self._gather_token_counts(hidden_states)
+            max_tokens = int(token_counts.max().item())
+        pad_size = max_tokens - local_tokens
         if pad_size > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
             router_logits = F.pad(router_logits, (0, 0, 0, pad_size))
@@ -202,7 +252,7 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         return MoEPrepareOutput(
             hidden_states=hidden_states,
             router_logits=router_logits,
-            padded_hidden_states_shape=hidden_states.shape,
+            padded_hidden_states_shape=input_shape,
         )
 
     def finalize(
@@ -211,14 +261,6 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         reduce_results: bool,
         padded_hidden_states_shape: torch.Size | None = None,
     ) -> torch.Tensor:
-        del padded_hidden_states_shape
-        if self._config.partitions_replicated_input:
-            if self._config.ep_size > 1:
-                ops.all_reduce_(
-                    hidden_states,
-                    group_name=self._config.ep_group_name,
-                )
-            return hidden_states
         if self._config.ep_size > 1:
             hidden_states = ops.reduce_scatter(
                 hidden_states,
@@ -226,7 +268,18 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
                 world_size=self._config.ep_size,
                 group_name=self._config.ep_group_name,
             )
-            hidden_states = hidden_states[: self._num_tokens]
+            local_tokens = (
+                padded_hidden_states_shape[0] // self._config.input_tp_size
+                if self._config.partitions_replicated_input
+                and padded_hidden_states_shape is not None
+                else self._num_tokens
+            )
+            hidden_states = hidden_states[:local_tokens]
+        if self._config.partitions_replicated_input:
+            return self._gather_partitioned_output(
+                hidden_states,
+                padded_hidden_states_shape,
+            )
         return self._reduce_tp(hidden_states, reduce_results)
 
 
@@ -275,24 +328,39 @@ class MC2PrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
                 hidden_states,
                 router_logits,
             )
-            local_tokens = prepared.hidden_states.shape[0]
-            if local_tokens > self._config.mc2_tokens_capacity:
+            hidden_states = prepared.hidden_states
+            router_logits = prepared.router_logits
+            local_tokens = hidden_states.shape[0]
+            max_tokens = self._runtime_max_tokens(
+                local_tokens,
+                partitioned_input=True,
+            )
+            if max_tokens is None:
+                token_counts = self._gather_token_counts(hidden_states)
+                max_tokens = int(token_counts.max().item())
+            if max_tokens > self._config.mc2_tokens_capacity:
                 raise ValueError(
-                    f"MC2 token count {local_tokens} exceeds capacity "
+                    f"MC2 token count {max_tokens} exceeds capacity "
                     f"{self._config.mc2_tokens_capacity}"
                 )
+            actual_tokens = self._runtime_actual_tokens()
             active_mask = torch.arange(
                 prepared.padded_hidden_states_shape[0],
                 device=hidden_states.device,
-            ) < self._num_tokens
+            ) < actual_tokens
             active_mask = torch.tensor_split(
                 active_mask,
                 self._config.input_tp_size,
                 dim=0,
             )[self._config.input_tp_rank]
+            pad_size = max_tokens - local_tokens
+            if pad_size > 0:
+                hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
+                router_logits = F.pad(router_logits, (0, 0, 0, pad_size))
+                active_mask = F.pad(active_mask, (0, pad_size), value=False)
             return MoEPrepareOutput(
-                hidden_states=prepared.hidden_states,
-                router_logits=prepared.router_logits,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
                 padded_hidden_states_shape=(
                     prepared.padded_hidden_states_shape
                 ),
@@ -310,8 +378,13 @@ class MC2PrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
                 active_mask=active_mask,
             )
 
-        token_counts = self._gather_token_counts(hidden_states)
-        max_tokens = int(token_counts.max().item())
+        max_tokens = self._runtime_max_tokens(
+            self._num_tokens,
+            partitioned_input=False,
+        )
+        if max_tokens is None:
+            token_counts = self._gather_token_counts(hidden_states)
+            max_tokens = int(token_counts.max().item())
         if max_tokens > self._config.mc2_tokens_capacity:
             raise ValueError(
                 f"MC2 token count {max_tokens} exceeds capacity "
@@ -320,7 +393,7 @@ class MC2PrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         active_mask = torch.arange(
             max_tokens,
             device=hidden_states.device,
-        ) < self._num_tokens
+        ) < self._runtime_actual_tokens()
         pad_size = max_tokens - self._num_tokens
         if pad_size > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
@@ -340,8 +413,16 @@ class MC2PrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
     ) -> torch.Tensor:
         hidden_states = self._reduce_tp(hidden_states, reduce_results)
         if self._config.partitions_replicated_input:
+            if padded_hidden_states_shape is None:
+                raise ValueError(
+                    "MC2 partitioned input requires its padded shape"
+                )
+            local_tokens = (
+                padded_hidden_states_shape[0]
+                // self._config.input_tp_size
+            )
             return self._gather_partitioned_output(
-                hidden_states,
+                hidden_states[:local_tokens],
                 padded_hidden_states_shape,
             )
         return hidden_states[: self._num_tokens]

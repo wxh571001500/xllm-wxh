@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -38,6 +39,9 @@ sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, KVCache  # noqa: E402
 from xllm.python.layers.attention import Attention  # noqa: E402
+from xllm.python.layers.moe.runtime import (  # noqa: E402
+    get_moe_batch_metadata,
+)
 from xllm.python.model_executor.executor import (  # noqa: E402
     ModelExecutor,
     _create_attention_backend,
@@ -395,6 +399,44 @@ class TestExecuteRouting:
         result = executor.execute(torch.zeros(1), torch.zeros(1), metadata)
         executor.eager_runner.execute.assert_called_once()
         assert torch.equal(result, torch.ones(5))
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+    )
+    def test_execute_shares_scheduler_moe_metadata(self, mock_create):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+        executor = ModelExecutor(
+            model,
+            {"dp_size": 4, "rank": 4, "tp_size": 2},
+            max_seqs_per_batch=4,
+        )
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+        executor.eager_runner = MagicMock()
+
+        def _execute(*_args):
+            batch_metadata = get_moe_batch_metadata()
+            assert batch_metadata is not None
+            assert batch_metadata.local_num_tokens == 64
+            assert batch_metadata.local_actual_tokens == 63
+            assert batch_metadata.max_num_tokens == 90
+            return torch.ones(5)
+
+        executor.eager_runner.execute.side_effect = _execute
+        moe_metadata = SimpleNamespace(
+            dp_global_token_nums=[75, 83, 64, 90],
+            raw_dp_global_token_nums=[75, 83, 63, 90],
+        )
+
+        result = executor.execute(
+            torch.zeros(64),
+            torch.zeros(64),
+            MagicMock(spec=AttentionMetadata),
+            moe_metadata=moe_metadata,
+        )
+
+        assert torch.equal(result, torch.ones(5))
+        assert get_moe_batch_metadata() is None
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",

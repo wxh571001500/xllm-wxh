@@ -82,14 +82,13 @@ class MoEParallelConfig:
             raise ValueError("MoE input TP rank and size are invalid")
         if input_tp_size != self.tp_size:
             supported = (
-                self.dp_size == 1
-                and self.tp_size == 1
-                and input_tp_size == self.ep_size
+                self.tp_size == 1
+                and input_tp_size * self.dp_size == self.ep_size
             )
             if not supported:
                 raise ValueError(
-                    "MoE currently supports distinct input TP only for "
-                    "dp=1, moe_tp=1, and input_tp=ep"
+                    "MoE distinct input TP requires moe_tp=1 and "
+                    "input_tp_size * dp_size == ep_size"
                 )
 
     @property

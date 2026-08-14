@@ -46,6 +46,11 @@ from xllm.python.layers.moe.prepare_finalize import (
     TensorParallelPrepareAndFinalize,
 )
 from xllm.python.layers.moe.router import GroupedTopKRouter, MoERouter
+from xllm.python.layers.moe.runtime import (
+    MoEBatchMetadata,
+    get_moe_batch_metadata,
+    moe_batch_context,
+)
 from xllm.python.layers.moe.runner import MoERunner
 from xllm.python.layers.moe.token_dispatcher import (
     AllToAllTokenDispatcher,
@@ -86,6 +91,7 @@ __all__ = [
     "MC2PrepareAndFinalize",
     "MC2TokenDispatcher",
     "MoE",
+    "MoEBatchMetadata",
     "MoECommType",
     "MoECommMethod",
     "MoEExpertsConfig",
@@ -108,4 +114,6 @@ __all__ = [
     "TensorParallelPrepareAndFinalize",
     "UnquantizedRoutedExperts",
     "build_moe_comm_method",
+    "get_moe_batch_metadata",
+    "moe_batch_context",
 ]

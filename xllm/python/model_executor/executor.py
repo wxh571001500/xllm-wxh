@@ -22,6 +22,10 @@ from xllm.python.layers.attention import (
     AttentionLayerSpec,
     AttentionRuntimeLayer,
 )
+from xllm.python.layers.moe.runtime import (
+    MoEBatchMetadata,
+    moe_batch_context,
+)
 from xllm.python.model_executor.runners.eager import EagerRunner
 
 
@@ -113,6 +117,13 @@ class ModelExecutor:
         # DP size from the C++ parallel properties (1 when DP is disabled).
         # Used to gate decode-graph execution on all DP ranks decoding.
         self._dp_size = int(config.get("dp_size", 1) or 1)
+        global_rank = int(config.get("rank", config.get("tp_rank", 0)) or 0)
+        attention_tp_size = int(config.get("tp_size", 1) or 1)
+        self._dp_rank = int(
+            config.get("dp_rank", global_rank // attention_tp_size) or 0
+        )
+        if not 0 <= self._dp_rank < self._dp_size:
+            raise ValueError("Python model DP rank must be within DP size")
         # The paged-KV backend geometry (heads/dims) must come from a real
         # paged-attention layer. KDA ("linear") layers are runtime layers for
         # ordering only and carry no paged-KV geometry, so build the backend
@@ -263,6 +274,47 @@ class ModelExecutor:
             has_initial_state=_to_device(view.has_initial_state),
         )
 
+    def _build_moe_batch_metadata(
+        self,
+        view: object | None,
+        num_tokens: int,
+    ) -> MoEBatchMetadata | None:
+        if view is None:
+            return None
+        dp_token_counts = tuple(
+            int(count)
+            for count in getattr(view, "dp_global_token_nums", ())
+        )
+        if not dp_token_counts:
+            return MoEBatchMetadata(
+                local_num_tokens=num_tokens,
+                local_actual_tokens=num_tokens,
+                max_num_tokens=num_tokens,
+            )
+        if len(dp_token_counts) != self._dp_size:
+            raise ValueError(
+                "MoE DP token metadata size does not match configured DP size"
+            )
+        raw_token_counts = tuple(
+            int(count)
+            for count in getattr(view, "raw_dp_global_token_nums", ())
+        )
+        if raw_token_counts and len(raw_token_counts) != self._dp_size:
+            raise ValueError(
+                "MoE raw DP token metadata size does not match configured DP size"
+            )
+        local_num_tokens = dp_token_counts[self._dp_rank]
+        local_actual_tokens = (
+            raw_token_counts[self._dp_rank]
+            if raw_token_counts
+            else local_num_tokens
+        )
+        return MoEBatchMetadata(
+            local_num_tokens=local_num_tokens,
+            local_actual_tokens=local_actual_tokens,
+            max_num_tokens=max(dp_token_counts),
+        )
+
     def execute(
         self,
         input_ids: torch.Tensor,
@@ -270,6 +322,7 @@ class ModelExecutor:
         metadata: AttentionMetadata,
         inputs_embeds: torch.Tensor | None = None,
         kda_metadata: object | None = None,
+        moe_metadata: object | None = None,
     ) -> torch.Tensor:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
@@ -279,6 +332,27 @@ class ModelExecutor:
         if kda_metadata is not None:
             self.set_kda_metadata(kda_metadata, input_ids.shape[0])
 
+        batch_metadata = self._build_moe_batch_metadata(
+            moe_metadata,
+            input_ids.shape[0],
+        )
+        with moe_batch_context(batch_metadata):
+            return self._execute_model(
+                input_ids,
+                positions,
+                metadata,
+                inputs_embeds,
+                kda_metadata,
+            )
+
+    def _execute_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+        inputs_embeds: torch.Tensor | None,
+        kda_metadata: object | None,
+    ) -> torch.Tensor:
         # Multimodal prefill supplies already-merged embeddings from the C++
         # VLM data path. Graph runners only accept token ids, so execute this
         # path eagerly until they grow an inputs_embeds input contract.

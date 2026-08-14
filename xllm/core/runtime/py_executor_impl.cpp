@@ -189,6 +189,25 @@ class KimiK3KDAMetadataView final {
   bool all_dp_decode_ = true;
 };
 
+class MoEBatchMetadataView final {
+ public:
+  explicit MoEBatchMetadataView(const ModelInputParams& params)
+      : dp_global_token_nums_(params.parallel.dp_global_token_nums),
+        raw_dp_global_token_nums_(params.parallel.raw_dp_global_token_nums) {}
+
+  const std::vector<int32_t>& dp_global_token_nums() const {
+    return dp_global_token_nums_;
+  }
+
+  const std::vector<int32_t>& raw_dp_global_token_nums() const {
+    return raw_dp_global_token_nums_;
+  }
+
+ private:
+  std::vector<int32_t> dp_global_token_nums_;
+  std::vector<int32_t> raw_dp_global_token_nums_;
+};
+
 }  // namespace
 
 PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
@@ -227,6 +246,12 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
                              &KimiK3KDAMetadataView::num_prefill_seqs)
       .def_property_readonly("all_dp_decode",
                              &KimiK3KDAMetadataView::all_dp_decode);
+
+  py::class_<MoEBatchMetadataView>(m, "MoEBatchMetadataView")
+      .def_property_readonly("dp_global_token_nums",
+                             &MoEBatchMetadataView::dp_global_token_nums)
+      .def_property_readonly("raw_dp_global_token_nums",
+                             &MoEBatchMetadataView::raw_dp_global_token_nums);
 }
 
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
@@ -319,14 +344,19 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object py_kda_metadata =
       has_kda_layers_ ? py::object(py::cast(KimiK3KDAMetadataView(params)))
                       : py::object(py::none());
+  py::object py_moe_metadata = py::cast(MoEBatchMetadataView(params));
 
   // Execute: one C++ -> Python call per step.
   py::object input_embedding =
       params.embedding.input_embedding.defined()
           ? py::object(py::cast(params.embedding.input_embedding))
           : py::object(py::none());
-  py::object hidden_obj = py_executor_.attr("execute")(
-      tokens, positions, py_metadata, input_embedding, py_kda_metadata);
+  py::object hidden_obj = py_executor_.attr("execute")(tokens,
+                                                       positions,
+                                                       py_metadata,
+                                                       input_embedding,
+                                                       py_kda_metadata,
+                                                       py_moe_metadata);
   return ModelOutput(hidden_obj.cast<torch::Tensor>());
 }
 

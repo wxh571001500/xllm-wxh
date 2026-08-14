@@ -57,6 +57,7 @@ from xllm.python.layers.moe import (
     MC2PrepareAndFinalize,
     MC2TokenDispatcher,
     MoE,
+    MoEBatchMetadata,
     MoECommType,
     MoEExpertsConfig,
     MoEParallelConfig,
@@ -67,6 +68,7 @@ from xllm.python.layers.moe import (
     NativeTokenDispatcher,
     TensorParallelCommMethod,
     UnquantizedRoutedExperts,
+    moe_batch_context,
 )
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
@@ -1525,34 +1527,132 @@ def test_all_gather_reduces_replicated_input_over_ep() -> None:
     config = MoEParallelConfig(
         tp_size=1,
         tp_rank=0,
-        ep_size=2,
+        ep_size=8,
         ep_rank=0,
-        dp_size=1,
+        dp_size=4,
         dp_rank=0,
         input_tp_size=2,
         input_tp_rank=0,
     )
     stage = AllGatherPrepareAndFinalize(config)
-    hidden_states = torch.arange(6, dtype=torch.float32).view(2, 3)
-    router_logits = torch.ones(2, 4)
+    hidden_states = torch.arange(9, dtype=torch.float32).view(3, 3)
+    router_logits = torch.ones(3, 4)
+    local_partition = torch.tensor(
+        [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+    )
+    gathered_hidden = local_partition.repeat(8, 1)
+    gathered_router = torch.ones(16, 4)
 
     with (
         patch(
-            "xllm.python.layers.moe.prepare_finalize.ops.all_gather"
+            "xllm.python.layers.moe.prepare_finalize.ops.all_gather",
+            side_effect=[
+                torch.full((8,), 2, dtype=torch.int64),
+                gathered_hidden,
+                gathered_router,
+                torch.tensor(
+                    [
+                        [10.0, 11.0, 12.0],
+                        [13.0, 14.0, 15.0],
+                        [20.0, 21.0, 22.0],
+                        [0.0, 0.0, 0.0],
+                    ]
+                ),
+            ],
         ) as mock_all_gather,
         patch(
-            "xllm.python.layers.moe.prepare_finalize.ops.all_reduce_",
-            side_effect=lambda tensor, **_: tensor.mul_(2),
-        ) as mock_all_reduce,
+            "xllm.python.layers.moe.prepare_finalize.ops.reduce_scatter",
+            return_value=torch.tensor(
+                [[10.0, 11.0, 12.0], [13.0, 14.0, 15.0]]
+            ),
+        ) as mock_reduce_scatter,
     ):
         prepared = stage.prepare(hidden_states, router_logits)
-        output = stage.finalize(hidden_states.clone(), reduce_results=True)
+        output = stage.finalize(
+            prepared.hidden_states,
+            reduce_results=True,
+            padded_hidden_states_shape=prepared.padded_hidden_states_shape,
+        )
 
-    assert prepared.hidden_states is hidden_states
-    assert prepared.router_logits is router_logits
-    torch.testing.assert_close(output, hidden_states * 2)
-    mock_all_gather.assert_not_called()
-    assert mock_all_reduce.call_args.kwargs["group_name"] == "moe_ep"
+    assert prepared.hidden_states.shape == (16, 3)
+    assert prepared.router_logits.shape == (16, 4)
+    torch.testing.assert_close(
+        output,
+        torch.tensor(
+            [[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [20.0, 21.0, 22.0]]
+        ),
+    )
+    assert mock_all_gather.call_count == 4
+    mock_reduce_scatter.assert_called_once()
+
+
+def test_all_gather_uses_forward_metadata_without_ep_count_gather() -> None:
+    config = MoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        ep_size=8,
+        ep_rank=0,
+        dp_size=4,
+        dp_rank=0,
+        input_tp_size=2,
+        input_tp_rank=1,
+    )
+    stage = AllGatherPrepareAndFinalize(config)
+    metadata = MoEBatchMetadata(
+        local_num_tokens=3,
+        local_actual_tokens=3,
+        max_num_tokens=5,
+    )
+    gathered_hidden = torch.zeros(24, 3)
+    gathered_router = torch.zeros(24, 4)
+
+    with (
+        moe_batch_context(metadata),
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.all_gather",
+            side_effect=[
+                gathered_hidden,
+                gathered_router,
+                torch.tensor(
+                    [
+                        [10.0, 11.0, 12.0],
+                        [13.0, 14.0, 15.0],
+                        [20.0, 21.0, 22.0],
+                        [0.0, 0.0, 0.0],
+                    ]
+                ),
+            ],
+        ) as mock_all_gather,
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.reduce_scatter",
+            return_value=torch.tensor(
+                [
+                    [20.0, 21.0, 22.0],
+                    [0.0, 0.0, 0.0],
+                    [30.0, 31.0, 32.0],
+                ]
+            ),
+        ),
+    ):
+        prepared = stage.prepare(
+            torch.arange(9, dtype=torch.float32).view(3, 3),
+            torch.ones(3, 4),
+        )
+        output = stage.finalize(
+            prepared.hidden_states,
+            reduce_results=True,
+            padded_hidden_states_shape=prepared.padded_hidden_states_shape,
+        )
+
+    assert prepared.hidden_states.shape == (24, 3)
+    assert prepared.router_logits.shape == (24, 4)
+    torch.testing.assert_close(
+        output,
+        torch.tensor(
+            [[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [20.0, 21.0, 22.0]]
+        ),
+    )
+    assert mock_all_gather.call_count == 3
 
 
 def test_all_to_all_partitions_and_restores_replicated_input() -> None:
@@ -1620,17 +1720,90 @@ def test_mc2_partitions_active_mask_with_replicated_input() -> None:
     )
     stage = MC2PrepareAndFinalize(config)
 
-    prepared = stage.prepare(
-        torch.arange(6, dtype=torch.float32).view(3, 2),
-        torch.arange(12, dtype=torch.float32).view(3, 4),
-    )
+    with patch(
+        "xllm.python.layers.moe.prepare_finalize.ops.all_gather",
+        side_effect=[
+            torch.tensor([2, 3], dtype=torch.int64),
+            torch.tensor(
+                [[10.0, 11.0], [12.0, 13.0], [20.0, 21.0], [0.0, 0.0]]
+            ),
+        ],
+    ) as mock_all_gather:
+        prepared = stage.prepare(
+            torch.arange(6, dtype=torch.float32).view(3, 2),
+            torch.arange(12, dtype=torch.float32).view(3, 4),
+        )
+        output = stage.finalize(
+            torch.tensor(
+                [[20.0, 21.0], [0.0, 0.0], [30.0, 31.0]]
+            ),
+            reduce_results=True,
+            padded_hidden_states_shape=prepared.padded_hidden_states_shape,
+        )
 
     torch.testing.assert_close(
         prepared.active_mask,
-        torch.tensor([True, False]),
+        torch.tensor([True, False, False]),
     )
-    assert prepared.hidden_states.shape == (2, 2)
-    assert prepared.router_logits.shape == (2, 4)
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[10.0, 11.0], [12.0, 13.0], [20.0, 21.0]]),
+    )
+    assert prepared.hidden_states.shape == (3, 2)
+    assert prepared.router_logits.shape == (3, 4)
+    assert mock_all_gather.call_count == 2
+
+
+def test_mc2_uses_forward_metadata_without_ep_count_gather() -> None:
+    config = MoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=1,
+        dp_size=1,
+        dp_rank=0,
+        input_tp_size=2,
+        input_tp_rank=1,
+        comm_type=MoECommType.MC2,
+    )
+    stage = MC2PrepareAndFinalize(config)
+    metadata = MoEBatchMetadata(
+        local_num_tokens=3,
+        local_actual_tokens=3,
+        max_num_tokens=5,
+    )
+
+    with (
+        moe_batch_context(metadata),
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.all_gather",
+            return_value=torch.tensor(
+                [[10.0, 11.0], [12.0, 13.0], [20.0, 21.0], [0.0, 0.0]]
+            ),
+        ) as mock_all_gather,
+    ):
+        prepared = stage.prepare(
+            torch.arange(6, dtype=torch.float32).view(3, 2),
+            torch.arange(12, dtype=torch.float32).view(3, 4),
+        )
+        output = stage.finalize(
+            torch.tensor(
+                [[20.0, 21.0], [0.0, 0.0], [30.0, 31.0]]
+            ),
+            reduce_results=True,
+            padded_hidden_states_shape=prepared.padded_hidden_states_shape,
+        )
+
+    torch.testing.assert_close(
+        prepared.active_mask,
+        torch.tensor([True, False, False]),
+    )
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[10.0, 11.0], [12.0, 13.0], [20.0, 21.0]]),
+    )
+    mock_all_gather.assert_called_once()
+    assert mock_all_gather.call_args.kwargs["group_name"] == "tp"
 
 
 def test_all_to_all_dispatcher_restores_local_token_order() -> None:
