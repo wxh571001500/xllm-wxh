@@ -366,14 +366,17 @@ void DisaggPDScheduler::dispatch_requests() {
     }
     remote_instances_info_[selected_instance] = remote_info;
 
-    const bool enable_mla = engine_->model_args().enable_mla();
+    const ModelArgs& model_args = engine_->model_args();
+    const bool kv_cache_is_tp_invariant =
+        model_args.enable_mla() ||
+        util::is_tp_invariant_kv_cache_model_type(model_args.model_type());
     const bool enable_heterogeneous_pd =
         DisaggPDConfig::get_instance().enable_heterogeneous_pd();
     const PdTopoResult topo_result =
         check_pd_topo(instance_info_,
                       remote_info,
                       options_.kv_cache_transfer_mode(),
-                      enable_mla,
+                      kv_cache_is_tp_invariant,
                       enable_heterogeneous_pd);
     const bool allow_pd_topo = topo_result.status == PdTopoStatus::ALLOW_HOMO ||
                                topo_result.status == PdTopoStatus::ALLOW_HETERO;
@@ -388,12 +391,14 @@ void DisaggPDScheduler::dispatch_requests() {
                " is incompatible: " + topo_result.reason});
       continue;
     }
-    if (!enable_mla && topo_result.status == PdTopoStatus::ALLOW_HETERO &&
+    if (!kv_cache_is_tp_invariant &&
+        topo_result.status == PdTopoStatus::ALLOW_HETERO &&
         options_.num_speculative_tokens() <= 0) {
       response_processor_->process_failed_request(
           request,
           {StatusCode::INVALID_ARGUMENT,
-           "non-mla heterogeneous PD requires speculative decoding"});
+           "tp-sharded kv cache heterogeneous PD requires speculative "
+           "decoding"});
       continue;
     }
     if (topo_result.status == PdTopoStatus::ALLOW_HETERO && VLOG_IS_ON(1)) {
@@ -405,7 +410,8 @@ void DisaggPDScheduler::dispatch_requests() {
               << remote_topo.tp_size;
     }
     request->state().heterogeneous_pd =
-        !enable_mla && topo_result.status == PdTopoStatus::ALLOW_HETERO;
+        !kv_cache_is_tp_invariant &&
+        topo_result.status == PdTopoStatus::ALLOW_HETERO;
 
     proto::DisaggPDService_Stub* stub = create_rpc_channel(selected_instance);
     if (stub == nullptr) {
@@ -491,6 +497,9 @@ void DisaggPDScheduler::dispatch_requests() {
       req->set_skip_special_tokens(requests[i]->state().skip_special_tokens);
       req->set_include_stop_str_in_output(
           requests[i]->state().include_stop_str_in_output);
+      req->set_json_object(requests[i]->state().sampling_param.json_object);
+      req->set_json_reasoning_enabled(
+          requests[i]->state().json_reasoning_enabled);
       //*reqs.mutable_reqs()->Add() = req;
     }
     reqs.mutable_cluster_infos()->mutable_cluster_ids()->Add(
@@ -987,7 +996,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
   const double prepare_seconds = receive_timer.elapsed_seconds();
 
-  // Pull KV cache in native PULL mode. For a non-MLA heterogeneous TP PUSH
+  // Pull KV cache in native PULL mode. For a TP-sharded heterogeneous PUSH
   // deployment, pull every P-side shard into temporary D-side caches and
   // concatenate the sharded tensor dimensions before decode starts.
   if (kv_cache_transfer_mode == "PULL" || hetero_kv_pull) {
@@ -1123,8 +1132,6 @@ void DisaggPDScheduler::update_token_latency_metrics(
   const auto now = absl::Now();
   const bool speculative_metrics_enabled =
       options_.num_speculative_tokens() > 0;
-  int64_t step_committed_tokens = 0;
-  int64_t step_decode_seqs = 0;
   for (Sequence* sequence : sequences) {
     if (sequence->is_chunked_prefill_stage() ||
         sequence->last_token_handled()) {
@@ -1147,18 +1154,12 @@ void DisaggPDScheduler::update_token_latency_metrics(
       if (speculative_metrics_enabled && committed_tokens > 0) {
         inter_token_latency_us =
             amortized_token_latency(tbt_microseconds, committed_tokens);
-        step_committed_tokens += static_cast<int64_t>(committed_tokens);
-        ++step_decode_seqs;
       }
       HISTOGRAM_OBSERVE(inter_token_latency_microseconds,
                         inter_token_latency_us);
       HISTOGRAM_OBSERVE(inter_token_latency_milliseconds,
                         microseconds_to_milliseconds(inter_token_latency_us));
     }
-  }
-  if (step_decode_seqs > 0) {
-    GAUGE_SET(speculative_mean_tokens_per_decode_step,
-              static_cast<double>(step_committed_tokens) / step_decode_seqs);
   }
 }
 

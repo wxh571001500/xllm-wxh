@@ -16,6 +16,7 @@ limitations under the License.
 #include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
 
 #include <algorithm>
+#include <exception>
 #include <future>
 #include <memory>
 #include <string>
@@ -79,6 +80,46 @@ std::string make_store_local_hostname(const std::string& configured,
 // one stream per such thread so concurrent offloads never block on the stream
 // queue.
 constexpr size_t kOffloadStreamCount = 4;
+
+using CopyStreamQueue =
+    moodycamel::BlockingConcurrentQueue<std::unique_ptr<Stream>>;
+
+class CopyStreamLease final {
+ public:
+  explicit CopyStreamLease(CopyStreamQueue* stream_pool)
+      : stream_pool_(stream_pool) {
+    CHECK(stream_pool_ != nullptr) << "copy stream pool must not be null.";
+    stream_pool_->wait_dequeue(stream_);
+    CHECK(stream_ != nullptr) << "copy stream must not be null.";
+  }
+
+  ~CopyStreamLease() { stream_pool_->enqueue(std::move(stream_)); }
+
+  CopyStreamLease(const CopyStreamLease&) = delete;
+  CopyStreamLease& operator=(const CopyStreamLease&) = delete;
+
+  Stream* get() const { return stream_.get(); }
+
+  void drain_or_die(const char* reason) const {
+    try {
+      const int synchronize_result = stream_->synchronize();
+      if (synchronize_result != 0) {
+        LOG(FATAL) << "Failed to drain KV Cache copy stream: reason=" << reason
+                   << ", result=" << synchronize_result;
+      }
+    } catch (const std::exception& error) {
+      LOG(FATAL) << "Failed to drain KV Cache copy stream: reason=" << reason
+                 << ", error=" << error.what();
+    } catch (...) {
+      LOG(FATAL) << "Failed to drain KV Cache copy stream: reason=" << reason
+                 << ", unknown error.";
+    }
+  }
+
+ private:
+  CopyStreamQueue* stream_pool_ = nullptr;
+  std::unique_ptr<Stream> stream_;
+};
 
 std::vector<HierarchyKVCacheTransfer::LayerBatchRange> build_layer_batch_ranges(
     int64_t num_layers,
@@ -256,7 +297,24 @@ HierarchyKVCacheTransfer::HierarchyKVCacheTransfer(
   }
 }
 
-HierarchyKVCacheTransfer::~HierarchyKVCacheTransfer() = default;
+HierarchyKVCacheTransfer::~HierarchyKVCacheTransfer() {
+  // Joining the load pool first guarantees no producer can enqueue more work
+  // while the copy streams and host cache storage are being released.
+  load_threadpool_.reset();
+
+  device_.set_device();
+  std::unique_ptr<Stream> stream;
+  while (copy_stream_.try_dequeue(stream)) {
+    if (stream == nullptr) {
+      continue;
+    }
+    CHECK_EQ(stream->synchronize(), 0)
+        << "Failed to drain hierarchy KV copy stream during shutdown.";
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  layer_wise_load_synchronizer_.clear();
+}
 
 void HierarchyKVCacheTransfer::build_device_block_type_map() {
   device_kv_caches_.clear();
@@ -518,13 +576,12 @@ bool HierarchyKVCacheTransfer::offload_to_host(
   }
 
   CHECK(batch_memcpy_ != nullptr) << "batch memcpy must be initialized.";
-  std::unique_ptr<Stream> stream;
-  copy_stream_.wait_dequeue(stream);
+  CopyStreamLease stream(&copy_stream_);
   // D2H is issued from an RPC worker, while the preceding forward is enqueued
   // on WorkerImpl's compute stream. Establish a device-side dependency before
   // reading KV; the RPC thread's current/default stream is unrelated when
   // schedule overlap is enabled.
-  stream->wait_stream(*compute_stream_);
+  stream.get()->wait_stream(*compute_stream_);
   bool success = true;
   for (const auto& range : layer_batch_ranges_) {
     CopyPlan plan = build_copy_plan(
@@ -539,7 +596,6 @@ bool HierarchyKVCacheTransfer::offload_to_host(
       break;
     }
   }
-  copy_stream_.enqueue(std::move(stream));
   return success;
 }
 
@@ -553,34 +609,33 @@ bool HierarchyKVCacheTransfer::load_from_host(
   CHECK(synchronizer != nullptr) << "layer synchronizer must not be null.";
   CHECK(batch_memcpy_ != nullptr) << "batch memcpy must be initialized.";
 
-  std::unique_ptr<Stream> stream;
-  copy_stream_.wait_dequeue(stream);
+  CopyStreamLease stream(&copy_stream_);
   bool success = true;
+  bool stream_has_async_h2d = false;
   for (size_t range_idx = 0; range_idx < layer_batch_ranges_.size();
        ++range_idx) {
     CopyPlan plan =
         build_copy_plan(block_transfer_info, layer_batch_ranges_[range_idx]);
-    if (plan.src_tensors.empty()) {
-      if (!synchronizer->record_stream(static_cast<int64_t>(range_idx),
-                                       stream.get())) {
+    if (!plan.src_tensors.empty()) {
+      if (!batch_memcpy_->submit_h2d(
+              plan.src_tensors, plan.dst_tensors, stream.get())) {
+        stream_has_async_h2d = false;
         success = false;
         break;
       }
-      continue;
-    }
-    if (!batch_memcpy_->copy_h2d(
-            plan.src_tensors, plan.dst_tensors, stream.get())) {
-      success = false;
-      break;
+      stream_has_async_h2d = true;
     }
     if (!synchronizer->record_stream(static_cast<int64_t>(range_idx),
                                      stream.get())) {
+      if (stream_has_async_h2d) {
+        stream.drain_or_die("layer-ready event recording failed");
+        stream_has_async_h2d = false;
+      }
       success = false;
       break;
     }
   }
 
-  copy_stream_.enqueue(std::move(stream));
   // On failure some ranges were never recorded; abort the synchronizer so a
   // forward thread spinning on those layers unblocks and reports failure
   // (aborting the forward) instead of hanging or reading uncopied KV cache.

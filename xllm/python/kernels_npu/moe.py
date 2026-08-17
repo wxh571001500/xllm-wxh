@@ -68,6 +68,7 @@ def grouped_moe(
     topk_group: int,
     num_expert_groups: int,
     renormalize: bool,
+    active_expert_range: list[int] | None = None,
 ) -> torch.Tensor:
     """Route and run grouped quantized experts as one fused operator.
 
@@ -83,6 +84,8 @@ def grouped_moe(
         topk_group: Groups selected per token.
         num_expert_groups: Expert groups the router splits experts into.
         renormalize: Whether to rescale the selected weights to sum to one.
+        active_expert_range: ``[start, end)`` of global expert indices handled
+            by this rank.  Defaults to ``[0, num_experts]`` (all experts).
 
     Returns:
         Hidden states of shape ``[num_tokens, hidden_size]``.
@@ -102,21 +105,21 @@ def grouped_moe(
         eps=1e-20,
     )
     num_tokens = hidden_states.shape[0]
-    num_experts = w13.shape[0]
-    sorted_hidden_i8, expanded_row_idx, expert_tokens, pertoken_scale = (
-        torch_npu.npu_moe_init_routing_v2(
-            hidden_states,
-            topk_ids.to(torch.int32),
-            scale=None,
-            active_num=num_tokens * topk,
-            expert_num=num_experts,
-            expert_tokens_num_type=1,
-            expert_tokens_num_flag=True,
-            active_expert_range=[0, num_experts],
-            quant_mode=1,
-        )
+    num_experts = gating_output.shape[1]
+    expert_range = active_expert_range if active_expert_range is not None else [0, num_experts]
+    sorted_hidden_i8, expanded_row_idx, expert_tokens, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+        hidden_states,
+        topk_ids.to(torch.int32),
+        scale=None,
+        active_num=num_tokens * topk,
+        expert_num=num_experts,
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        active_expert_range=expert_range,
+        quant_mode=1,
     )
-    group_list = torch.cumsum(expert_tokens.to(torch.int64), 0)
+    num_local_experts = expert_range[1] - expert_range[0]
+    group_list = torch.cumsum(expert_tokens[:num_local_experts].to(torch.int64), 0)
     act_i8, act_pt, _ = torch.ops.npu.npu_grouped_matmul_swiglu_quant(
         x=sorted_hidden_i8,
         weight=w13,
@@ -135,6 +138,9 @@ def grouped_moe(
         group_list=group_list,
         output_dtype=torch.bfloat16,
     )[0]
+    if expert_range[0] != 0 or expert_range[1] != num_experts:
+        local_mask = (topk_ids >= expert_range[0]) & (topk_ids < expert_range[1])
+        topk_weights = topk_weights * local_mask
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=output,
         sorted_indices=expanded_row_idx.abs(),
@@ -155,6 +161,7 @@ def _grouped_moe_fake(
     topk_group: int,
     num_expert_groups: int,
     renormalize: bool,
+    active_expert_range: list[int] | None = None,
 ) -> torch.Tensor:
     del (
         gating_output,
@@ -167,6 +174,7 @@ def _grouped_moe_fake(
         topk_group,
         num_expert_groups,
         renormalize,
+        active_expert_range,
     )
     return torch.empty_like(hidden_states)
 
@@ -190,8 +198,7 @@ def moe_fused_topk(
     """
     del gating_output, topk, renormalize, scoring_func
     raise NotImplementedError(
-        "moe_fused_topk has no NPU kernel; NPU routes and runs experts in one "
-        "step through grouped_moe"
+        "moe_fused_topk has no NPU kernel; NPU routes and runs experts in one step through grouped_moe"
     )
 
 
@@ -233,10 +240,7 @@ def cutlass_fused_moe(
         ep_size,
         ep_rank,
     )
-    raise NotImplementedError(
-        "cutlass_fused_moe is a CUDA library kernel; the NPU equivalent is "
-        "grouped_moe"
-    )
+    raise NotImplementedError("cutlass_fused_moe is a CUDA library kernel; the NPU equivalent is grouped_moe")
 
 
 def fused_moe(
@@ -260,8 +264,7 @@ def fused_moe(
     """
     del hidden_states, topk_ids, topk_weights, w13, w2
     raise NotImplementedError(
-        "fused_moe has no NPU kernel; see kernels_cuda/triton/fused_moe.py for "
-        "the reference implementation"
+        "fused_moe has no NPU kernel; see kernels_cuda/triton/fused_moe.py for the reference implementation"
     )
 
 

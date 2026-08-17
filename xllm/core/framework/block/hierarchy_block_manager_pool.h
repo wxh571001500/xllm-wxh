@@ -15,13 +15,13 @@ limitations under the License.
 
 #pragma once
 
-#include <atomic>
 #include <map>
 #include <mutex>
 #include <unordered_map>
 
 #include "block_manager_pool.h"
 #include "composite_block_manager.h"
+#include "core/framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "distributed_runtime/engine.h"
 #include "util/blockingconcurrentqueue.h"
 #include "util/timer.h"
@@ -108,10 +108,13 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   // owned only by the Sequence's Host/device cache states.
   std::vector<std::vector<BlockTransferInfo>> load_block_transfer_infos_;
   std::vector<OffloadBlockPairQueue> offload_block_pair_queues_;
-  std::atomic<size_t> pending_offload_transfers_{0};
 
   std::mutex prefetch_plans_mutex_;
   std::unordered_map<Sequence*, std::shared_ptr<PrefetchPlan>> prefetch_plans_;
+
+  // Declared last so destruction waits for callbacks before any manager or
+  // block storage captured by those callbacks is released.
+  KVTransferTracker offload_transfers_;
 };
 
 }  // namespace xllm

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "hierarchy_block_manager_pool.h"
 
+#include <folly/executors/InlineExecutor.h>
+
 #include <algorithm>
 #include <iterator>
 #include <limits>
@@ -31,6 +33,31 @@ namespace xllm {
 namespace {
 
 using ProbeResult = CompositeBlockManager::ProbeResult;
+using HostLeafSnapshot = std::unordered_map<BlockType, BlockManager*>;
+
+void finalize_host_blocks(bool publish,
+                          std::vector<Block> host_blocks,
+                          const std::vector<BlockType>& block_types,
+                          const HostLeafSnapshot& host_leaves) {
+  CHECK_EQ(host_blocks.size(), block_types.size());
+  std::unordered_map<BlockType, std::vector<Block>> blocks_by_type;
+  for (size_t i = 0; i < host_blocks.size(); ++i) {
+    blocks_by_type[block_types[i]].emplace_back(std::move(host_blocks[i]));
+  }
+
+  for (auto& [type, blocks] : blocks_by_type) {
+    auto leaf = host_leaves.find(type);
+    if (leaf == host_leaves.end()) {
+      LOG(ERROR) << "Missing Host block manager for block type "
+                 << static_cast<int32_t>(type);
+      continue;
+    }
+    if (publish) {
+      leaf->second->cache(blocks);
+    }
+    leaf->second->deallocate(blocks);
+  }
+}
 
 // Wrap a leaf in the concurrency adapter when the D2H offload callback frees
 // blocks off-thread. Host-offload leaves always need this wrap.
@@ -944,7 +971,7 @@ void HierarchyBlockManagerPool::transfer_blocks(std::vector<Batch>& batches) {
 void HierarchyBlockManagerPool::transfer_blocks() { transfer_offload_blocks(); }
 
 bool HierarchyBlockManagerPool::has_pending_async_block_release() const {
-  if (pending_offload_transfers_.load(std::memory_order_relaxed) > 0) {
+  if (offload_transfers_.has_pending()) {
     return true;
   }
   for (const OffloadBlockPairQueue& queue : offload_block_pair_queues_) {
@@ -983,16 +1010,15 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
     if (!transfer_infos.empty()) {
       // Capture per-leaf host manager pointers so the completion callback can
       // route each block to the correct host leaf on publish.
-      std::unordered_map<BlockType, BlockManager*> host_leaves_snapshot;
+      HostLeafSnapshot host_leaves_snapshot;
       for (const auto& [type, entry] : host_block_managers_[i]) {
         host_leaves_snapshot.emplace(type, entry.leaf.get());
       }
-      pending_offload_transfers_.fetch_add(1, std::memory_order_relaxed);
-      std::atomic<size_t>* pending_offload_transfers =
-          &pending_offload_transfers_;
+      std::shared_ptr<KVTransferTracker::Completion> completion =
+          offload_transfers_.track();
       folly::collectAll(
           std::move(engine_->transfer_kv_blocks(i, std::move(transfer_infos))))
-          .via(folly::getGlobalCPUExecutor())
+          .via(&folly::InlineExecutor::instance())
           .thenValue([device_blocks = std::move(src_blocks),
                       host_blocks = std::move(dst_blocks),
                       block_types_vec = std::move(block_types),
@@ -1018,54 +1044,16 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
             device_block_mgr_ptr->deallocate(device_blocks);
             device_blocks.clear();
 
-            if (copy_ok) {
-              // Group host blocks by type and cache/free them on the matching
-              // host leaf. Publishing per-type keeps a partial success from
-              // corrupting sibling leaves.
-              std::unordered_map<BlockType, std::vector<Block>> by_type;
-              for (size_t k = 0; k < host_blocks.size(); ++k) {
-                by_type[block_types_vec[k]].emplace_back(
-                    std::move(host_blocks[k]));
-              }
-              for (auto& [type, blocks] : by_type) {
-                auto it = host_leaves.find(type);
-                if (it == host_leaves.end()) {
-                  LOG(ERROR) << "Missing Host block manager for block type "
-                             << static_cast<int32_t>(type);
-                  blocks.clear();
-                  continue;
-                }
-                it->second->cache(blocks);
-                it->second->deallocate(blocks);
-                blocks.clear();
-              }
-              host_blocks.clear();
-            } else {
-              // Publish nothing on failure. Return all host ids to their
-              // owning leaf so no host slot leaks.
-              std::unordered_map<BlockType, std::vector<Block>> by_type;
-              for (size_t k = 0; k < host_blocks.size(); ++k) {
-                by_type[block_types_vec[k]].emplace_back(
-                    std::move(host_blocks[k]));
-              }
-              for (auto& [type, blocks] : by_type) {
-                auto it = host_leaves.find(type);
-                if (it == host_leaves.end()) {
-                  LOG(ERROR) << "Missing Host block manager for block type "
-                             << static_cast<int32_t>(type);
-                  blocks.clear();
-                  continue;
-                }
-                it->second->deallocate(blocks);
-                blocks.clear();
-              }
-              host_blocks.clear();
-            }
+            // Successful copies become visible in the Host prefix cache.
+            // Failures publish nothing, but both paths release every reserved
+            // Host id through the same type-aware ownership path.
+            finalize_host_blocks(
+                copy_ok, std::move(host_blocks), block_types_vec, host_leaves);
 
             return 0;
           })
-          .ensure([pending_offload_transfers]() {
-            pending_offload_transfers->fetch_sub(1, std::memory_order_relaxed);
+          .ensure([completion = std::move(completion)]() mutable {
+            completion.reset();
           });
     }
   }

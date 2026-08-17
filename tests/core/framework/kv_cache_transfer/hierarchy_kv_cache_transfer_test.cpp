@@ -15,12 +15,17 @@ limitations under the License.
 
 #include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
 
+#include <cnrt.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "framework/kv_cache/kv_cache_capacity.h"
@@ -30,7 +35,114 @@ limitations under the License.
 #include "platform/platform.h"
 
 namespace xllm {
+
+class HierarchyKVCacheTransferTestPeer final {
+ public:
+  static void replace_batch_memcpy(HierarchyKVCacheTransfer* transfer,
+                                   std::unique_ptr<BatchMemcpy> batch_memcpy) {
+    transfer->batch_memcpy_ = std::move(batch_memcpy);
+  }
+
+  static void set_layer_batch_ranges(
+      HierarchyKVCacheTransfer* transfer,
+      std::vector<HierarchyKVCacheTransfer::LayerBatchRange> ranges) {
+    transfer->layer_batch_ranges_ = std::move(ranges);
+  }
+
+  static bool load_from_host(
+      HierarchyKVCacheTransfer* transfer,
+      std::shared_ptr<LayerSynchronizer> synchronizer,
+      const std::vector<BlockTransferInfo>& block_transfer_info) {
+    return transfer->load_from_host(std::move(synchronizer),
+                                    block_transfer_info);
+  }
+};
+
 namespace {
+
+struct LoadFailureState {
+  std::atomic<bool> gate_open{false};
+  std::atomic<bool> copy_finished{false};
+  std::atomic<bool> record_failed{false};
+  std::atomic<bool> abort_called{false};
+  std::atomic<bool> abort_saw_completed_copy{false};
+};
+
+void finish_pending_copy(void* user_data) {
+  LoadFailureState* state = static_cast<LoadFailureState*>(user_data);
+  while (!state->gate_open.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  state->copy_finished.store(true, std::memory_order_release);
+}
+
+bool wait_for_flag(const std::atomic<bool>& flag) {
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!flag.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  return flag.load(std::memory_order_acquire);
+}
+
+class PendingBatchMemcpy final : public BatchMemcpy {
+ public:
+  explicit PendingBatchMemcpy(LoadFailureState* state) : state_(state) {}
+
+  void init(int32_t /*device_id*/) override {}
+
+  bool submit_h2d(const std::vector<torch::Tensor>& /*src_tensors*/,
+                  const std::vector<torch::Tensor>& /*dst_tensors*/,
+                  Stream* stream) override {
+    return cnrtInvokeHostFunc(stream->get_stream()->stream(),
+                              finish_pending_copy,
+                              state_) == cnrtSuccess;
+  }
+
+  bool copy_d2h(const std::vector<torch::Tensor>& /*src_tensors*/,
+                const std::vector<torch::Tensor>& /*dst_tensors*/,
+                Stream* /*stream*/) override {
+    ADD_FAILURE() << "Unexpected D2H copy.";
+    return false;
+  }
+
+ private:
+  LoadFailureState* state_ = nullptr;
+};
+
+class SecondRecordFailsSynchronizer final : public LayerSynchronizer {
+ public:
+  explicit SecondRecordFailsSynchronizer(LoadFailureState* state)
+      : state_(state) {}
+
+  bool synchronize_layer(int64_t /*layer_index*/) override {
+    ADD_FAILURE() << "Unexpected layer synchronization.";
+    return false;
+  }
+
+  bool record_stream(int64_t /*layer_index*/, Stream* /*stream*/) override {
+    ++record_count_;
+    if (record_count_ == 1) {
+      return true;
+    }
+    state_->record_failed.store(true, std::memory_order_release);
+    return false;
+  }
+
+  void abort() override {
+    state_->abort_saw_completed_copy.store(
+        state_->copy_finished.load(std::memory_order_acquire),
+        std::memory_order_release);
+    state_->abort_called.store(true, std::memory_order_release);
+  }
+
+  uint32_t size() const override { return 2; }
+
+ private:
+  LoadFailureState* state_ = nullptr;
+  int32_t record_count_ = 0;
+};
 
 TEST(HierarchyKVCacheTransferTest,
      RestoreRegistersReadyEventsForConfiguredLayerGroups) {
@@ -220,6 +332,89 @@ TEST(HierarchyKVCacheTransferTest,
                    caches[0].get_index_cache()[kDestinationBlockId].cpu()));
   EXPECT_TRUE(torch::equal(source_scale.cpu(),
                            index_scale.value()[kDestinationBlockId].cpu()));
+}
+
+TEST(HierarchyKVCacheTransferTest, EventFailureDrainsEarlierCopyBeforeAbort) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "MLU device is required for hierarchy KV cache transfer.";
+  }
+
+  constexpr int64_t kLayerCount = 1;
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+
+  KVCacheCapacity capacity;
+  capacity.n_blocks(2).block_size(4);
+  ModelArgs model_args;
+  model_args.model_type("test_model")
+      .n_layers(kLayerCount)
+      .n_heads(2)
+      .n_kv_heads(1)
+      .head_dim(8);
+  const KVCacheShape cache_shape(capacity, model_args, /*world_size=*/1);
+
+  KVCacheCreateOptions create_options;
+  create_options.device(device.unwrap())
+      .dtype(torch::kFloat32)
+      .num_layers(kLayerCount)
+      .model_type("test_model");
+  std::vector<KVCache> caches;
+  allocate_kv_caches(caches, cache_shape, create_options);
+
+  HierarchyKVCacheTransfer::Options transfer_options;
+  transfer_options.tp_rank(0)
+      .tp_size(1)
+      .layers(kLayerCount)
+      .host_blocks_factor(2.0)
+      .layers_wise_copy_batchs(1);
+  std::unique_ptr<Stream> compute_stream = device.current_stream();
+  HierarchyKVCacheTransfer transfer(transfer_options,
+                                    device.unwrap(),
+                                    compute_stream.get(),
+                                    &caches,
+                                    cache_shape,
+                                    create_options);
+
+  LoadFailureState state;
+  HierarchyKVCacheTransferTestPeer::replace_batch_memcpy(
+      &transfer, std::make_unique<PendingBatchMemcpy>(&state));
+  HierarchyKVCacheTransferTestPeer::set_layer_batch_ranges(
+      &transfer,
+      {{/*begin_layer=*/0, /*end_layer=*/1},
+       {/*begin_layer=*/1, /*end_layer=*/1}});
+  std::shared_ptr<LayerSynchronizer> synchronizer =
+      std::make_shared<SecondRecordFailsSynchronizer>(&state);
+  BlockTransferInfo load_info(/*src_block_id=*/0, /*dst_block_id=*/1);
+  load_info.block_type = BlockType::KV;
+  load_info.transfer_type = TransferType::H2D;
+
+  std::future<bool> load_result = std::async(
+      std::launch::async, [&device, &transfer, &synchronizer, &load_info]() {
+        device.set_device();
+        device.init_device_context();
+        return HierarchyKVCacheTransferTestPeer::load_from_host(
+            &transfer, synchronizer, {load_info});
+      });
+
+  const bool record_failure_observed = wait_for_flag(state.record_failed);
+  if (!record_failure_observed) {
+    state.gate_open.store(true, std::memory_order_release);
+  }
+  ASSERT_TRUE(record_failure_observed);
+  const std::future_status drain_status =
+      load_result.wait_for(std::chrono::milliseconds(100));
+  EXPECT_FALSE(state.abort_called.load(std::memory_order_acquire));
+
+  state.gate_open.store(true, std::memory_order_release);
+
+  ASSERT_EQ(load_result.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  EXPECT_FALSE(load_result.get());
+  EXPECT_EQ(drain_status, std::future_status::timeout);
+  EXPECT_TRUE(state.copy_finished.load(std::memory_order_acquire));
+  EXPECT_TRUE(state.abort_called.load(std::memory_order_acquire));
+  EXPECT_TRUE(state.abort_saw_completed_copy.load(std::memory_order_acquire));
 }
 
 }  // namespace

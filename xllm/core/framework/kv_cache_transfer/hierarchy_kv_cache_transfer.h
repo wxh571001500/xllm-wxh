@@ -94,6 +94,8 @@ class HierarchyKVCacheTransfer {
   void set_layer_synchronizer(ModelInputParams& params);
 
  private:
+  friend class HierarchyKVCacheTransferTestPeer;
+
   void build_device_block_type_map();
   void create_host_cache();
   CopyPlan build_copy_plan(
