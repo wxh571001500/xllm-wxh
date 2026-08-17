@@ -44,7 +44,7 @@ class SpeculativeWorkerImpl : public WorkerImpl {
                         const torch::Device& device,
                         const runtime::Options& options,
                         const runtime::Options& target_options,
-                        WorkerType worker_type);
+                        WorkerType worker_type = WorkerType::LLM);
 
  public:
   // initialize model, cache manager. blocking call

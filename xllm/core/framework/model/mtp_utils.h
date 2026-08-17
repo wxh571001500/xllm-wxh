@@ -31,10 +31,9 @@ inline int64_t mtp_hidden_state_width(const ModelArgs& model_args) {
 }
 
 inline bool uses_embedded_eagle3_draft(std::string_view algorithm,
-                                       const ModelArgs& target_model_args,
-                                       const ModelArgs& draft_model_args) {
-  return algorithm == "Eagle3" && target_model_args.enable_mla() &&
-         !draft_model_args.enable_mla();
+                                       const ModelArgs& target_model_args) {
+  return algorithm == "Eagle3" &&
+         target_model_args.enable_embedded_eagle3_draft();
 }
 
 }  // namespace xllm

@@ -59,7 +59,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
     } else if (algorithm == "DSpark") {
       impl_ = new DSparkWorkerImpl(parallel_args, device, options);
     } else if (algorithm == "Suffix") {
-      impl_ = new SuffixWorkerImpl(parallel_args, device, options, worker_type);
+      impl_ = new SuffixWorkerImpl(parallel_args, device, options);
     } else if (SpeculativeConfig::is_mtp_algorithm(algorithm)) {
       impl_ = new MTPWorkerImpl(parallel_args, device, options, worker_type);
     } else {

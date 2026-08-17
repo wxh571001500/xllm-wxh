@@ -65,13 +65,11 @@ runtime::Options SuffixTargetOptions(const runtime::Options& options) {
 
 SuffixWorkerImpl::SuffixWorkerImpl(const ParallelArgs& parallel_args,
                                    const torch::Device& device,
-                                   const runtime::Options& options,
-                                   WorkerType worker_type)
+                                   const runtime::Options& options)
     : SpeculativeWorkerImpl(parallel_args,
                             device,
                             options,
-                            SuffixTargetOptions(options),
-                            worker_type) {
+                            SuffixTargetOptions(options)) {
   suffix_cache_ = std::make_unique<SuffixDecodingCache>(
       options_.speculative_suffix_cache_max_depth(),
       options_.speculative_suffix_max_cached_requests());

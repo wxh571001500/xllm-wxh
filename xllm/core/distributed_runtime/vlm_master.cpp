@@ -43,13 +43,13 @@ limitations under the License.
 #include "vlm_engine.h"
 
 namespace xllm {
-bool should_use_ssm_engine(const Options& options) {
-  return !options.draft_model_path().value_or("").empty() ||
-         (options.speculative_algorithm() == "Suffix" &&
-          options.num_speculative_tokens() > 0);
-}
 
 namespace {
+
+bool should_use_vlm_speculative_engine(const Options& options) {
+  return options.speculative_algorithm() != "Suffix" &&
+         !options.draft_model_path().value_or("").empty();
+}
 
 std::vector<Message> build_user_messages_from_image_urls(
     std::string prompt,
@@ -70,8 +70,8 @@ std::vector<Message> build_user_messages_from_image_urls(
 
 VLMMaster::VLMMaster(const Options& options)
     : Master(options,
-             should_use_ssm_engine(options) ? EngineType::VLMSSM
-                                            : EngineType::VLM) {
+             should_use_vlm_speculative_engine(options) ? EngineType::VLMSSM
+                                                        : EngineType::VLM) {
   CHECK(engine_->init(master_status_));
 
   model_args_ = engine_->model_args();
@@ -521,8 +521,8 @@ std::shared_ptr<Request> VLMMaster::generate_request(
 volatile bool VLMAssistantMaster::running_ = false;
 VLMAssistantMaster::VLMAssistantMaster(const Options& options)
     : Master(options,
-             should_use_ssm_engine(options) ? EngineType::VLMSSM
-                                            : EngineType::VLM) {
+             should_use_vlm_speculative_engine(options) ? EngineType::VLMSSM
+                                                        : EngineType::VLM) {
   auto master_node_addr = options_.master_node_addr().value_or("");
   if (master_node_addr.empty()) {
     LOG(FATAL)

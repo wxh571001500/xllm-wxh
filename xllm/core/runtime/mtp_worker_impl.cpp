@@ -800,10 +800,8 @@ bool MTPWorkerImpl::uses_embedded_eagle3_draft() const {
       draft_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
     return false;
   }
-  return ::xllm::uses_embedded_eagle3_draft(
-      options_.speculative_algorithm(),
-      impl_->context_.get_model_args(),
-      draft_impl_->context_.get_model_args());
+  return ::xllm::uses_embedded_eagle3_draft(options_.speculative_algorithm(),
+                                            impl_->context_.get_model_args());
 }
 
 bool MTPWorkerImpl::requires_probability_based_validation() const {

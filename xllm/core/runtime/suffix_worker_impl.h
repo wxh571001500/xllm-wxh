@@ -31,8 +31,7 @@ class SuffixWorkerImpl : public SpeculativeWorkerImpl {
  public:
   SuffixWorkerImpl(const ParallelArgs& parallel_args,
                    const torch::Device& device,
-                   const runtime::Options& options,
-                   WorkerType worker_type);
+                   const runtime::Options& options);
 
   ~SuffixWorkerImpl() override = default;
 

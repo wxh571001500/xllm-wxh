@@ -28,27 +28,13 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/batch/batch_factory.h"
-#include "framework/model/model_args.h"
 #include "framework/request/priority_comparator.h"
-#include "util/env_var.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
 namespace xllm {
 
 namespace {
-
-constexpr int64_t kDefaultMaxMediaPrefillRequestsPerBatch = 2;
-
-size_t max_media_prefill_requests_per_batch() {
-  static const size_t cap = []() -> size_t {
-    const int64_t value =
-        util::get_int_env("XLLM_MAX_MEDIA_PREFILL_PER_BATCH",
-                          kDefaultMaxMediaPrefillRequestsPerBatch);
-    return value <= 0 ? 0 : static_cast<size_t>(value);
-  }();
-  return cap;
-}
 
 // Align chunk down to kv_split_size*block_size.
 // TODO: refactor kv-split block mapping to remove this limitation.
@@ -129,14 +115,14 @@ bool SchedulerPolicy::request_has_media_prefill(
 
 bool SchedulerPolicy::should_limit_media_prefill_requests(
     const SchedulerState& state) const {
-  return state.model_args.model_type() == "kimi_k25" &&
-         max_media_prefill_requests_per_batch() > 0;
+  return state.model_args.max_concurrent_media_prefills_per_dp() > 0;
 }
 
 int32_t SchedulerPolicy::select_media_prefill_dp_rank(
     const Sequence* sequence,
     const SchedulerState& state) const {
-  const size_t cap = max_media_prefill_requests_per_batch();
+  const size_t cap = static_cast<size_t>(
+      state.model_args.max_concurrent_media_prefills_per_dp());
   const int32_t dp_size = state.options.dp_size();
   std::vector<size_t> per_dp_counts(dp_size, 0);
   for (const auto& request : state.running_requests) {
@@ -326,7 +312,7 @@ void SchedulerPolicy::schedule_prefill_from_queue(
         if (dp_rank < 0) {
           LOG_EVERY_N(INFO, 100)
               << "[media_prefill_cap] no eligible DP rank is below the cap of "
-              << max_media_prefill_requests_per_batch()
+              << state.model_args.max_concurrent_media_prefills_per_dp()
               << " media prefill requests; deferring remaining prefills";
           can_schedule = false;
           break;

@@ -200,8 +200,7 @@ bool SpeculativeEngineBase<TargetEngine>::should_skip_external_draft_kv_cache()
     return false;
   }
   return uses_embedded_eagle3_draft(options_.speculative_algorithm(),
-                                    model_args_,
-                                    draft_engine_->model_args());
+                                    model_args_);
 }
 
 template <typename TargetEngine>
