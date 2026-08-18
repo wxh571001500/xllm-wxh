@@ -29,6 +29,8 @@ namespace xllm {
 
 class LLMWorkerImpl;
 
+int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args);
+
 // Returns whether this rank may execute the multi-step speculative decode
 // plan for the current global DP batch.
 bool should_run_speculative_decode(const ModelInputParams& params);

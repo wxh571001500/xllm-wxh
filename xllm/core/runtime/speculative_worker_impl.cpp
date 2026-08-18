@@ -32,6 +32,12 @@ limitations under the License.
 
 namespace xllm {
 
+int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
+  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
+  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
+  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
+}
+
 namespace {
 #define TENSOR_REPEAT(tensor_, repeats)                                       \
   do {                                                                        \
@@ -42,12 +48,6 @@ namespace {
 
 Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
   return {tensor.data_ptr<int32_t>(), static_cast<size_t>(tensor.numel())};
-}
-
-int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
-  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
-  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
-  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
 }
 
 KVCacheEstimateOptions make_kv_cache_estimate_options(
