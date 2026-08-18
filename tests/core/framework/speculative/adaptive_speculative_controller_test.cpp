@@ -45,7 +45,8 @@ void setup_registry() {
       predictor);
 }
 
-TEST(AdaptiveSpeculativeControllerTest, EnablesOnlyForMtpWithoutGraph) {
+TEST(AdaptiveSpeculativeControllerTest,
+     EnablesForSupportedAlgorithmWithAndWithoutGraph) {
   runtime::Options options = make_options();
   AdaptiveSpeculativeController controller(options);
   EXPECT_TRUE(controller.enabled());
@@ -57,7 +58,7 @@ TEST(AdaptiveSpeculativeControllerTest, EnablesOnlyForMtpWithoutGraph) {
   options = make_options();
   options.enable_graph(true);
   AdaptiveSpeculativeController graph_controller(options);
-  EXPECT_FALSE(graph_controller.enabled());
+  EXPECT_TRUE(graph_controller.enabled());
 }
 
 TEST(AdaptiveSpeculativeControllerTest, SelectsPrunedPrefixesByPathProb) {
