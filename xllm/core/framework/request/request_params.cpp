@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,12 +16,12 @@ limitations under the License.
 
 #include "request_params.h"
 
-#include <type_traits>
+#include <algorithm>
+#include <unordered_map>
 
 #include "core/common/global_flags.h"
 #include "core/common/instance_name.h"
 #include "core/framework/config/model_config.h"
-#include "core/framework/config/service_config.h"
 #include "core/util/uuid.h"
 #include "request.h"
 
@@ -323,20 +323,6 @@ std::vector<xllm::JsonTool> parse_tools_from_proto(
 
 template <typename ChatRequest>
 void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
-  if constexpr (std::is_same_v<ChatRequest, proto::ChatRequest>) {
-    if (request.has_response_format()) {
-      const std::string& type = request.response_format().type();
-      if (type == "json_object") {
-        if (ServiceConfig::get_instance().enable_json_object_output()) {
-          params.response_format = ResponseFormatType::JSON_OBJECT;
-        }
-      } else {
-        params.response_format_error =
-            "Unsupported response_format.type: " + type +
-            "; only json_object is supported";
-      }
-    }
-  }
   if (request.has_request_id()) {
     params.request_id = request.request_id();
   }
@@ -469,6 +455,11 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
     params.chat_template_kwargs =
         proto_struct_to_json(request.chat_template_kwargs());
   }
+
+  if (request.has_reasoning_effort()) {
+    params.reasoning_effort = request.reasoning_effort();
+  }
+
 }
 }  // namespace
 
@@ -496,6 +487,55 @@ RequestParams::RequestParams(const proto::MMChatRequest& request,
   x_request_time = x_rtime;
 
   init_from_chat_request(*this, request);
+}
+
+void RequestParams::prepare_kimi_k3_chat_params() {
+  skip_special_tokens = false;
+  if (!chat_template_kwargs.contains("tool_choice")) {
+    std::string prompt_tool_choice =
+        tools.empty() ? "none" : tool_choice;
+    if (!tool_choice.empty() && tool_choice.front() == '{') {
+      const nlohmann::json named_choice =
+          nlohmann::json::parse(tool_choice, nullptr, false);
+      if (named_choice.is_object() &&
+          named_choice.contains("function") &&
+          named_choice["function"].is_object() &&
+          named_choice["function"].contains("name") &&
+          named_choice["function"]["name"].is_string()) {
+        const std::string name =
+            named_choice["function"]["name"].get<std::string>();
+        std::erase_if(tools, [&name](const JsonTool& tool) {
+          return tool.function.name != name;
+        });
+        prompt_tool_choice = "required";
+      }
+    }
+    chat_template_kwargs["tool_choice"] = prompt_tool_choice;
+  }
+  if (!reasoning_effort.has_value()) {
+    return;
+  }
+
+  const std::string& effort = *reasoning_effort;
+  if (!chat_template_kwargs.contains("thinking")) {
+    chat_template_kwargs["thinking"] = effort != "none";
+  }
+  if (effort == "none" ||
+      chat_template_kwargs.contains("thinking_effort")) {
+    return;
+  }
+
+  static const std::unordered_map<std::string, std::string> kEffortMap = {
+      {"minimal", "low"},
+      {"low", "low"},
+      {"medium", "high"},
+      {"high", "high"},
+      {"xhigh", "max"},
+      {"max", "max"},
+  };
+  const auto effort_it = kEffortMap.find(effort);
+  chat_template_kwargs["thinking_effort"] =
+      effort_it != kEffortMap.end() ? effort_it->second : effort;
 }
 
 RequestParams::RequestParams(const proto::EmbeddingRequest& request,
@@ -591,13 +631,6 @@ RequestParams::RequestParams(const proto::AnthropicMessagesRequest& request,
 }
 
 bool RequestParams::verify_params(OutputCallback callback) const {
-  if (!response_format_error.empty()) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        response_format_error,
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
-  }
   if (n == 0) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "n should be greater than 0",

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,26 +21,10 @@ limitations under the License.
 #include "anthropic.pb.h"
 #include "chat.pb.h"
 #include "completion.pb.h"
-#include "core/framework/config/service_config.h"
 #include "multimodal.pb.h"
 
 namespace xllm {
 namespace {
-
-class ScopedJsonObjectOutput final {
- public:
-  explicit ScopedJsonObjectOutput(bool enabled)
-      : previous_(ServiceConfig::get_instance().enable_json_object_output()) {
-    ServiceConfig::get_instance().enable_json_object_output(enabled);
-  }
-
-  ~ScopedJsonObjectOutput() {
-    ServiceConfig::get_instance().enable_json_object_output(previous_);
-  }
-
- private:
-  bool previous_;
-};
 
 TEST(RequestParamsTest, IncludeStopStringInOutputDefaultsToFalse) {
   RequestParams completion_params(proto::CompletionRequest(), "", "");
@@ -80,47 +64,63 @@ TEST(RequestParamsTest, IncludeStopStringInOutputUsesVllmJsonName) {
   EXPECT_TRUE(params.include_stop_str_in_output);
 }
 
-TEST(RequestParamsTest, ParsesJsonObjectResponseFormat) {
-  const ServiceConfig default_config;
-  EXPECT_TRUE(default_config.enable_json_object_output());
-  ScopedJsonObjectOutput enabled(/*enabled=*/true);
+TEST(RequestParamsTest, MapsKimiK3ReasoningEffortToTemplateKwargs) {
   proto::ChatRequest request;
-  request.mutable_response_format()->set_type("json_object");
+  auto status = google::protobuf::util::JsonStringToMessage(
+      R"({"reasoning_effort":"medium"})", &request);
+  ASSERT_TRUE(status.ok()) << status.ToString();
 
   RequestParams params(request, "", "");
+  params.prepare_kimi_k3_chat_params();
 
-  EXPECT_EQ(params.response_format, ResponseFormatType::JSON_OBJECT);
-  EXPECT_TRUE(params.response_format_error.empty());
+  EXPECT_EQ(params.chat_template_kwargs["thinking"], true);
+  EXPECT_EQ(params.chat_template_kwargs["thinking_effort"], "high");
 }
 
-TEST(RequestParamsTest, IgnoresJsonObjectResponseFormatWhenDisabled) {
-  ScopedJsonObjectOutput disabled(/*enabled=*/false);
-  proto::ChatRequest request;
-  request.mutable_response_format()->set_type("json_object");
+TEST(RequestParamsTest, ReasoningEffortNoneDisablesThinking) {
+  proto::MMChatRequest request;
+  request.set_reasoning_effort("none");
 
   RequestParams params(request, "", "");
+  params.prepare_kimi_k3_chat_params();
 
-  EXPECT_EQ(params.response_format, ResponseFormatType::NONE);
-  EXPECT_TRUE(params.response_format_error.empty());
+  EXPECT_EQ(params.chat_template_kwargs["thinking"], false);
+  EXPECT_FALSE(params.chat_template_kwargs.contains("thinking_effort"));
 }
 
-TEST(RequestParamsTest, RejectsUnsupportedResponseFormat) {
-  ScopedJsonObjectOutput disabled(/*enabled=*/false);
+TEST(RequestParamsTest, NativeThinkingKwargsOverrideReasoningEffort) {
   proto::ChatRequest request;
-  request.mutable_response_format()->set_type("text");
+  request.set_reasoning_effort("low");
+  (*request.mutable_chat_template_kwargs()->mutable_fields())["thinking"]
+      .set_bool_value(false);
+  (*request.mutable_chat_template_kwargs()->mutable_fields())
+       ["thinking_effort"]
+           .set_string_value("max");
 
   RequestParams params(request, "", "");
-  std::optional<Status> received_status;
-  const bool valid =
-      params.verify_params([&received_status](RequestOutput output) {
-        received_status = output.status;
-        return false;
-      });
+  params.prepare_kimi_k3_chat_params();
 
-  EXPECT_FALSE(valid);
-  ASSERT_TRUE(received_status.has_value());
-  EXPECT_EQ(received_status->code(), StatusCode::INVALID_ARGUMENT);
-  EXPECT_NE(received_status->message().find("json_object"), std::string::npos);
+  EXPECT_EQ(params.chat_template_kwargs["thinking"], false);
+  EXPECT_EQ(params.chat_template_kwargs["thinking_effort"], "max");
+}
+
+TEST(RequestParamsTest, NamedToolChoiceFiltersPromptToolsAndBecomesRequired) {
+  proto::ChatRequest request;
+  auto* first = request.add_tools();
+  first->set_type("function");
+  first->mutable_function()->set_name("first");
+  auto* second = request.add_tools();
+  second->set_type("function");
+  second->mutable_function()->set_name("second");
+  request.set_tool_choice(
+      R"({"type":"function","function":{"name":"second"}})");
+
+  RequestParams params(request, "", "");
+  params.prepare_kimi_k3_chat_params();
+
+  ASSERT_EQ(params.tools.size(), 1);
+  EXPECT_EQ(params.tools[0].function.name, "second");
+  EXPECT_EQ(params.chat_template_kwargs["tool_choice"], "required");
 }
 
 TEST(RequestParamsTest,
