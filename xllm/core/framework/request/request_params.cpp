@@ -16,6 +16,9 @@ limitations under the License.
 
 #include "request_params.h"
 
+#include <algorithm>
+#include <unordered_map>
+
 #include "core/common/global_flags.h"
 #include "core/common/instance_name.h"
 #include "core/framework/config/model_config.h"
@@ -452,6 +455,11 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
     params.chat_template_kwargs =
         proto_struct_to_json(request.chat_template_kwargs());
   }
+
+  if (request.has_reasoning_effort()) {
+    params.reasoning_effort = request.reasoning_effort();
+  }
+
 }
 }  // namespace
 
@@ -479,6 +487,55 @@ RequestParams::RequestParams(const proto::MMChatRequest& request,
   x_request_time = x_rtime;
 
   init_from_chat_request(*this, request);
+}
+
+void RequestParams::prepare_kimi_k3_chat_params() {
+  skip_special_tokens = false;
+  if (!chat_template_kwargs.contains("tool_choice")) {
+    std::string prompt_tool_choice =
+        tools.empty() ? "none" : tool_choice;
+    if (!tool_choice.empty() && tool_choice.front() == '{') {
+      const nlohmann::json named_choice =
+          nlohmann::json::parse(tool_choice, nullptr, false);
+      if (named_choice.is_object() &&
+          named_choice.contains("function") &&
+          named_choice["function"].is_object() &&
+          named_choice["function"].contains("name") &&
+          named_choice["function"]["name"].is_string()) {
+        const std::string name =
+            named_choice["function"]["name"].get<std::string>();
+        std::erase_if(tools, [&name](const JsonTool& tool) {
+          return tool.function.name != name;
+        });
+        prompt_tool_choice = "required";
+      }
+    }
+    chat_template_kwargs["tool_choice"] = prompt_tool_choice;
+  }
+  if (!reasoning_effort.has_value()) {
+    return;
+  }
+
+  const std::string& effort = *reasoning_effort;
+  if (!chat_template_kwargs.contains("thinking")) {
+    chat_template_kwargs["thinking"] = effort != "none";
+  }
+  if (effort == "none" ||
+      chat_template_kwargs.contains("thinking_effort")) {
+    return;
+  }
+
+  static const std::unordered_map<std::string, std::string> kEffortMap = {
+      {"minimal", "low"},
+      {"low", "low"},
+      {"medium", "high"},
+      {"high", "high"},
+      {"xhigh", "max"},
+      {"max", "max"},
+  };
+  const auto effort_it = kEffortMap.find(effort);
+  chat_template_kwargs["thinking_effort"] =
+      effort_it != kEffortMap.end() ? effort_it->second : effort;
 }
 
 RequestParams::RequestParams(const proto::EmbeddingRequest& request,

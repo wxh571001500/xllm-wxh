@@ -64,6 +64,65 @@ TEST(RequestParamsTest, IncludeStopStringInOutputUsesVllmJsonName) {
   EXPECT_TRUE(params.include_stop_str_in_output);
 }
 
+TEST(RequestParamsTest, MapsKimiK3ReasoningEffortToTemplateKwargs) {
+  proto::ChatRequest request;
+  auto status = google::protobuf::util::JsonStringToMessage(
+      R"({"reasoning_effort":"medium"})", &request);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+
+  RequestParams params(request, "", "");
+  params.prepare_kimi_k3_chat_params();
+
+  EXPECT_EQ(params.chat_template_kwargs["thinking"], true);
+  EXPECT_EQ(params.chat_template_kwargs["thinking_effort"], "high");
+}
+
+TEST(RequestParamsTest, ReasoningEffortNoneDisablesThinking) {
+  proto::MMChatRequest request;
+  request.set_reasoning_effort("none");
+
+  RequestParams params(request, "", "");
+  params.prepare_kimi_k3_chat_params();
+
+  EXPECT_EQ(params.chat_template_kwargs["thinking"], false);
+  EXPECT_FALSE(params.chat_template_kwargs.contains("thinking_effort"));
+}
+
+TEST(RequestParamsTest, NativeThinkingKwargsOverrideReasoningEffort) {
+  proto::ChatRequest request;
+  request.set_reasoning_effort("low");
+  (*request.mutable_chat_template_kwargs()->mutable_fields())["thinking"]
+      .set_bool_value(false);
+  (*request.mutable_chat_template_kwargs()->mutable_fields())
+       ["thinking_effort"]
+           .set_string_value("max");
+
+  RequestParams params(request, "", "");
+  params.prepare_kimi_k3_chat_params();
+
+  EXPECT_EQ(params.chat_template_kwargs["thinking"], false);
+  EXPECT_EQ(params.chat_template_kwargs["thinking_effort"], "max");
+}
+
+TEST(RequestParamsTest, NamedToolChoiceFiltersPromptToolsAndBecomesRequired) {
+  proto::ChatRequest request;
+  auto* first = request.add_tools();
+  first->set_type("function");
+  first->mutable_function()->set_name("first");
+  auto* second = request.add_tools();
+  second->set_type("function");
+  second->mutable_function()->set_name("second");
+  request.set_tool_choice(
+      R"({"type":"function","function":{"name":"second"}})");
+
+  RequestParams params(request, "", "");
+  params.prepare_kimi_k3_chat_params();
+
+  ASSERT_EQ(params.tools.size(), 1);
+  EXPECT_EQ(params.tools[0].function.name, "second");
+  EXPECT_EQ(params.chat_template_kwargs["tool_choice"], "required");
+}
+
 TEST(RequestParamsTest,
      CompletionBeamSearchDefaultsTopLogprobsToBeamWidthWhenUnset) {
   proto::CompletionRequest request;

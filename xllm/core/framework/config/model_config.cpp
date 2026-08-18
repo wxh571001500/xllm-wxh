@@ -61,13 +61,14 @@ DEFINE_string(reasoning_parser,
               "",
               "Specify the reasoning parser for handling reasoning "
               "interactions(e.g. auto, glm45, glm47, glm5, qwen3, qwen35, "
-              "deepseek-r1).");
+              "deepseek-r1, kimi_k3).");
 
 DEFINE_string(tool_call_parser,
               "",
               "Specify the parser for handling tool-call interactions(e.g. "
               "auto, qwen25, qwen3, qwen35, qwen3_coder, kimi_k2, "
-              "deepseekv3, deepseekv32, deepseekv4, glm45, glm47, glm5).");
+              "kimi_k3, deepseekv3, deepseekv32, deepseekv4, glm45, glm47, "
+              "glm5).");
 
 DEFINE_bool(enable_qwen3_reranker, false, "Whether to enable qwen3 reranker.");
 

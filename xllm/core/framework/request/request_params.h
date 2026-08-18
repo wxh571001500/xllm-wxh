@@ -62,6 +62,8 @@ struct RequestParams {
                 const std::string& x_rid,
                 const std::string& x_rtime);
 
+  void prepare_kimi_k3_chat_params();
+
   bool verify_params(OutputCallback callback) const;
 
   // request id
@@ -143,6 +145,8 @@ struct RequestParams {
   std::vector<xllm::JsonTool> tools;
 
   std::string tool_choice = "auto";
+
+  std::optional<std::string> reasoning_effort;
 
   bool offline = false;
 

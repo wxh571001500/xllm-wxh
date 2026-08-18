@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -226,10 +227,24 @@ std::optional<std::string> KimiK3ChatTemplate::apply(
   }
 
   int32_t tool_index = 0;
+  std::unordered_map<std::string, std::pair<int32_t, std::string>>
+      pending_tool_calls;
   for (const Message& message : messages) {
     if (message.role == kRoleAssistant) {
       append_assistant_message(output, message, thinking);
       tool_index = 0;
+      pending_tool_calls.clear();
+      if (message.tool_calls.has_value()) {
+        int32_t index = 1;
+        for (const Message::ToolCall& tool_call : *message.tool_calls) {
+          if (!tool_call.id.empty()) {
+            pending_tool_calls.emplace(
+                tool_call.id,
+                std::make_pair(index, tool_call.function.name));
+          }
+          ++index;
+        }
+      }
       continue;
     }
 
@@ -237,10 +252,17 @@ std::optional<std::string> KimiK3ChatTemplate::apply(
         {"role", message.role}};
     if (message.role == kRoleTool) {
       ++tool_index;
-      attributes.emplace_back(
-          "tool",
-          message.tool_call_id.has_value() ? *message.tool_call_id : "tool");
-      attributes.emplace_back("index", std::to_string(tool_index));
+      std::string tool_name = "tool";
+      int32_t resolved_index = tool_index;
+      if (message.tool_call_id.has_value()) {
+        const auto call_it = pending_tool_calls.find(*message.tool_call_id);
+        if (call_it != pending_tool_calls.end()) {
+          resolved_index = call_it->second.first;
+          tool_name = call_it->second.second;
+        }
+      }
+      attributes.emplace_back("tool", tool_name);
+      attributes.emplace_back("index", std::to_string(resolved_index));
     } else if (message.role != kRoleUser && message.role != kRoleSystem) {
       continue;
     }
@@ -248,6 +270,25 @@ std::optional<std::string> KimiK3ChatTemplate::apply(
     append_open_tag(output, "message", attributes);
     append_content(output, message.content);
     append_message_end(output);
+  }
+
+  const auto tool_choice = chat_template_kwargs.find("tool_choice");
+  if (tool_choice != chat_template_kwargs.end() &&
+      tool_choice->is_string()) {
+    const std::string choice = tool_choice->get<std::string>();
+    if (choice == "required") {
+      append_internal_system_message(
+          output,
+          "tool-choice",
+          "The system is invoked with `tool_choice=required`.\n"
+          "You MUST call tools in the next message.");
+    } else if (choice == "none") {
+      append_internal_system_message(
+          output,
+          "tool-choice",
+          "The system is invoked with `tool_choice=none`.\n"
+          "You MUST NOT call any tools in the next message.");
+    }
   }
 
   append_open_tag(output, "message", {{"role", kRoleAssistant}});

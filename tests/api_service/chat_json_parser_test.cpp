@@ -320,6 +320,23 @@ TEST_F(PreprocessChatJsonTest, InvalidObjectToolChoiceReturnsError) {
   expect_error(input, parser, "function.name");
 }
 
+TEST_F(PreprocessChatJsonTest, UndeclaredNamedToolChoiceReturnsError) {
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "tools": [{
+      "type": "function",
+      "function": {"name": "declared", "parameters": {}}
+    }],
+    "tool_choice": {
+      "type": "function",
+      "function": {"name": "missing"}
+    }
+  })";
+
+  LlmChatJsonParser parser;
+  expect_error(input, parser, "not declared");
+}
+
 TEST_F(PreprocessChatJsonTest, UnknownContentTypeOnMultimodal) {
   // Unknown content types should pass through on multimodal
   std::string input = R"({

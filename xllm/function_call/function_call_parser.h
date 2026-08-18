@@ -59,6 +59,7 @@ class FunctionCallParser {
       const std::string& tool_call_parser);
   std::unique_ptr<BaseFormatDetector> detector_;
   std::vector<JsonTool> tools_;
+  std::string tool_call_parser_;
 };
 
 namespace utils {

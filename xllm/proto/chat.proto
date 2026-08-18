@@ -173,6 +173,9 @@ message ChatRequest {
   // whether to include stop strings or stop tokens in the output text.
   // default = false
   optional bool include_stop_str_in_output = 46;
+
+  // OpenAI reasoning effort. Kimi K3 maps this to thinking/thinking_effort.
+  optional string reasoning_effort = 47;
 }
 
 message ChatLogProbData {
