@@ -151,6 +151,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         tp_rank: int = 0,
         rms_norm_eps: float = 1e-6,
         quantized: bool = False,
+        reduce_o_proj: bool = True,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
@@ -275,7 +276,13 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             torch.empty(self.head_dim, dtype=dtype, device=device)
         )
         self.o_proj = RowParallelLinear(
-            local_proj, hidden_size, tp_size, bias=False, dtype=dtype, device=device
+            local_proj,
+            hidden_size,
+            tp_size,
+            bias=False,
+            dtype=dtype,
+            device=device,
+            reduce_results=reduce_o_proj,
         )
 
     # -- state cache contract --------------------------------------------------
