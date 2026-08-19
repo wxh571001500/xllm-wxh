@@ -266,6 +266,7 @@ class KimiK3TextConfig:
     dp_rank: int = 0
     moe_comm_type: str = "all_gather"
     mc2_tokens_capacity: int = 512
+    enable_flashcomm1: bool = False
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> KimiK3TextConfig:
@@ -401,6 +402,7 @@ class KimiK3TextConfig:
             mc2_tokens_capacity=int(
                 pick("mc2_tokens_capacity", default=512)
             ),
+            enable_flashcomm1=bool(pick("enable_flashcomm1", default=False)),
         )
 
     def validate(self) -> None:
@@ -551,6 +553,21 @@ class KimiK3TextConfig:
             and layer_id >= self.first_k_dense_replace
             and layer_id % self.moe_layer_freq == 0
         )
+
+    @property
+    def use_sequence_parallel(self) -> bool:
+        """FlashComm1 sequence parallelism gate.
+
+        The residual trunk is sharded over the attention TP group, so it only
+        applies when TP is active. It composes with DP and EP: TP is the
+        innermost rank dimension, so a TP group stays inside one DP cell and
+        shares its batch; and the MoE always returns output replicated across
+        the attention TP group (the trunk layout contract), so the EP path is
+        treated as a black box — FlashComm1 optimizes only the TP part
+        (attention o_proj + residual trunk) and leaves the MoE's own EP
+        communication untouched.
+        """
+        return self.enable_flashcomm1 and self.tp_size > 1
 
     def is_kda_layer(self, layer_id: int) -> bool:
         """``layer_id`` is 0-based; the config's ``kda_layers`` is 1-based."""
@@ -961,6 +978,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
             config.tp_size,
             dtype=dtype,
             device=device,
+            reduce_results=not config.use_sequence_parallel,
         )
         self.register_buffer(
             "W_UK",
@@ -1304,6 +1322,40 @@ def _apply_attention_residual(
     return (probabilities * values_float).sum(dim=1).to(values.dtype)
 
 
+def _flashcomm1_pad_size(num_tokens: int, tp_size: int) -> int:
+    return (-num_tokens) % tp_size
+
+
+def _flashcomm1_gather(
+    shard: torch.Tensor, num_tokens: int, tp_size: int
+) -> torch.Tensor:
+    """All-gather a sequence-parallel shard back to the full ``num_tokens`` rows."""
+    full = ops.all_gather(shard, dim=0, world_size=tp_size, group_name="tp")
+    return full[:num_tokens]
+
+
+def _flashcomm1_reduce_scatter(partial: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """Reduce a TP partial-sum and keep only this rank's token shard.
+
+    Replaces the row-parallel all-reduce so the output stays sequence-parallel.
+    """
+    pad = _flashcomm1_pad_size(partial.shape[0], tp_size)
+    if pad > 0:
+        partial = F.pad(partial, (0, 0, 0, pad))
+    return ops.reduce_scatter(partial, dim=0, world_size=tp_size, group_name="tp")
+
+
+def _flashcomm1_shard(
+    full: torch.Tensor, num_tokens: int, tp_size: int, tp_rank: int
+) -> torch.Tensor:
+    """Take this rank's token shard of an already-replicated full tensor."""
+    pad = _flashcomm1_pad_size(num_tokens, tp_size)
+    if pad > 0:
+        full = F.pad(full, (0, 0, 0, pad))
+    shard = full.shape[0] // tp_size
+    return full[tp_rank * shard : (tp_rank + 1) * shard].contiguous()
+
+
 class KimiK3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1318,6 +1370,9 @@ class KimiK3DecoderLayer(nn.Module):
         self.config = config
         self.kda_runtime = kda_runtime
         self.is_kda = config.is_kda_layer(layer_id)
+        self._sp = config.use_sequence_parallel
+        self.tp_size = config.tp_size
+        self.tp_rank = config.tp_rank
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -1333,6 +1388,7 @@ class KimiK3DecoderLayer(nn.Module):
                 tp_rank=config.tp_rank,
                 rms_norm_eps=config.rms_norm_eps,
                 quantized=config.uses_quantized_weights,
+                reduce_o_proj=not config.use_sequence_parallel,
                 dtype=dtype,
                 device=device,
             )
@@ -1402,7 +1458,12 @@ class KimiK3DecoderLayer(nn.Module):
                 quantized=config.uses_quantized_weights,
             )
         else:
-            self.mlp = KimiK3MLP(config, dtype, device)
+            self.mlp = KimiK3MLP(
+                config,
+                dtype,
+                device,
+                reduce_results=not config.use_sequence_parallel,
+            )
         self.attn_res_block_size = config.attn_res_block_size
         self.self_attention_res_norm = RMSNorm(
             config.hidden_size,
@@ -1438,6 +1499,12 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # With FlashComm1 the residual trunk is sequence-parallel: hidden_states
+        # and block_residual carry this rank's token shard. Per-token ops
+        # (norms, hyper-connection residual math) run on the shard directly;
+        # attention and the FFN need the full token set, so we gather before
+        # them and shard their outputs back.
+        num_tokens = positions.shape[0]
         prefix_sum: torch.Tensor | None = hidden_states
         if block_residual.shape[1] > 0:
             hidden_states = _apply_attention_residual(
@@ -1450,15 +1517,24 @@ class KimiK3DecoderLayer(nn.Module):
             block_residual = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
             prefix_sum = None
         hidden_states = self.input_layernorm(hidden_states)
+        attention_input = (
+            _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
+            if self._sp
+            else hidden_states
+        )
         if self.is_kda:
             metadata, conv_state, recurrent_state = self.kda_runtime.require(
                 self.layer_id
             )
             attention_output = self.self_attn(
-                hidden_states, metadata, conv_state, recurrent_state
+                attention_input, metadata, conv_state, recurrent_state
             )
         else:
-            attention_output = self.self_attn(hidden_states, positions)
+            attention_output = self.self_attn(attention_input, positions)
+        if self._sp:
+            attention_output = _flashcomm1_reduce_scatter(
+                attention_output, self.tp_size
+            )
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         hidden_states = _apply_attention_residual(
             prefix_sum,
@@ -1467,11 +1543,27 @@ class KimiK3DecoderLayer(nn.Module):
             self.mlp_res_norm,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = (
-            self.block_sparse_moe(hidden_states)
-            if hasattr(self, "block_sparse_moe")
-            else self.mlp(hidden_states)
-        )
+        if hasattr(self, "block_sparse_moe"):
+            # The MoE keeps its own replicated TP/EP reductions, so gather to
+            # full tokens and shard the result back.
+            if self._sp:
+                moe_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
+                hidden_states = _flashcomm1_shard(
+                    self.block_sparse_moe(moe_input),
+                    num_tokens,
+                    self.tp_size,
+                    self.tp_rank,
+                )
+            else:
+                hidden_states = self.block_sparse_moe(hidden_states)
+        else:
+            if self._sp:
+                mlp_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
+                hidden_states = _flashcomm1_reduce_scatter(
+                    self.mlp(mlp_input), self.tp_size
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
         return prefix_sum + hidden_states, block_residual
 
     def load_weights(
@@ -1603,6 +1695,9 @@ class KimiK3TextModel(nn.Module):
             device=device,
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, dtype=dtype, device=device)
+        self._sp = config.use_sequence_parallel
+        self.tp_size = config.tp_size
+        self.tp_rank = config.tp_rank
         self._loaded_weights: set[str] = set()
 
     def initial_block_count(self) -> int:
@@ -1619,6 +1714,14 @@ class KimiK3TextModel(nn.Module):
             if inputs_embeds is None
             else inputs_embeds
         )
+        num_tokens = hidden_states.shape[0]
+        if self._sp:
+            # FlashComm1: shard the token dimension so the residual trunk runs
+            # sequence-parallel; the embedding output is replicated, so this is
+            # a local slice.
+            hidden_states = _flashcomm1_shard(
+                hidden_states, num_tokens, self.tp_size, self.tp_rank
+            )
         block_residual = hidden_states.new_zeros(
             (hidden_states.shape[0], 0, hidden_states.shape[-1])
         )
@@ -1630,6 +1733,10 @@ class KimiK3TextModel(nn.Module):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
         )
+        if self._sp:
+            hidden_states = _flashcomm1_gather(
+                hidden_states, num_tokens, self.tp_size
+            )
         return self.norm(hidden_states)
 
     def load_weights(
