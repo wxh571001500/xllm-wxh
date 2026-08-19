@@ -81,6 +81,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         sliding_window: int,
         device: torch.device,
         dtype: torch.dtype,
+        has_mha_layers: bool = True,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -89,6 +90,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self.sliding_window = sliding_window
         self.dtype = dtype
         self.device = device
+        self._has_mha_layers = has_mha_layers
 
         self._kv_caches: list[KVCache] = []
         self._metadata: AttentionMetadata | None = None
@@ -97,6 +99,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self._graph_lses: dict[int, torch.Tensor] = {}
         self._current_graph_output: torch.Tensor | None = None
         self._current_graph_lse: torch.Tensor | None = None
+        self._mla_v2_graph_workspaces: dict[
+            tuple[int, int, int, int],
+            torch.Tensor,
+        ] = {}
+        self._mla_v2_graph_outputs: dict[
+            tuple[int, int, int, int, int],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         self._mla_actual_seq_q: torch.Tensor | None = None
         self._mla_actual_seq_kv: torch.Tensor | None = None
         self._causal_mask = (
@@ -108,15 +118,19 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
     @property
     def num_kv_blocks(self) -> int:
-        if not self._kv_caches:
-            return 0
-        return self._kv_caches[0][0].shape[0]
+        cache = self._first_paged_cache()
+        return 0 if cache is None else cache.shape[0]
 
     @property
     def page_size(self) -> int:
-        if not self._kv_caches:
-            return 1
-        return self._kv_caches[0][0].shape[1]
+        cache = self._first_paged_cache()
+        return 1 if cache is None else cache.shape[1]
+
+    def _first_paged_cache(self) -> torch.Tensor | None:
+        for key_cache, _value_cache, _scale_cache in self._kv_caches:
+            if key_cache is not None:
+                return key_cache
+        return None
 
     def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
         self._kv_caches = kv_caches
@@ -157,7 +171,11 @@ class NpuPagedAttentionBackend(AttentionBackend):
         else:
             self._block_table_i32 = None
 
-        if graph_mode and self._block_table_i32 is not None:
+        if (
+            graph_mode
+            and self._has_mha_layers
+            and self._block_table_i32 is not None
+        ):
             graph_batch_size = self._block_table_i32.shape[0]
             if self._graph_workspace is None:
                 block_size = self.page_size
@@ -587,25 +605,117 @@ class NpuPagedAttentionBackend(AttentionBackend):
             1,
             q_pe.shape[-1],
         )
-        output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-            query,
-            nope_cache,
-            nope_cache,
-            query_rope=query_position,
-            key_rope=rope_cache,
-            num_query_heads=fia_num_heads,
-            num_key_value_heads=layer.num_kv_heads,
-            input_layout="BNSD_NBSD",
-            atten_mask=None,
-            sparse_mode=0,
-            softmax_scale=layer.scale,
-            block_table=self._block_table_i32[:num_tokens],
-            block_size=block_size,
-            actual_seq_qlen=None,
-            actual_seq_kvlen=self._actual_seq_kv[:num_tokens],
-            return_softmax_lse=False,
-        )
-        output = output[: layer.num_heads]
+        graph_context = get_forward_context().acl_graph
+        if graph_context is not None:
+            shape_key = (
+                num_tokens,
+                fia_num_heads,
+                layer.num_kv_heads,
+                q_latent.shape[-1],
+            )
+            output_key = (layer.layer_id, *shape_key)
+            outputs = self._mla_v2_graph_outputs.get(output_key)
+            if outputs is None:
+                # BNSD_NBSD returns head-major output. Allocate it explicitly,
+                # matching vLLM-Ascend, so graph capture never depends on the
+                # generic output-shape inference used by the default handler.
+                # Keep outputs layer-local because all captured MLA layers
+                # remain live in the same graph.
+                output = torch.empty(
+                    fia_num_heads,
+                    num_tokens,
+                    1,
+                    q_latent.shape[-1],
+                    dtype=query.dtype,
+                    device=query.device,
+                )
+                lse = torch.empty(
+                    num_tokens,
+                    dtype=query.dtype,
+                    device=query.device,
+                )
+                outputs = (output, lse)
+                self._mla_v2_graph_outputs[output_key] = outputs
+            attn_output, softmax_lse = outputs
+
+            workspace = self._mla_v2_graph_workspaces.get(shape_key)
+            if workspace is None:
+                workspace = (
+                    torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                        query,
+                        nope_cache,
+                        nope_cache,
+                        query_rope=query_position,
+                        key_rope=rope_cache,
+                        num_query_heads=fia_num_heads,
+                        num_key_value_heads=layer.num_kv_heads,
+                        input_layout="BNSD_NBSD",
+                        atten_mask=None,
+                        sparse_mode=0,
+                        softmax_scale=layer.scale,
+                        block_table=self._block_table_i32[:num_tokens],
+                        block_size=block_size,
+                        actual_seq_qlen=None,
+                        actual_seq_kvlen=self._actual_seq_kv[:num_tokens],
+                        return_softmax_lse=False,
+                    )
+                )
+                self._mla_v2_graph_workspaces[shape_key] = workspace
+
+            def _run_v2_out() -> None:
+                torch_npu.npu_fused_infer_attention_score_v2.out(
+                    query,
+                    nope_cache,
+                    nope_cache,
+                    query_rope=query_position,
+                    key_rope=rope_cache,
+                    num_query_heads=fia_num_heads,
+                    num_key_value_heads=layer.num_kv_heads,
+                    input_layout="BNSD_NBSD",
+                    atten_mask=None,
+                    sparse_mode=0,
+                    softmax_scale=layer.scale,
+                    block_table=self._block_table_i32[:num_tokens],
+                    block_size=block_size,
+                    actual_seq_qlen=None,
+                    actual_seq_kvlen=self._actual_seq_kv[:num_tokens],
+                    return_softmax_lse=False,
+                    workspace=workspace,
+                    out=[attn_output, softmax_lse],
+                )
+
+            stream = graph_context.stream
+            event = torch.npu.ExternalEvent()
+            event.wait(stream)
+            event.reset(stream)
+            torch.npu.graph_task_group_begin(stream)
+            try:
+                _run_v2_out()
+            except Exception:
+                torch.npu.graph_task_group_end(stream)
+                raise
+            handle = torch.npu.graph_task_group_end(stream)
+            graph_context.tasks.append(AclGraphTask(event, handle, _run_v2_out))
+        else:
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                query,
+                nope_cache,
+                nope_cache,
+                query_rope=query_position,
+                key_rope=rope_cache,
+                num_query_heads=fia_num_heads,
+                num_key_value_heads=layer.num_kv_heads,
+                input_layout="BNSD_NBSD",
+                atten_mask=None,
+                sparse_mode=0,
+                softmax_scale=layer.scale,
+                block_table=self._block_table_i32[:num_tokens],
+                block_size=block_size,
+                actual_seq_qlen=None,
+                actual_seq_kvlen=self._actual_seq_kv[:num_tokens],
+                return_softmax_lse=False,
+            )
+        output = attn_output[: layer.num_heads]
         output = output.view(
             layer.num_heads,
             num_tokens,

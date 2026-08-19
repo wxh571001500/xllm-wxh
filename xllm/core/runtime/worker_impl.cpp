@@ -211,6 +211,10 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params,
     return;
   }
   input_params.parallel.query_start_loc.resize(batch_size + 1, 0);
+  if (batch_size == 0) {
+    input_params.parallel.has_initial_state.clear();
+    return;
+  }
   for (int64_t i = 0; i < batch_size; ++i) {
     int64_t seq_len =
         has_leading_zero

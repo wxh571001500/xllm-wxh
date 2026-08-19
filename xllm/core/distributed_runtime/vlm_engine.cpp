@@ -538,6 +538,22 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         batched_inputs[dp_rank].input_params.meta.q_max_seq_len == 1;
   }
 
+  // Empty DP shards still participate in decode graph collectives using
+  // padded inputs. Match LLMEngine's DP graph contract so every rank makes the
+  // same graph/eager decision and uses the global maximum token count as the
+  // graph bucket. Mixed prefill/decode batches retain their real phase flags
+  // and therefore fall back to eager execution.
+  if (::xllm::ExecutionConfig::get_instance().enable_graph() &&
+      batch_forward_type.is_decode()) {
+    for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      if (batched_inputs[dp_rank]
+              .input_params.meta.batch_forward_type.is_empty() &&
+          dp_global_token_nums[dp_rank] == 0) {
+        dp_is_decode[dp_rank] = 1;
+      }
+    }
+  }
+
   // update dp_global_token_nums and batch_forward_type
   for (auto dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
     batched_inputs[dp_rank].input_params.parallel.dp_global_token_nums =
