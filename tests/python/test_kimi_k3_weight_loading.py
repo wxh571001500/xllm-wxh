@@ -78,8 +78,8 @@ from xllm.python.models.kimi_k3 import (
 from xllm.python.models.kimi_k3_gated_mla import KimiK3GatedMLA
 from xllm.python.models.kimi_k3_text import (
     KimiK3ForCausalLM,
-    KimiK3MLP,
     KimiK3MLAAttention,
+    KimiK3MLP,
     KimiK3TextConfig,
 )
 from xllm.python.models.kimi_k3_vit import KimiK3VisionModel
@@ -1519,6 +1519,37 @@ def test_all_gather_prepare_finalize_handles_uneven_ep_tokens() -> None:
     assert mock_all_gather.call_count == 3
     mock_reduce_scatter.assert_called_once()
     mock_all_reduce.assert_called_once()
+
+
+def test_all_gather_prepare_skips_token_count_sync_during_graph_capture() -> None:
+    config = MoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        ep_size=2,
+        ep_rank=0,
+        dp_size=2,
+        dp_rank=0,
+    )
+    stage = AllGatherPrepareAndFinalize(config)
+    hidden_states = torch.arange(6, dtype=torch.float32).view(2, 3)
+    router_logits = torch.ones(2, 4)
+
+    with (
+        patch(
+            "xllm.python.layers.moe.prepare_finalize._in_acl_graph_capture",
+            return_value=True,
+        ),
+        patch.object(stage, "_gather_token_counts") as mock_counts,
+        patch(
+            "xllm.python.layers.moe.prepare_finalize.ops.all_gather",
+            side_effect=lambda tensor, **_: torch.cat((tensor, tensor), dim=0),
+        ),
+    ):
+        prepared = stage.prepare(hidden_states, router_logits)
+
+    mock_counts.assert_not_called()
+    assert prepared.hidden_states.shape == (4, 3)
+    assert prepared.router_logits.shape == (4, 4)
 
 
 def test_all_gather_reduces_replicated_input_over_ep() -> None:

@@ -61,7 +61,9 @@ std::optional<ForwardOutput> VLMWorkerImpl::step(const ForwardInput& input) {
   const bool empty_shard =
       input.input_params.meta.num_sequences == 0 &&
       (!input.token_ids.defined() || input.token_ids.numel() == 0);
-  if (empty_shard) {
+  const bool needs_collective_participation =
+      parallel_args_.ep_size() > 1 || !parallel_args_.mapping_data().empty();
+  if (empty_shard && !needs_collective_participation) {
     return ForwardOutput{};
   }
 

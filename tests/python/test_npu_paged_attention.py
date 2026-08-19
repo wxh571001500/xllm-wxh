@@ -43,6 +43,62 @@ from xllm.python.attention.backend import MlaUnabsorbedPrefill
 from xllm.python.attention.npu_paged_attention import (
     NpuPagedAttentionBackend,
 )
+from xllm.python.model_executor.forward_context import (
+    AclGraphCaptureContext,
+    ForwardContext,
+    forward_context,
+)
+
+
+def test_cache_geometry_skips_leading_linear_attention_slots():
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    paged_cache = torch.empty(17, 128, 1, 64)
+    backend._kv_caches = [
+        (None, None, None),
+        (None, None, None),
+        (paged_cache, torch.empty_like(paged_cache), None),
+    ]
+
+    assert backend.num_kv_blocks == 17
+    assert backend.page_size == 128
+
+
+def test_cache_geometry_defaults_without_paged_attention_slots():
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._kv_caches = [(None, None, None)]
+
+    assert backend.num_kv_blocks == 0
+    assert backend.page_size == 1
+
+
+def test_mla_only_graph_prepare_skips_mha_workspace(monkeypatch):
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._has_mha_layers = False
+    backend._graph_workspace = None
+    backend._graph_outputs = {}
+    backend._graph_lses = {}
+    backend._current_graph_output = None
+    backend._current_graph_lse = None
+    backend._mla_actual_seq_q = None
+    backend._mla_actual_seq_kv = None
+    metadata = SimpleNamespace(
+        q_cu_seq_lens=None,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([0, 1], dtype=torch.int32),
+        kv_seq_lens=None,
+    )
+
+    workspace = MagicMock(side_effect=AssertionError("MHA workspace requested"))
+    monkeypatch.setattr(
+        torch_npu,
+        "_npu_fused_infer_attention_score_get_max_workspace",
+        workspace,
+    )
+
+    backend.prepare(metadata, graph_mode=True)
+
+    workspace.assert_not_called()
+    assert backend._graph_workspace is None
 
 
 def test_execute_mla_uses_torch_npu_cache_writer(monkeypatch):
@@ -346,13 +402,15 @@ def test_dense_mla_decode_v2_matches_kimi_fia_contract(monkeypatch):
         "npu_fused_infer_attention_score_v2",
         fake_fia_v2,
     )
-    output = backend._mla_dense_decode_v2(
-        q_latent,
-        q_position,
-        nope_cache,
-        rope_cache,
-        layer,
-    )
+    context = ForwardContext(backend, torch.device("cpu"))
+    with forward_context(context):
+        output = backend._mla_dense_decode_v2(
+            q_latent,
+            q_position,
+            nope_cache,
+            rope_cache,
+            layer,
+        )
 
     assert captured["query"].shape == (2, 64, 1, 512)
     assert captured["query_rope"].shape == (2, 64, 1, 64)
@@ -379,6 +437,83 @@ def test_dense_mla_decode_v2_matches_kimi_fia_contract(monkeypatch):
     assert not captured["return_softmax_lse"]
     expected = operator_output[:48].view(48, 2, 512).transpose(0, 1)
     torch.testing.assert_close(output, expected)
+
+
+def test_dense_mla_graph_keeps_outputs_layer_local(monkeypatch):
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._block_table_i32 = torch.tensor([[0], [1]], dtype=torch.int32)
+    backend._actual_seq_kv = [3, 5]
+    backend._mla_v2_graph_workspaces = {}
+    backend._mla_v2_graph_outputs = {}
+    q_latent = torch.randn(2, 4, 6, dtype=torch.bfloat16)
+    q_position = torch.randn(2, 4, 2, dtype=torch.bfloat16)
+    nope_cache = torch.randn(2, 8, 1, 6, dtype=torch.bfloat16)
+    rope_cache = torch.randn(2, 8, 1, 2, dtype=torch.bfloat16)
+    workspace_calls = []
+    operator_outputs = []
+
+    monkeypatch.setattr(
+        torch_npu,
+        "_npu_fused_infer_attention_score_v2_get_max_workspace",
+        lambda *args, **kwargs: workspace_calls.append((args, kwargs))
+        or torch.empty(16, dtype=torch.uint8),
+    )
+    monkeypatch.setattr(
+        torch_npu.npu_fused_infer_attention_score_v2,
+        "out",
+        lambda *args, **kwargs: operator_outputs.append(kwargs["out"]),
+    )
+
+    class _Event:
+        def wait(self, _stream):
+            pass
+
+        def reset(self, _stream):
+            pass
+
+    monkeypatch.setattr(torch.npu, "ExternalEvent", _Event)
+    monkeypatch.setattr(torch.npu, "graph_task_group_begin", lambda _stream: None)
+    monkeypatch.setattr(torch.npu, "graph_task_group_end", lambda _stream: object())
+
+    capture = AclGraphCaptureContext(stream=object(), tasks=[])
+    context = ForwardContext(
+        backend,
+        torch.device("cpu"),
+        acl_graph=capture,
+    )
+    layer_3 = SimpleNamespace(
+        layer_id=3,
+        num_heads=4,
+        num_kv_heads=1,
+        scale=0.125,
+    )
+    layer_7 = SimpleNamespace(
+        layer_id=7,
+        num_heads=4,
+        num_kv_heads=1,
+        scale=0.125,
+    )
+    with forward_context(context):
+        output_3 = backend._mla_dense_decode_v2(
+            q_latent, q_position, nope_cache, rope_cache, layer_3
+        )
+        output_7 = backend._mla_dense_decode_v2(
+            q_latent, q_position, nope_cache, rope_cache, layer_7
+        )
+
+    assert output_3.shape == output_7.shape == (2, 4, 6)
+    assert output_3.data_ptr() != output_7.data_ptr()
+    assert len(backend._mla_v2_graph_outputs) == 2
+    assert len(backend._mla_v2_graph_workspaces) == 1
+    assert len(workspace_calls) == 1
+    assert len(capture.tasks) == 2
+
+    # Task updates run after the Python method has reshaped its public result.
+    # They must retain the original four-dimensional FIA output tensors.
+    capture.tasks[0].update()
+    assert len(operator_outputs) == 3
+    assert operator_outputs[-1][0].shape == (4, 2, 1, 6)
+    assert operator_outputs[-1][1].shape == (2,)
 
 
 def test_dense_mla_chunked_prefill_uses_paged_caches_and_total_kv_lens(
