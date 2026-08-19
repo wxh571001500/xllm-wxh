@@ -49,8 +49,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from xllm.python.layers.attention import AttentionRuntimeLayer
 from xllm.python.layers.linear import (
@@ -93,6 +93,8 @@ class KimiK3KDAMetadata:
     # loaded from the caches (always True for decode; True for chunked-prefill
     # continuations). Required whenever ``num_prefill_seqs > 0``.
     has_initial_state: torch.Tensor | None = None
+    graph_num_tokens: int | None = None
+    empty_shard: bool = False
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:

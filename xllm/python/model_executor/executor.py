@@ -15,8 +15,9 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
+from scripts.logger import logger
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, KVCache
 from xllm.python.layers.attention import (
     AttentionLayerSpec,
@@ -32,9 +33,12 @@ def _is_npu_device(device: torch.device) -> bool:
 def _resolve_graph_backend(config: dict, device: torch.device) -> str:
     graph_backend = str(config.get("python_graph_backend", "off")).lower()
     graph_disabled = graph_backend in ("", "off", "none", "0")
-    if graph_disabled and config.get("enable_graph", False):
-        if _is_npu_device(device):
-            return "aclgraph"
+    if (
+        graph_disabled
+        and config.get("enable_graph", False)
+        and _is_npu_device(device)
+    ):
+        return "aclgraph"
     return graph_backend
 
 
@@ -42,6 +46,7 @@ def _create_attention_backend(
     first_attention: AttentionLayerSpec,
     device: torch.device,
     dtype: torch.dtype,
+    attention_kinds: set[str] | None = None,
 ) -> AttentionBackend:
     if _is_npu_device(device):
         from xllm.python.attention.npu_paged_attention import (
@@ -55,6 +60,11 @@ def _create_attention_backend(
             sliding_window=first_attention.sliding_window,
             device=device,
             dtype=dtype,
+            has_mha_layers=(
+                first_attention.kind == "mha"
+                if attention_kinds is None
+                else "mha" in attention_kinds
+            ),
         )
     if device.type == "cuda":
         from xllm.python.attention.flashinfer import FlashInferBackend
@@ -72,6 +82,25 @@ def _create_attention_backend(
     raise NotImplementedError(
         f"No attention backend available for device type '{device.type}'"
     )
+
+
+def _acl_graph_unsupported_reason(
+    attention_layers: list[AttentionRuntimeLayer],
+    *,
+    supports_kimi_k3_graph: bool = False,
+) -> str | None:
+    """Return why ACL graph is unsafe for this model, or ``None``."""
+    kinds = {layer.attention_kind for layer in attention_layers}
+    if supports_kimi_k3_graph:
+        unsupported_kinds = kinds.difference({"mha", "mla", "linear"})
+        if unsupported_kinds:
+            return f"ACL graph does not support attention kinds {sorted(unsupported_kinds)}"
+        return None
+    if "linear" in kinds:
+        return "ACL graph does not support linear-attention runtime state"
+    if kinds.difference({"mha"}):
+        return "ACL graph currently supports MHA attention only"
+    return None
 
 
 class ModelExecutor:
@@ -122,7 +151,10 @@ class ModelExecutor:
             layer_specs[0],
         )
         self.attention_backend = _create_attention_backend(
-            backend_spec, device, first_parameter.dtype
+            backend_spec,
+            device,
+            first_parameter.dtype,
+            {spec.kind for spec in layer_specs},
         )
 
         execution_model = model.model
@@ -135,6 +167,11 @@ class ModelExecutor:
         self.inductor_runner = None
 
         graph_backend = _resolve_graph_backend(config, device)
+        logger.info(
+            f"Python model graph backend: backend={graph_backend}, "
+            f"enable_graph={bool(config.get('enable_graph', False))}, "
+            f"device={device}"
+        )
         if graph_backend in ("", "off", "none", "0"):
             pass
         elif graph_backend == "cudagraphs":
@@ -149,6 +186,12 @@ class ModelExecutor:
                 int(config["max_position_embeddings"]),
             )
         elif graph_backend == "aclgraph":
+            unsupported_reason = _acl_graph_unsupported_reason(
+                attention_layers,
+                supports_kimi_k3_graph=hasattr(execution_model, "kda_runtime"),
+            )
+            if unsupported_reason is not None:
+                raise ValueError(unsupported_reason)
             from xllm.python.model_executor.runners.decode_acl_graph import (
                 DecodeAclGraphRunner,
             )
@@ -158,6 +201,7 @@ class ModelExecutor:
                 device,
                 max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
+                int(config.get("block_size", 128)),
             )
         else:
             from xllm.python.model_executor.runners.inductor import InductorRunner
@@ -239,6 +283,8 @@ class ModelExecutor:
                 num_decode_seqs=0,
                 num_prefill_seqs=0,
                 has_initial_state=None,
+                graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
+                empty_shard=True,
             )
             return
 
@@ -261,6 +307,8 @@ class ModelExecutor:
             num_decode_seqs=view.num_decode_seqs,
             num_prefill_seqs=view.num_prefill_seqs,
             has_initial_state=_to_device(view.has_initial_state),
+            graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
+            empty_shard=bool(getattr(view, "empty_shard", False)),
         )
 
     def execute(
@@ -279,32 +327,46 @@ class ModelExecutor:
         if kda_metadata is not None:
             self.set_kda_metadata(kda_metadata, input_ids.shape[0])
 
-        # Multimodal prefill supplies already-merged embeddings from the C++
-        # VLM data path. Graph runners only accept token ids, so execute this
-        # path eagerly until they grow an inputs_embeds input contract.
+        graph_runner = self.decode_graph_runner
+        if graph_runner is not None:
+            # Capture before eager prefill populates live KV/KDA caches. The
+            # synthetic graph warmup writes its own cache slots, so deferring it
+            # until the first decode would overwrite the active request state.
+            graph_runner.warmup(
+                input_ids.device,
+                input_ids.dtype,
+                inputs_embeds,
+            )
+            if graph_runner.can_execute(input_ids, metadata) and self._all_dp_decode(
+                kda_metadata
+            ):
+                return graph_runner.execute(
+                    input_ids,
+                    positions,
+                    metadata,
+                    inputs_embeds,
+                )
         if inputs_embeds is not None:
             return self.eager_runner.execute(
                 input_ids, positions, metadata, inputs_embeds
             )
-
-        graph_runner = self.decode_graph_runner
-        if graph_runner is not None:
-            graph_runner.warmup(input_ids.device, input_ids.dtype)
-            if graph_runner.can_execute(input_ids, metadata) and self._all_dp_decode(
-                kda_metadata
-            ):
-                return graph_runner.execute(input_ids, positions, metadata)
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(input_ids, positions, metadata)
         return self.eager_runner.execute(input_ids, positions, metadata)
 
     def _all_dp_decode(self, kda_metadata: object | None) -> bool:
-        """Whether every DP rank runs a decode batch this step.
+        """Whether every DP rank can safely enter decode graph this step.
 
         The C++ engine host-syncs per-rank batch types (``dp_is_decode``), so
-        this is a plain host-side check. Decode graphs are only entered when
-        all DP ranks decode, mirroring the C++ ACL graph executor gating.
+        this is a plain host-side check. DP graph execution requires complete
+        metadata and every rank to be in decode; otherwise all ranks fall back
+        to eager. Empty decode shards are marked as decode by the engine and
+        participate with padded inputs.
         """
-        if self._dp_size <= 1 or kda_metadata is None:
+        if self._dp_size <= 1:
             return True
-        return bool(getattr(kda_metadata, "all_dp_decode", True))
+        if kda_metadata is None:
+            return False
+        return bool(getattr(kda_metadata, "dp_metadata_valid", False)) and bool(
+            getattr(kda_metadata, "all_dp_decode", False)
+        )

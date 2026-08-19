@@ -79,6 +79,10 @@ class AttentionMetadataView final {
  private:
   static torch::Tensor make_kv_seq_lens_host(
       const std::shared_ptr<layer::AttentionMetadata>& metadata) {
+    if (metadata->is_dummy) {
+      return torch::zeros(
+          {2}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+    }
     if (metadata->kv_seq_lens_vec.empty()) {
       return torch::Tensor();
     }
@@ -161,9 +165,19 @@ class KimiK3KDAMetadataView final {
     // may only run when all DP ranks decode, keeping HCCL usage consistent
     // across ranks (mirrors AclGraphExecutorImpl's all-ranks-decode gate).
     const std::vector<int32_t>& dp_is_decode = params.parallel.dp_is_decode;
-    all_dp_decode_ = std::all_of(dp_is_decode.begin(),
+    const std::vector<int32_t>& dp_token_nums =
+        params.parallel.dp_global_token_nums;
+    dp_metadata_valid_ =
+        !dp_token_nums.empty() && dp_is_decode.size() == dp_token_nums.size();
+    all_dp_decode_ = dp_metadata_valid_ &&
+                     std::all_of(dp_is_decode.begin(),
                                  dp_is_decode.end(),
-                                 [](int32_t v) { return v != 0; });
+                                 [](int32_t value) { return value != 0; });
+    graph_num_tokens_ =
+        dp_token_nums.empty()
+            ? num_sequences
+            : *std::max_element(dp_token_nums.begin(), dp_token_nums.end());
+    empty_shard_ = num_sequences == 0;
   }
 
   py::object query_start_loc() const {
@@ -178,7 +192,10 @@ class KimiK3KDAMetadataView final {
   }
   int32_t num_decode_seqs() const { return num_decode_seqs_; }
   int32_t num_prefill_seqs() const { return num_prefill_seqs_; }
+  bool dp_metadata_valid() const { return dp_metadata_valid_; }
   bool all_dp_decode() const { return all_dp_decode_; }
+  int32_t graph_num_tokens() const { return graph_num_tokens_; }
+  bool empty_shard() const { return empty_shard_; }
 
  private:
   torch::Tensor query_start_loc_;
@@ -186,7 +203,10 @@ class KimiK3KDAMetadataView final {
   torch::Tensor has_initial_state_;
   int32_t num_decode_seqs_ = 0;
   int32_t num_prefill_seqs_ = 0;
+  bool dp_metadata_valid_ = false;
   bool all_dp_decode_ = true;
+  int32_t graph_num_tokens_ = 0;
+  bool empty_shard_ = false;
 };
 
 }  // namespace
@@ -225,8 +245,14 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
                              &KimiK3KDAMetadataView::num_decode_seqs)
       .def_property_readonly("num_prefill_seqs",
                              &KimiK3KDAMetadataView::num_prefill_seqs)
+      .def_property_readonly("dp_metadata_valid",
+                             &KimiK3KDAMetadataView::dp_metadata_valid)
       .def_property_readonly("all_dp_decode",
-                             &KimiK3KDAMetadataView::all_dp_decode);
+                             &KimiK3KDAMetadataView::all_dp_decode)
+      .def_property_readonly("graph_num_tokens",
+                             &KimiK3KDAMetadataView::graph_num_tokens)
+      .def_property_readonly("empty_shard",
+                             &KimiK3KDAMetadataView::empty_shard);
 }
 
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
