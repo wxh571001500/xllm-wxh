@@ -23,6 +23,14 @@ import torch.nn.functional as F
 
 from xllm.python import ops
 from xllm.python.layers.moe.types import MoEParallelConfig, MoEPrepareOutput
+from xllm.python.model_executor.forward_context import get_forward_context
+
+
+def _in_acl_graph_capture() -> bool:
+    try:
+        return get_forward_context().acl_graph is not None
+    except RuntimeError:
+        return False
 
 
 class PrepareAndFinalize(ABC):
@@ -181,8 +189,12 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         ):
             return MoEPrepareOutput(hidden_states, router_logits)
 
-        token_counts = self._gather_token_counts(hidden_states)
-        max_tokens = int(token_counts.max().item())
+        if _in_acl_graph_capture():
+            # Decode Graph pads every DP rank to the same static bucket.
+            max_tokens = self._num_tokens
+        else:
+            token_counts = self._gather_token_counts(hidden_states)
+            max_tokens = int(token_counts.max().item())
         pad_size = max_tokens - self._num_tokens
         if pad_size > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))

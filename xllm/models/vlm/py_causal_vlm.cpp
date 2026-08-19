@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
@@ -87,6 +88,7 @@ py::dict PyCausalVLM::build_config_dict(const ParallelArgs& parallel_args,
   config["tp_size"] = tp_size_;
   config["tp_rank"] = tp_rank_;
   config["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
+  config["block_size"] = KVCacheConfig::get_instance().block_size();
   config["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();
   return config;
