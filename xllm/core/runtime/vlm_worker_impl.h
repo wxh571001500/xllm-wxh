@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
+
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
@@ -42,6 +44,25 @@ class VLMWorkerImpl : public WorkerImpl {
   bool init_model(ModelContext& context) override;
 
   std::optional<ForwardOutput> step(const ForwardInput& input) override;
+
+ protected:
+  std::optional<ForwardOutput> step_for_schedule_overlap(
+      const ForwardInput& input) override;
+  ForwardInput update_input_by_last_step_output_for_schedule_overlap(
+      ForwardInput& input) override;
+
+ private:
+  enum class ForwardSyncPolicy : int8_t {
+    LEGACY = 0,
+    NO_SYNC,
+  };
+
+  std::optional<ForwardOutput> execute_no_sync_on_stream(
+      const ForwardInput& input,
+      Stream& compute_stream);
+  std::optional<ForwardOutput> step_internal(
+      const ForwardInput& input,
+      ForwardSyncPolicy sync_policy = ForwardSyncPolicy::LEGACY);
 };
 
 }  // namespace xllm
