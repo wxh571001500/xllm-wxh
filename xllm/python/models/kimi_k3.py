@@ -33,6 +33,10 @@ class KimiK3ForConditionalGeneration(PyCausalVLMBase):
         self.vision_model = KimiK3VisionModel(config)
         self.language_model = KimiK3ForCausalLM(config)
 
+    @property
+    def supports_prefix_cache(self) -> bool:
+        return self.language_model.supports_prefix_cache
+
     def encode_multimodal(
         self, pixel_values: torch.Tensor, grid_thws: torch.Tensor
     ) -> list[torch.Tensor]:
