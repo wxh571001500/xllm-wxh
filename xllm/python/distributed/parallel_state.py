@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os, sys
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -175,12 +176,13 @@ def _create_process_group(
     options.group_id = spec.group_id
     options.global_ranks_in_group = list(spec.ranks)
     options._timeout = _GROUP_TIMEOUT
-    return ProcessGroupHCCL(
+    pg = ProcessGroupHCCL(
         group_store,
         spec.local_rank,
         len(spec.ranks),
         options,
     )
+    return pg
 
 
 def _make_group(
@@ -227,10 +229,11 @@ def init_parallel_groups(
 
     store = None
     if world_size > 1:
+        os.environ.pop("RANK_TABLE_FILE", None)
         store = dist.TCPStore(
             host,
             port,
-            world_size,
+            -1,
             rank == 0,
             _GROUP_TIMEOUT,
             wait_for_workers=False,

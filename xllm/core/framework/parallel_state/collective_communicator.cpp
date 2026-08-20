@@ -313,24 +313,6 @@ void CollectiveCommunicator::create_process_groups(
       ->python_process_group_specs_ = build_python_process_group_specs(
       global_rank, world_size, dp_size, ep_size, cp_size, enable_encoder_dp);
 
-  // Encoder DP is used by multi-modal models to parallelize vision encoder
-  // work inside each language-model TP group. The rank set matches the TP
-  // group, but each rank runs a full encoder on different multi-modal items.
-  if (enable_encoder_dp) {
-    const int32_t encoder_dp_size = world_size / dp_size;
-    port_offset = global_rank / encoder_dp_size + 1;
-    encoder_dp_group_ = create_process_group(global_rank,
-                                             world_size,
-                                             encoder_dp_size,
-                                             port + port_offset,
-                                             false,
-                                             host,
-                                             "encoder_dp_group",
-                                             device);
-    parallel_args_->encoder_dp_group_ = encoder_dp_group_.get();
-    port += dp_size;
-  }
-
 #if defined(USE_NPU)
   if (::xllm::KernelConfig::get_instance().npu_kernel_backend() == "ATB") {
     // ATB owns TP/DP/EP; build a standalone HCCL CP ProcessGroup for
@@ -366,7 +348,37 @@ void CollectiveCommunicator::create_process_groups(
         << "No TCP port remains for the Python process-group rendezvous.";
     return;
   }
+  // TORCH backend (Python model_impl): Python creates its own process
+  // groups via init_parallel_groups.  Skip C++ process-group creation to
+  // avoid port conflicts and lazy-init timeouts on the C++ TCPStores.
+  if (::xllm::KernelConfig::get_instance().npu_kernel_backend() == "TORCH") {
+    parallel_args_->python_rendezvous_host_ = host;
+    parallel_args_->python_rendezvous_port_ = port + 1;
+    CHECK_LE(parallel_args_->python_rendezvous_port_, 65535)
+        << "No TCP port remains for the Python process-group rendezvous.";
+    return;
+  }
 #endif
+
+  // Encoder DP is used by multi-modal models to parallelize vision encoder
+  // work inside each language-model TP group. The rank set matches the TP
+  // group, but each rank runs a full encoder on different multi-modal items.
+  // On NPU TORCH/ATB backends, Python creates its own process groups, so the
+  // C++ encoder_dp group is skipped to avoid cross-machine TCPStore issues.
+  if (enable_encoder_dp) {
+    const int32_t encoder_dp_size = world_size / dp_size;
+    port_offset = global_rank / encoder_dp_size + 1;
+    encoder_dp_group_ = create_process_group(global_rank,
+                                             world_size,
+                                             encoder_dp_size,
+                                             port + port_offset,
+                                             false,
+                                             host,
+                                             "encoder_dp_group",
+                                             device);
+    parallel_args_->encoder_dp_group_ = encoder_dp_group_.get();
+    port += dp_size;
+  }
 
   process_group_ = create_process_group(global_rank,
                                         world_size,
