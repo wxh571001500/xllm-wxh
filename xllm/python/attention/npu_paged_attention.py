@@ -149,10 +149,33 @@ class NpuPagedAttentionBackend(AttentionBackend):
         else:
             self._actual_seq_lens = None
 
-        if metadata.block_table is not None:
-            self._block_table_i32 = metadata.block_table.to(torch.int32)
+        block_table = metadata.block_table
+        if block_table is None and metadata.paged_kv_indices is not None:
+            try:
+                _indptr = metadata.paged_kv_indptr
+                _indices = metadata.paged_kv_indices.to(torch.int32)
+                _batch = _indptr.shape[0] - 1
+                if _batch > 0:
+                    _counts = _indptr[1:] - _indptr[:-1]
+                    _max_blocks = int(_counts.max().item())
+                    if _max_blocks > 0:
+                        block_table = torch.zeros(
+                            (_batch, _max_blocks), dtype=torch.int32,
+                            device=_indices.device,
+                        )
+                        for _i in range(_batch):
+                            _s = int(_indptr[_i].item())
+                            _e = int(_indptr[_i + 1].item())
+                            _n = _e - _s
+                            if _n > 0:
+                                block_table[_i, :_n] = _indices[_s:_e]
+            except Exception:
+                block_table = None
 
-            real_batch = metadata.block_table.shape[0]
+        if block_table is not None:
+            self._block_table_i32 = block_table.to(torch.int32).to(self.device)
+
+            real_batch = block_table.shape[0]
 
             kv_host = metadata.kv_seq_lens_host
             if kv_host is not None:

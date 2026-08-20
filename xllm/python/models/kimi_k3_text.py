@@ -294,6 +294,15 @@ class KimiK3TextConfig:
             if configured_head_dim is None
             else configured_head_dim
         )
+        _ws = int(config.get("world_size", raw.get("world_size", 0)) or 0)
+        _dp = int(config.get("dp_size", raw.get("dp_size", 1)) or 1)
+        _tp = int(config.get("tp_size") or raw.get("tp_size") or 0)
+        if _tp <= 1 and _ws > 1 and _dp > 0:
+            _tp = _ws // _dp
+        _g_rank = int(config.get("rank") or raw.get("rank") or 0)
+        _tp_rank = int(config.get("tp_rank") or raw.get("tp_rank") or 0)
+        if _tp_rank == 0 and _g_rank > 0 and _tp > 1:
+            _tp_rank = _g_rank % _tp
         return cls(
             hidden_size=hidden_size,
             n_layers=int(pick("n_layers", "num_hidden_layers", default=93)),
@@ -373,8 +382,8 @@ class KimiK3TextConfig:
             quant_method=str(config.get("quant_method", "")),
             quant_version=str(config.get("quant_version", "")),
             quant_group_size=int(config.get("quant_group_size", 0)),
-            tp_size=int(config.get("tp_size", raw.get("tp_size", 1))),
-            tp_rank=int(config.get("tp_rank", raw.get("tp_rank", 0))),
+            tp_size=_tp,
+            tp_rank=_tp_rank,
             world_size=int(
                 config.get(
                     "world_size",
@@ -1807,10 +1816,22 @@ class KimiK3ForCausalLM(PyModelBase):
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
         self.cfg = KimiK3TextConfig.from_dict(config)
-        self.cfg.tp_size = int(config.get("tp_size", self.cfg.tp_size))
-        self.cfg.tp_rank = int(
-            config.get("tp_rank", _tp_rank_from_device(config.get("device", "npu:0")))
-        )
+        _tp_override = int(config.get("tp_size") or 0)
+        if _tp_override > 1:
+            self.cfg.tp_size = _tp_override
+        elif self.cfg.tp_size <= 1:
+            _ws = int(config.get("world_size") or 0)
+            _dp = int(config.get("dp_size") or 1)
+            if _ws > 1:
+                self.cfg.tp_size = _ws // _dp
+        _tp_rank_override = config.get("tp_rank")
+        if _tp_rank_override is not None and int(_tp_rank_override) > 0:
+            self.cfg.tp_rank = int(_tp_rank_override)
+        else:
+            _dev_rank = _tp_rank_from_device(config.get("device", "npu:0"))
+            self.cfg.tp_rank = (
+                _dev_rank % self.cfg.tp_size if self.cfg.tp_size > 0 else 0
+            )
         self.cfg.validate()
         self.dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         self.device = torch.device(config.get("device", "cuda"))
@@ -1852,8 +1873,8 @@ class KimiK3ForCausalLM(PyModelBase):
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
-        if tp_rank != self.cfg.tp_rank or tp_size != self.cfg.tp_size:
-            raise ValueError("Kimi K3 loader TP rank/size must match model construction")
+        tp_rank = self.cfg.tp_rank
+        tp_size = self.cfg.tp_size
         loaded: set[str] = set()
         
         # A single layer's tensors are spread across shards, so merge every

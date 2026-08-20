@@ -260,9 +260,7 @@ AttentionMetadata build_attention_metadata(
   }
 #endif
 
-#if defined(USE_ILU)
   attn_metadata.block_table = params.attention.device.block_tables;
-#endif
 
   // TODO: set use_tensor_core from options.
   // for xattention
