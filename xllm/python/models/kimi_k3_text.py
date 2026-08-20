@@ -267,6 +267,7 @@ class KimiK3TextConfig:
     moe_comm_type: str = "all_gather"
     mc2_tokens_capacity: int = 512
     enable_flashcomm1: bool = False
+    enable_prefix_cache: bool = True
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> KimiK3TextConfig:
@@ -412,6 +413,7 @@ class KimiK3TextConfig:
                 pick("mc2_tokens_capacity", default=512)
             ),
             enable_flashcomm1=bool(pick("enable_flashcomm1", default=False)),
+            enable_prefix_cache=bool(pick("enable_prefix_cache", default=True)),
         )
 
     def validate(self) -> None:
@@ -1263,16 +1265,18 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
 class KimiK3KDARuntime:
     """Per-step execution context for KDA layers.
 
-    The C++ executor must, before every model forward:
-      1. set ``metadata`` to a :class:`KimiK3KDAMetadata` for the batch;
-      2. populate ``caches[layer_id] = (conv_state, recurrent_state)`` for
-         every KDA layer, with shapes / dtypes per
+    The C++ executor, before every model forward:
+      1. sets ``metadata`` to a :class:`KimiK3KDAMetadata` for the batch
+         via :meth:`xllm.python.model_executor.executor.ModelExecutor.set_kda_metadata`;
+      2. populates ``caches[layer_id] = (conv_state, recurrent_state)`` for
+         every KDA layer via :meth:`xllm.python.model_executor.executor.ModelExecutor.bind_kda_caches`,
+         with shapes / dtypes per
          :meth:`KimiK3DeltaAttention.conv_state_shape` /
          :meth:`KimiK3DeltaAttention.recurrent_state_shape` /
          :meth:`KimiK3DeltaAttention.state_dtypes`.
 
-    This plumbing is not wired on the C++ side yet; the layers read from here so
-    the integration surface is a single object.
+    The C++ ``PyExecutorImpl`` wires both steps so the KDA layers read state
+    directly from this runtime object; no further C++-side plumbing is needed.
     """
 
     def __init__(self) -> None:
@@ -1845,6 +1849,18 @@ class KimiK3ForCausalLM(PyModelBase):
             device=self.device,
         )
         self._lm_head_loaded = False
+
+    @property
+    def supports_prefix_cache(self) -> bool:
+        """Kimi K3 participates in the C++ prefix cache.
+
+        The KDA layers restore their conv/recurrent state from checkpoints
+        identified by the C++ ``LinearStatePrefixCache``, and the Gated-MLA
+        layers reuse KV blocks through the standard ``PrefixCache``. Both
+        paths are driven by the C++ scheduler with no Python-side save/restore
+        logic needed.
+        """
+        return self.cfg.enable_prefix_cache
 
     def forward(
         self,
