@@ -187,7 +187,9 @@ AttentionMetadata build_attention_metadata(
 
   // MLA-family MLU paths require per-sequence q/kv lengths during prefill.
   if (!attn_metadata.is_prefill || enable_mla) {
-    attn_metadata.block_table = params.attention.device.block_tables;
+    if (params.attention.device.block_tables.defined()) {
+      attn_metadata.block_table = params.attention.device.block_tables;
+    }
 #if !defined(USE_NPU) && !defined(USE_CUDA)
     attn_metadata.kv_seq_lens =
         torch::diff(params.attention.device.kv_seq_lens);  // kv seqlens
@@ -260,7 +262,29 @@ AttentionMetadata build_attention_metadata(
   }
 #endif
 
-  attn_metadata.block_table = params.attention.device.block_tables;
+  // Only override block_table when the batch actually provides one. When
+  // block_tables_vec is empty (e.g., a DP rank with no real sequences during a
+  // chunked-prefill step), params.attention.device.block_tables is undefined;
+  // keep the dummy block_table set above (or create one below) so the Python
+  // attention backend does not crash on the chunked-prefill path.
+  if (params.attention.device.block_tables.defined()) {
+    attn_metadata.block_table = params.attention.device.block_tables;
+  }
+  // Fallback: ensure block_table is never undefined for downstream kernels.
+  if (!attn_metadata.block_table.defined()) {
+    torch::TensorOptions fallback_options =
+        int32_options_like(params.attention.device.new_cache_slots,
+                           params.attention.device.q_seq_lens);
+    if (!params.attention.device.new_cache_slots.defined() &&
+        !params.attention.device.q_seq_lens.defined()) {
+      if (device.has_value()) {
+        fallback_options = fallback_options.device(device.value());
+      } else {
+        fallback_options = fallback_options.device(torch::kCPU);
+      }
+    }
+    attn_metadata.block_table = torch::zeros({1, 1}, fallback_options);
+  }
 
   // TODO: set use_tensor_core from options.
   // for xattention
