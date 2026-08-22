@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -111,25 +111,22 @@ inline ToolCallResult process_tool_calls(
 
   function_call::FunctionCallParser parser(tools, parser_format);
 
-  if (!parser.has_tool_call(text)) {
+  if (!parser.has_tool_call(text) && parser_format != "kimi_k3") {
     result.text = std::move(text);
     result.finish_reason = std::move(finish_reason);
     return result;
   }
 
-  result.text = text;
-  result.finish_reason = finish_reason;
-
   try {
     auto [parsed_text, call_info_list] = parser.parse_non_stream(text);
     result.text = std::move(parsed_text);
 
-    if (call_info_list.empty()) {
-      return result;
-    }
-
-    if (finish_reason == "stop") {
+    const bool has_emitted_calls = !call_info_list.empty();
+    if ((parser_format != "kimi_k3" || has_emitted_calls) &&
+        finish_reason == "stop") {
       result.finish_reason = "tool_calls";
+    } else {
+      result.finish_reason = std::move(finish_reason);
     }
 
     google::protobuf::RepeatedPtrField<proto::ToolCall> tool_calls;
@@ -151,7 +148,9 @@ inline ToolCallResult process_tool_calls(
       tool_calls.AddAllocated(tool_call);
     }
 
-    result.tool_calls = std::move(tool_calls);
+    if (parser_format != "kimi_k3" || !tool_calls.empty()) {
+      result.tool_calls = std::move(tool_calls);
+    }
   } catch (const std::exception& e) {
     LOG(ERROR) << "Tool call parsing error: " << e.what();
   }

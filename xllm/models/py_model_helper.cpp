@@ -24,6 +24,7 @@ limitations under the License.
 #include <c10/util/Exception.h>
 #include <glog/logging.h>
 #include <pybind11/embed.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <cstdlib>
@@ -31,6 +32,7 @@ limitations under the License.
 #include <string>
 
 #include "core/framework/config/model_config.h"
+#include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/kernels/xllm_torch_ops.h"
 
@@ -73,6 +75,37 @@ std::string dtype_to_string(const torch::TensorOptions& options) {
     default:
       return "bfloat16";
   }
+}
+
+void init_python_process_groups(const ParallelArgs& parallel_args,
+                                const torch::Device& device) {
+  CHECK(!parallel_args.python_rendezvous_host_.empty());
+  CHECK_GT(parallel_args.python_rendezvous_port_, 0);
+  CHECK(!parallel_args.python_process_group_specs_.empty());
+
+  py::list group_specs;
+  for (const PythonProcessGroupSpec& spec :
+       parallel_args.python_process_group_specs_) {
+    py::dict group_spec;
+    group_spec["name"] = spec.name;
+    group_spec["ranks"] = spec.ranks;
+    group_spec["local_rank"] = spec.local_rank;
+    group_spec["group_id"] = spec.group_id;
+    if (spec.alias_of.empty()) {
+      group_spec["alias_of"] = py::none();
+    } else {
+      group_spec["alias_of"] = spec.alias_of;
+    }
+    group_specs.append(std::move(group_spec));
+  }
+
+  py::module_::import("xllm.python.distributed")
+      .attr("init_parallel_groups")(parallel_args.python_rendezvous_host_,
+                                    parallel_args.python_rendezvous_port_,
+                                    parallel_args.rank(),
+                                    parallel_args.world_size(),
+                                    c10::str(device),
+                                    group_specs);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +166,14 @@ torch::Tensor PyStateDict::get_tensor(const std::string& name) const {
   return sd_->get_tensor(name);
 }
 
+torch::Tensor PyStateDict::get_sharded_tensor(const std::string& name,
+                                              int64_t dim,
+                                              int32_t rank,
+                                              int32_t world_size) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return sd_->get_sharded_tensor(name, dim, rank, world_size);
+}
+
 bool PyStateDict::has(const std::string& name) const {
   CHECK(sd_ != nullptr) << "PyStateDict: access after release";
   return sd_->has(name);
@@ -147,11 +188,42 @@ py::list PyStateDict::keys() const {
   return result;
 }
 
+PyStateDict PyStateDict::get_dict_with_prefix(const std::string& prefix) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return PyStateDict(
+      std::make_unique<StateDict>(sd_->get_dict_with_prefix(prefix)));
+}
+
+PyStateDict PyStateDict::get_dict_with_prefixes(
+    const std::vector<std::string>& prefixes) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return PyStateDict(
+      std::make_unique<StateDict>(sd_->get_dict_with_prefix(prefixes)));
+}
+
+size_t PyStateDict::size() const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return sd_->size();
+}
+
 PYBIND11_EMBEDDED_MODULE(xllm_weight_loader, m) {
   py::class_<PyStateDict>(m, "StateDict")
       .def("get_tensor", &PyStateDict::get_tensor, py::arg("name"))
+      .def("get_sharded_tensor",
+           &PyStateDict::get_sharded_tensor,
+           py::arg("name"),
+           py::arg("dim"),
+           py::arg("rank"),
+           py::arg("world_size"))
       .def("has", &PyStateDict::has, py::arg("name"))
-      .def("keys", &PyStateDict::keys);
+      .def("keys", &PyStateDict::keys)
+      .def("get_dict_with_prefix",
+           &PyStateDict::get_dict_with_prefix,
+           py::arg("prefix"))
+      .def("get_dict_with_prefixes",
+           &PyStateDict::get_dict_with_prefixes,
+           py::arg("prefixes"))
+      .def("size", &PyStateDict::size);
 }
 
 }  // namespace xllm

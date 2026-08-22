@@ -1,10 +1,10 @@
-# Copyright 2026 The xLLM Authors.
+# Copyright 2026 The xLLM Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -26,6 +26,13 @@ from xllm.python.distributed.collectives import (
     init_tp_group,
     tp_rank,
 )
+from xllm.python.distributed.parallel_state import (
+    ParallelGroup,
+    get_parallel_group,
+    init_parallel_groups,
+    parallel_group_rank,
+    parallel_group_world_size,
+)
 
 __all__ = [
     "init_process_group",
@@ -36,4 +43,9 @@ __all__ = [
     "all_reduce_",
     "all_gather",
     "all_gather_variable",
+    "ParallelGroup",
+    "get_parallel_group",
+    "init_parallel_groups",
+    "parallel_group_rank",
+    "parallel_group_world_size",
 ]

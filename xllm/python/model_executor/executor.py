@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,35 +15,36 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
-from xllm.python.attention.backend import (
-    AttentionBackend,
-    AttentionMetadata,
-    LayerCacheInput,
-    normalize_layer_caches,
+from scripts.logger import logger
+from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, KVCache
+from xllm.python.layers.attention import (
+    AttentionLayerSpec,
+    AttentionRuntimeLayer,
 )
-from xllm.python.layers.attention import Attention
-from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.model_executor.runners.eager import EagerRunner
-from xllm.python.platform import current_platform
 
 
-def _resolve_graph_backend(config: dict) -> str:
+def _is_npu_device(device: torch.device) -> bool:
+    return device.type in ("npu", "privateuseone")
+
+
+def _resolve_graph_backend(config: dict, device: torch.device) -> str:
     graph_backend = str(config.get("python_graph_backend", "off")).lower()
     graph_disabled = graph_backend in ("", "off", "none", "0")
-    if graph_disabled and config.get("enable_graph", False):
-        if current_platform.is_npu():
-            return "aclgraph"
+    if graph_disabled and config.get("enable_graph", False) and _is_npu_device(device):
+        return "aclgraph"
     return graph_backend
 
 
 def _create_attention_backend(
-    first_attention: Attention,
+    first_attention: AttentionLayerSpec,
     device: torch.device,
     dtype: torch.dtype,
+    attention_kinds: set[str] | None = None,
 ) -> AttentionBackend:
-    if current_platform.is_npu():
+    if _is_npu_device(device):
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
         )
@@ -56,10 +57,13 @@ def _create_attention_backend(
             sliding_window=first_attention.sliding_window,
             device=device,
             dtype=dtype,
+            has_mha_layers=(first_attention.kind == "mha" if attention_kinds is None else "mha" in attention_kinds),
         )
-    if current_platform.is_cuda():
+    if device.type == "cuda":
         from xllm.python.attention.flashinfer import FlashInferBackend
 
+        if first_attention.kind != "mha":
+            raise NotImplementedError("CUDA Python backend does not support MLA")
         return FlashInferBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -72,55 +76,85 @@ def _create_attention_backend(
     raise NotImplementedError(f"No attention backend available for device type '{device.type}'")
 
 
+def _acl_graph_unsupported_reason(
+    attention_layers: list[AttentionRuntimeLayer],
+    *,
+    supports_kimi_k3_graph: bool = False,
+) -> str | None:
+    """Return why ACL graph is unsafe for this model, or ``None``."""
+    kinds = {layer.attention_kind for layer in attention_layers}
+    if supports_kimi_k3_graph:
+        unsupported_kinds = kinds.difference({"mha", "mla", "linear"})
+        if unsupported_kinds:
+            return f"ACL graph does not support attention kinds {sorted(unsupported_kinds)}"
+        return None
+    if "linear" in kinds:
+        return "ACL graph does not support linear-attention runtime state"
+    if kinds.difference({"mha"}):
+        return "ACL graph currently supports MHA attention only"
+    return None
+
+
 class ModelExecutor:
     def __init__(
         self,
         model: nn.Module,
         config: dict,
         max_seqs_per_batch: int,
-        num_decoding_tokens: int = 1,
-        acl_graph_decode_batch_size_limit: int | None = None,
     ) -> None:
         self.model = model
         self._kv_bound = False
 
-        attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
+        attention_layers = sorted(
+            (module for module in model.modules() if isinstance(module, AttentionRuntimeLayer)),
+            key=lambda layer: layer.layer_id,
+        )
         if not attention_layers:
-            raise ValueError("Python model does not contain an Attention layer")
+            raise ValueError("Python model does not contain a runtime attention layer")
 
-        first_attention = attention_layers[0]
-        expected_config = self._attention_config(first_attention)
-        for layer in attention_layers[1:]:
-            if self._attention_config(layer) != expected_config:
-                raise ValueError("Attention backend requires identical attention configuration across all layers")
+        layer_specs = [layer.attention_layer_spec() for layer in attention_layers]
+        layer_ids = [spec.layer_id for spec in layer_specs]
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(f"Runtime attention layer ids must be unique: got {layer_ids}")
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
-        self._num_attention_layers = len(attention_layers)
-        self.attention_backend = _create_attention_backend(first_attention, device, first_parameter.dtype)
+        self._device = device
+        self._attention_layer_specs = layer_specs
+        self._num_attention_layers = len(layer_specs)
+        # DP size from the C++ parallel properties (1 when DP is disabled).
+        # Used to gate decode-graph execution on all DP ranks decoding.
+        self._dp_size = int(config.get("dp_size", 1) or 1)
+        # The paged-KV backend geometry (heads/dims) must come from a real
+        # paged-attention layer. KDA ("linear") layers are runtime layers for
+        # ordering only and carry no paged-KV geometry, so build the backend
+        # from the first non-linear spec.
+        backend_spec = next(
+            (spec for spec in layer_specs if spec.kind != "linear"),
+            layer_specs[0],
+        )
+        self.attention_backend = _create_attention_backend(
+            backend_spec,
+            device,
+            first_parameter.dtype,
+            {spec.kind for spec in layer_specs},
+        )
 
         execution_model = model.model
+        # The execution model (e.g. KimiK3TextModel) owns the KDA runtime when
+        # the model has linear-attention (KDA) layers; other models leave it
+        # unset and the KDA bind/metadata calls below become no-ops.
+        self._execution_model = execution_model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
-        # Context-Parallel: shard prefill sequences across the CP group. Decode
-        # stays on the non-CP path (CP is prefill-only, eager-only in v1).
-        self.eager_runner.cp_size = int(config.get("cp_size", 1))
-        self.eager_runner.cp_rank = int(config.get("cp_rank", 0))
         self.decode_graph_runner = None
         self.inductor_runner = None
 
-        graph_backend = _resolve_graph_backend(config)
-        dp_size = int(config.get("dp_size", 1))
-        dp_rank = int(config.get("dp_rank", 0))
-        self.dp_size = dp_size
-        if dp_size > 1 and graph_backend not in (
-            "",
-            "off",
-            "none",
-            "0",
-            "cudagraphs",
-            "aclgraph",
-        ):
-            raise NotImplementedError("Python data parallel graph execution supports cudagraphs and aclgraph only")
+        graph_backend = _resolve_graph_backend(config, device)
+        logger.info(
+            f"Python model graph backend: backend={graph_backend}, "
+            f"enable_graph={bool(config.get('enable_graph', False))}, "
+            f"device={device}"
+        )
         if graph_backend in ("", "off", "none", "0"):
             pass
         elif graph_backend == "cudagraphs":
@@ -134,53 +168,35 @@ class ModelExecutor:
                 device,
                 max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
-                dp_size,
-                dp_rank,
             )
         elif graph_backend == "aclgraph":
+            unsupported_reason = _acl_graph_unsupported_reason(
+                attention_layers,
+                supports_kimi_k3_graph=hasattr(execution_model, "kda_runtime"),
+            )
+            if unsupported_reason is not None:
+                raise ValueError(unsupported_reason)
             from xllm.python.model_executor.runners.decode_acl_graph import (
                 DecodeAclGraphRunner,
             )
 
-            num_decoding_tokens = max(1, int(num_decoding_tokens))
-            decode_batch_size_limit = (
-                None if acl_graph_decode_batch_size_limit is None else max(1, int(acl_graph_decode_batch_size_limit))
-            )
-            graph_sequence_capacity = max_seqs_per_batch
-            if decode_batch_size_limit is not None:
-                graph_sequence_capacity = min(
-                    graph_sequence_capacity,
-                    decode_batch_size_limit,
-                )
-            max_graph_tokens = graph_sequence_capacity * num_decoding_tokens
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
                 device,
-                max_graph_tokens,
+                max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
-                dp_size,
-                dp_rank,
-                decode_batch_size_limit,
-                num_decoding_tokens,
+                int(config.get("block_size", 128)),
             )
         else:
-            if self.eager_runner.cp_size > 1:
-                # CP is prefill-only and lives on eager_runner; a compile
-                # backend serves prefill through InductorRunner, which carries
-                # no cp_context, so CP would silently no-op. Reject rather than
-                # run without the requested sharding.
-                raise NotImplementedError(
-                    "Context-Parallel (cp_size > 1) is not supported with the "
-                    f"'{graph_backend}' graph backend; CP is eager-only. Use "
-                    "graph_backend=off/aclgraph, or set cp_size=1."
-                )
             from xllm.python.model_executor.runners.inductor import InductorRunner
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
 
     @staticmethod
-    def _attention_config(layer: Attention) -> tuple[int, int, int, float, int]:
+    def _attention_config(
+        layer: AttentionRuntimeLayer,
+    ) -> tuple[int, int, int, float, int]:
         return (
             layer.num_heads,
             layer.num_kv_heads,
@@ -189,54 +205,142 @@ class ModelExecutor:
             layer.sliding_window,
         )
 
-    def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> None:
-        layer_caches = normalize_layer_caches(kv_caches)
-        required_layers = max(layer.layer_id for layer in self.model.modules() if isinstance(layer, Attention)) + 1
-        if len(layer_caches) < required_layers:
-            raise ValueError("cache layer count does not match the model layer layout")
+    def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
+        # Runtime layers are indexed by physical decoder layer id. The cache
+        # list may therefore contain slots for layers not present in a truncated
+        # runtime model, including KDA conv/SSM slots that the paged-KV backend
+        # never indexes directly.
+        highest_layer_id = max(spec.layer_id for spec in self._attention_layer_specs)
+        if len(kv_caches) <= highest_layer_id:
+            raise ValueError(
+                "KV cache list does not cover runtime physical-layer KV caches: "
+                f"highest layer id is {highest_layer_id}, got {len(kv_caches)} caches"
+            )
         if self._kv_bound:
             return
-        self.attention_backend.bind_kv_caches(layer_caches)
-        self.eager_runner.bind_layer_caches(layer_caches)
-        if self.decode_graph_runner is not None:
-            self.decode_graph_runner.bind_layer_caches(layer_caches)
-        if self.inductor_runner is not None:
-            self.inductor_runner.bind_layer_caches(layer_caches)
+        self.attention_backend.bind_kv_caches(kv_caches)
         self._kv_bound = True
 
-    @torch.inference_mode()
+    def bind_kda_caches(self, kda_caches: list[tuple[int, torch.Tensor, torch.Tensor]]) -> None:
+        """Bind linear-attention (KDA) conv/recurrent caches by decoder layer id.
+
+        Each entry is ``(layer_id, conv_state, recurrent_state)``. No-op for
+        models without a KDA runtime (i.e. non-Kimi-K3 models).
+        """
+        kda_runtime = getattr(self._execution_model, "kda_runtime", None)
+        if kda_runtime is None:
+            return
+        for layer_id, conv_state, recurrent_state in kda_caches:
+            kda_runtime.caches[int(layer_id)] = (conv_state, recurrent_state)
+
+    def set_kda_metadata(self, view: object, num_tokens: int) -> None:
+        """Populate the KDA runtime metadata for the current step.
+
+        ``view`` exposes the per-step linear-attention scheduling info the C++
+        runtime already computes for GDN layers. No-op for models without a KDA
+        runtime.
+        """
+        kda_runtime = getattr(self._execution_model, "kda_runtime", None)
+        if kda_runtime is None:
+            return
+        from xllm.python.layers.kda import PAD_SLOT_ID, KimiK3KDAMetadata
+
+        # Empty DP shard: the C++ worker feeds fake token rows with zero real
+        # sequences. Preserve the tensor shape, but describe zero-length
+        # sequences so KDA projections run while stateful operators see no
+        # actual tokens and do not touch conv/recurrent caches.
+        if view.num_decode_seqs + view.num_prefill_seqs == 0 and num_tokens > 0:
+            kda_runtime.metadata = KimiK3KDAMetadata(
+                query_start_loc=torch.zeros(1, dtype=torch.int64, device=self._device),
+                state_indices=torch.full(
+                    (num_tokens,),
+                    PAD_SLOT_ID,
+                    dtype=torch.int64,
+                    device=self._device,
+                ),
+                num_decode_seqs=0,
+                num_prefill_seqs=0,
+                has_initial_state=None,
+                graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
+                empty_shard=True,
+            )
+            return
+
+        # The C++ view builds query_start_loc / has_initial_state as host
+        # tensors (state_indices is already moved to device). KDA feeds all of
+        # them to the AscendC operators, which require device tensors, so move
+        # the host ones here to honor the on-device contract of
+        # KimiK3KDAMetadata.
+        def _to_device(
+            tensor: torch.Tensor | None,
+            dtype: torch.dtype | None = None,
+        ) -> torch.Tensor | None:
+            if tensor is None or tensor.device == self._device:
+                return tensor if dtype is None else tensor.to(dtype=dtype)
+            return tensor.to(self._device, dtype=dtype, non_blocking=True)
+
+        kda_runtime.metadata = KimiK3KDAMetadata(
+            query_start_loc=_to_device(view.query_start_loc, torch.int64),
+            state_indices=_to_device(view.state_indices),
+            num_decode_seqs=view.num_decode_seqs,
+            num_prefill_seqs=view.num_prefill_seqs,
+            has_initial_state=_to_device(view.has_initial_state),
+            graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
+            empty_shard=bool(getattr(view, "empty_shard", False)),
+        )
+
     def execute(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
-        input_embedding: torch.Tensor | None = None,
-        layer_synchronizer: LayerSynchronizer | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        kda_metadata: object | None = None,
     ) -> torch.Tensor:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
 
+        # Push per-step KDA scheduling info into the runtime before forward so
+        # KDA layers can read it via kda_runtime.require(). No-op without KDA.
+        if kda_metadata is not None:
+            self.set_kda_metadata(kda_metadata, input_ids.shape[0])
+
         graph_runner = self.decode_graph_runner
-        if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding):
+        if graph_runner is not None:
+            # Capture before eager prefill populates live KV/KDA caches. The
+            # synthetic graph warmup writes its own cache slots, so deferring it
+            # until the first decode would overwrite the active request state.
             graph_runner.warmup(
-                input_ids,
-                positions,
-                metadata,
-                input_embedding,
+                input_ids.device,
+                input_ids.dtype,
+                inputs_embeds,
             )
-            return graph_runner.execute(input_ids, positions, metadata, input_embedding)
+            if graph_runner.can_execute(input_ids, metadata) and self._all_dp_decode(kda_metadata):
+                return graph_runner.execute(
+                    input_ids,
+                    positions,
+                    metadata,
+                    inputs_embeds,
+                )
+        if inputs_embeds is not None:
+            return self.eager_runner.execute(input_ids, positions, metadata, inputs_embeds)
         if self.inductor_runner is not None:
-            return self.inductor_runner.execute(
-                input_ids,
-                positions,
-                metadata,
-                input_embedding,
-                layer_synchronizer,
-            )
-        return self.eager_runner.execute(
-            input_ids,
-            positions,
-            metadata,
-            input_embedding,
-            layer_synchronizer,
+            return self.inductor_runner.execute(input_ids, positions, metadata)
+        return self.eager_runner.execute(input_ids, positions, metadata)
+
+    def _all_dp_decode(self, kda_metadata: object | None) -> bool:
+        """Whether every DP rank can safely enter decode graph this step.
+
+        The C++ engine host-syncs per-rank batch types (``dp_is_decode``), so
+        this is a plain host-side check. DP graph execution requires complete
+        metadata and every rank to be in decode; otherwise all ranks fall back
+        to eager. Empty decode shards are marked as decode by the engine and
+        participate with padded inputs.
+        """
+        if self._dp_size <= 1:
+            return True
+        if kda_metadata is None:
+            return False
+        return bool(getattr(kda_metadata, "dp_metadata_valid", False)) and bool(
+            getattr(kda_metadata, "all_dp_decode", False)
         )

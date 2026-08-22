@@ -44,6 +44,18 @@ class PyModelBase(nn.Module):
     model: nn.Module
     lm_head: nn.Module
 
+    @property
+    def supports_prefix_cache(self) -> bool:
+        """Whether this model participates in the C++ prefix cache.
+
+        The C++ scheduler owns the prefix-cache hash chain, block sharing and
+        linear-state restore; a Python model opts in here so the bridge can
+        advertise capability without the scheduler downcasting the model. A
+        model that reuses KV blocks across requests but never reproduces its
+        own recurrent state from them must return False.
+        """
+        return False
+
     @staticmethod
     def resolve_dtype(dtype: object) -> torch.dtype:
         """Resolve a torch dtype from a ``torch.dtype`` or its string name."""
@@ -74,3 +86,22 @@ class PyModelBase(nn.Module):
         concatenation, format conversion, etc.
         """
         raise NotImplementedError
+
+
+class PyCausalVLMBase(nn.Module):
+    """Base class for Python VLMs composed around a causal language model."""
+
+    language_model: PyModelBase
+
+    @property
+    def supports_prefix_cache(self) -> bool:
+        """Delegates to the language model."""
+        return self.language_model.supports_prefix_cache
+
+    @property
+    def model(self) -> nn.Module:
+        """Expose the language-model body to ``ModelExecutor``."""
+        return self.language_model.model
+
+    def compute_logits(self, hidden: torch.Tensor, selected_idxes: Optional[torch.Tensor]) -> torch.Tensor:
+        return self.language_model.compute_logits(hidden, selected_idxes)

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "core/common/macros.h"
 #include "core/framework/parallel_state/process_group.h"
+#include "core/framework/parallel_state/python_process_group.h"
 
 #if defined(USE_NPU)
 #include "hccl/hccl.h"
@@ -234,10 +235,12 @@ struct ParallelArgs {
   ProcessGroup* mc2_group_ = nullptr;
   ProcessGroup* moe_tp_group_ = nullptr;
 
-  // Python process groups reuse the native world TCPStore. PrefixStore keeps
-  // the bootstrap keys for each logical group independent.
+  // PyTorch creates its own process groups from the native topology. These
+  // fields reserve one world-scoped TCPStore endpoint after the native
+  // process-group port range and describe every group containing this rank.
   std::string python_rendezvous_host_;
   int32_t python_rendezvous_port_ = 0;
+  std::vector<PythonProcessGroupSpec> python_process_group_specs_;
 
   // ProcessGroups for DiT models
   ProcessGroup* dit_tp_group_ = nullptr;

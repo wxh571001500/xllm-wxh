@@ -26,6 +26,7 @@ limitations under the License.
 #include "deepseekv3_detector.h"
 #include "glm45_detector.h"
 #include "glm47_detector.h"
+#include "kimi_k3_detector.h"
 #include "kimik2_detector.h"
 #include "qwen25_detector.h"
 #include "qwen3_coder_detector.h"
@@ -40,6 +41,7 @@ const std::unordered_map<std::string, std::vector<std::string>> auto_paser_map =
         {"qwen25", {"qwen2", "qwen3"}},
         {"qwen3_coder", {"qwen3_coder", "qwen35"}},
         {"kimi_k2", {"kimi_k2", "kimi_k25"}},
+        {"kimi_k3", {"kimi_k3"}},
         {"deepseekv3", {"deepseek_v3"}},
         {"deepseekv32", {"deepseek_v32"}},
         {"deepseekv4", {"deepseek_v4", "deepseek_v4_mtp"}},
@@ -67,6 +69,7 @@ const std::unordered_map<std::string,
         {"qwen25", [] { return std::make_unique<Qwen25Detector>(); }},
         {"qwen3_coder", [] { return std::make_unique<Qwen3CoderDetector>(); }},
         {"kimi_k2", [] { return std::make_unique<KimiK2Detector>(); }},
+        {"kimi_k3", [] { return std::make_unique<KimiK3Detector>(); }},
         {"deepseekv3", [] { return std::make_unique<DeepSeekV3Detector>(); }},
         {"deepseekv32", [] { return std::make_unique<DeepSeekV32Detector>(); }},
         {"deepseekv4", [] { return std::make_unique<DeepSeekV4Detector>(); }},
@@ -124,7 +127,7 @@ std::string FunctionCallParser::get_parser_auto(const std::string& parser,
 
 FunctionCallParser::FunctionCallParser(const std::vector<JsonTool>& tools,
                                        const std::string& tool_call_parser)
-    : tools_(tools) {
+    : tools_(tools), tool_call_parser_(tool_call_parser) {
   detector_ = create_detector(tool_call_parser);
   CHECK(detector_ != nullptr)
       << "Unsupported tool_call_parser: " << tool_call_parser;
@@ -139,7 +142,7 @@ FunctionCallParser::parse_non_stream(const std::string& full_text) {
   StreamingParseResult parsed_result =
       detector_->detect_and_parse(full_text, tools_);
 
-  if (!parsed_result.calls.empty()) {
+  if (!parsed_result.calls.empty() || tool_call_parser_ == "kimi_k3") {
     return std::make_tuple(parsed_result.normal_text, parsed_result.calls);
   } else {
     return std::make_tuple(full_text, std::vector<ToolCallItem>());

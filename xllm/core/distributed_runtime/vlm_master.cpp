@@ -31,7 +31,7 @@ limitations under the License.
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
 #include "core/platform/device_name_utils.h"
-#include "framework/chat_template/jinja_chat_template.h"
+#include "framework/chat_template/chat_template.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request.h"
 #include "runtime/xservice_client.h"
@@ -105,7 +105,7 @@ VLMMaster::VLMMaster(const Options& options)
   }
 
   chat_template_ =
-      std::make_unique<JinjaChatTemplate>(engine_->tokenizer_args());
+      ChatTemplate::create(engine_->tokenizer_args(), model_args_.model_type());
   tokenizer_ = engine_->tokenizer()->clone();
   processor_ = create_multimodal_processor(model_args_,
                                            tokenizer_,

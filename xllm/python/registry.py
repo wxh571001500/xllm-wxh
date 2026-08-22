@@ -113,5 +113,17 @@ def _register_builtin_models() -> None:
         "deepseek_v32_mtp",
     )
 
+    from xllm.python.models.deepseek_v32 import DeepseekV3ForCausalLM
+
+    register_model("deepseek_v32")(DeepseekV3ForCausalLM)
+
+    from xllm.python.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+    register_model("kimi_k3", "KimiK3ForConditionalGeneration")(KimiK3ForConditionalGeneration)
+
+    from xllm.python.models.kimi_k3_text import KimiK3ForCausalLM
+
+    register_model("KimiK3ForCausalLM", "kimi_k3_text")(KimiK3ForCausalLM)
+
 
 _register_builtin_models()

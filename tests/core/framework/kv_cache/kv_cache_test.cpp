@@ -527,6 +527,42 @@ TEST(KVCacheTest, IndexedKVCacheExposesQuantizedKvScaleTensors) {
             (std::vector<int64_t>{2, 4, 1}));
 }
 
+#if defined(USE_NPU)
+TEST(KVCacheTest, KimiK3HybridAttentionCreatesMlaAndKdaCacheShapes) {
+  KVCacheCapacity capacity;
+  capacity.n_blocks(8)
+      .block_size(16)
+      .num_linear_state_blocks(3)
+      .linear_conv_state_len(3);
+
+  ModelArgs model_args;
+  model_args.model_type("kimi_k3")
+      .enable_mla(true)
+      .n_heads(96)
+      .n_kv_heads(96)
+      .head_dim(192)
+      .kv_lora_rank(512)
+      .qk_rope_head_dim(64)
+      .linear_conv_kernel_dim(4)
+      .linear_key_head_dim(128)
+      .linear_value_head_dim(128)
+      .linear_num_key_heads(96)
+      .linear_num_value_heads(96)
+      .layer_types({"linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention"});
+
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/2);
+
+  EXPECT_EQ(shape.key_cache_shape(), (std::vector<int64_t>{8, 16, 1, 512}));
+  EXPECT_EQ(shape.value_cache_shape(), (std::vector<int64_t>{8, 16, 1, 64}));
+  EXPECT_EQ(shape.conv_cache_shape(), (std::vector<int64_t>{3, 3, 18432}));
+  EXPECT_EQ(shape.ssm_cache_shape(), (std::vector<int64_t>{3, 48, 128, 128}));
+}
+#endif
+
 #if defined(USE_MLU)
 TEST(KVCacheTest, DeepSeekV4UsesInjectedAllocatorForTransferableOwners) {
   KVCacheCapacity capacity;

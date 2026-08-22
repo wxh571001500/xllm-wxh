@@ -20,6 +20,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "platform/device.h"
 #include "platform/platform.h"
@@ -39,9 +40,12 @@ VlmExecutorImpl::VlmExecutorImpl(CausalLM* model,
         options_.max_encoder_cache_size() * 1024 * 1024);
   }
 
-  if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
+  const bool python_model = ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl());
+  if (python_model || ::xllm::ExecutionConfig::get_instance().enable_graph()) {
+    const std::string backend = python_model ? "python" : Platform::type_str();
     llm_executor_ = ExecutorImplFactory::get_instance().create_executor_impl(
-        model, args, device, options, Platform::type_str());
+        model, args, device, options, backend);
   }
 }
 

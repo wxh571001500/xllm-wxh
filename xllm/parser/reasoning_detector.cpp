@@ -18,6 +18,9 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <utility>
+
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_replace.h"
 #include "absl/strings/str_split.h"
@@ -28,16 +31,28 @@ std::string absl_trim(absl::string_view str) {
   absl::string_view trimmed = absl::StripAsciiWhitespace(str);
   return std::string(trimmed);
 }
+
+size_t partial_token_overlap(absl::string_view text, absl::string_view token) {
+  const size_t maximum = std::min(text.size(), token.size() - 1);
+  for (size_t overlap = maximum; overlap > 0; --overlap) {
+    if (text.substr(text.size() - overlap) == token.substr(0, overlap)) {
+      return overlap;
+    }
+  }
+  return 0;
+}
 }  // namespace
 
 ReasoningDetector::ReasoningDetector(const std::string& think_start_token,
                                      const std::string& think_end_token,
                                      bool force_reasoning,
-                                     bool stream_reasoning)
+                                     bool stream_reasoning,
+                                     bool trim_output)
     : think_start_token_(think_start_token),
       think_end_token_(think_end_token),
       in_reasoning_(force_reasoning),
-      stream_reasoning_(stream_reasoning) {}
+      stream_reasoning_(stream_reasoning),
+      trim_output_(trim_output) {}
 
 ReasoningResult ReasoningDetector::detect_and_parse(std::string& text) {
   bool in_reasoning =
@@ -49,7 +64,9 @@ ReasoningResult ReasoningDetector::detect_and_parse(std::string& text) {
 
   std::string processed_text =
       absl::StrReplaceAll(text, {{think_start_token_, ""}});
-  processed_text = absl_trim(processed_text);
+  if (trim_output_) {
+    processed_text = absl_trim(processed_text);
+  }
 
   if (!absl::StrContains(processed_text, think_end_token_)) {
     return ReasoningResult(std::nullopt, processed_text);
@@ -59,7 +76,10 @@ ReasoningResult ReasoningDetector::detect_and_parse(std::string& text) {
       absl::StrSplit(processed_text, absl::MaxSplits(think_end_token_, 1));
 
   std::string reasoning_text = std::string(parts[0]);
-  std::string normal_text = parts.size() > 1 ? absl_trim(parts[1]) : "";
+  std::string normal_text = parts.size() > 1 ? std::string(parts[1]) : "";
+  if (trim_output_) {
+    normal_text = absl_trim(normal_text);
+  }
 
   return ReasoningResult(normal_text, reasoning_text);
 }
@@ -95,7 +115,10 @@ ReasoningResult ReasoningDetector::parse_streaming_increment(
         absl::StrSplit(current_text, absl::MaxSplits(think_end_token_, 1));
 
     std::string reasoning_text = std::string(parts[0]);
-    std::string normal_text = parts.size() > 1 ? absl_trim(parts[1]) : "";
+    std::string normal_text = parts.size() > 1 ? std::string(parts[1]) : "";
+    if (trim_output_) {
+      normal_text = absl_trim(normal_text);
+    }
 
     buffer_.clear();
     in_reasoning_ = false;
@@ -106,8 +129,15 @@ ReasoningResult ReasoningDetector::parse_streaming_increment(
   // Continue with reasoning content
   if (in_reasoning_) {
     if (stream_reasoning_) {
-      buffer_.clear();
-      return ReasoningResult(std::nullopt, std::string(current_text));
+      const size_t overlap =
+          partial_token_overlap(current_text, think_end_token_);
+      const size_t safe_size = current_text.size() - overlap;
+      std::string reasoning_text = current_text.substr(0, safe_size);
+      buffer_ = current_text.substr(safe_size);
+      if (reasoning_text.empty()) {
+        return ReasoningResult();
+      }
+      return ReasoningResult(std::nullopt, std::move(reasoning_text));
     } else {
       return ReasoningResult();
     }

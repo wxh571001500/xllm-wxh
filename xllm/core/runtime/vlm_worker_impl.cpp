@@ -26,7 +26,9 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "core/framework/config/model_config.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/kv_cache/linear_state_restore.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/model_registry.h"
@@ -34,6 +36,24 @@ limitations under the License.
 #include "util/timer.h"
 
 namespace xllm {
+
+namespace {
+
+void wait_input_ready_event(const ForwardInput& input, const Stream& stream) {
+  CHECK(stream.wait_event(input.metadata_ready_event))
+      << "failed to wait ForwardInput metadata ready event";
+}
+
+StreamEventPtr record_current_stream_event(const Device& device) {
+  std::unique_ptr<Stream> stream = device.current_stream();
+  StreamEventPtr event = stream->record_event();
+  if (event == nullptr) {
+    stream->synchronize();
+  }
+  return event;
+}
+
+}  // namespace
 
 VLMWorkerImpl::VLMWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
@@ -47,6 +67,7 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
 
   // initialize model
   context.set_encoder_embedding_mode(false);
+  context.set_model_impl(ModelConfig::get_instance().model_impl());
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(
@@ -55,15 +76,55 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
 }
 
 std::optional<ForwardOutput> VLMWorkerImpl::step(const ForwardInput& input) {
+  std::unique_ptr<Stream> stream = device_.current_stream();
+  wait_input_ready_event(input, *stream);
+  return step_internal(input, ForwardSyncPolicy::LEGACY);
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::step_for_schedule_overlap(
+    const ForwardInput& input) {
+#if defined(USE_NPU)
+  if (has_linear_attention_layers(context_.get_model_args())) {
+    c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
+    auto& mutable_params = const_cast<ModelInputParams&>(input.input_params);
+    restore_linear_state_slots(kv_caches_,
+                               mutable_params.linear_state_cache_ops,
+                               mutable_params.parallel.has_initial_state);
+  }
+#endif
+  return execute_no_sync_on_stream(input, *compute_stream_);
+}
+
+ForwardInput
+VLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
+    ForwardInput& input) {
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
+      << "failed to wait last step output ready event";
+  return update_input_by_last_step_output(input);
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::execute_no_sync_on_stream(
+    const ForwardInput& input,
+    Stream& compute_stream) {
+  c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+  wait_input_ready_event(input, compute_stream);
+  return step_internal(input, ForwardSyncPolicy::NO_SYNC);
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
+    const ForwardInput& input,
+    ForwardSyncPolicy sync_policy) {
   Timer timer;
   const bool empty_shard =
       input.input_params.meta.num_sequences == 0 &&
       (!input.token_ids.defined() || input.token_ids.numel() == 0);
-  if (empty_shard) {
+  const bool needs_collective_participation =
+      parallel_args_.ep_size() > 1 || !parallel_args_.mapping_data().empty();
+  if (empty_shard && !needs_collective_participation) {
     return ForwardOutput{};
   }
 
-  // TODO guojinrong, to adapt multi stream parallel later
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
@@ -78,7 +139,11 @@ std::optional<ForwardOutput> VLMWorkerImpl::step(const ForwardInput& input) {
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
       !options_.enable_speculative_decode()) {
-    auto ret = device_.synchronize_default_stream();
+    if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+      return std::nullopt;
+    }
+    int32_t ret = device_.synchronize_default_stream();
+    CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
     return std::nullopt;
   }
 
@@ -96,7 +161,15 @@ std::optional<ForwardOutput> VLMWorkerImpl::step(const ForwardInput& input) {
     output.logprobs = sampling_params.logprobs;
     output.max_top_logprobs = sampling_params.max_top_logprobs;
   }
-  auto ret = device_.synchronize_default_stream();
+
+  if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+    output.retained_input = std::make_shared<ForwardInput>(input);
+    output.ready_event = record_current_stream_event(device_);
+    return output;
+  }
+
+  int32_t ret = device_.synchronize_default_stream();
+  CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
   return output;
 }
 

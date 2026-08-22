@@ -31,7 +31,7 @@ limitations under the License.
 
 namespace xllm {
 
-class PyCausalLM;
+class PyModelBridge;
 
 class __attribute__((visibility("hidden"))) PyExecutorImpl final
     : public ExecutorImpl {
@@ -51,7 +51,7 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                   const ModelInputParams& params) override;
 
  private:
-  PyCausalLM* py_causal_lm_;
+  PyModelBridge* py_model_bridge_;
   ModelArgs args_;
   torch::Device device_;
   runtime::Options options_;
@@ -60,6 +60,9 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   pybind11::object py_executor_;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;
+  // True when the model has linear-attention (KDA) layers; gates KDA cache
+  // binding and per-step metadata push.
+  bool has_kda_layers_ = false;
 };
 
 REGISTER_EXECUTOR("python", PyExecutorImpl);

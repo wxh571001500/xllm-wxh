@@ -306,6 +306,14 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
   CHECK_GE(seq_index, 0);
 
   auto token_pos = item.state().token_pos();
+  torch::Tensor mm_token_mask = state.mm_token_mask();
+  if (!mm_token_mask.defined()) {
+    // Processors that represent an item as a contiguous media span do not
+    // need a separate mask; every token in the span is multimodal.
+    mm_token_mask = torch::ones(
+        {token_pos.length},
+        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+  }
   int32_t start_pos = state.schedule_data().start_pos;
   int32_t end_pos = state.schedule_data().end_pos;
   // start_pos / end_pos select the scheduled subrange inside this multimodal
@@ -313,7 +321,7 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
   // multimodal token, so mm_token_mask is used to filter out non-multimodal
   // positions when slicing multimodal embeddings.
   auto [emb_start, emb_end] =
-      compute_emb_range(start_pos, end_pos, state.mm_token_mask());
+      compute_emb_range(start_pos, end_pos, mm_token_mask);
   int32_t schedule_tokens_num = per_seq_scheduled_lens_[seq_index];
   int32_t context_tokens_num = per_seq_context_lens_[seq_index];
 
@@ -328,19 +336,19 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
     image_mask_.slice(/*dim*/ 0,
                       /*start*/ req_start_pos,
                       /*end*/ req_end_pos) =
-        state.mm_token_mask().slice(
+        mm_token_mask.slice(
             /*dim*/ 0, /*start*/ start_pos, /*end*/ end_pos);
   } else if (item.type() == MMType::VIDEO) {
     video_mask_.slice(/*dim*/ 0,
                       /*start*/ req_start_pos,
                       /*end*/ req_end_pos) =
-        state.mm_token_mask().slice(
+        mm_token_mask.slice(
             /*dim*/ 0, /*start*/ start_pos, /*end*/ end_pos);
   } else if (item.type() == MMType::AUDIO) {
     audio_mask_.slice(/*dim*/ 0,
                       /*start*/ req_start_pos,
                       /*end*/ req_end_pos) =
-        state.mm_token_mask().slice(
+        mm_token_mask.slice(
             /*dim*/ 0, /*start*/ start_pos, /*end*/ end_pos);
   }
   const std::string key = get_embedding_key(item.type());
@@ -350,6 +358,8 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
     return false;
   }
   torch::Tensor embedding = safe_to(emb.value(), device_, true);
+  CHECK(embedding.defined())
+      << "Multimodal embedding is undefined for key " << key;
   datas_[key].push_back(
       embedding.slice(/*dim*/ 0, /*start*/ emb_start, /*end*/ emb_end));
   return true;

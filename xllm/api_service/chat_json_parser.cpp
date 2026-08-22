@@ -61,9 +61,27 @@ Status normalize_tool_choice(nlohmann::json* json, bool* modified) {
         "Function tool_choice must contain a non-empty function.name string.");
   }
 
+  const std::string function_name = function["name"].get<std::string>();
+  bool declared = false;
+  if (json->contains("tools") && (*json)["tools"].is_array()) {
+    for (const auto& tool : (*json)["tools"]) {
+      if (tool.is_object() && tool.contains("function") &&
+          tool["function"].is_object() && tool["function"].contains("name") &&
+          tool["function"]["name"].is_string() &&
+          tool["function"]["name"].get<std::string>() == function_name) {
+        declared = true;
+        break;
+      }
+    }
+  }
+  if (!declared) {
+    return Status(
+        StatusCode::INVALID_ARGUMENT,
+        "Named tool_choice function is not declared: " + function_name);
+  }
+
   nlohmann::json normalized_tool_choice = {
-      {"type", "function"},
-      {"function", {{"name", function["name"].get<std::string>()}}}};
+      {"type", "function"}, {"function", {{"name", function_name}}}};
   tool_choice = normalized_tool_choice.dump();
   *modified = true;
   return Status();

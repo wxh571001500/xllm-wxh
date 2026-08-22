@@ -37,7 +37,8 @@ class ReasoningDetector {
   ReasoningDetector(const std::string& think_start_token,
                     const std::string& think_end_token,
                     bool force_reasoning = false,
-                    bool stream_reasoning = true);
+                    bool stream_reasoning = true,
+                    bool trim_output = true);
 
   ~ReasoningDetector() = default;
 
@@ -59,6 +60,7 @@ class ReasoningDetector {
   std::string think_end_token_;
   bool in_reasoning_;
   bool stream_reasoning_;
+  bool trim_output_;
   std::string buffer_ = "";
   bool stripped_think_start_ = false;
 };

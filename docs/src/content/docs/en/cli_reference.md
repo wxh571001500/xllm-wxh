@@ -41,8 +41,8 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `task` | `string` | `"generate"` | Model task, for example `generate`, `embed`, or `mm_embed`. |
 | `limit_image_per_prompt` | `int32` | `8` | Maximum number of images per prompt. Only applies to multimodal models. |
 | `max_encoder_cache_size` | `int64` | `0` | Maximum GPU/NPU memory size in MB for the encoder cache per worker. `0` disables the encoder cache. |
-| `reasoning_parser` | `string` | `""` | Reasoning parser, for example `auto`, `glm45`, `glm47`, `glm5`, `qwen3`, `qwen35`, or `deepseek-r1`. |
-| `tool_call_parser` | `string` | `""` | Tool-call parser, for example `auto`, `qwen25`, `qwen3`, `qwen35`, `qwen3_coder`, `kimi_k2`, `deepseekv3`, `deepseekv32`, `deepseekv4`, `glm45`, `glm47`, or `glm5`. |
+| `reasoning_parser` | `string` | `""` | Reasoning parser, for example `auto`, `glm45`, `glm47`, `glm5`, `qwen3`, `qwen35`, `deepseek-r1`, or `kimi_k3`. |
+| `tool_call_parser` | `string` | `""` | Tool-call parser, for example `auto`, `qwen25`, `qwen3`, `qwen35`, `qwen3_coder`, `kimi_k2`, `kimi_k3`, `deepseekv3`, `deepseekv32`, `deepseekv4`, `glm45`, `glm47`, or `glm5`. |
 | `enable_qwen3_reranker` | `bool` | `false` | Whether to enable the Qwen3 reranker. |
 | `flashinfer_workspace_buffer_size` | `int32` | `134217728` | Reserved FlashInfer workspace buffer for intermediate attention results in split-k attention. Default is 128 MiB. |
 | `enable_return_mm_full_embeddings` | `bool` | `false` | Whether VLM models return ViT embeddings and sequence embeddings. |

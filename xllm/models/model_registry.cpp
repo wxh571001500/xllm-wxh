@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,13 +20,18 @@ limitations under the License.
 
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
+#include <vector>
 
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/util/dit_model_discovery.h"
 #include "llm/py_causal_lm.h"
 #include "models.h"
+#include "models/vlm/py_causal_vlm.h"
+#include "processors/kimi25_image_processor.h"
+#include "processors/multimodal_processor.h"
 
 namespace {
 
@@ -64,6 +69,145 @@ namespace xllm {
 
 namespace {
 
+using KimiK3MultimodalProcessor =
+    MultimodalProcessor<KimiK25PromptProcessor, KimiK25ImageProcessor>;
+
+REGISTER_MULTIMODAL_PROCESSOR(kimi_k3, KimiK3MultimodalProcessor);
+const bool kimi_k3_python_vlm_registered = []() {
+  ModelRegistry::register_model_backend("kimi_k3", "vlm");
+  return true;
+}();
+
+REGISTER_MODEL_ARGS(kimi_k3, [&] {
+  LOAD_ARG_OR(model_type, "model_type", "kimi_k3");
+  LOAD_ARG_OR_FUNC(dtype, "dtype", [&] {
+    return json.value_or<std::string>("torch_dtype", "bfloat16");
+  });
+
+  LOAD_ARG_OR(n_layers, "text_config.num_hidden_layers", 93);
+  LOAD_ARG_OR(hidden_size, "text_config.hidden_size", 7168);
+  LOAD_ARG_OR(n_heads, "text_config.num_attention_heads", 96);
+  LOAD_ARG_OR(n_kv_heads, "text_config.num_key_value_heads", 96);
+  LOAD_ARG_OR(qk_nope_head_dim, "text_config.qk_nope_head_dim", 128);
+  LOAD_ARG_OR(qk_rope_head_dim, "text_config.qk_rope_head_dim", 64);
+  LOAD_ARG_OR(v_head_dim, "text_config.v_head_dim", 128);
+  LOAD_ARG_OR(q_lora_rank, "text_config.q_lora_rank", 1536);
+  LOAD_ARG_OR(kv_lora_rank, "text_config.kv_lora_rank", 512);
+  SET_ARG(head_dim, args->qk_nope_head_dim() + args->qk_rope_head_dim());
+  SET_ARG(rotary_dim, args->qk_rope_head_dim());
+  LOAD_ARG_OR(vocab_size, "text_config.vocab_size", 163840);
+  LOAD_ARG_OR(
+      max_position_embeddings, "text_config.max_position_embeddings", 1048576);
+  LOAD_ARG_OR(eos_token_id, "text_config.eos_token_id", 163586);
+  LOAD_ARG_OR(pad_token_id, "text_config.pad_token_id", 163839);
+
+  // Kimi-K3 Delta Attention (KDA / linear attention). These flat linear_*
+  // fields drive the shared C++ linear-attention cache path
+  // (has_linear_attention_layers -> KVCacheShape conv/ssm allocation). Kimi-K3
+  // stores its KDA config nested under text_config.linear_attn_config, and it
+  // shares one head_dim / num_heads across q/k/v (unlike Qwen GDN), so key and
+  // value dims/heads map to the same source field.
+  LOAD_ARG_OR(linear_conv_kernel_dim,
+              "text_config.linear_attn_config.short_conv_kernel_size",
+              4);
+  LOAD_ARG_OR(
+      linear_key_head_dim, "text_config.linear_attn_config.head_dim", 128);
+  LOAD_ARG_OR(
+      linear_value_head_dim, "text_config.linear_attn_config.head_dim", 128);
+  LOAD_ARG_OR(
+      linear_num_key_heads, "text_config.linear_attn_config.num_heads", 96);
+  LOAD_ARG_OR(
+      linear_num_value_heads, "text_config.linear_attn_config.num_heads", 96);
+  // The recurrent (ssm) state must stay fp32 to match the KDA layer contract
+  // (kda.py state_dtypes); the KVCache create-option default is bf16.
+  SET_ARG(mamba_ssm_dtype, "float32");
+  // Build per-layer types from the 1-based kda_layers list so both
+  // has_linear_attention_layers and the per-layer cache dispatch classify
+  // Kimi-K3's irregular KDA layout correctly.
+  [&] {
+    int64_t n_layers = args->n_layers();
+    auto kda_layers = json.value<std::vector<int64_t>>(
+        "text_config.linear_attn_config.kda_layers");
+    if (!kda_layers.has_value() || kda_layers->empty() || n_layers <= 0) {
+      return;
+    }
+    std::unordered_set<int64_t> kda_layer_set(kda_layers->begin(),
+                                              kda_layers->end());
+    std::vector<std::string> layer_types;
+    layer_types.reserve(n_layers);
+    for (int64_t layer_id = 0; layer_id < n_layers; ++layer_id) {
+      // kda_layers is 1-based; a 0-based layer_id maps to layer_id + 1.
+      const bool is_kda = kda_layer_set.count(layer_id + 1) > 0;
+      layer_types.emplace_back(is_kda ? "linear_attention" : "full_attention");
+    }
+    args->layer_types() = std::move(layer_types);
+  }();
+
+  LOAD_ARG_OR(mm_num_channels, "vision_config.in_chans", 3);
+  LOAD_ARG_OR(mm_patch_size, "vision_config.patch_size", 14);
+  LOAD_ARG_OR(mm_hidden_size, "vision_config.vt_hidden_size", 1024);
+  LOAD_ARG_OR(mm_intermediate_size, "vision_config.vt_intermediate_size", 4096);
+  LOAD_ARG_OR(
+      mm_num_attention_heads, "vision_config.vt_num_attention_heads", 12);
+  LOAD_ARG_OR(mm_num_hidden_layers, "vision_config.vt_num_hidden_layers", 27);
+  LOAD_ARG_OR_FUNC(mm_projection_dim, "vision_config.text_hidden_size", [&] {
+    return json.value_or<int64_t>("text_config.hidden_size", 7168);
+  });
+  LOAD_ARG_OR(
+      mm_projector_type, "vision_config.mm_projector_type", "patchmergerv2");
+  LOAD_ARG_OR(
+      mm_projector_hidden_act, "vision_config.projector_hidden_act", "gelu");
+  LOAD_ARG_OR(mm_layer_norm_eps, "vision_config.projector_ln_eps", 1e-5f);
+  [&] {
+    auto merge_kernel_size =
+        json.value<std::vector<int64_t>>("vision_config.merge_kernel_size");
+    args->mm_spatial_merge_size() =
+        merge_kernel_size.has_value() && !merge_kernel_size->empty()
+            ? (*merge_kernel_size)[0]
+            : int64_t(2);
+  }();
+  SET_ARG(mm_image_merge_size, args->mm_spatial_merge_size());
+  LOAD_ARG_OR(mm_init_pos_emb_time, "vision_config.init_pos_emb_time", 4);
+  LOAD_ARG_OR(mm_init_pos_emb_width, "vision_config.init_pos_emb_width", 64);
+  LOAD_ARG_OR(mm_init_pos_emb_height, "vision_config.init_pos_emb_height", 64);
+
+  SET_ARG(vision_start_token_id, 163602);
+  SET_ARG(vision_token_id, 163603);
+  SET_ARG(vision_end_token_id, 163604);
+  SET_ARG(image_token_id, 163605);
+  SET_ARG(video_token_id, 163605);
+  SET_ARG(mm_km_patch_size, 14);
+  SET_ARG(mm_km_merge_kernel_size, 2);
+  SET_ARG(stop_token_ids, std::unordered_set<int32_t>({0, 163585, 163586}));
+});
+
+REGISTER_TOKENIZER_ARGS(kimi_k3, [&] {
+  SET_ARG(tokenizer_type, "tiktoken");
+  SET_ARG(vocab_file, "tiktoken.model");
+  SET_ARG(special_tokens,
+          std::vector<SpecialToken>({{"[BOS]", 163584},
+                                     {"[EOS]", 163585},
+                                     {"<|end_of_msg|>", 163586},
+                                     {"<|open|>", 163587},
+                                     {"<|close|>", 163588},
+                                     {"<|sep|>", 163589},
+                                     {"[start_header_id]", 163590},
+                                     {"[end_header_id]", 163591},
+                                     {"[EOT]", 163593},
+                                     {"<|media_begin|>", 163602},
+                                     {"<|media_content|>", 163603},
+                                     {"<|media_end|>", 163604},
+                                     {"<|media_pad|>", 163605},
+                                     {"[UNK]", 163838},
+                                     {"[PAD]", 163839}}));
+  SET_ARG(visible_special_tokens,
+          std::vector<std::string>(
+              {"<|end_of_msg|>", "<|open|>", "<|close|>", "<|sep|>"}));
+  SET_ARG(
+      pattern,
+      R"([\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+[^\s]|\s+)");
+});
+
 #if defined(USE_NPU)
 constexpr char kAutoBackend[] = "AUTO";
 constexpr char kAtbBackend[] = "ATB";
@@ -72,9 +216,7 @@ constexpr char kTorchBackend[] = "TORCH";
 bool is_torch_only_model_type(const std::string& model_type) {
   static const std::unordered_set<std::string> kTorchOnlyModelTypes = {
       "deepseek_v4",
-      "deepseek_v4_dspark",
       "deepseek_v4_mtp",
-      "glm5_next",
       "qwen3_5",
       "qwen3_5_text",
       "qwen3_5_moe",
@@ -82,7 +224,8 @@ bool is_torch_only_model_type(const std::string& model_type) {
       "qwen3_5_mtp",
       "qwen3_5_moe_mtp",
       "qwen3_next",
-      "minimax_m2"};
+      "minimax_m2",
+      "kimi_k3"};
   return kTorchOnlyModelTypes.count(model_type) != 0;
 }
 #endif
@@ -119,11 +262,8 @@ bool resolve_model_registration(const std::string& model_type,
     effective_backend =
         is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
   } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
-             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
-             model_type == "qwen3_vl" || model_type == "deepseek_v32_mtp") {
-    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl/deepseek_v32_mtp
-    // support both backends. qwen3_vl on TORCH is used by the Python model
-    // executor (--model_impl=python implements its own ViT + deepstack).
+             model_type == "deepseek_v32") {
+    // qwen3/qwen3_moe/deepseek_v32 support both backends.
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
@@ -147,12 +287,6 @@ bool resolve_model_registration(const std::string& model_type,
     *resolved_name = "qwen3_atb";
   } else if (model_type == "qwen3_moe" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_moe_atb";
-  } else if (model_type == "qwen2" && effective_backend == kAtbBackend) {
-    *resolved_name = "qwen2_atb";
-  } else if (model_type == "qwen2_5_vl" && effective_backend == kAtbBackend) {
-    *resolved_name = "qwen2_5_vl_atb";
-  } else if (model_type == "qwen3_vl" && effective_backend == kAtbBackend) {
-    *resolved_name = "qwen3_vl_atb";
   } else {
     *resolved_name = model_type;
   }
@@ -180,16 +314,9 @@ bool resolve_model_registration_name(const std::string& model_type,
 }
 
 bool is_npu_model_cp_capable(const std::string& resolved_name) {
-  // Registers model-side CP capability for master-side validation. Note this
-  // is not the same switch as the worker-side NpuCpPlan gate: deepseek_v4 and
-  // deepseek_v4_mtp own their CP split inside the model (TORCH backend) and
-  // deliberately keep model_supports_model_cp() false so the worker does not
-  // shard a second time.
   static const std::unordered_set<std::string> kCpCapableModels = {
       "deepseek_v32",
       "deepseek_v32_mtp",
-      "deepseek_v4",
-      "deepseek_v4_mtp",
       "glm_moe_dsa",
       "glm_moe_dsa_mtp",
   };
@@ -248,6 +375,12 @@ void ModelRegistry::register_causalvlm_factory(const std::string& name,
   }
 }
 
+void ModelRegistry::register_model_backend(const std::string& name,
+                                           const std::string& backend) {
+  ModelRegistry* instance = get_instance();
+  instance->model_backend_[name] = backend;
+}
+
 void ModelRegistry::register_dit_model_factory(const std::string& name,
                                                DiTModelFactory factory) {
   ModelRegistry* instance = get_instance();
@@ -258,17 +391,6 @@ void ModelRegistry::register_dit_model_factory(const std::string& name,
   } else {
     instance->model_registry_[name].dit_model_factory = factory;
     instance->model_backend_[name] = "dit";
-  }
-}
-
-void ModelRegistry::register_model_backend(const std::string& name,
-                                           const std::string& backend) {
-  ModelRegistry* instance = get_instance();
-  auto [it, inserted] = instance->model_backend_.emplace(name, backend);
-  if (!inserted && it->second != backend) {
-    SAFE_LOG_WARNING("model backend for "
-                     << name << " already registered as " << it->second
-                     << "; ignoring conflicting backend " << backend << ".");
   }
 }
 
@@ -534,15 +656,17 @@ std::unique_ptr<CausalLM> create_rec_model(const ModelContext& context) {
 }
 
 std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
-  // Python model executor: build the graph in Python (Qwen3VLForConditional-
-  // Generation etc.). PyCausalLM is-a CausalVLM so it satisfies this factory's
-  // return type; PyExecutorImpl drives encode/get_input_embeddings via pybind.
-  // Read from the global ModelConfig (the VLM worker does not populate
-  // context.model_impl, unlike the LLM worker).
-  if (ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl())) {
-    return std::make_unique<PyCausalLM>(context);
+  const auto& model_impl = context.get_model_impl();
+#if defined(USE_CUDA) || defined(USE_NPU)
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    return std::make_unique<PyCausalVLM>(context);
   }
+#else
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    LOG(ERROR) << "--model_impl=python is only supported on CUDA/NPU builds.";
+    return nullptr;
+  }
+#endif
 
   std::string resolved_name;
   std::string error_message;
