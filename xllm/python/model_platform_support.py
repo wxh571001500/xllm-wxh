@@ -24,4 +24,6 @@ MODEL_PLATFORM_SUPPORT: dict[str, dict[str, bool]] = {
     "deepseek_v4": {"cuda": False, "npu": True},
     "glm5_2": {"cuda": False, "npu": True},
     "deepseek_v32_mtp": {"cuda": False, "npu": True},
+    "kimi_k3": {"cuda": False, "npu": True},
+    "kimi_k3_text": {"cuda": False, "npu": True},
 }

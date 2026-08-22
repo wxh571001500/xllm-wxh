@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-import os, sys
+import os
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -24,9 +25,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-
 _GROUP_TIMEOUT = timedelta(minutes=5)
-_contexts: dict[str, "_ParallelContext"] = {}
+_contexts: dict[str, _ParallelContext] = {}
 
 
 @dataclass(frozen=True)
@@ -92,17 +92,14 @@ def _normalize_group_specs(
         if not ranks or len(set(ranks)) != len(ranks):
             raise ValueError(f"process group {name} has invalid ranks: {ranks}")
         if any(group_rank < 0 or group_rank >= world_size for group_rank in ranks):
-            raise ValueError(
-                f"process group {name} has rank outside world size: {ranks}"
-            )
+            raise ValueError(f"process group {name} has rank outside world size: {ranks}")
         if rank not in ranks:
             raise ValueError(f"global rank {rank} is not in process group {name}")
 
         local_rank = int(raw_spec["local_rank"])
         if local_rank != ranks.index(rank):
             raise ValueError(
-                f"process group {name} local rank mismatch: "
-                f"got {local_rank}, expected {ranks.index(rank)}"
+                f"process group {name} local rank mismatch: got {local_rank}, expected {ranks.index(rank)}"
             )
 
         raw_alias = raw_spec.get("alias_of")
@@ -110,10 +107,7 @@ def _normalize_group_specs(
         group_id = str(raw_spec.get("group_id", ""))
         if alias_of is None:
             if not group_id or group_id in group_ids:
-                raise ValueError(
-                    f"process group {name} has duplicate or empty group_id: "
-                    f"{group_id}"
-                )
+                raise ValueError(f"process group {name} has duplicate or empty group_id: {group_id}")
             group_ids.add(group_id)
 
         normalized.append(
@@ -136,13 +130,9 @@ def _normalize_group_specs(
             continue
         target = specs_by_name.get(spec.alias_of)
         if target is None:
-            raise ValueError(
-                f"process group {spec.name} aliases unknown group {spec.alias_of}"
-            )
+            raise ValueError(f"process group {spec.name} aliases unknown group {spec.alias_of}")
         if spec.ranks != target.ranks or spec.local_rank != target.local_rank:
-            raise ValueError(
-                f"process group alias {spec.name} does not match {spec.alias_of}"
-            )
+            raise ValueError(f"process group alias {spec.name} does not match {spec.alias_of}")
     return tuple(normalized)
 
 
@@ -154,9 +144,7 @@ def _create_process_group(
     if len(spec.ranks) == 1:
         return None
 
-    prefix = f"xllm_python/{spec.group_id}/" + ",".join(
-        str(rank) for rank in spec.ranks
-    )
+    prefix = f"xllm_python/{spec.group_id}/" + ",".join(str(rank) for rank in spec.ranks)
     group_store = dist.PrefixStore(prefix, store)
     if device.type == "cuda":
         return dist.ProcessGroupNCCL(
@@ -243,16 +231,10 @@ def init_parallel_groups(
     for spec in normalized_specs:
         if spec.alias_of is not None:
             continue
-        process_group = (
-            None
-            if store is None
-            else _create_process_group(store, spec, device_obj)
-        )
+        process_group = None if store is None else _create_process_group(store, spec, device_obj)
         groups[spec.name] = _make_group(spec, process_group)
 
-    unresolved_aliases = [
-        spec for spec in normalized_specs if spec.alias_of is not None
-    ]
+    unresolved_aliases = [spec for spec in normalized_specs if spec.alias_of is not None]
     while unresolved_aliases:
         remaining: list[_GroupSpec] = []
         for spec in unresolved_aliases:
@@ -276,6 +258,23 @@ def init_parallel_groups(
         store=store,
         groups=groups,
     )
+
+    # Bridge into the collectives registry so the xllm_ops::* custom ops
+    # (all_gather / all_reduce_ / ...) used by the shared Python layers resolve
+    # the same c10d process groups. Both registries are keyed by
+    # (group_name, str(device)); publishing the groups here instead of
+    # re-creating communicators keeps the kimi parallel_state init and the
+    # coding-main collectives custom ops consistent.
+    from xllm.python.distributed import collectives as _collectives
+
+    for _name, _pg in groups.items():
+        if _pg.process_group is None:
+            continue
+        _gkey = (_name, device_key)
+        if _gkey not in _collectives._groups:
+            _collectives._groups[_gkey] = _pg.process_group
+            _collectives._symm_eligible[_gkey] = _collectives._supports_symmetric_memory(device_obj, _pg.ranks)
+
     return groups
 
 
@@ -283,9 +282,7 @@ def get_parallel_group(name: str, device: object) -> ParallelGroup:
     device_key = str(torch.device(device))
     context = _contexts.get(device_key)
     if context is None:
-        raise RuntimeError(
-            f"parallel groups were not initialized for device {device_key}"
-        )
+        raise RuntimeError(f"parallel groups were not initialized for device {device_key}")
     group = context.groups.get(name)
     if group is None:
         raise KeyError(f"unknown parallel group: {name}")

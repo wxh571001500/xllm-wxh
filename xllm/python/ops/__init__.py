@@ -12,66 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Op dispatch layer for the Python model executor.
+"""Backwards-compatible op-dispatch shim.
 
-Each op is a direct binding to the C++ ``torch.ops.xllm_ops.*`` kernel (routed
-by PyTorch DispatchKey per device).  FakeTensor / disallow_in_graph semantics
-are registered as import-time side effects in the submodules.
+The coding-main split the old ``xllm.python.ops`` package into the platform
+kernel package (``xllm.python.kernels``, e.g. ``kernels_npu``) and
+``xllm.python.distributed`` (collectives). Model and layer code that still
+imports ``from xllm.python import ops`` is transparently forwarded to the new
+homes without re-registering native ops or fakes, so there is exactly one
+source of truth per operator.
 
-Attention kernels (batch_prefill/batch_decode) are provided by the flashinfer
-Python package directly via ``layers/attention.py``, not through this module.
+Attribute access is resolved lazily on first use, by which point the embedded
+runtime has called ``xllm.python.initialize_runtime`` and published the active
+platform kernel package.
 """
 
-from xllm.python.ops.compute import (
-    dynamic_quant,
-    fused_add_rms_norm,
-    fused_qk_norm_rope,
-    lightning_indexer,
-    quant_matmul,
-    quantize_per_tensor,
-    rms_norm,
-    scatter_nd_update,
-    silu_and_mul,
-    sparse_flash_attention,
-)
-from xllm.python.ops.attention import (
-    reshape_paged_cache,
-    update_decode_graph_metadata,
-)
-from xllm.python.ops.collectives import (
-    all_gather,
-    all_reduce_,
-    all_to_all_single,
-    get_parallel_group,
-    init_tp_group,
-    parallel_group_rank,
-    parallel_group_world_size,
-    reduce_scatter,
-    tp_rank,
-)
-from xllm.python.ops.vision import encoder_attention
+from __future__ import annotations
 
-__all__ = [
-    "rms_norm",
-    "fused_add_rms_norm",
-    "silu_and_mul",
-    "fused_qk_norm_rope",
-    "quant_matmul",
-    "quantize_per_tensor",
-    "dynamic_quant",
-    "lightning_indexer",
-    "scatter_nd_update",
-    "sparse_flash_attention",
-    "reshape_paged_cache",
-    "update_decode_graph_metadata",
-    "all_reduce_",
-    "all_gather",
-    "all_to_all_single",
-    "init_tp_group",
-    "get_parallel_group",
-    "parallel_group_rank",
-    "parallel_group_world_size",
-    "reduce_scatter",
-    "tp_rank",
-    "encoder_attention",
-]
+import importlib
+from typing import Any
+
+_MISSING = object()
+
+
+def __getattr__(name: str) -> Any:
+    # Compute / attention / sparse-op kernels published by initialize_runtime().
+    kernels = importlib.import_module("xllm.python.kernels")
+    value = getattr(kernels, name, _MISSING)
+    if value is not _MISSING:
+        return value
+
+    # Tensor-parallel collectives.
+    distributed = importlib.import_module("xllm.python.distributed")
+    value = getattr(distributed, name, _MISSING)
+    if value is not _MISSING:
+        return value
+
+    # Vision packed attention lives in the platform kernels' ``vision`` submodule
+    # but is intentionally not part of the published ``__all__`` surface, so
+    # resolve it through the active backend rather than hard-coding a device.
+    if name == "encoder_attention":
+        vision = importlib.import_module(f"{kernels.__name__}.vision")
+        return getattr(vision, name)
+
+    raise AttributeError(f"module 'xllm.python.ops' has no attribute {name!r}")
+
+
+__all__: list[str] = []

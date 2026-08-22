@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Distributed execution for the Python model executor."""
+
+from __future__ import annotations
+
+from xllm.python.distributed.collectives import (
+    all_gather,
+    all_gather_variable,
+    all_reduce_,
+    all_to_all_single,
+    cp_rank,
+    cp_world_size,
+    init_process_group,
+    init_tp_group,
+    reduce_scatter,
+    tp_rank,
+)
 from xllm.python.distributed.parallel_state import (
     ParallelGroup,
     get_parallel_group,
@@ -21,6 +37,16 @@ from xllm.python.distributed.parallel_state import (
 )
 
 __all__ = [
+    "init_process_group",
+    "init_tp_group",
+    "tp_rank",
+    "cp_rank",
+    "cp_world_size",
+    "all_reduce_",
+    "all_gather",
+    "all_gather_variable",
+    "reduce_scatter",
+    "all_to_all_single",
     "ParallelGroup",
     "get_parallel_group",
     "init_parallel_groups",

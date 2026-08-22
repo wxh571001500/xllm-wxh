@@ -26,6 +26,11 @@ limitations under the License.
 #include "core/framework/model_context.h"
 #include "models/py_model_bridge.h"
 
+namespace xllm::detail {
+void share_python_model_weights(pybind11::object& draft_model,
+                                const pybind11::object& target_model);
+}  // namespace xllm::detail
+
 namespace xllm {
 
 class ProcessGroup;
