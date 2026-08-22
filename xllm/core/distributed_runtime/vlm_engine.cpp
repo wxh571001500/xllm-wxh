@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -26,6 +26,7 @@ limitations under the License.
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 
 #include "common/device_monitor.h"
 #include "common/interruption_bus.h"
@@ -272,8 +273,6 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
   estimate_options.is_draft_engine = options_.is_draft_engine();
   estimate_options.enable_prefix_cache =
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
-  estimate_options.enable_rdma_scale_padding =
-      options_.instance_role() != InstanceRole::DEFAULT;
 
   KVCacheCapacity kv_cache_cap =
       ::xllm::estimate_kv_cache_capacity(args_, estimate_options);
@@ -390,7 +389,7 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
-  // update dp related global paramters and then execute model
+  // update dp related global parameters and then execute model
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
     auto dp_rank = worker_rank / dp_local_tp_size_;
     futures.emplace_back(worker_clients_[worker_rank]->step_remote_async(
@@ -507,6 +506,7 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
   batched_inputs.reserve(dp_size_);
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(dp_size_);
+  std::vector<int32_t> dp_global_kv_max_seq_lens(dp_size_);
   std::vector<int32_t> dp_is_decode(dp_size_, 0);
   // when enable dp, we need to check the forward type of each batch
   // and set the empty forward type of each batch to the same value as the first
@@ -526,6 +526,8 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
     }
     dp_global_token_nums[dp_rank] =
         static_cast<int32_t>(batched_inputs[dp_rank].host_token_ids().numel());
+    dp_global_kv_max_seq_lens[dp_rank] =
+        batched_inputs[dp_rank].input_params.meta.kv_max_seq_len;
     if (batch_forward_type.is_empty() &&
         !batched_inputs[dp_rank]
              .input_params.meta.batch_forward_type.is_empty()) {
@@ -538,11 +540,7 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         batched_inputs[dp_rank].input_params.meta.q_max_seq_len == 1;
   }
 
-  // Empty DP shards still participate in decode graph collectives using
-  // padded inputs. Match LLMEngine's DP graph contract so every rank makes the
-  // same graph/eager decision and uses the global maximum token count as the
-  // graph bucket. Mixed prefill/decode batches retain their real phase flags
-  // and therefore fall back to eager execution.
+  // Empty DP ranks inherit decode below and use fake inputs in WorkerImpl.
   if (::xllm::ExecutionConfig::get_instance().enable_graph() &&
       batch_forward_type.is_decode()) {
     for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
@@ -560,6 +558,8 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         dp_global_token_nums;
     batched_inputs[dp_rank].input_params.parallel.raw_dp_global_token_nums =
         dp_global_token_nums;
+    batched_inputs[dp_rank].input_params.parallel.dp_global_kv_max_seq_lens =
+        dp_global_kv_max_seq_lens;
     batched_inputs[dp_rank].input_params.parallel.dp_is_decode = dp_is_decode;
     if (batched_inputs[dp_rank]
             .input_params.meta.batch_forward_type.is_empty()) {

@@ -32,6 +32,16 @@ limitations under the License.
 
 namespace py = pybind11;
 
+namespace xllm::detail {
+void share_python_model_weights(py::object& draft_model,
+                                const py::object& target_model) {
+  draft_model.attr("lm_head") = target_model.attr("lm_head");
+  py::object draft_body = draft_model.attr("model");
+  py::object target_body = target_model.attr("model");
+  draft_body.attr("embed_tokens") = target_body.attr("embed_tokens");
+}
+}  // namespace xllm::detail
+
 namespace xllm {
 
 PyCausalLM::PyCausalLM(const ModelContext& context)

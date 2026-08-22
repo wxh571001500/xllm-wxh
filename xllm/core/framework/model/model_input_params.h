@@ -881,6 +881,10 @@ struct ParallelInput {
   std::vector<int64_t> query_start_loc;
 #endif
 
+#if defined(USE_NPU)
+  std::vector<int64_t> has_initial_state;
+#endif
+
   ParallelInput to(const torch::Device& device) const {
     ParallelInput out;
     out.dp_global_token_nums = dp_global_token_nums;
@@ -897,6 +901,9 @@ struct ParallelInput {
     out.layer_wise_load_synchronizer = layer_wise_load_synchronizer;
 #if defined(USE_NPU) || defined(USE_MUSA)
     out.query_start_loc = query_start_loc;
+#endif
+#if defined(USE_NPU)
+    out.has_initial_state = has_initial_state;
 #endif
     return out;
   }

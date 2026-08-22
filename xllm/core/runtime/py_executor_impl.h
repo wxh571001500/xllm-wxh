@@ -53,7 +53,6 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
  private:
   PyModelBridge* py_model_bridge_;
   ModelArgs args_;
-  torch::Device device_;
   runtime::Options options_;
   bool enable_mla_ = false;
 

@@ -66,8 +66,15 @@ class AclGraphCaptureContext:
 class ForwardContext:
     attention_backend: AttentionBackend
     device: torch.device
-    metadata: AttentionMetadata
-    layer_caches: list[LayerCache]
+    # ``metadata`` and ``layer_caches`` are optional so that runners which
+    # carry their attention metadata out-of-band (e.g. the Kimi K3 ACL-graph
+    # runner, which threads the static decode metadata through ``_kda_runtime``
+    # and the attention backend rather than the forward context) can construct
+    # a ``ForwardContext`` with only ``attention_backend``/``device``. Layers
+    # that consume them (``gated_delta_net``/``fused_moe``) are only reachable
+    # from runners that populate the fields explicitly.
+    metadata: AttentionMetadata | None = None
+    layer_caches: list[LayerCache] | None = None
     acl_graph: AclGraphCaptureContext | None = None
     layer_synchronizer: LayerSynchronizer | None = None
     execution_state: AclGraphExecutionState | None = None

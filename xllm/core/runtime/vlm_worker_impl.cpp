@@ -163,7 +163,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   }
 
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-    output.retained_input = std::make_shared<ForwardInput>(input);
+    output.retained_inputs.push_back(std::make_shared<ForwardInput>(input));
     output.ready_event = record_current_stream_event(device_);
     return output;
   }
