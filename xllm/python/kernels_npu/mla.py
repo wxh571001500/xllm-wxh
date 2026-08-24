@@ -216,7 +216,7 @@ def _mla_cache_mode(kv_cache: torch.Tensor) -> str:
     return "PA"
 
 
-def _write_mla_kv_cache(
+def write_mla_kv_cache(
     kv: torch.Tensor,
     kv_norm_weight: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -350,7 +350,7 @@ def deepseek_mla_preprocess_decode(
         rope_cos,
         rope_sin,
     ).view(num_tokens, num_heads, qk_rope_head_dim)
-    _write_mla_kv_cache(
+    write_mla_kv_cache(
         kv,
         kv_norm_weight,
         rope_cos,

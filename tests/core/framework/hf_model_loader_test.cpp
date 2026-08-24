@@ -88,6 +88,45 @@ TEST(HFModelLoaderTest, KimiK3ModelArgsExposeHybridMlaDimensions) {
                                       "linear_attention"}));
 }
 
+TEST(HFModelLoaderTest, KimiK3DSparkArchitectureSelectsDraftModelType) {
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "architectures": ["K3DSparkModel"],
+      "model_type": "qwen3"
+    }
+  )json"));
+
+  const std::filesystem::path fake_model_path("/tmp/Kimi-K3-DSpark");
+  EXPECT_EQ(util::get_model_type(reader, fake_model_path), "k3_dspark");
+  EXPECT_EQ(ModelRegistry::get_model_backend("k3_dspark"), "llm");
+}
+
+TEST(HFModelLoaderTest, KimiK3DSparkOverridesMlaModelArgs) {
+  auto loader = ModelRegistry::get_model_args_loader("k3_dspark");
+  ASSERT_NE(loader, nullptr);
+
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "qwen3",
+      "num_attention_heads": 64,
+      "num_key_value_heads": 16,
+      "qk_nope_head_dim": 128,
+      "qk_rope_head_dim": 64
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.model_type(), "k3_dspark");
+  EXPECT_TRUE(args.enable_mla());
+  EXPECT_TRUE(util::is_mla_model_type(args.model_type()));
+  EXPECT_EQ(args.n_kv_heads(), std::optional<int64_t>(1));
+  EXPECT_EQ(args.head_dim(), 192);
+  EXPECT_EQ(args.rotary_dim(), 64);
+}
+
 class DummyRecCausalLM final : public RecCausalLM {
  public:
   explicit DummyRecCausalLM(const torch::TensorOptions& options)

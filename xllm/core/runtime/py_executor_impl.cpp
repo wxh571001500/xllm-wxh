@@ -110,10 +110,15 @@ class AttentionMetadataView final {
 class KimiK3KDAMetadataView final {
  public:
   explicit KimiK3KDAMetadataView(const ModelInputParams& params) {
+    is_spec_verify_ = params.is_spec_verify;
     // state_indices: per-sequence linear-state slot id, [num_seqs] int64.
     state_indices_ = params.embedding.linear_state_indices;
     if (state_indices_.defined()) {
       state_indices_ = state_indices_.to(torch::kInt64);
+    }
+    num_accepted_tokens_ = params.num_accepted_tokens;
+    if (num_accepted_tokens_.defined()) {
+      num_accepted_tokens_ = num_accepted_tokens_.to(torch::kInt32);
     }
 
 #if defined(USE_NPU)
@@ -133,9 +138,39 @@ class KimiK3KDAMetadataView final {
     }
 #endif
 
+    // DFlash validation stores tokens as a flat buffer, but KDA kernels must
+    // retain the logical sequence segments (q_len=N+1) for speculative state
+    // selection. Keep state indices and accepted counts sequence-scoped, and
+    // expose a logical cumulative-length tensor to Python.
+    if (params.is_spec_verify && state_indices_.defined()) {
+      const int64_t target_rows = query_start_loc_.defined()
+                                      ? query_start_loc_.numel() - 1
+                                      : params.meta.num_sequences;
+      const int64_t source_rows = state_indices_.numel();
+      CHECK_GT(source_rows, 0)
+          << "speculative KDA state indices must not be empty";
+      CHECK_GT(target_rows, 0)
+          << "speculative KDA query rows must be positive";
+      CHECK_EQ(target_rows % source_rows, 0)
+          << "speculative KDA query rows must expand evenly from logical "
+          << "sequences: rows=" << target_rows
+          << ", logical_sequences=" << source_rows;
+      const int64_t repeat_count = target_rows / source_rows;
+      const torch::Device metadata_device = query_start_loc_.defined()
+                                                 ? query_start_loc_.device()
+                                                 : state_indices_.device();
+      spec_query_start_loc_ = torch::arange(
+          source_rows + 1,
+          torch::TensorOptions().dtype(torch::kInt64).device(
+              metadata_device)) * repeat_count;
+    }
+
     // Decode/prefill sequence split. Decodes are ordered before prefills, and
     // pure batches (the only supported paths) map directly from the batch type.
-    const int32_t num_sequences = params.meta.num_sequences;
+    const int32_t num_sequences =
+        params.is_spec_verify && state_indices_.defined()
+            ? static_cast<int32_t>(state_indices_.numel())
+            : params.meta.num_sequences;
     const BatchForwardType batch_type = params.meta.batch_forward_type;
     if (batch_type.is_decode()) {
       num_decode_seqs_ = num_sequences;
@@ -183,6 +218,10 @@ class KimiK3KDAMetadataView final {
   py::object query_start_loc() const {
     return query_start_loc_.defined() ? py::cast(query_start_loc_) : py::none();
   }
+  py::object spec_query_start_loc() const {
+    return spec_query_start_loc_.defined() ? py::cast(spec_query_start_loc_)
+                                           : py::none();
+  }
   py::object state_indices() const {
     return state_indices_.defined() ? py::cast(state_indices_) : py::none();
   }
@@ -190,6 +229,11 @@ class KimiK3KDAMetadataView final {
     return has_initial_state_.defined() ? py::cast(has_initial_state_)
                                         : py::none();
   }
+  py::object num_accepted_tokens() const {
+    return num_accepted_tokens_.defined() ? py::cast(num_accepted_tokens_)
+                                           : py::none();
+  }
+  bool is_spec_verify() const { return is_spec_verify_; }
   int32_t num_decode_seqs() const { return num_decode_seqs_; }
   int32_t num_prefill_seqs() const { return num_prefill_seqs_; }
   bool dp_metadata_valid() const { return dp_metadata_valid_; }
@@ -201,6 +245,9 @@ class KimiK3KDAMetadataView final {
   torch::Tensor query_start_loc_;
   torch::Tensor state_indices_;
   torch::Tensor has_initial_state_;
+  torch::Tensor num_accepted_tokens_;
+  torch::Tensor spec_query_start_loc_;
+  bool is_spec_verify_ = false;
   int32_t num_decode_seqs_ = 0;
   int32_t num_prefill_seqs_ = 0;
   bool dp_metadata_valid_ = false;
@@ -237,10 +284,16 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
   py::class_<KimiK3KDAMetadataView>(m, "KimiK3KDAMetadataView")
       .def_property_readonly("query_start_loc",
                              &KimiK3KDAMetadataView::query_start_loc)
+      .def_property_readonly("spec_query_start_loc",
+                             &KimiK3KDAMetadataView::spec_query_start_loc)
       .def_property_readonly("state_indices",
                              &KimiK3KDAMetadataView::state_indices)
       .def_property_readonly("has_initial_state",
                              &KimiK3KDAMetadataView::has_initial_state)
+      .def_property_readonly("num_accepted_tokens",
+                             &KimiK3KDAMetadataView::num_accepted_tokens)
+      .def_property_readonly("is_spec_verify",
+                             &KimiK3KDAMetadataView::is_spec_verify)
       .def_property_readonly("num_decode_seqs",
                              &KimiK3KDAMetadataView::num_decode_seqs)
       .def_property_readonly("num_prefill_seqs",
@@ -353,7 +406,12 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
           : py::object(py::none());
   py::object hidden_obj = py_executor_.attr("execute")(
       tokens, positions, py_metadata, input_embedding, py_kda_metadata);
-  return ModelOutput(hidden_obj.cast<torch::Tensor>());
+  py::object aux_obj = py_executor_.attr("aux_hidden_states")();
+  torch::Tensor aux_hidden_states =
+      aux_obj.is_none() ? torch::Tensor() : aux_obj.cast<torch::Tensor>();
+  return ModelOutput(hidden_obj.cast<torch::Tensor>(),
+                     torch::Tensor(),
+                     aux_hidden_states);
 }
 
 }  // namespace xllm

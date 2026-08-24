@@ -185,10 +185,10 @@ int64_t layerwise_split_block_count(const ModelArgs& model_args,
   return common_block_count;
 }
 
-bool enable_qwen3_5_spec_verify(const ModelArgs& model_args,
-                                const KVCacheEstimateOptions& options) {
+bool enable_linear_spec_verify(const ModelArgs& model_args,
+                               const KVCacheEstimateOptions& options) {
   return options.num_speculative_tokens > 0 && !options.is_draft_engine &&
-         is_qwen3_5_target_model_type(model_args.model_type());
+         has_linear_attention_layers(model_args);
 }
 
 int64_t linear_slot_size(const ModelArgs& model_args,
@@ -198,7 +198,7 @@ int64_t linear_slot_size(const ModelArgs& model_args,
     return 0;
   }
   const int64_t num_speculative_tokens =
-      enable_qwen3_5_spec_verify(model_args, options)
+      enable_linear_spec_verify(model_args, options)
           ? options.num_speculative_tokens
           : 0;
 
@@ -620,7 +620,7 @@ KVCacheCapacity estimate_kv_cache_capacity(
       .n_layers(model_args.n_layers())
       .block_size(options.block_size);
   const int64_t num_speculative_tokens =
-      enable_qwen3_5_spec_verify(model_args, options)
+      enable_linear_spec_verify(model_args, options)
           ? options.num_speculative_tokens
           : 0;
   kv_cache_cap.linear_conv_state_len(model_args.linear_conv_kernel_dim() - 1 +

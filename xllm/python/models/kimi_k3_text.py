@@ -268,6 +268,7 @@ class KimiK3TextConfig:
     mc2_tokens_capacity: int = 512
     enable_flashcomm1: bool = False
     enable_prefix_cache: bool = True
+    layers_to_capture: list[int] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> KimiK3TextConfig:
@@ -414,6 +415,13 @@ class KimiK3TextConfig:
             ),
             enable_flashcomm1=bool(pick("enable_flashcomm1", default=False)),
             enable_prefix_cache=bool(pick("enable_prefix_cache", default=True)),
+            layers_to_capture=[
+                int(layer_id)
+                for layer_id in config.get(
+                    "layers_to_capture",
+                    raw.get("layers_to_capture", []),
+                )
+            ],
         )
 
     def validate(self) -> None:
@@ -1508,8 +1516,8 @@ class KimiK3DecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # With FlashComm1 the residual trunk is sequence-parallel: hidden_states
@@ -1712,6 +1720,28 @@ class KimiK3TextModel(nn.Module):
         self.tp_size = config.tp_size
         self.tp_rank = config.tp_rank
         self._loaded_weights: set[str] = set()
+        self.last_aux_hidden_states: torch.Tensor | None = None
+        self.layers_to_capture: tuple[int, ...] = ()
+        self.set_layers_to_capture(config.layers_to_capture)
+
+    def set_layers_to_capture(self, layer_ids: list[int]) -> None:
+        capture_layers = tuple(int(layer_id) for layer_id in layer_ids)
+        invalid = [
+            layer_id
+            for layer_id in capture_layers
+            if not 1 <= layer_id <= len(self.layers)
+        ]
+        if invalid:
+            raise ValueError(
+                "Kimi K3 capture layer ids must be within the model: "
+                f"got {invalid}, num_layers={len(self.layers)}"
+            )
+        if len(set(capture_layers)) != len(capture_layers):
+            raise ValueError(
+                f"Kimi K3 capture layer ids must be unique: {capture_layers}"
+            )
+        self.layers_to_capture = capture_layers
+        self.config.layers_to_capture = list(capture_layers)
 
     def initial_block_count(self) -> int:
         return sum(i % self.config.attn_res_block_size == 0 for i in range(self.config.n_layers))
@@ -1738,8 +1768,36 @@ class KimiK3TextModel(nn.Module):
         block_residual = hidden_states.new_zeros(
             (hidden_states.shape[0], 0, hidden_states.shape[-1])
         )
-        for layer in self.layers:
-            hidden_states, block_residual = layer(hidden_states, positions, block_residual)
+        captured_hidden_states: list[torch.Tensor] = []
+        capture_layers = set(self.layers_to_capture)
+        for layer_id, layer in enumerate(self.layers):
+            hidden_states, block_residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                block_residual=block_residual,
+            )
+            if layer_id + 1 in capture_layers:
+                captured = (
+                    _flashcomm1_gather(
+                        hidden_states,
+                        num_tokens,
+                        self.tp_size,
+                    )
+                    if self._sp
+                    else hidden_states
+                )
+                captured_hidden_states.append(captured)
+        self.last_aux_hidden_states = (
+            torch.cat(captured_hidden_states, dim=-1)
+            if captured_hidden_states
+            else None
+        )
+        if len(captured_hidden_states) != len(capture_layers):
+            raise RuntimeError(
+                "Kimi K3 did not capture every requested DSpark target layer: "
+                f"requested={self.layers_to_capture}, "
+                f"captured={len(captured_hidden_states)}"
+            )
         hidden_states = _apply_attention_residual(
             hidden_states,
             block_residual,

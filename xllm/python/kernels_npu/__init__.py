@@ -48,6 +48,7 @@ _EXPORTS = {
         "has_mla_preprocess_v2",
         "prepare_mla_preprocess_v2_q_b",
         "prepare_mla_preprocess_v2_qkv",
+        "write_mla_kv_cache",
     ),
     "moe": (
         "cutlass_fused_moe",
@@ -123,6 +124,7 @@ __all__ = [
     "has_mla_preprocess_v2",
     "prepare_mla_preprocess_v2_q_b",
     "prepare_mla_preprocess_v2_qkv",
+    "write_mla_kv_cache",
     "quant_matmul",
     "quantize_per_tensor",
     "dynamic_quant",

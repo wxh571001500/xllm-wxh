@@ -40,6 +40,7 @@ _mock_ops.rms_norm.side_effect = _rms_norm
 sys.modules.setdefault("xllm.python.ops", _mock_ops)
 sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
 
+import xllm.python.models.kimi_k3_text as kimi_k3_text
 from xllm.python.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -81,6 +82,7 @@ from xllm.python.models.kimi_k3_text import (
     KimiK3MLAAttention,
     KimiK3MLP,
     KimiK3TextConfig,
+    KimiK3TextModel,
 )
 from xllm.python.models.kimi_k3_vit import KimiK3VisionModel
 
@@ -242,6 +244,60 @@ def test_text_config_parses_kimi_k3_moe_and_output_fields() -> None:
     assert parsed.topk_method == "noaux_tc"
     assert parsed.num_nextn_predict_layers == 1
     assert parsed.logit_scale == 0.5
+
+
+def test_text_model_captures_requested_layer_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AddLayer(torch.nn.Module):
+        def __init__(self, value: float) -> None:
+            super().__init__()
+            self.value = value
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            block_residual: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del positions
+            return hidden_states + self.value, block_residual
+
+    model = KimiK3TextModel.__new__(KimiK3TextModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        layers_to_capture=[1, 3],
+        attn_res_block_size=1,
+    )
+    model.embed_tokens = torch.nn.Embedding(4, 2)
+    model.layers = torch.nn.ModuleList(
+        [AddLayer(1.0), AddLayer(2.0), AddLayer(4.0)]
+    )
+    model.output_attn_res_proj = torch.nn.Identity()
+    model.output_attn_res_norm = torch.nn.Identity()
+    model.norm = torch.nn.Identity()
+    model._sp = False
+    model.tp_size = 1
+    model.tp_rank = 0
+    monkeypatch.setattr(
+        kimi_k3_text,
+        "_apply_attention_residual",
+        lambda hidden_states, *_args: hidden_states,
+    )
+    inputs = torch.zeros(2, 2)
+
+    output = model(
+        torch.tensor([0, 1]),
+        torch.tensor([0, 1]),
+        inputs_embeds=inputs,
+    )
+
+    torch.testing.assert_close(output, torch.full((2, 2), 7.0))
+    expected_aux = torch.cat(
+        (torch.full((2, 2), 1.0), torch.full((2, 2), 7.0)),
+        dim=-1,
+    )
+    torch.testing.assert_close(model.last_aux_hidden_states, expected_aux)
 
 
 def _weight(shape: tuple[int, ...], value: float) -> torch.Tensor:

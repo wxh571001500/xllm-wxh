@@ -54,6 +54,7 @@ from xllm.python.model_executor.forward_context import (  # noqa: E402
 from xllm.python.models.deepseek_v32 import (  # noqa: E402
     DeepseekV3Config,
     DeepseekV3MoE,
+    DeepseekYarnRotaryEmbedding,
 )
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,34 @@ class TestDeepseekV3ConfigValidation:
         cfg = _config(ep_size=2, moe_tp_size=2, world_size=3)
         with pytest.raises(ValueError, match="world_size"):
             cfg.validate()
+
+
+class TestDeepseekYarnRotaryEmbedding:
+    @staticmethod
+    def _make_rope(**overrides) -> DeepseekYarnRotaryEmbedding:
+        return DeepseekYarnRotaryEmbedding(
+            head_dim=8,
+            original_max_position_embeddings=16,
+            scaling_factor=2.0,
+            base=10000.0,
+            beta_fast=32,
+            beta_slow=1,
+            mscale=1.0,
+            mscale_all_dim=1.0,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            **overrides,
+        )
+
+    def test_default_cache_uses_scaled_length(self):
+        rope = self._make_rope()
+
+        assert rope.cos_sin_cache.shape == (32, 8)
+
+    def test_explicit_cache_length(self):
+        rope = self._make_rope(cache_max_position_embeddings=20)
+
+        assert rope.cos_sin_cache.shape == (20, 8)
 
 
 # ---------------------------------------------------------------------------

@@ -37,14 +37,17 @@ place:
 
 - ``conv_state``:      ``[num_slots, conv_size - 1, 3 * local_proj]``, model
   dtype (width-first layout, raw pre-conv tokens).
-- ``recurrent_state``: ``[num_slots, local_num_heads, head_dim, head_dim]``,
-  float32; per-slot layout is ``[H, V, K]``. The ``chunk_kda_fwd`` operator
-  uses the transposed ``[H, K, V]`` layout, so the initial/final states are
-  transposed at that operator boundary only.
+- ``recurrent_state``: ``[num_slots * checkpoint_stride, local_num_heads,
+  head_dim, head_dim]``, float32; per-slot layout is ``[H, V, K]``. During
+  speculative verification, each logical slot owns one checkpoint row per
+  token in the block. The ``chunk_kda_fwd`` operator uses the transposed
+  ``[H, K, V]`` layout, so the initial/final states are transposed at that
+  operator boundary only.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -93,6 +96,13 @@ class KimiK3KDAMetadata:
     # loaded from the caches (always True for decode; True for chunked-prefill
     # continuations). Required whenever ``num_prefill_seqs > 0``.
     has_initial_state: torch.Tensor | None = None
+    # Speculative validation uses one accepted-token count per logical
+    # sequence, matching vLLM's grouped q segments.
+    num_accepted_tokens: torch.Tensor | None = None
+    # Logical cumulative lengths for speculative rows. The token buffer is
+    # flat, but causal-conv/recurrent kernels consume q segments per request.
+    spec_query_start_loc: torch.Tensor | None = None
+    is_spec_verify: bool = False
     graph_num_tokens: int | None = None
     empty_shard: bool = False
 
@@ -104,6 +114,76 @@ def _l2norm(x: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _causal_conv1d_torch_fallback(
+    mixed_qkv: torch.Tensor,
+    conv_weight_t: torch.Tensor,
+    conv_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    initial_state_mode: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Reference causal convolution for environments without ACLNN tiling.
+
+    This path is intentionally opt-in and is for functional validation on
+    older CANN releases. It uses ordinary grouped ``conv1d`` and preserves the
+    same width-first cache contract as the Ascend custom operator.
+    """
+    state_len = conv_weight_t.size(0) - 1
+    feature_dim = mixed_qkv.size(-1)
+    weight = conv_weight_t.transpose(0, 1).contiguous().unsqueeze(1)
+    state_work = conv_state.contiguous()
+    output = mixed_qkv.clone()
+
+    for row in range(cache_indices.numel()):
+        start = int(query_start_loc[row].item())
+        end = int(query_start_loc[row + 1].item())
+        if end <= start:
+            continue
+        slot = int(cache_indices[row].item())
+        if slot == PAD_SLOT_ID:
+            continue
+        if slot < 0 or slot >= state_work.size(0):
+            raise RuntimeError(
+                "Kimi K3 causal-conv fallback received an invalid cache slot: "
+                f"slot={slot}, cache_lines={state_work.size(0)}"
+            )
+
+        sequence = mixed_qkv[start:end]
+        valid_tokens = sequence.size(0)
+        if num_accepted_tokens is not None:
+            valid_tokens = min(valid_tokens, int(num_accepted_tokens[row].item()))
+        if valid_tokens <= 0:
+            continue
+        sequence = sequence[:valid_tokens]
+
+        if initial_state_mode is not None and not bool(initial_state_mode[row].item()):
+            history = torch.zeros(
+                (state_len, feature_dim),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
+        else:
+            history = state_work[slot, :state_len, :]
+
+        conv_input = torch.cat((history, sequence), dim=0)
+        conv_input = conv_input.transpose(0, 1).unsqueeze(0)
+        conv_output = F.conv1d(conv_input, weight, groups=feature_dim)
+        output[start : start + valid_tokens] = F.silu(
+            conv_output.squeeze(0).transpose(0, 1)
+        ).to(mixed_qkv.dtype)
+
+        if valid_tokens >= state_len:
+            final_history = sequence[-state_len:]
+        else:
+            final_history = torch.cat((history[valid_tokens:], sequence), dim=0)
+        state_work[slot, :state_len, :].copy_(final_history)
+
+    if state_work is not conv_state:
+        conv_state.copy_(state_work)
+    return output
+
+
 def _build_chunk_indices(cu_seqlens: list[int], chunk_size: int) -> list[int]:
     """Flat [seq_idx, chunk_idx] pairs, mirroring build_kda_chunk_indices."""
     indices: list[int] = []
@@ -112,6 +192,37 @@ def _build_chunk_indices(cu_seqlens: list[int], chunk_size: int) -> list[int]:
         for chunk in range(-(-seq_len // chunk_size)):
             indices.extend((seq, chunk))
     return indices
+
+
+def _normalize_query_start_loc(
+    query_start_loc: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Restore one cumulative q segment per logical KDA state slot.
+
+    Some NPU decode/graph paths expose a block as ``[0, 1, ..., N]`` while
+    still providing one linear-state slot. vLLM keeps this block as one
+    ``[0, N]`` segment; passing the expanded boundaries to causal-conv makes
+    the operator interpret one cache line as N independent sequences.
+    """
+    expected_rows = state_indices.numel()
+    if query_start_loc.numel() == expected_rows + 1:
+        return query_start_loc
+    if (
+        expected_rows == 1
+        and query_start_loc.numel() == num_tokens + 1
+    ):
+        return torch.tensor(
+            [0, num_tokens],
+            dtype=query_start_loc.dtype,
+            device=query_start_loc.device,
+        )
+    raise RuntimeError(
+        "Kimi K3 KDA query/state metadata mismatch: "
+        f"query_start_loc={tuple(query_start_loc.shape)}, "
+        f"state_indices={tuple(state_indices.shape)}, num_tokens={num_tokens}"
+    )
 
 
 class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
@@ -397,7 +508,86 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         """
         num_tokens = hidden_states.size(0)
         num_decode = metadata.num_decode_seqs
-        num_decode_tokens = num_decode  # decode requests carry 1 token each
+        num_prefill = metadata.num_prefill_seqs
+        num_decode_tokens = num_tokens if metadata.is_spec_verify else num_decode
+        spec_num_accepted_tokens = (
+            metadata.num_accepted_tokens if metadata.is_spec_verify else None
+        )
+        if recurrent_state.size(0) % conv_state.size(0) != 0:
+            raise RuntimeError(
+                "Kimi K3 recurrent cache rows must divide evenly by logical "
+                f"slots: recurrent_rows={recurrent_state.size(0)}, "
+                f"logical_slots={conv_state.size(0)}"
+            )
+        checkpoint_stride = recurrent_state.size(0) // conv_state.size(0)
+        recurrent_state_indices = (
+            metadata.state_indices.to(torch.int64) * checkpoint_stride
+        )
+        query_start_loc = metadata.query_start_loc
+        if metadata.is_spec_verify:
+            if metadata.spec_query_start_loc is None:
+                raise RuntimeError(
+                    "Kimi K3 speculative metadata is missing logical q lengths"
+                )
+            query_start_loc = metadata.spec_query_start_loc
+            if num_decode <= 0 or num_tokens % num_decode != 0:
+                raise RuntimeError(
+                    "Kimi K3 speculative token rows must divide evenly by "
+                    f"logical sequences: tokens={num_tokens}, sequences={num_decode}"
+                )
+            if spec_num_accepted_tokens is None:
+                raise RuntimeError(
+                    "Kimi K3 speculative metadata is missing accepted-token counts"
+                )
+            width = num_tokens // num_decode
+            expected_conv_state_len = self.conv_size - 1 + width - 1
+            if conv_state.size(1) < expected_conv_state_len:
+                raise RuntimeError(
+                    "Kimi K3 speculative convolution cache is too short: "
+                    f"cache_state_len={conv_state.size(1)}, "
+                    f"required={expected_conv_state_len}, width={width}, "
+                    f"conv_kernel_size={self.conv_size}"
+                )
+            if checkpoint_stride < width:
+                raise RuntimeError(
+                    "Kimi K3 speculative recurrent cache has too few "
+                    "checkpoints: "
+                    f"checkpoint_stride={checkpoint_stride}, required={width}"
+                )
+            if metadata.state_indices.numel() != num_decode:
+                raise RuntimeError(
+                    "Kimi K3 speculative state slots must be sequence-scoped: "
+                    f"slots={metadata.state_indices.numel()}, sequences={num_decode}"
+                )
+            if spec_num_accepted_tokens.numel() != num_decode:
+                raise RuntimeError(
+                    "Kimi K3 speculative accepted-token counts must be "
+                    f"sequence-scoped: counts={spec_num_accepted_tokens.numel()}, "
+                    f"sequences={num_decode}"
+                )
+            offsets = torch.arange(
+                width, dtype=torch.int64, device=metadata.state_indices.device
+            )
+            recurrent_state_indices = (
+                metadata.state_indices.to(torch.int64).unsqueeze(1)
+                * checkpoint_stride
+                + offsets.unsqueeze(0)
+            ).contiguous()
+        elif num_decode + num_prefill > 0 and not metadata.empty_shard:
+            raw_query_start_loc = query_start_loc
+            query_start_loc = _normalize_query_start_loc(
+                query_start_loc,
+                metadata.state_indices,
+                num_tokens,
+            )
+            # A one-slot block can be represented by N q_len=1 rows by the
+            # NPU graph builder. Once collapsed to one logical segment, run
+            # recurrent KDA over the complete block and keep one output row
+            # per input token.
+            if query_start_loc.numel() != raw_query_start_loc.numel():
+                num_decode = 1
+                num_prefill = 0
+                num_decode_tokens = num_tokens
 
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -415,14 +605,14 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        if num_decode + metadata.num_prefill_seqs > 0:
+        if num_decode + num_prefill > 0:
             mixed_qkv = torch.cat((q, k, v), dim=-1)
-            if metadata.num_prefill_seqs > 0:
+            if num_prefill > 0:
                 assert metadata.has_initial_state is not None
                 mixed_qkv = self._causal_conv1d(
                     mixed_qkv,
                     conv_state,
-                    query_start_loc=metadata.query_start_loc,
+                    query_start_loc=query_start_loc,
                     cache_indices=metadata.state_indices,
                     initial_state_mode=metadata.has_initial_state,
                     run_mode=0,
@@ -431,10 +621,11 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
                 mixed_qkv = self._causal_conv1d(
                     mixed_qkv,
                     conv_state,
-                    query_start_loc=metadata.query_start_loc,
+                    query_start_loc=query_start_loc,
                     cache_indices=metadata.state_indices,
                     initial_state_mode=None,
                     run_mode=1,
+                    num_accepted_tokens=spec_num_accepted_tokens,
                 )
 
             q, k, v = (
@@ -443,6 +634,16 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             )
 
             if num_decode > 0:
+                recurrent_cu_seqlens = (
+                    query_start_loc
+                    if metadata.is_spec_verify
+                    else query_start_loc[: num_decode + 1]
+                )
+                recurrent_indices = (
+                    recurrent_state_indices.reshape(-1)
+                    if metadata.is_spec_verify
+                    else recurrent_state_indices[:num_decode]
+                )
                 core_attn_out[:, :num_decode_tokens] = self._recurrent(
                     q[:, :num_decode_tokens],
                     k[:, :num_decode_tokens],
@@ -450,10 +651,11 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
                     raw_gate[:, :num_decode_tokens],
                     beta[:, :num_decode_tokens],
                     recurrent_state,
-                    cu_seqlens=metadata.query_start_loc[: num_decode + 1],
-                    state_indices=metadata.state_indices[:num_decode],
+                    cu_seqlens=recurrent_cu_seqlens,
+                    state_indices=recurrent_indices,
+                    num_accepted_tokens=spec_num_accepted_tokens,
                 )
-            if metadata.num_prefill_seqs > 0:
+            if num_prefill > 0:
                 core_attn_out[:, num_decode_tokens:] = (
                     self._prefill(
                         q[:, num_decode_tokens:],
@@ -463,6 +665,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
                         beta[:, num_decode_tokens:],
                         recurrent_state,
                         metadata,
+                        recurrent_state_indices,
                     )
                 )
 
@@ -480,23 +683,114 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         cache_indices: torch.Tensor,
         initial_state_mode: torch.Tensor | None,
         run_mode: int,
+        num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ensure_ascend_custom_ops(_KDA_CUSTOM_OPS)
+        if conv_state.shape[-1] != mixed_qkv.shape[-1]:
+            raise RuntimeError(
+                "Ascend Kimi K3 KDA requires convolution cache layout "
+                "[num_cache_lines, state_len, qkv_dim]: "
+                f"cache={tuple(conv_state.shape)}, "
+                f"mixed_qkv={tuple(mixed_qkv.shape)}"
+            )
+        if self.conv_weight_t.shape != (
+            self.conv_size,
+            mixed_qkv.shape[-1],
+        ):
+            raise RuntimeError(
+                "Ascend Kimi K3 KDA convolution weight shape mismatch: "
+                f"weight={tuple(self.conv_weight_t.shape)}, "
+                f"expected=({self.conv_size}, {mixed_qkv.shape[-1]})"
+            )
+        if (
+            mixed_qkv.dtype != conv_state.dtype
+            or mixed_qkv.dtype != self.conv_weight_t.dtype
+        ):
+            raise RuntimeError(
+                "Ascend Kimi K3 KDA causal-conv tensors must have one dtype: "
+                f"input={mixed_qkv.dtype}, cache={conv_state.dtype}, "
+                f"weight={self.conv_weight_t.dtype}"
+            )
+        if mixed_qkv.dim() != 2 or conv_state.dim() != 3:
+            raise RuntimeError(
+                "Ascend Kimi K3 KDA causal-conv expects input [tokens, qkv_dim] "
+                "and cache [slots, state_len, qkv_dim]: "
+                f"input={tuple(mixed_qkv.shape)}, cache={tuple(conv_state.shape)}"
+            )
+
+        # Keep the operator boundary identical to vLLM-Ascend.  In particular,
+        # ACLNN requires device-side contiguous int32 row offsets/slot ids;
+        # the C++ metadata view is already int32, but pybind tensors can retain
+        # a non-contiguous view after graph/speculation slicing.
+        mixed_qkv = mixed_qkv.contiguous()
+        conv_weight_t = self.conv_weight_t.contiguous()
+        query_start_loc = query_start_loc.to(torch.int32).contiguous()
+        cache_indices = cache_indices.to(torch.int32).contiguous()
+        if initial_state_mode is not None:
+            initial_state_mode = initial_state_mode.to(torch.bool).contiguous()
+        if num_accepted_tokens is not None:
+            num_accepted_tokens = num_accepted_tokens.to(torch.int32).contiguous()
+        conv_state_work = conv_state.contiguous()
+
+        fallback_mode = os.getenv(
+            "XLLM_KIMI_K3_CAUSAL_CONV_FALLBACK", ""
+        ).lower()
+        if fallback_mode == "torch":
+            return _causal_conv1d_torch_fallback(
+                mixed_qkv,
+                conv_weight_t,
+                conv_state,
+                query_start_loc,
+                cache_indices,
+                initial_state_mode,
+                num_accepted_tokens,
+            )
+
         out = torch.empty_like(mixed_qkv)
-        torch.ops._C_ascend.npu_causal_conv1d_custom(
-            out,
-            mixed_qkv,
-            self.conv_weight_t,
-            conv_state=conv_state,
-            bias_opt=None,
-            query_start_loc_opt=query_start_loc,
-            cache_indices_opt=cache_indices.to(torch.int32),
-            initial_state_mode_opt=initial_state_mode,
-            num_accepted_tokens_opt=None,
-            activation_mode=1,  # silu
-            pad_slot_id=PAD_SLOT_ID,
-            run_mode=run_mode,
-        )
+        try:
+            torch.ops._C_ascend.npu_causal_conv1d_custom(
+                out,
+                mixed_qkv,
+                conv_weight_t,
+                conv_state=conv_state_work,
+                bias_opt=None,
+                query_start_loc_opt=query_start_loc,
+                cache_indices_opt=cache_indices,
+                initial_state_mode_opt=initial_state_mode,
+                num_accepted_tokens_opt=num_accepted_tokens,
+                activation_mode=1,  # silu
+                pad_slot_id=PAD_SLOT_ID,
+                run_mode=run_mode,
+            )
+        except RuntimeError as error:
+            if fallback_mode != "auto":
+                accepted_values = (
+                    None
+                    if num_accepted_tokens is None
+                    else num_accepted_tokens.tolist()
+                )
+                raise RuntimeError(
+                    "Ascend Kimi K3 causal-conv tiling failed with "
+                    f"input={tuple(mixed_qkv.shape)}, "
+                    f"weight={tuple(conv_weight_t.shape)}, "
+                    f"cache={tuple(conv_state_work.shape)}, "
+                    f"query_start_loc={query_start_loc.tolist()}, "
+                    f"cache_indices_shape={tuple(cache_indices.shape)}, "
+                    f"cache_indices={cache_indices.tolist()}, "
+                    f"num_accepted_tokens={accepted_values}, "
+                    f"run_mode={run_mode}, dtype={mixed_qkv.dtype}"
+                ) from error
+            return _causal_conv1d_torch_fallback(
+                mixed_qkv,
+                conv_weight_t,
+                conv_state,
+                query_start_loc,
+                cache_indices,
+                initial_state_mode,
+                num_accepted_tokens,
+            )
+        if conv_state_work is not conv_state:
+            conv_state.copy_(conv_state_work)
         return out
 
     def _recurrent(
@@ -510,6 +804,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return torch.ops._C_ascend.recurrent_kda(
             q.contiguous(),
@@ -522,7 +817,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             state_indices,
             self.A_log.reshape(-1).contiguous(),
             self.dt_bias.contiguous(),
-            num_accepted_tokens=None,
+            num_accepted_tokens=num_accepted_tokens,
             scale=self.scale,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
@@ -543,13 +838,14 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         beta: torch.Tensor,
         recurrent_state: torch.Tensor,
         metadata: KimiK3KDAMetadata,
+        recurrent_state_indices: torch.Tensor,
     ) -> torch.Tensor:
         num_decode = metadata.num_decode_seqs
         prefill_cu = metadata.query_start_loc[num_decode:]
         # The AscendC prefill operators take host-side cumulative lengths.
         cu_list = (prefill_cu - prefill_cu[0]).tolist()
         cu_list = [int(x) for x in cu_list]
-        slots = metadata.state_indices.long()[num_decode:]
+        slots = recurrent_state_indices[num_decode:]
         has_init = metadata.has_initial_state[num_decode:]
 
         # The recurrent cache is [H, V, K]; the chunk operator uses [H, K, V].

@@ -389,6 +389,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
             k_pe = k_pe.to(torch.bfloat16)
         q_latent, q_pe, fia_num_heads = _pad_mla_query_heads(q_latent, q_pe, layer.num_heads)
 
+        causal = not bool(getattr(layer, "non_causal_block", False))
         output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             q_latent.contiguous(),
             k_latent.contiguous(),
@@ -396,14 +397,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
             query_rope=q_pe.contiguous(),
             key_rope=k_pe.contiguous(),
             pse_shift=None,
-            atten_mask=self._causal_mask,
+            atten_mask=self._causal_mask if causal else None,
             actual_seq_lengths=actual_seq,
             actual_seq_lengths_kv=actual_seq,
             num_heads=fia_num_heads,
             scale=layer.scale,
             input_layout="TND",
             num_key_value_heads=layer.num_kv_heads,
-            sparse_mode=3,
+            sparse_mode=3 if causal else 0,
             softmax_lse_flag=False,
         )
         output = output.view(num_tokens, fia_num_heads, q_latent.shape[-1])
@@ -480,6 +481,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if nope_flat.dtype != torch.bfloat16 or rope_flat.dtype != torch.bfloat16:
             raise RuntimeError("dense MLA paged caches must use BF16 for NPU FIA chunked prefill")
 
+        causal = not bool(getattr(layer, "non_causal_block", False))
         output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             q_latent.contiguous(),
             nope_flat.contiguous(),
@@ -487,7 +489,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
             query_rope=q_pe.contiguous(),
             key_rope=rope_flat.contiguous(),
             pse_shift=None,
-            atten_mask=self._causal_mask,
+            atten_mask=self._causal_mask if causal else None,
             actual_seq_lengths=actual_seq_q,
             actual_seq_lengths_kv=actual_seq_kv,
             block_table=self._block_table_i32[: len(actual_seq_kv)],
@@ -495,7 +497,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
             scale=layer.scale,
             input_layout="TND",
             num_key_value_heads=layer.num_kv_heads,
-            sparse_mode=3,
+            sparse_mode=3 if causal else 0,
             block_size=block_size,
             softmax_lse_flag=False,
         )

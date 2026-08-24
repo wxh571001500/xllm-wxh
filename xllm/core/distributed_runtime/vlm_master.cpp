@@ -65,7 +65,11 @@ std::vector<Message> build_user_messages_from_image_urls(
 
 VLMMaster::VLMMaster(const Options& options)
     : Master(options, EngineType::VLM) {
-  CHECK(engine_->init());
+  if (should_use_vlm_speculative_engine(options_)) {
+    CHECK(engine_->init(master_status_));
+  } else {
+    CHECK(engine_->init());
+  }
 
   model_args_ = engine_->model_args();
 
@@ -85,7 +89,10 @@ VLMMaster::VLMMaster(const Options& options)
       .max_seqs_per_batch(options.max_seqs_per_batch())
       .max_tokens_per_chunk_for_prefill(
           options.max_tokens_per_chunk_for_prefill())
+      .num_speculative_tokens(options_.num_speculative_tokens())
+      .nnodes(options_.nnodes())
       .dp_size(options_.dp_size())
+      .cp_size(options_.cp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_chunked_prefill(options_.enable_chunked_prefill())
       .instance_name(options_.instance_name())

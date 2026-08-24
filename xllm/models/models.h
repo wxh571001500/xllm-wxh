@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include "llm/kimi_k3_dspark.h"  // IWYU pragma: keep
+
 #if defined(USE_NPU)
 #include "dit/pipelines/pipeline_flux.h"                 // IWYU pragma: keep
 #include "dit/pipelines/pipeline_flux2.h"                // IWYU pragma: keep

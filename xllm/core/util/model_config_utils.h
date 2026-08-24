@@ -26,6 +26,9 @@ class JsonReader;
 
 namespace util {
 
+void register_model_architecture_alias(const std::string& architecture,
+                                       const std::string& model_type);
+
 std::string get_model_type(const JsonReader& reader,
                            const std::filesystem::path& model_path,
                            std::optional<std::string> backend = std::nullopt);

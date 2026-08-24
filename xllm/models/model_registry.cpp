@@ -73,7 +73,7 @@ using KimiK3MultimodalProcessor =
     MultimodalProcessor<KimiK25PromptProcessor, KimiK25ImageProcessor>;
 
 REGISTER_MULTIMODAL_PROCESSOR(kimi_k3, KimiK3MultimodalProcessor);
-const bool kimi_k3_python_vlm_registered = []() {
+const bool kKimiK3PythonVlmRegistered = []() {
   ModelRegistry::register_model_backend("kimi_k3", "vlm");
   return true;
 }();
@@ -226,7 +226,8 @@ bool is_torch_only_model_type(const std::string& model_type) {
       "qwen3_next",
       "minimax_m2",
       "kimi_k3"};
-  return kTorchOnlyModelTypes.count(model_type) != 0;
+  return kTorchOnlyModelTypes.count(model_type) != 0 ||
+         ModelRegistry::is_npu_torch_only_model(model_type);
 }
 #endif
 
@@ -379,6 +380,14 @@ void ModelRegistry::register_model_backend(const std::string& name,
                                            const std::string& backend) {
   ModelRegistry* instance = get_instance();
   instance->model_backend_[name] = backend;
+}
+
+void ModelRegistry::register_npu_torch_only_model(const std::string& name) {
+  get_instance()->model_registry_[name].npu_torch_only = true;
+}
+
+void ModelRegistry::register_mla_model(const std::string& name) {
+  get_instance()->model_registry_[name].mla = true;
 }
 
 void ModelRegistry::register_dit_model_factory(const std::string& name,
@@ -597,6 +606,18 @@ std::string resolve_dit_pipeline_type(
 std::string ModelRegistry::get_model_backend(const std::string& name) {
   ModelRegistry* instance = get_instance();
   return instance->model_backend_[name];
+}
+
+bool ModelRegistry::is_npu_torch_only_model(const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  return it != instance->model_registry_.end() && it->second.npu_torch_only;
+}
+
+bool ModelRegistry::is_mla_model(const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  return it != instance->model_registry_.end() && it->second.mla;
 }
 
 std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context) {

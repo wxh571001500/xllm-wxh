@@ -71,6 +71,8 @@ struct ModelArgs {
   // non-DSpark models).
   PROPERTY(int64_t, markov_rank) = 0;
   PROPERTY(int32_t, dspark_num_layers) = 0;
+  PROPERTY(int32_t, dspark_num_target_layers) = 0;
+  PROPERTY(int64_t, dspark_target_hidden_size) = 0;
   PROPERTY(int32_t, dspark_block_size) = 0;
   // True only when SparseAttnSharedkv accepts explicit DSpark SWA indices.
   // False selects the CANN 9.0-compatible q_len=1 row fallback.

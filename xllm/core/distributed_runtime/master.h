@@ -74,6 +74,11 @@ class Master {
   RateLimiter* get_rate_limiter() { return &rate_limiter_; }
 
  protected:
+  static bool should_use_vlm_speculative_engine(const Options& options) {
+    return options.speculative_algorithm() == "DSpark" &&
+           !options.draft_model_path().value_or("").empty();
+  }
+
   Options options_;
   EngineType engine_type_ = EngineType::INVALID;
   std::unique_ptr<Engine> engine_;

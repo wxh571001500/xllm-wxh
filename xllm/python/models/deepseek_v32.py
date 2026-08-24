@@ -101,6 +101,7 @@ class DeepseekYarnRotaryEmbedding(RotaryEmbedding):
         mscale_all_dim: float,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        cache_max_position_embeddings: Optional[int] = None,
     ) -> None:
         nn.Module.__init__(self)
         self.head_dim = head_dim
@@ -114,7 +115,10 @@ class DeepseekYarnRotaryEmbedding(RotaryEmbedding):
             device,
         )
         t = torch.arange(
-            int(original_max_position_embeddings * scaling_factor),
+            int(
+                cache_max_position_embeddings
+                or original_max_position_embeddings * scaling_factor
+            ),
             dtype=torch.float32,
             device=device,
         )

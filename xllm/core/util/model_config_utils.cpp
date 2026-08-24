@@ -19,11 +19,27 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <filesystem>
+#include <unordered_map>
+#include <vector>
 
 #include "core/util/dit_model_discovery.h"
 #include "core/util/json_reader.h"
 
 namespace xllm::util {
+
+namespace {
+
+std::unordered_map<std::string, std::string>& architecture_aliases() {
+  static std::unordered_map<std::string, std::string> aliases;
+  return aliases;
+}
+
+}  // namespace
+
+void register_model_architecture_alias(const std::string& architecture,
+                                       const std::string& model_type) {
+  architecture_aliases()[architecture] = model_type;
+}
 
 std::string get_model_type(const JsonReader& reader,
                            const std::filesystem::path& model_path,
@@ -39,6 +55,16 @@ std::string get_model_type(const JsonReader& reader,
   if (!model_type.has_value()) {
     LOG(FATAL) << "Please check config.json file in model path: " << model_path
                << ", it should contain model_type or model_name key.";
+  }
+
+  const std::vector<std::string> architectures =
+      reader.value_or<std::vector<std::string>>("architectures",
+                                                std::vector<std::string>{});
+  for (const std::string& architecture : architectures) {
+    const auto alias = architecture_aliases().find(architecture);
+    if (alias != architecture_aliases().end()) {
+      return alias->second;
+    }
   }
 
   const bool is_qwen35_native_model_type =

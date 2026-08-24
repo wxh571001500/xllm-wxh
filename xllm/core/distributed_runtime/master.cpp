@@ -488,7 +488,10 @@ Master::Master(const Options& options, EngineType type)
     }
   }
 
-  if (type == EngineType::VLM) {
+  const bool use_vlm_speculative_engine =
+      type == EngineType::VLM &&
+      should_use_vlm_speculative_engine(options_);
+  if (type == EngineType::VLM && !use_vlm_speculative_engine) {
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
         .devices(devices)
@@ -537,7 +540,7 @@ Master::Master(const Options& options, EngineType type)
 
     auto engine = std::make_unique<VLMEngine>(eng_options);
     engine_ = std::move(engine);
-  } else if (type == EngineType::SSM) {
+  } else if (type == EngineType::SSM || use_vlm_speculative_engine) {
     // create a speculative engine if draft model path is provided
     const std::string draft_model_path =
         options_.draft_model_path().value_or("");
@@ -558,6 +561,8 @@ Master::Master(const Options& options, EngineType type)
         .max_cache_size(options_.max_cache_size())
         .max_memory_utilization(options_.max_memory_utilization())
         .enable_prefix_cache(options_.enable_prefix_cache())
+        .max_encoder_cache_size(options_.max_encoder_cache_size())
+        .max_processor_cache_items(options_.max_processor_cache_items())
         .max_linear_state_cache_slots(options_.max_linear_state_cache_slots())
         .num_speculative_tokens(options_.num_speculative_tokens())
         .speculative_algorithm(options_.speculative_algorithm())

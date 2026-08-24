@@ -12,6 +12,16 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      dflash_backend_test
+    SRCS
+      dflash_backend_test.cpp
+    DEPS
+      :runtime
+      GTest::gtest_main
+  )
+
+  cc_test(
+    NAME
       dspark_confidence_head_test
     SRCS
       dspark_confidence_head_test.cpp

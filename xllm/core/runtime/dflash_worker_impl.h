@@ -32,6 +32,15 @@ namespace xllm {
 
 namespace dflash_detail {
 
+inline runtime::Options target_options(const runtime::Options& options) {
+  runtime::Options target = options;
+  target.backend(options.backend() == "vlm" ? "vlm" : "llm")
+      .enable_schedule_overlap(false)
+      .is_draft_engine(false)
+      .enable_graph_aux_hidden_states(true);
+  return target;
+}
+
 inline int32_t decode_draft_width(int32_t num_speculative_tokens,
                                   bool sample_from_anchor) {
   return sample_from_anchor ? num_speculative_tokens

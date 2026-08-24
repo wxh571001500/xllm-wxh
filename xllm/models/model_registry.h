@@ -78,6 +78,8 @@ struct ModelMeta {
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
   CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
+  bool npu_torch_only = false;
+  bool mla = false;
 };
 
 // Model registry is a singleton class that registers all models with the
@@ -97,6 +99,10 @@ class ModelRegistry {
 
   static void register_model_backend(const std::string& name,
                                      const std::string& backend);
+
+  static void register_npu_torch_only_model(const std::string& name);
+
+  static void register_mla_model(const std::string& name);
 
   static void register_dit_model_factory(const std::string& name,
                                          DiTModelFactory factory);
@@ -143,6 +149,10 @@ class ModelRegistry {
   static bool has_dit_model_factory(const std::string& name);
 
   static std::string get_model_backend(const std::string& name);
+
+  static bool is_npu_torch_only_model(const std::string& name);
+
+  static bool is_mla_model(const std::string& name);
 
  private:
   std::unordered_map<std::string, ModelMeta> model_registry_;

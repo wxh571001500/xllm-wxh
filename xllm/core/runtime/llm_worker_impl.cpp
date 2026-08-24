@@ -123,9 +123,16 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
   }
 #endif
 
-  // Try to create a causal LM model
+  // Speculative workers reuse the LLM execution lifecycle for target
+  // validation. A multimodal target still needs its CausalVLM wrapper so the
+  // VLM executor runs the encoder and merges image embeddings during prefill.
   context.set_model_impl(model_config.model_impl());
-  model_ = create_llm_model(context);
+  if (options_.backend() == "vlm") {
+    context.set_encoder_embedding_mode(false);
+    model_ = create_vlm_model(context);
+  } else {
+    model_ = create_llm_model(context);
+  }
 
   // Dont find model in causal models
   CHECK(model_ != nullptr) << "Failed to create model.";

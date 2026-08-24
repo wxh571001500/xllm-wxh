@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
@@ -67,12 +68,24 @@ void broadcast_spec_tokens(torch::Tensor& tokens,
   pg->broadcast(tokens, root_rank);
 }
 
-runtime::Options target_options(const runtime::Options& options) {
-  runtime::Options opts = options;
-  opts.enable_schedule_overlap(false)
-      .is_draft_engine(false)
-      .enable_graph_aux_hidden_states(true);
-  return opts;
+KVCacheShape make_dflash_draft_kv_cache_shape(
+    const KVCacheShape& target_shape,
+    const ModelContext& draft_context,
+    int64_t block_size) {
+  CHECK_GT(target_shape.key_cache_shape().size(), 0U)
+      << "DFlash target KV cache shape is empty.";
+  const auto& parallel_args = draft_context.get_parallel_args();
+  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
+  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
+  const int64_t local_tp_size = std::max<int64_t>(
+      parallel_args.world_size() / (dp_size * cp_size), 1);
+
+  KVCacheCapacity draft_capacity;
+  draft_capacity.n_blocks(target_shape.key_cache_shape()[0])
+      .block_size(block_size);
+  return KVCacheShape(draft_capacity,
+                      draft_context.get_model_args(),
+                      local_tp_size);
 }
 
 runtime::Options draft_options(const runtime::Options& options) {
@@ -83,7 +96,8 @@ runtime::Options draft_options(const runtime::Options& options) {
           ? options.num_speculative_tokens()
           : 0;
   runtime::Options opts = options;
-  opts.enable_schedule_overlap(false)
+  opts.backend("llm")
+      .enable_schedule_overlap(false)
       .is_draft_engine(true)
       .num_decoding_tokens(1)
       .num_speculative_tokens(draft_num_speculative_tokens)
@@ -300,7 +314,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
     : SpeculativeWorkerImpl(parallel_args,
                             device,
                             options,
-                            target_options(options)) {
+                            dflash_detail::target_options(options)) {
   // DFlash feeds the target's captured intermediate-layer aux hidden states
   // into the draft's context K/V. Under context parallelism the worker only
   // exposes the lm_head-gathered final hidden (see llm_worker_impl.cpp), not
@@ -387,6 +401,11 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
       // DeepseekV4DSparkForCausalLMImpl. Sharing the target modules here makes
       // the draft backbone/Markov head project through the wrong vocabulary
       // basis and reduces acceptance to near-random levels.
+    } else if (ModelConfig::is_python_model_impl(
+                   draft_impl_->context_.get_model_impl())) {
+      CHECK(draft_impl_->share_weights_from(*impl_))
+          << "Python block-diffusion draft failed to share target vocabulary "
+             "weights.";
     } else {
 #if defined(USE_NPU)
       auto head = impl_->get_npu_lm_head();
@@ -431,6 +450,22 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
            "target_layer_ids, or dflash_config.target_layer_ids.";
     expected_context_hidden_size_ =
         static_cast<int64_t>(target_args.hidden_size()) * num_target_layers;
+    if (draft_args.model_type() == "k3_dspark") {
+      CHECK_EQ(draft_args.dspark_num_target_layers(), num_target_layers)
+          << "Kimi-K3 DSpark num_target_layers must match the target capture "
+             "layer count.";
+      CHECK_EQ(draft_args.dspark_target_hidden_size(),
+               target_args.hidden_size())
+          << "Kimi-K3 DSpark target_hidden_size must match the target model "
+             "hidden_size.";
+      CHECK_EQ(draft_args.kv_lora_rank(), target_args.kv_lora_rank())
+          << "Kimi-K3 DSpark and target must use the same latent KV cache "
+             "dimension.";
+      CHECK_EQ(draft_args.qk_rope_head_dim(),
+               target_args.qk_rope_head_dim())
+          << "Kimi-K3 DSpark and target must use the same RoPE cache "
+             "dimension.";
+    }
     draft_sas_mode_ = dflash_detail::classify_dspark_sas_mode(
         draft_args, sample_from_anchor());
   }
@@ -441,7 +476,9 @@ std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
   return estimate_kv_cache_capacity_with_draft(
-      *draft_impl_, target_options(options_), draft_options(options_));
+      *draft_impl_,
+      dflash_detail::target_options(options_),
+      draft_options(options_));
 }
 
 bool DFlashWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
@@ -459,7 +496,11 @@ bool DFlashWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   bool draft_allocated = true;
   const WorkerImpl::Status draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated = draft_impl_->allocate_kv_cache(kv_cache_shape);
+    const KVCacheShape draft_shape = make_dflash_draft_kv_cache_shape(
+        kv_cache_shape,
+        draft_impl_->context_,
+        options_.block_size());
+    draft_allocated = draft_impl_->allocate_kv_cache(draft_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
@@ -495,8 +536,12 @@ bool DFlashWorkerImpl::allocate_kv_cache_with_transfer(
   bool draft_allocated = true;
   const WorkerImpl::Status draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
+    const KVCacheShape draft_shape = make_dflash_draft_kv_cache_shape(
+        kv_cache_shape,
+        draft_impl_->context_,
+        options_.block_size());
     draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
+        kv_cache_transfer_, draft_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
@@ -1233,6 +1278,24 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   prepared_input.metadata_ready_event.reset();
   SpeculativeWorkerImpl::prepare_validate_inputs(prepared_input,
                                                  validate_input);
+  validate_input.input_params.is_spec_verify = true;
+  if (embedding_cache_ != nullptr &&
+      !input.input_params.embedding.embedding_ids.empty()) {
+    const std::vector<int32_t> accepted_prefix_lengths =
+        embedding_cache_->read_accepted_prefix_lengths(
+            input.input_params.embedding.embedding_ids,
+            input.input_params.embedding.request_ids);
+    const int64_t logical_sequences =
+        static_cast<int64_t>(input.input_params.meta.num_sequences);
+    CHECK_EQ(accepted_prefix_lengths.size(),
+             static_cast<size_t>(logical_sequences))
+        << "DFlash accepted-prefix count must match logical sequences";
+    validate_input.input_params.num_accepted_tokens = torch::tensor(
+        accepted_prefix_lengths,
+        validate_input.token_ids.options().dtype(torch::kInt32));
+    validate_input.input_params.num_accepted_tokens_host.assign(
+        accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
+  }
   validate_input.input_params.embedding.input_embedding = torch::Tensor();
   record_metadata_ready_event(*prepare_stream_, validate_input);
 }
@@ -1529,6 +1592,22 @@ void DFlashWorkerImpl::apply_per_seq_varlen_prune(
   ForwardInput new_validate;
   SpeculativeWorkerImpl::prepare_validate_inputs(
       prepared_input, new_validate, per_seq_val_tokens);
+  new_validate.input_params.is_spec_verify = true;
+  if (embedding_cache_ != nullptr &&
+      !input.input_params.embedding.embedding_ids.empty()) {
+    const std::vector<int32_t> accepted_prefix_lengths =
+        embedding_cache_->read_accepted_prefix_lengths(
+            input.input_params.embedding.embedding_ids,
+            input.input_params.embedding.request_ids);
+    CHECK_EQ(accepted_prefix_lengths.size(),
+             input.input_params.embedding.embedding_ids.size())
+        << "DFlash accepted-prefix count must match logical sequences";
+    new_validate.input_params.num_accepted_tokens = torch::tensor(
+        accepted_prefix_lengths,
+        new_validate.token_ids.options().dtype(torch::kInt32));
+    new_validate.input_params.num_accepted_tokens_host.assign(
+        accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
+  }
   new_validate.input_params.embedding.input_embedding = torch::Tensor();
   record_metadata_ready_event(*prepare_stream_, new_validate);
   validate_input = std::move(new_validate);
@@ -1580,19 +1659,20 @@ void DFlashWorkerImpl::record_validate_metrics(
     const int32_t prefix_len = seq_width - 1;
     num_draft_tokens += prefix_len;
 
-    // Count accepted drafts by walking columns [0, prefix_len) — the first
-    // -1 marks the boundary where the sampler rejected. Padding tail past
-    // prefix_len is ignored so it never counts as rejection.
+    // The sampler emits accepted drafts followed by one target correction (or
+    // bonus) token. Walk through that boundary token, then exclude it from the
+    // draft acceptance count. Padding after the boundary remains ignored.
     const int64_t row_offset =
         static_cast<int64_t>(seq_id) * static_cast<int64_t>(width);
-    int32_t emitted = 0;
-    for (int32_t token_idx = 0; token_idx < prefix_len; ++token_idx) {
+    int32_t emitted_len = 0;
+    for (int32_t token_idx = 0; token_idx <= prefix_len; ++token_idx) {
       if (token_data[row_offset + token_idx] < 0) {
         break;
       }
-      ++emitted;
+      ++emitted_len;
     }
-    accepted_count += emitted;
+    accepted_count +=
+        std::min(prefix_len, std::max(emitted_len - 1, 0));
   }
   COUNTER_ADD(speculative_num_draft_tokens_total, num_draft_tokens);
   COUNTER_ADD(speculative_num_accepted_tokens_total, accepted_count);

@@ -57,6 +57,17 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM,
   void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
   void update_expert_weight(int32_t) override {}
 
+  bool share_weights_from(CausalLM& source) override;
+
+  ModelOutput write_context_kv(const torch::Tensor& target_hidden,
+                               const torch::Tensor& positions,
+                               const torch::Tensor& device_cache_slots,
+                               std::vector<KVCache>& kv_caches,
+                               const ModelInputParams& input_params) override;
+
+  torch::Tensor dspark_markov_bias(
+      const torch::Tensor& previous_token_ids) override;
+
   pybind11::object& python_model() override { return py_model_; }
   const pybind11::object& config_dict() const override { return config_dict_; }
 

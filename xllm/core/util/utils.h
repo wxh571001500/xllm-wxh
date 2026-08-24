@@ -145,7 +145,9 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
 }
 
 inline bool is_mla_model_type(std::string_view model_type) {
-  return mla_model_type_set().contains(std::string(model_type));
+  const std::string name(model_type);
+  return mla_model_type_set().contains(name) ||
+         ModelRegistry::is_mla_model(name);
 }
 
 inline bool has_mtp_model_type_marker(std::string_view model_type) {

@@ -77,6 +77,7 @@ py::dict PyCausalVLM::build_config_dict(const ParallelArgs& parallel_args,
   PyDictVisitor visitor(config);
   visit_properties(model_args_, visitor);
   visit_properties(parallel_args, visitor);
+  config["layers_to_capture"] = model_args_.layers_to_capture();
   if (model_args_.model_type() == "kimi_k3") {
     config["quantize_type"] = quant_args.quantize_type();
     config["quant_method"] = quant_args.quant_method();

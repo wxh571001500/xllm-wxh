@@ -32,6 +32,10 @@ class BaseRunner(ABC):
         self.model = model
         self.attention_backend = attention_backend
         self.device = device
+        # Linear-attention layers may consume per-layer recurrent caches from
+        # ForwardContext. Standard paged-KV models, including Qwen3 DSpark,
+        # do not have them; runners still pass this optional field uniformly.
+        self.layer_caches = None
 
     @abstractmethod
     def execute(

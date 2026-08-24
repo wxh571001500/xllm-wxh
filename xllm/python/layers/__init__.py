@@ -22,6 +22,7 @@ touch the kernel backends directly. The dependency direction is
 
 from xllm.python.layers.attention import Attention
 from xllm.python.layers.embedding import HiddenParallelEmbedding
+from xllm.python.layers.gated_mlp import GatedMLP
 from xllm.python.layers.layernorm import RMSNorm
 from xllm.python.layers.linear import (
     ColumnParallelLinear,
@@ -48,6 +49,7 @@ __all__ = [
     "RowParallelLinear",
     "W8A8DynamicLinearMethod",
     "HiddenParallelEmbedding",
+    "GatedMLP",
     "GroupedTopKRouter",
     "KimiK3MoE",
     "MoE",

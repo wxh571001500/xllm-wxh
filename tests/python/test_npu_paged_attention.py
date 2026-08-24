@@ -20,6 +20,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch_npu
 
@@ -209,6 +210,44 @@ def test_dense_mla_prefill_uses_split_positional_inputs_and_bf16(monkeypatch):
     assert captured["scale"] == 0.125
     assert captured["input_layout"] == "TND"
     assert captured["sparse_mode"] == 3
+
+
+def test_dense_mla_prefill_supports_non_causal_dspark_blocks(monkeypatch):
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._actual_seq_lens = [3]
+    backend._causal_mask = torch.ones(4, 4, dtype=torch.int8)
+    query = torch.randn(3, 2, 4, dtype=torch.bfloat16)
+    query_rope = torch.randn(3, 2, 2, dtype=torch.bfloat16)
+    key = torch.randn(3, 1, 4, dtype=torch.bfloat16)
+    key_rope = torch.randn(3, 1, 2, dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_fia(q, k, v, **kwargs):
+        captured.update(kwargs)
+        return torch.zeros_like(q), torch.empty(0, dtype=q.dtype)
+
+    monkeypatch.setattr(
+        torch.ops.npu,
+        "npu_fused_infer_attention_score",
+        fake_fia,
+    )
+    output = backend._mla_dense_prefill(
+        query,
+        query_rope,
+        key,
+        key_rope,
+        SimpleNamespace(),
+        SimpleNamespace(
+            num_heads=2,
+            num_kv_heads=1,
+            scale=0.5,
+            non_causal_block=True,
+        ),
+    )
+
+    assert output.shape == query.shape
+    assert captured["atten_mask"] is None
+    assert captured["sparse_mode"] == 0
 
 
 def test_dense_mla_prefill_keeps_bf16_without_conversion(monkeypatch):
@@ -516,8 +555,10 @@ def test_dense_mla_graph_keeps_outputs_layer_local(monkeypatch):
     assert operator_outputs[-1][1].shape == (2,)
 
 
+@pytest.mark.parametrize("non_causal", [False, True])
 def test_dense_mla_chunked_prefill_uses_paged_caches_and_total_kv_lens(
     monkeypatch,
+    non_causal,
 ):
     backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
     backend._actual_seq_lens = [2, 5]
@@ -535,7 +576,12 @@ def test_dense_mla_chunked_prefill_uses_paged_caches_and_total_kv_lens(
         kv_seq_lens_host=torch.tensor([7, 11], dtype=torch.int32),
         block_table=backend._block_table_i32,
     )
-    layer = SimpleNamespace(num_heads=4, num_kv_heads=1, scale=0.125)
+    layer = SimpleNamespace(
+        num_heads=4,
+        num_kv_heads=1,
+        scale=0.125,
+        non_causal_block=non_causal,
+    )
     captured = {}
 
     def fake_fia(query, key, value, **kwargs):
@@ -569,8 +615,10 @@ def test_dense_mla_chunked_prefill_uses_paged_caches_and_total_kv_lens(
     assert captured["num_key_value_heads"] == 1
     assert captured["scale"] == 0.125
     assert captured["input_layout"] == "TND"
-    assert captured["sparse_mode"] == 3
-    assert captured["atten_mask"] is backend._causal_mask
+    assert captured["sparse_mode"] == (0 if non_causal else 3)
+    assert captured["atten_mask"] is (
+        None if non_causal else backend._causal_mask
+    )
 
 
 def test_chunked_kv_seq_lens_accepts_cumulative_fallback():

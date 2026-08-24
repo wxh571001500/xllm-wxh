@@ -28,3 +28,29 @@ def test_unsupported_model_fails_before_import(monkeypatch: pytest.MonkeyPatch) 
         registry.get_model_class("qwen3_5")
 
     import_model.assert_not_called()
+
+
+def test_kimi_k3_dspark_is_registered_lazily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_class = type("KimiK3DSparkForCausalLM", (), {})
+    model_module = Mock(KimiK3DSparkForCausalLM=model_class)
+    import_model = Mock(return_value=model_module)
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
+    monkeypatch.setattr(registry, "import_module", import_model)
+
+    assert registry.get_model_class("K3DSparkModel") is model_class
+    import_model.assert_called_once_with("xllm.python.models.kimi_k3_dspark")
+
+
+def test_legacy_dspark_is_registered_as_qwen3_gqa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_class = type("Qwen3DSparkForCausalLM", (), {})
+    model_module = Mock(Qwen3DSparkForCausalLM=model_class)
+    import_model = Mock(return_value=model_module)
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
+    monkeypatch.setattr(registry, "import_module", import_model)
+
+    assert registry.get_model_class("DSparkDraftModel") is model_class
+    import_model.assert_called_once_with("xllm.python.models.qwen3_dspark")

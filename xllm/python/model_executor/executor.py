@@ -141,6 +141,15 @@ class ModelExecutor:
         )
 
         execution_model = model.model
+        capture_layers = list(config.get("layers_to_capture") or [])
+        self._capture_layers = tuple(capture_layers)
+        set_capture_layers = getattr(execution_model, "set_layers_to_capture", None)
+        if capture_layers and set_capture_layers is not None:
+            set_capture_layers(capture_layers)
+        elif capture_layers:
+            execution_config = getattr(execution_model, "config", None)
+            if execution_config is not None:
+                execution_config.layers_to_capture = capture_layers
         # The execution model (e.g. KimiK3TextModel) owns the KDA runtime when
         # the model has linear-attention (KDA) layers; other models leave it
         # unset and the KDA bind/metadata calls below become no-ops.
@@ -150,6 +159,11 @@ class ModelExecutor:
         self.inductor_runner = None
 
         graph_backend = _resolve_graph_backend(config, device)
+        if config.get("layers_to_capture") or config.get("model_type") == "k3_dspark":
+            # Aux-hidden tensors are consumed immediately by block-diffusion
+            # drafts, and the K3 draft uses non-causal MLA blocks. Neither is
+            # currently represented safely by the ACL graph runner.
+            graph_backend = "off"
         logger.info(
             f"Python model graph backend: backend={graph_backend}, "
             f"enable_graph={bool(config.get('enable_graph', False))}, "
@@ -251,7 +265,7 @@ class ModelExecutor:
         # actual tokens and do not touch conv/recurrent caches.
         if view.num_decode_seqs + view.num_prefill_seqs == 0 and num_tokens > 0:
             kda_runtime.metadata = KimiK3KDAMetadata(
-                query_start_loc=torch.zeros(1, dtype=torch.int64, device=self._device),
+                query_start_loc=torch.zeros(1, dtype=torch.int32, device=self._device),
                 state_indices=torch.full(
                     (num_tokens,),
                     PAD_SLOT_ID,
@@ -261,6 +275,9 @@ class ModelExecutor:
                 num_decode_seqs=0,
                 num_prefill_seqs=0,
                 has_initial_state=None,
+                num_accepted_tokens=None,
+                spec_query_start_loc=None,
+                is_spec_verify=False,
                 graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
                 empty_shard=True,
             )
@@ -275,16 +292,27 @@ class ModelExecutor:
             tensor: torch.Tensor | None,
             dtype: torch.dtype | None = None,
         ) -> torch.Tensor | None:
-            if tensor is None or tensor.device == self._device:
+            if tensor is None:
+                return None
+            if tensor.device == self._device:
                 return tensor if dtype is None else tensor.to(dtype=dtype)
             return tensor.to(self._device, dtype=dtype, non_blocking=True)
 
         kda_runtime.metadata = KimiK3KDAMetadata(
-            query_start_loc=_to_device(view.query_start_loc, torch.int64),
+            # AscendC CausalConv1d consumes cumulative row offsets as int32;
+            # the C++ metadata view already materializes this dtype.
+            query_start_loc=_to_device(view.query_start_loc, torch.int32),
             state_indices=_to_device(view.state_indices),
             num_decode_seqs=view.num_decode_seqs,
             num_prefill_seqs=view.num_prefill_seqs,
             has_initial_state=_to_device(view.has_initial_state),
+            num_accepted_tokens=_to_device(
+                getattr(view, "num_accepted_tokens", None), torch.int32
+            ),
+            spec_query_start_loc=_to_device(
+                getattr(view, "spec_query_start_loc", None), torch.int32
+            ),
+            is_spec_verify=bool(getattr(view, "is_spec_verify", False)),
             graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
             empty_shard=bool(getattr(view, "empty_shard", False)),
         )
@@ -327,6 +355,20 @@ class ModelExecutor:
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(input_ids, positions, metadata)
         return self.eager_runner.execute(input_ids, positions, metadata)
+
+    def aux_hidden_states(self) -> torch.Tensor | None:
+        """Return target-layer features captured by the latest forward."""
+        aux_hidden_states = getattr(
+            self._execution_model,
+            "last_aux_hidden_states",
+            None,
+        )
+        if self._capture_layers and aux_hidden_states is None:
+            raise RuntimeError(
+                "Python target model did not return requested aux hidden states: "
+                f"layers_to_capture={self._capture_layers}"
+            )
+        return aux_hidden_states
 
     def _all_dp_decode(self, kda_metadata: object | None) -> bool:
         """Whether every DP rank can safely enter decode graph this step.

@@ -371,8 +371,41 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
     input_params.linear_state_validity_mask.clear();
     return;
   }
+#if defined(USE_NPU)
+  // Kimi K3's recurrent state is sequence-scoped.  Speculative validation
+  // expands one sequence into multiple query rows (for example, the eight
+  // anchor/draft rows), but it still has one linear-state cache operation.
+  // Keep the validity mask aligned with linear_state_ids/cache_ops; the NPU
+  // KDA kernels also require this sequence-scoped layout.
+  if (input_params.is_spec_verify) {
+    const int64_t logical_rows = static_cast<int64_t>(
+        input_params.linear_state_cache_ops.size());
+    CHECK_GT(logical_rows, 0)
+        << "speculative KDA input requires linear-state cache operations";
+    CHECK_EQ(rows.cached_tokens.size() % static_cast<size_t>(logical_rows),
+             0)
+        << "speculative KDA cached-token rows must divide logical rows: "
+        << "cached_rows=" << rows.cached_tokens.size()
+        << ", logical_rows=" << logical_rows;
+    const size_t repeat_count =
+        rows.cached_tokens.size() / static_cast<size_t>(logical_rows);
+    std::vector<int32_t> logical_cached_tokens;
+    logical_cached_tokens.reserve(static_cast<size_t>(logical_rows));
+    for (int64_t row = 0; row < logical_rows; ++row) {
+      logical_cached_tokens.emplace_back(
+          rows.cached_tokens[static_cast<size_t>(row) * repeat_count]);
+    }
+    input_params.linear_state_validity_mask = build_linear_state_mask(
+        logical_cached_tokens, logical_rows);
+  } else {
+    input_params.linear_state_validity_mask = build_linear_state_mask(
+        rows.cached_tokens,
+        static_cast<int64_t>(rows.cached_tokens.size()));
+  }
+#else
   input_params.linear_state_validity_mask =
       build_linear_state_mask(rows.cached_tokens, rows.active_rows);
+#endif
 
 #if defined(USE_NPU)
   // Kimi K3's KDA causal-conv1d prefill reads a per-sequence has_initial_state
@@ -2007,10 +2040,14 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
       const bool is_dspark = speculative_algorithm == "DSpark";
       const bool is_deepseek_v4_dspark =
           is_dspark && util::is_deepseek_v4_model_type(args.model_type());
+      const bool is_kimi_k3_dspark =
+          is_dspark && args.model_type() == "k3_dspark";
       std::string draft_model_type =
           is_dspark ? "DSparkDraftModel" : "DFlashDraftModel";
       if (is_deepseek_v4_dspark) {
         draft_model_type = std::string(util::kDeepseekV4DSparkModelType);
+      } else if (is_kimi_k3_dspark) {
+        draft_model_type = "k3_dspark";
       }
       LOG(INFO) << "Overriding draft model_type from " << args.model_type()
                 << " to " << draft_model_type

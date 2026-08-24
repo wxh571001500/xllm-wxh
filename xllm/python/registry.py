@@ -112,6 +112,22 @@ def _register_builtin_models() -> None:
         "DeepseekV32MtpForCausalLM",
         "deepseek_v32_mtp",
     )
+    _register_model_path(
+        "xllm.python.models.kimi_k3_dspark",
+        "KimiK3DSparkForCausalLM",
+        "K3DSparkForCausalLM",
+        "K3DSparkModel",
+        "k3_dspark",
+        "kimi_k3_dspark",
+    )
+    _register_model_path(
+        "xllm.python.models.qwen3_dspark",
+        "Qwen3DSparkForCausalLM",
+        "DSparkDraftModel",
+        "Qwen3DSparkForCausalLM",
+        "Qwen3DSparkModel",
+        "qwen3_dspark",
+    )
 
     from xllm.python.models.deepseek_v32 import DeepseekV3ForCausalLM
 

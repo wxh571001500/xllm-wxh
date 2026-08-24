@@ -274,5 +274,30 @@ TEST(MtpAsyncInputBuilderTest, SharedModulesPointToTargetModel) {
   EXPECT_TRUE(draft_embedding.is(target_embedding));
 }
 
+TEST(MtpAsyncInputBuilderTest, SharedModulesUnwrapTargetLanguageModel) {
+  py::gil_scoped_acquire gil;
+  py::module_ types = py::module_::import("types");
+  py::object target_lm_head = py::module_::import("builtins").attr("object")();
+  py::object target_embedding =
+      py::module_::import("builtins").attr("object")();
+  py::object target_body =
+      types.attr("SimpleNamespace")(py::arg("embed_tokens") = target_embedding);
+  py::object target_language_model = types.attr("SimpleNamespace")(
+      py::arg("lm_head") = target_lm_head, py::arg("model") = target_body);
+  py::object target_model = types.attr("SimpleNamespace")(
+      py::arg("language_model") = target_language_model);
+  py::object draft_body =
+      types.attr("SimpleNamespace")(py::arg("embed_tokens") = py::none());
+  py::object draft_model = types.attr("SimpleNamespace")(
+      py::arg("lm_head") = py::none(), py::arg("model") = draft_body);
+
+  ::xllm::detail::share_python_model_weights(draft_model, target_model);
+
+  py::object draft_lm_head = draft_model.attr("lm_head");
+  py::object draft_embedding = draft_model.attr("model").attr("embed_tokens");
+  EXPECT_TRUE(draft_lm_head.is(target_lm_head));
+  EXPECT_TRUE(draft_embedding.is(target_embedding));
+}
+
 }  // namespace
 }  // namespace xllm::mtp_async

@@ -830,6 +830,7 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
   const JsonReader config_reader = normalize_config_torch_dtype(reader);
   model_args_loader(config_reader, &args_);
   args_.enable_mla(
+      args_.enable_mla() ||
       util::should_enable_mla(std::filesystem::path(model_weights_path),
                               ModelConfig::get_instance().backend()));
 
