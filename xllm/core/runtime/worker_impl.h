@@ -146,6 +146,8 @@ class WorkerImpl {
 
   virtual std::optional<ForwardOutput> step(const ForwardInput& inputs) = 0;
 
+  // Optional no-sync execution hook used by speculative LLM/VLM workers.
+  // Other worker types do not support this execution mode.
   virtual std::optional<ForwardOutput> execute_no_sync_on_stream(
       const ForwardInput& input,
       Stream& compute_stream);
