@@ -145,11 +145,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Hook for algorithm-specific draft output post-processing during decode.
   virtual void process_draft_sample_output(SampleOutput& sample_output);
 
-  virtual void check_draft_input_embedding(const torch::Tensor& embedding,
-                                           const std::string& phase) const {
-    (void)embedding;
-    (void)phase;
-  }
+  virtual void check_draft_input_embedding(
+      const torch::Tensor& /*embedding*/,
+      const std::string& /*phase*/) const {}
   virtual bool share_target_lm_head_with_draft() const { return true; }
 
   SampleOutput validate(

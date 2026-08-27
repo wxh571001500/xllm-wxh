@@ -543,6 +543,17 @@ Master::Master(const Options& options, EngineType type)
     auto engine = std::make_unique<VLMEngine>(eng_options);
     engine_ = std::move(engine);
   } else if (type == EngineType::SSM || type == EngineType::VLMSSM) {
+    if (type == EngineType::VLMSSM) {
+      CHECK(!options_.enable_disagg_pd())
+          << "VLM speculative decoding does not support disaggregated PD";
+      CHECK(!options_.enable_pd_ooc())
+          << "VLM speculative decoding does not support PD OOC";
+      CHECK(!options_.enable_service_routing())
+          << "VLM speculative decoding does not support service routing";
+      CHECK(!options_.enable_adaptive_speculative_decode())
+          << "VLM speculative decoding does not support adaptive speculative "
+             "decode";
+    }
     // create a speculative engine if draft model path is provided
     const std::string draft_model_path =
         options_.draft_model_path().value_or("");
