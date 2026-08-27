@@ -1004,6 +1004,8 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     return language_model_->logits(hidden_states, seleted_idxes);
   }
 
+  // Variant that also outputs hidden states for downstream processing
+  // (e.g., Eagle3 draft model aux hidden state capture).
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes,
                        torch::Tensor& out_hidden) {

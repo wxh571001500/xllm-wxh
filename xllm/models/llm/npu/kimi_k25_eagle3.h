@@ -24,6 +24,11 @@ limitations under the License.
 
 namespace xllm::npu::model {
 
+// Kimi K2.5 Eagle3 draft model for speculative decoding.
+// Inherits from QWen3Eagle3 with Kimi-specific configuration (vocab size,
+// hidden dimensions, tokenizer). Used as the draft model in Eagle3 speculative
+// decoding where it generates candidate tokens verified against the target
+// model.
 class KimiK25Eagle3ForCausalLMImpl final : public QWen3Eagle3ForCausalLMImpl {
  public:
   explicit KimiK25Eagle3ForCausalLMImpl(const ModelContext& context)
