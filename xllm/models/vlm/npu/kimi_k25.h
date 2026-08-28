@@ -1152,7 +1152,7 @@ REGISTER_MODEL_ARGS(kimi_k25, [&] {
   LOAD_ARG_OR(
       num_nextn_predict_layers, "text_config.num_nextn_predict_layers", 1);
   SET_ARG(enable_embedded_eagle3_draft, true);
-  SET_ARG(max_concurrent_media_prefills_per_dp, 2);
+  SET_ARG(max_concurrent_prefills_per_dp, 2);
   LOAD_ARG_OR(layers_to_capture, "layers_to_capture", std::vector<int32_t>{});
   LOAD_ARG_OR(layers_to_capture,
               "text_config.layers_to_capture",

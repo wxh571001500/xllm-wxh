@@ -101,34 +101,20 @@ SchedulerPolicy::SchedulerPolicy(const BatchMode& mode,
                                  const ContinuousScheduler::Options& options)
     : batch_mode_(mode), options_(options) {}
 
-bool SchedulerPolicy::request_has_media_prefill(
-    const std::shared_ptr<Request>& request) const {
-  if (request == nullptr) {
-    return false;
-  }
-  for (const auto& sequence : request->sequences()) {
-    if (sequence && sequence->is_prefill_stage() &&
-        sequence->mm_data().valid()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool SchedulerPolicy::should_limit_media_prefill_requests(
+bool SchedulerPolicy::should_limit_prefill_requests(
     const SchedulerState& state) const {
-  return state.model_args.max_concurrent_media_prefills_per_dp() > 0;
+  return state.model_args.max_concurrent_prefills_per_dp() > 0;
 }
 
-int32_t SchedulerPolicy::select_media_prefill_dp_rank(
+int32_t SchedulerPolicy::select_prefill_dp_rank(
     const Sequence* sequence,
     const SchedulerState& state) const {
   const size_t cap = static_cast<size_t>(
-      state.model_args.max_concurrent_media_prefills_per_dp());
+      state.model_args.max_concurrent_prefills_per_dp());
   const int32_t dp_size = state.options.dp_size();
   std::vector<size_t> per_dp_counts(dp_size, 0);
   for (const auto& request : state.running_requests) {
-    if (!request_has_media_prefill(request)) {
+    if (request == nullptr) {
       continue;
     }
     std::vector<bool> counted_dp_ranks(dp_size, false);
@@ -307,15 +293,14 @@ void SchedulerPolicy::schedule_prefill_from_queue(
         continue;
       }
 
-      if (should_limit_media_prefill_requests(state) &&
-          request_has_media_prefill(request)) {
+      if (should_limit_prefill_requests(state)) {
         const int32_t dp_rank =
-            select_media_prefill_dp_rank(prefill_sequence.get(), state);
+            select_prefill_dp_rank(prefill_sequence.get(), state);
         if (dp_rank < 0) {
           LOG_EVERY_N(INFO, 100)
-              << "[media_prefill_cap] no eligible DP rank is below the cap of "
-              << state.model_args.max_concurrent_media_prefills_per_dp()
-              << " media prefill requests; deferring remaining prefills";
+              << "[prefill_cap] no eligible DP rank is below the cap of "
+              << state.model_args.max_concurrent_prefills_per_dp()
+              << " prefill requests; deferring remaining prefills";
           can_schedule = false;
           break;
         }

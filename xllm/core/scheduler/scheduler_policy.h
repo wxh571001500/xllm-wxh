@@ -154,10 +154,9 @@ class SchedulerPolicy {
       ScheduleBudget& budget,
       std::vector<std::shared_ptr<Request>>& finished,
       size_t& reserved_full_footprint);
-  bool request_has_media_prefill(const std::shared_ptr<Request>& request) const;
-  int32_t select_media_prefill_dp_rank(const Sequence* sequence,
-                                       const SchedulerState& state) const;
-  bool should_limit_media_prefill_requests(const SchedulerState& state) const;
+  int32_t select_prefill_dp_rank(const Sequence* sequence,
+                                 const SchedulerState& state) const;
+  bool should_limit_prefill_requests(const SchedulerState& state) const;
   size_t compute_prefill_tokens(Sequence* seq,
                                 size_t remaining_budget,
                                 const SchedulerState& state);
