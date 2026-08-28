@@ -1152,6 +1152,7 @@ REGISTER_MODEL_ARGS(kimi_k25, [&] {
   LOAD_ARG_OR(
       num_nextn_predict_layers, "text_config.num_nextn_predict_layers", 1);
   SET_ARG(enable_embedded_eagle3_draft, true);
+  // Workaround for Kimi K2.5 Eagle3 prefill resource contention.
   SET_ARG(max_concurrent_prefills_per_dp, 2);
   LOAD_ARG_OR(layers_to_capture, "layers_to_capture", std::vector<int32_t>{});
   LOAD_ARG_OR(layers_to_capture,
