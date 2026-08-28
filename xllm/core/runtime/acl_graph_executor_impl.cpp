@@ -1043,7 +1043,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
            "ACL graph path is not adapted for Eagle3 aux hidden-state "
            "validation yet.";
     COUNTER_INC(num_model_execution_total_eager);
-    return model_->forward(tokens, positions, kv_caches, params);
+    return run_eager();
   }
   if (in_decoding_phase &&
       params_single.parallel.dp_global_token_nums.size() > 1) {
