@@ -20,7 +20,8 @@
 	fetchRecurseSubmodules = false
 [submodule "third_party/xllm_ops"]
 	path = third_party/xllm_ops
-	url = https://gitcode.com/xLLM-AI/xllm_ops.git
+	url = https://gitcode.com/wxh571001500/xllm_ops.git
+	branch = main
 	fetchRecurseSubmodules = true
 [submodule "third_party/etcd_cpp_apiv3"]
 	path = third_party/etcd_cpp_apiv3
@@ -44,7 +45,8 @@
 	fetchRecurseSubmodules = false
 [submodule "third_party/xllm_atb_layers"]
 	path = third_party/xllm_atb_layers
-	url = https://gitcode.com/xLLM-AI/xllm_atb_layers.git
+	url = https://gitcode.com/wxh571001500/xllm_atb_layers.git
+	branch = main
 	fetchRecurseSubmodules = false
 [submodule "third_party/xxHash"]
 	path = third_party/xxHash
