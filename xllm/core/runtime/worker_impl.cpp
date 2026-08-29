@@ -63,6 +63,7 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "core/platform/sleepable_allocator.h"
 #if defined(USE_NPU)
+#include "core/runtime/kimi_eagle3_graph_mode.h"
 #include "platform/npu/device_capture_lock.h"
 #elif defined(USE_CUDA) || defined(USE_DCU) || defined(USE_MUSA)
 #include "platform/torch_profiler.h"
@@ -1129,7 +1130,7 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
     return;
   }
 
-  const std::vector<int32_t>& token_sizes =
+  const std::vector<int32_t>& real_token_sizes =
       input_params.parallel.dp_global_token_nums;
   const std::vector<int32_t>& raw_token_sizes =
       input_params.parallel.raw_dp_global_token_nums;
@@ -1137,15 +1138,23 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
   const bool use_draft_decode_cache = options_.is_draft_engine() && !is_prefill;
   if (use_draft_decode_cache) {
     const DpEpPaddingData* cached =
-        draft_dp_ep_padding_cache_.find(token_sizes, raw_token_sizes);
+        draft_dp_ep_padding_cache_.find(real_token_sizes, raw_token_sizes);
     if (cached != nullptr) {
       input_params.parallel.dp_ep_padding_data = *cached;
       return;
     }
   }
 
+  std::vector<int32_t> graph_token_sizes = real_token_sizes;
+  const uint32_t canonical_bucket = kimi_eagle3_canonicalize_bucket(
+      context_.get_model_args(), options_, input_params);
+  if (canonical_bucket > 0) {
+    std::fill(graph_token_sizes.begin(),
+              graph_token_sizes.end(),
+              static_cast<int32_t>(canonical_bucket));
+  }
   torch::Tensor token_size_per_dp_group =
-      torch::tensor(token_sizes,
+      torch::tensor(graph_token_sizes,
                     torch::TensorOptions()
                         .device(torch::kCPU)
                         .dtype(torch::kInt32)
@@ -1181,7 +1190,7 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
   DpEpPaddingData data = dp_ep_padding.build();
   input_params.parallel.dp_ep_padding_data = data;
   if (use_draft_decode_cache) {
-    draft_dp_ep_padding_cache_.insert(token_sizes, raw_token_sizes, data);
+    draft_dp_ep_padding_cache_.insert(real_token_sizes, raw_token_sizes, data);
   }
 }
 

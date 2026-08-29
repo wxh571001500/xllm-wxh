@@ -361,11 +361,13 @@ class GraphPersistentParam final {
 
   // Copy src padding data into pre-allocated persistent buffers.
   void update_persistent_dp_ep_padding(const DpEpPaddingData& src,
+                                       const std::vector<int32_t>& dp_tokens,
                                        uint32_t padded_tokens);
   void update_persistent_cp_ep_meta(const CpEpMeta& src,
                                     uint32_t padded_tokens);
   void replace_capture_dp_ep_padding(const DpEpPaddingData& src,
-                                     DpEpPaddingData& dst) const;
+                                     DpEpPaddingData& dst,
+                                     uint32_t padded_tokens) const;
   void replace_capture_cp_ep_meta(const CpEpMeta& src, CpEpMeta& dst) const;
 };
 

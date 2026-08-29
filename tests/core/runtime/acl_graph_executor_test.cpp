@@ -53,6 +53,7 @@ limitations under the License.
 #include "core/runtime/base_executor_impl.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/dflash_worker_impl.h"
+#include "core/runtime/kimi_eagle3_graph_mode.h"
 #include "core/runtime/options.h"
 #include "core/runtime/speculative_worker_impl.h"
 #include "models/llm/deepseek_v4.h"
@@ -96,6 +97,63 @@ class AclGraphExecutorTestEnvironment : public ::testing::Environment {
     ::testing::AddGlobalTestEnvironment(new AclGraphExecutorTestEnvironment);
 
 namespace xllm {
+
+TEST(KimiEagle3GraphModeTest, CanonicalizesDpDecodeBucket) {
+  ModelArgs args;
+  args.model_type("kimi_k25");
+  args.n_layers(2);
+  args.max_position_embeddings(4096);
+
+  runtime::Options options;
+  options.enable_speculative_decode(true);
+  options.is_draft_engine(false);
+  options.speculative_algorithm("Eagle3");
+  options.num_decoding_tokens(4);
+
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.parallel.dp_global_token_nums = {12, 8};
+  params.parallel.dp_is_decode = {1, 1};
+  params.parallel.dp_global_kv_max_seq_lens = {1024, 2048};
+
+  auto& execution_config = ExecutionConfig::get_instance();
+  const bool original_enable_graph = execution_config.enable_graph();
+  const bool original_no_padding =
+      execution_config.enable_graph_mode_decode_no_padding();
+  const int32_t original_batch_limit =
+      execution_config.acl_graph_decode_batch_size_limit();
+  execution_config.enable_graph(true);
+  execution_config.enable_graph_mode_decode_no_padding(false);
+  execution_config.acl_graph_decode_batch_size_limit(16);
+
+  EXPECT_TRUE(npu::is_kimi_k25_eagle3_target(args, options));
+  EXPECT_EQ(npu::kimi_eagle3_canonicalize_bucket(args, options, params), 16);
+
+  params.parallel.dp_is_decode = {1, 0};
+  EXPECT_EQ(npu::kimi_eagle3_canonicalize_bucket(args, options, params), 0);
+  params.parallel.dp_is_decode = {1, 1};
+  params.parallel.dp_global_kv_max_seq_lens = {1024, 4097};
+  EXPECT_EQ(npu::kimi_eagle3_canonicalize_bucket(args, options, params), 0);
+
+  execution_config.enable_graph(original_enable_graph);
+  execution_config.enable_graph_mode_decode_no_padding(original_no_padding);
+  execution_config.acl_graph_decode_batch_size_limit(original_batch_limit);
+}
+
+TEST(KimiEagle3GraphModeTest, RejectsDraftAndOtherAlgorithms) {
+  ModelArgs args;
+  args.model_type("kimi_k25");
+
+  runtime::Options options;
+  options.enable_speculative_decode(true);
+  options.speculative_algorithm("Eagle3");
+  options.is_draft_engine(true);
+  EXPECT_FALSE(npu::is_kimi_k25_eagle3_target(args, options));
+
+  options.is_draft_engine(false);
+  options.speculative_algorithm("mtp");
+  EXPECT_FALSE(npu::is_kimi_k25_eagle3_target(args, options));
+}
 
 TEST(DeepseekV4MetadataInputTest, KeepsOnlyDraftRegisteredBlockTables) {
   ModelInputParams target_input_params;

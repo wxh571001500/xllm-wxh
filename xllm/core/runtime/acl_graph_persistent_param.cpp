@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/runtime/decode_graph_bucket.h"
+#include "core/runtime/kimi_eagle3_graph_mode.h"
 #include "core/util/utils.h"
 
 // ATB includes
@@ -400,17 +401,63 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
 }
 
 namespace {
-// Copy src into a pre-allocated persistent buffer. The buffer must already be
-// large enough (allocated in GraphPersistentParam constructor).
-void copy_into_persistent(torch::Tensor& persistent, const torch::Tensor& src) {
+int64_t tensor_first_dim(const torch::Tensor& tensor) {
+  if (!tensor.defined() || tensor.numel() == 0 || tensor.dim() == 0) {
+    return 0;
+  }
+  return tensor.size(0);
+}
+
+int64_t target_len_or_source(const torch::Tensor& src, int64_t target_len) {
+  if (!src.defined() || src.numel() == 0) {
+    return 0;
+  }
+  return std::max<int64_t>(tensor_first_dim(src), target_len);
+}
+
+std::vector<int64_t> effective_dp_token_nums(
+    const std::vector<int32_t>& dp_tokens) {
+  std::vector<int64_t> result;
+  result.reserve(dp_tokens.size());
+  for (int32_t token_num : dp_tokens) {
+    result.emplace_back(std::max<int64_t>(token_num, 1));
+  }
+  return result;
+}
+
+int64_t sum_token_nums(const std::vector<int64_t>& token_nums) {
+  return std::accumulate(token_nums.begin(), token_nums.end(), int64_t{0});
+}
+
+void copy_tensor_slice(torch::Tensor dst, const torch::Tensor& src) {
+  if (dst.sizes() == src.sizes()) {
+    dst.copy_(src, /*non_blocking=*/true);
+    return;
+  }
+  if (dst.numel() == src.numel()) {
+    dst.copy_(src.reshape(dst.sizes()), /*non_blocking=*/true);
+    return;
+  }
+  dst.copy_(src, /*non_blocking=*/true);
+}
+
+void copy_into_persistent(torch::Tensor& persistent,
+                          const torch::Tensor& src,
+                          int64_t target_len = 0) {
   if (!src.defined() || src.numel() == 0 || !persistent.defined()) {
     return;
   }
-  CHECK_LE(src.size(0), persistent.size(0))
-      << "dp_ep_padding persistent buffer overflow: src size " << src.size(0)
+  const int64_t copy_len = tensor_first_dim(src);
+  const int64_t graph_len = target_len_or_source(src, target_len);
+  CHECK_LE(graph_len, persistent.size(0))
+      << "dp_ep_padding persistent buffer overflow: graph size " << graph_len
       << " exceeds pre-allocated capacity " << persistent.size(0);
-  persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/src.size(0))
-      .copy_(src, /*non_blocking=*/true);
+  torch::Tensor dst =
+      persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/copy_len);
+  copy_tensor_slice(dst, src);
+  if (graph_len > copy_len) {
+    persistent.slice(/*dim=*/0, /*start=*/copy_len, /*end=*/graph_len).zero_();
+  }
 }
 
 torch::Tensor slice_like_source(const torch::Tensor& persistent,
@@ -420,41 +467,228 @@ torch::Tensor slice_like_source(const torch::Tensor& persistent,
   }
   return persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/src.size(0));
 }
+
+bool copy_dp_segmented_padding(torch::Tensor& persistent,
+                               const torch::Tensor& src,
+                               int64_t src_segment_len,
+                               int64_t target_segment_len,
+                               int64_t dp_size) {
+  if (!src.defined() || src.numel() == 0 || !persistent.defined() ||
+      src.dim() == 0 || src_segment_len <= 0 || target_segment_len <= 0 ||
+      dp_size <= 1 || tensor_first_dim(src) != src_segment_len * dp_size) {
+    return false;
+  }
+  const int64_t graph_len = target_segment_len * dp_size;
+  CHECK_LE(graph_len, persistent.size(0))
+      << "dp_ep_padding segmented persistent buffer overflow: graph size "
+      << graph_len << " exceeds pre-allocated capacity " << persistent.size(0);
+  persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/graph_len).zero_();
+  const int64_t copy_len = std::min(src_segment_len, target_segment_len);
+  for (int64_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
+    const int64_t src_start = dp_rank * src_segment_len;
+    const int64_t dst_start = dp_rank * target_segment_len;
+    torch::Tensor dst = persistent.slice(/*dim=*/0,
+                                         /*start=*/dst_start,
+                                         /*end=*/dst_start + copy_len);
+    torch::Tensor src_slice =
+        src.slice(/*dim=*/0, /*start=*/src_start, /*end=*/src_start + copy_len);
+    copy_tensor_slice(dst, src_slice);
+  }
+  return true;
+}
+
+bool copy_dp_compact_indices_with_bucket_offsets(
+    torch::Tensor& persistent,
+    const torch::Tensor& src,
+    int64_t src_segment_len,
+    int64_t target_segment_len,
+    const std::vector<int64_t>& dp_tokens,
+    int64_t target_len) {
+  if (!src.defined() || src.numel() == 0 || !persistent.defined() ||
+      src.dim() != 1 || src_segment_len <= 0 || target_segment_len <= 0 ||
+      dp_tokens.size() <= 1) {
+    return false;
+  }
+  const int64_t valid_token_count = sum_token_nums(dp_tokens);
+  if (tensor_first_dim(src) != valid_token_count) {
+    return false;
+  }
+  CHECK_LE(valid_token_count, target_len)
+      << "dp_ep_padding compact index valid size " << valid_token_count
+      << " exceeds graph size " << target_len;
+  CHECK_LE(target_len, persistent.size(0))
+      << "dp_ep_padding compact index persistent buffer overflow: graph size "
+      << target_len << " exceeds pre-allocated capacity " << persistent.size(0);
+
+  persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/target_len).zero_();
+  int64_t compact_offset = 0;
+  for (size_t dp_rank = 0; dp_rank < dp_tokens.size(); ++dp_rank) {
+    const int64_t token_count = dp_tokens[dp_rank];
+    CHECK_LE(token_count, src_segment_len)
+        << "dp token count " << token_count
+        << " exceeds source DP segment size " << src_segment_len;
+    torch::Tensor dst = persistent.slice(/*dim=*/0,
+                                         /*start=*/compact_offset,
+                                         /*end=*/compact_offset + token_count);
+    torch::Tensor src_slice = src.slice(/*dim=*/0,
+                                        /*start=*/compact_offset,
+                                        /*end=*/compact_offset + token_count);
+    copy_tensor_slice(dst, src_slice);
+    const int64_t offset_delta =
+        static_cast<int64_t>(dp_rank) * (target_segment_len - src_segment_len);
+    if (offset_delta != 0) {
+      dst.add_(offset_delta);
+    }
+    compact_offset += token_count;
+  }
+  return true;
+}
+
+torch::Tensor slice_persistent_for_graph(const torch::Tensor& persistent,
+                                         const torch::Tensor& src,
+                                         int64_t target_len) {
+  if (!src.defined() || src.numel() == 0 || !persistent.defined()) {
+    return src;
+  }
+  const int64_t graph_len = target_len_or_source(src, target_len);
+  CHECK_LE(graph_len, persistent.size(0))
+      << "dp_ep_padding graph slice overflow: graph size " << graph_len
+      << " exceeds pre-allocated capacity " << persistent.size(0);
+  return persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/graph_len);
+}
+
+int64_t infer_tp_size_from_padding(const torch::Tensor& attn_padding_idx,
+                                   const torch::Tensor& gather_prenorm_idx) {
+  const int64_t attn_len = tensor_first_dim(attn_padding_idx);
+  const int64_t gather_len = tensor_first_dim(gather_prenorm_idx);
+  if (attn_len <= 0 || gather_len <= 0 || attn_len % gather_len != 0) {
+    return 1;
+  }
+  return std::max<int64_t>(attn_len / gather_len, 1);
+}
+
+int64_t align_up(int64_t value, int64_t alignment) {
+  const int64_t safe_alignment = std::max<int64_t>(alignment, 1);
+  return ((value + safe_alignment - 1) / safe_alignment) * safe_alignment;
+}
+
+int64_t target_moe_padding_len(int64_t base_len,
+                               int64_t parallel_size,
+                               int64_t ep_size) {
+  if (base_len <= 1) {
+    return 1;
+  }
+  const int64_t safe_parallel_size = std::max<int64_t>(parallel_size, 1);
+  const int64_t safe_ep_size = std::max<int64_t>(ep_size, 1);
+  const float buffer_factor =
+      get_dp_ep_all2all_buffer_factor(base_len * safe_parallel_size);
+  const int64_t buffer_len =
+      static_cast<int64_t>(std::ceil(base_len * buffer_factor));
+  return align_up(buffer_len, safe_ep_size);
+}
 }  // namespace
 
 void GraphPersistentParam::update_persistent_dp_ep_padding(
     const DpEpPaddingData& src,
-    uint32_t /*padded_tokens*/) {
+    const std::vector<int32_t>& dp_tokens,
+    uint32_t padded_tokens) {
   // Skip when dp ep padding is not enabled. When enabled, build() always
   // populates attn_padding_idx first, so it is a reliable signal.
   if (!src.attn_padding_idx().defined() ||
       src.attn_padding_idx().numel() == 0) {
     return;
   }
+  const int64_t tp_size = infer_tp_size_from_padding(src.attn_padding_idx(),
+                                                     src.gather_prenorm_idx());
+  const int64_t source_local_tokens = tensor_first_dim(src.attn_padding_idx());
+  const int64_t local_tokens = align_up(padded_tokens, tp_size);
+  const int64_t local_tp_tokens = std::max<int64_t>(local_tokens / tp_size, 1);
+  const int64_t dp_size = std::max<int64_t>(options_.dp_size(), 1);
+  const std::vector<int64_t> effective_dp_tokens =
+      effective_dp_token_nums(dp_tokens);
+  const bool has_complete_dp_tokens =
+      static_cast<int64_t>(effective_dp_tokens.size()) == dp_size;
+  const int64_t global_tokens = local_tokens * dp_size;
+  const int64_t topk = std::max<int64_t>(args_.num_experts_per_tok(), 1);
+  const int64_t attn_unpadding_len =
+      tensor_first_dim(src.attn_unpadding_idx()) <= local_tp_tokens
+          ? local_tp_tokens
+          : global_tokens;
+  const int64_t ffn_padding_len =
+      tensor_first_dim(src.ffn_padding_idx()) <= local_tp_tokens
+          ? local_tp_tokens
+          : global_tokens;
+  const int64_t dynamic_ep_len = tensor_first_dim(src.dynamic_ep_idx()) > 1
+                                     ? attn_unpadding_len * topk
+                                     : 1;
+  const int64_t moe_len =
+      tensor_first_dim(src.moe_idx()) > 1
+          ? target_moe_padding_len(dynamic_ep_len, dp_size, options_.ep_size())
+          : 1;
+
   copy_into_persistent(persistent_dp_ep_padding_.attn_padding_idx(),
-                       src.attn_padding_idx());
-  copy_into_persistent(persistent_dp_ep_padding_.attn_unpadding_idx(),
-                       src.attn_unpadding_idx());
-  copy_into_persistent(persistent_dp_ep_padding_.ffn_padding_idx(),
-                       src.ffn_padding_idx());
+                       src.attn_padding_idx(),
+                       local_tokens);
+  const bool copied_attn_unpadding =
+      has_complete_dp_tokens &&
+      tensor_first_dim(src.attn_unpadding_idx()) > local_tp_tokens &&
+      copy_dp_compact_indices_with_bucket_offsets(
+          persistent_dp_ep_padding_.attn_unpadding_idx(),
+          src.attn_unpadding_idx(),
+          source_local_tokens,
+          local_tokens,
+          effective_dp_tokens,
+          attn_unpadding_len);
+  if (!copied_attn_unpadding) {
+    copy_into_persistent(persistent_dp_ep_padding_.attn_unpadding_idx(),
+                         src.attn_unpadding_idx(),
+                         attn_unpadding_len);
+  }
+  if (!copy_dp_segmented_padding(persistent_dp_ep_padding_.ffn_padding_idx(),
+                                 src.ffn_padding_idx(),
+                                 source_local_tokens,
+                                 local_tokens,
+                                 dp_size)) {
+    copy_into_persistent(persistent_dp_ep_padding_.ffn_padding_idx(),
+                         src.ffn_padding_idx(),
+                         ffn_padding_len);
+  }
   copy_into_persistent(persistent_dp_ep_padding_.ffn_unpadding_idx(),
-                       src.ffn_unpadding_idx());
-  copy_into_persistent(
-      persistent_dp_ep_padding_.lm_head_skip_padding_token_indices(),
-      src.lm_head_skip_padding_token_indices());
+                       src.ffn_unpadding_idx(),
+                       local_tokens);
+  const bool copied_lm_head_skip =
+      has_complete_dp_tokens &&
+      copy_dp_compact_indices_with_bucket_offsets(
+          persistent_dp_ep_padding_.lm_head_skip_padding_token_indices(),
+          src.lm_head_skip_padding_token_indices(),
+          source_local_tokens,
+          local_tokens,
+          effective_dp_tokens,
+          global_tokens);
+  if (!copied_lm_head_skip) {
+    copy_into_persistent(
+        persistent_dp_ep_padding_.lm_head_skip_padding_token_indices(),
+        src.lm_head_skip_padding_token_indices(),
+        global_tokens);
+  }
   copy_into_persistent(persistent_dp_ep_padding_.gather_prenorm_idx(),
-                       src.gather_prenorm_idx());
-  copy_into_persistent(persistent_dp_ep_padding_.padding_idx(),
-                       src.padding_idx());
+                       src.gather_prenorm_idx(),
+                       local_tp_tokens);
+  copy_into_persistent(
+      persistent_dp_ep_padding_.padding_idx(), src.padding_idx(), local_tokens);
   copy_into_persistent(persistent_dp_ep_padding_.un_padding_idx(),
-                       src.un_padding_idx());
+                       src.un_padding_idx(),
+                       tensor_first_dim(src.un_padding_idx()));
   copy_into_persistent(persistent_dp_ep_padding_.dynamic_ep_idx(),
-                       src.dynamic_ep_idx());
-  copy_into_persistent(persistent_dp_ep_padding_.moe_idx(), src.moe_idx());
-  copy_into_persistent(persistent_dp_ep_padding_.expert_array(),
-                       src.expert_array());
+                       src.dynamic_ep_idx(),
+                       dynamic_ep_len);
+  copy_into_persistent(
+      persistent_dp_ep_padding_.moe_idx(), src.moe_idx(), moe_len);
+  copy_into_persistent(
+      persistent_dp_ep_padding_.expert_array(), src.expert_array(), moe_len);
   copy_into_persistent(persistent_dp_ep_padding_.post_lmhead_gather_indices(),
-                       src.post_lmhead_gather_indices());
+                       src.post_lmhead_gather_indices(),
+                       global_tokens);
 }
 
 void GraphPersistentParam::update_persistent_cp_ep_meta(
@@ -488,39 +722,79 @@ void GraphPersistentParam::update_persistent_cp_ep_meta(
 
 void GraphPersistentParam::replace_capture_dp_ep_padding(
     const DpEpPaddingData& src,
-    DpEpPaddingData& dst) const {
+    DpEpPaddingData& dst,
+    uint32_t padded_tokens) const {
   if (!src.attn_padding_idx().defined() ||
       src.attn_padding_idx().numel() == 0) {
     return;
   }
-  dst.attn_padding_idx(slice_like_source(
-      persistent_dp_ep_padding_.attn_padding_idx(), src.attn_padding_idx()));
+  const int64_t tp_size = infer_tp_size_from_padding(src.attn_padding_idx(),
+                                                     src.gather_prenorm_idx());
+  const int64_t local_tokens = align_up(padded_tokens, tp_size);
+  const int64_t local_tp_tokens = std::max<int64_t>(local_tokens / tp_size, 1);
+  const int64_t dp_size = std::max<int64_t>(options_.dp_size(), 1);
+  const int64_t global_tokens = local_tokens * dp_size;
+  const int64_t topk = std::max<int64_t>(args_.num_experts_per_tok(), 1);
+  const int64_t attn_unpadding_len =
+      tensor_first_dim(src.attn_unpadding_idx()) <= local_tp_tokens
+          ? local_tp_tokens
+          : global_tokens;
+  const int64_t ffn_padding_len =
+      tensor_first_dim(src.ffn_padding_idx()) <= local_tp_tokens
+          ? local_tp_tokens
+          : global_tokens;
+  const int64_t dynamic_ep_len = tensor_first_dim(src.dynamic_ep_idx()) > 1
+                                     ? attn_unpadding_len * topk
+                                     : 1;
+  const int64_t moe_len =
+      tensor_first_dim(src.moe_idx()) > 1
+          ? target_moe_padding_len(dynamic_ep_len, dp_size, options_.ep_size())
+          : 1;
+
+  dst.attn_padding_idx(
+      slice_persistent_for_graph(persistent_dp_ep_padding_.attn_padding_idx(),
+                                 src.attn_padding_idx(),
+                                 local_tokens));
   dst.attn_unpadding_idx(
-      slice_like_source(persistent_dp_ep_padding_.attn_unpadding_idx(),
-                        src.attn_unpadding_idx()));
-  dst.ffn_padding_idx(slice_like_source(
-      persistent_dp_ep_padding_.ffn_padding_idx(), src.ffn_padding_idx()));
-  dst.ffn_unpadding_idx(slice_like_source(
-      persistent_dp_ep_padding_.ffn_unpadding_idx(), src.ffn_unpadding_idx()));
-  dst.lm_head_skip_padding_token_indices(slice_like_source(
+      slice_persistent_for_graph(persistent_dp_ep_padding_.attn_unpadding_idx(),
+                                 src.attn_unpadding_idx(),
+                                 attn_unpadding_len));
+  dst.ffn_padding_idx(
+      slice_persistent_for_graph(persistent_dp_ep_padding_.ffn_padding_idx(),
+                                 src.ffn_padding_idx(),
+                                 ffn_padding_len));
+  dst.ffn_unpadding_idx(
+      slice_persistent_for_graph(persistent_dp_ep_padding_.ffn_unpadding_idx(),
+                                 src.ffn_unpadding_idx(),
+                                 local_tokens));
+  dst.lm_head_skip_padding_token_indices(slice_persistent_for_graph(
       persistent_dp_ep_padding_.lm_head_skip_padding_token_indices(),
-      src.lm_head_skip_padding_token_indices()));
+      src.lm_head_skip_padding_token_indices(),
+      global_tokens));
   dst.gather_prenorm_idx(
-      slice_like_source(persistent_dp_ep_padding_.gather_prenorm_idx(),
-                        src.gather_prenorm_idx()));
-  dst.padding_idx(slice_like_source(persistent_dp_ep_padding_.padding_idx(),
-                                    src.padding_idx()));
-  dst.un_padding_idx(slice_like_source(
-      persistent_dp_ep_padding_.un_padding_idx(), src.un_padding_idx()));
-  dst.dynamic_ep_idx(slice_like_source(
-      persistent_dp_ep_padding_.dynamic_ep_idx(), src.dynamic_ep_idx()));
-  dst.moe_idx(
-      slice_like_source(persistent_dp_ep_padding_.moe_idx(), src.moe_idx()));
-  dst.expert_array(slice_like_source(persistent_dp_ep_padding_.expert_array(),
-                                     src.expert_array()));
-  dst.post_lmhead_gather_indices(
-      slice_like_source(persistent_dp_ep_padding_.post_lmhead_gather_indices(),
-                        src.post_lmhead_gather_indices()));
+      slice_persistent_for_graph(persistent_dp_ep_padding_.gather_prenorm_idx(),
+                                 src.gather_prenorm_idx(),
+                                 local_tp_tokens));
+  dst.padding_idx(
+      slice_persistent_for_graph(persistent_dp_ep_padding_.padding_idx(),
+                                 src.padding_idx(),
+                                 local_tokens));
+  dst.un_padding_idx(
+      slice_persistent_for_graph(persistent_dp_ep_padding_.un_padding_idx(),
+                                 src.un_padding_idx(),
+                                 tensor_first_dim(src.un_padding_idx())));
+  dst.dynamic_ep_idx(
+      slice_persistent_for_graph(persistent_dp_ep_padding_.dynamic_ep_idx(),
+                                 src.dynamic_ep_idx(),
+                                 dynamic_ep_len));
+  dst.moe_idx(slice_persistent_for_graph(
+      persistent_dp_ep_padding_.moe_idx(), src.moe_idx(), moe_len));
+  dst.expert_array(slice_persistent_for_graph(
+      persistent_dp_ep_padding_.expert_array(), src.expert_array(), moe_len));
+  dst.post_lmhead_gather_indices(slice_persistent_for_graph(
+      persistent_dp_ep_padding_.post_lmhead_gather_indices(),
+      src.post_lmhead_gather_indices(),
+      global_tokens));
 }
 
 void GraphPersistentParam::replace_capture_cp_ep_meta(const CpEpMeta& src,
@@ -623,9 +897,9 @@ void GraphPersistentParam::set_aux_hidden_states_list(
     if (args_.dtype() == "float" || args_.dtype() == "float32") {
       dtype = torch::kFloat32;
     }
-    aux_hidden_states_ = torch::zeros(
-        {num_captured, graph_token_capacity, hidden},
-        torch::dtype(dtype).device(device_));
+    aux_hidden_states_ =
+        torch::zeros({num_captured, graph_token_capacity, hidden},
+                     torch::dtype(dtype).device(device_));
   }
   for (int64_t k = 0; k < num_captured; ++k) {
     aux_hidden_states_[k]
@@ -910,9 +1184,13 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   const bool is_hybrid_spec_verify_chunked_prefill =
       params.is_spec_verify && is_chunked_prefill &&
       is_hybrid_linear_attention_;
-  CHECK(is_decode || is_hybrid_spec_verify_chunked_prefill)
-      << "ACL graph persistent param only supports decode or hybrid "
-         "spec-verify chunked prefill";
+  const bool is_kimi_eagle3_spec_verify_chunked_prefill =
+      params.is_spec_verify && is_chunked_prefill &&
+      is_kimi_k25_eagle3_target(args_, options_);
+  CHECK(is_decode || is_hybrid_spec_verify_chunked_prefill ||
+        is_kimi_eagle3_spec_verify_chunked_prefill)
+      << "ACL graph persistent param only supports decode, hybrid spec-verify "
+         "chunked prefill, or Kimi K2.5 Eagle3 spec-verify chunked prefill";
   const int64_t decode_tokens =
       is_decode ? std::max<int64_t>(options_.num_decoding_tokens(), 1) : 1;
   int64_t actual_batch_size = infer_actual_batch_size(params);
@@ -1307,6 +1585,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   // stable device addresses are recorded by the graph; for replay this
   // refreshes the data at those same addresses before graph_.replay().
   update_persistent_dp_ep_padding(params.parallel.dp_ep_padding_data,
+                                  params.parallel.dp_global_token_nums,
                                   padded_num_tokens);
   update_persistent_cp_ep_meta(params.parallel.cp_plan.cp_ep_meta(),
                                padded_num_tokens);
@@ -1454,14 +1733,14 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           /*end=*/padded_batch_size + (use_hybrid_query_start_loc ? 1 : 0));
     }
 
-    // Replace dp/cp ep padding with slices of persistent buffers so that
-    // the graph records stable device addresses.  Each slice has the same
-    // size as the original tensor but points into the persistent buffer.
+    // Replace dp/cp ep padding with bucket-sized slices of persistent buffers
+    // so that graph capture records stable device addresses and shapes.
     // dp ep and cp ep are mutually exclusive; when neither is enabled the
     // src fields are all undefined and we leave dst untouched so that the
     // captured graph behaves identically to eager mode.
     replace_capture_dp_ep_padding(params.parallel.dp_ep_padding_data,
-                                  graph_params->parallel.dp_ep_padding_data);
+                                  graph_params->parallel.dp_ep_padding_data,
+                                  padded_num_tokens);
     CpEpMeta capture_cp_ep_meta = params.parallel.cp_plan.cp_ep_meta();
     replace_capture_cp_ep_meta(params.parallel.cp_plan.cp_ep_meta(),
                                capture_cp_ep_meta);

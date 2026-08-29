@@ -40,6 +40,7 @@ limitations under the License.
 #include "core/kernels/ops_api.h"
 #include "core/platform/device.h"
 #include "core/platform/npu/acl_graph_task_update_context.h"
+#include "core/runtime/kimi_eagle3_graph_mode.h"
 #include "core/util/utils.h"
 #include "platform/npu/device_capture_lock.h"
 
@@ -222,13 +223,6 @@ ModelOutput forward_eager(CausalLM* model,
       mtp_async::materialize_speculative_verify_tokens(
           verify_tokens, params.graph.spec_verify_draft_token_sources);
   return model->forward(materialized_tokens, positions, kv_cache, params);
-}
-
-bool is_mla_graph_eagle3_target(const CausalLM* model,
-                                const runtime::Options& options) {
-  return model->supports_mla_graph_kv_bucketing() &&
-         options.enable_speculative_decode() && !options.is_draft_engine() &&
-         options.speculative_algorithm() == "Eagle3";
 }
 
 void hash_graph_key_value(uint64_t& hash, uint64_t value) {
@@ -1030,7 +1024,10 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     COUNTER_INC(num_model_execution_total_eager);
     return run_eager();
   }
-  if (in_spec_verify_phase && !model_->is_hybrid_linear_attention()) {
+  const bool use_kimi_k25_eagle3_acl_graph =
+      is_kimi_k25_eagle3_target(args_, options_);
+  if (in_spec_verify_phase && !model_->is_hybrid_linear_attention() &&
+      !use_kimi_k25_eagle3_acl_graph) {
     LOG_FIRST_N(WARNING, 1)
         << "Falling back to eager mode for spec verify because the "
            "chunked-prefill validate graph path is currently only adapted for "
@@ -1050,14 +1047,6 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
         << options_.cp_size()
         << ") shards prefill rows, which the captured graph shape does not "
            "describe.";
-    COUNTER_INC(num_model_execution_total_eager);
-    return run_eager();
-  }
-  if (is_mla_graph_eagle3_target(model_, options_)) {
-    LOG_FIRST_N(WARNING, 1)
-        << "Falling back to eager mode for MLA Eagle3 target validation; the "
-           "ACL graph path is not adapted for Eagle3 aux hidden-state "
-           "validation yet.";
     COUNTER_INC(num_model_execution_total_eager);
     return run_eager();
   }
@@ -1103,9 +1092,11 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   }
   // Keep actual n_tokens for replay output slicing.
   const uint32_t n_tokens = tokens_tensor.size(/*dim=*/0);
-  const uint32_t local_batch_size = n_tokens / options_.num_decoding_tokens();
+  const uint32_t num_decoding_tokens = static_cast<uint32_t>(
+      std::max<int64_t>(options_.num_decoding_tokens(), 1));
+  const uint32_t local_batch_size = n_tokens / num_decoding_tokens;
   const uint32_t max_local_batch_size =
-      max_local_num_tokens / options_.num_decoding_tokens();
+      max_local_num_tokens / num_decoding_tokens;
 
   // Large decode batches create too many/too large ACL graphs and may OOM.
   // Fall back to eager mode when batch size exceeds the safety threshold.
@@ -1132,8 +1123,13 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   // Check if conditions are suitable for graph execution (replay or capture)
   const auto max_seq_len = args_.max_position_embeddings();
-  const bool seq_len_supported =
-      params_single.meta.kv_max_seq_len <= max_seq_len;
+  int32_t graph_kv_max_seq_len = params_single.meta.kv_max_seq_len;
+  if (use_kimi_k25_eagle3_acl_graph &&
+      !params_single.parallel.dp_global_kv_max_seq_lens.empty()) {
+    graph_kv_max_seq_len =
+        util::max(params_single.parallel.dp_global_kv_max_seq_lens);
+  }
+  const bool seq_len_supported = graph_kv_max_seq_len <= max_seq_len;
 
   // Combined condition for graph capture support
   // ACL graph executor only supports single tensor inputs (no micro-batching)
@@ -1342,7 +1338,10 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
   if (model_->requires_graph_forward_metadata()) {
     return;
   }
-  if (in_spec_verify_phase && !model_->is_hybrid_linear_attention()) {
+  const bool use_kimi_k25_eagle3_acl_graph =
+      is_kimi_k25_eagle3_target(args_, options_);
+  if (in_spec_verify_phase && !model_->is_hybrid_linear_attention() &&
+      !use_kimi_k25_eagle3_acl_graph) {
     return;
   }
   if (in_decoding_phase && params.parallel.dp_global_token_nums.size() > 1) {
@@ -1356,7 +1355,12 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
       return;
     }
   }
-  if (params.meta.kv_max_seq_len > args_.max_position_embeddings()) {
+  int32_t graph_kv_max_seq_len = params.meta.kv_max_seq_len;
+  if (use_kimi_k25_eagle3_acl_graph &&
+      !params.parallel.dp_global_kv_max_seq_lens.empty()) {
+    graph_kv_max_seq_len = util::max(params.parallel.dp_global_kv_max_seq_lens);
+  }
+  if (graph_kv_max_seq_len > args_.max_position_embeddings()) {
     return;
   }
   if (graph_slot_count_ <= 1) {
@@ -1473,22 +1477,7 @@ void AclGraph::print_graph_tensors() const {
 // bucket will be [1, 2, 4, 8, 16, 32, 48, 64, ..., max_seqs_per_batch]
 uint32_t AclGraphExecutorImpl::get_bucket_num_tokens(
     uint32_t num_tokens) const {
-  if (::xllm::ExecutionConfig::get_instance()
-          .enable_graph_mode_decode_no_padding()) {
-    return num_tokens;
-  }
-  if (num_tokens <= 1) {
-    return 1;
-  } else if (num_tokens <= 2) {
-    return 2;
-  } else if (num_tokens <= 4) {
-    return 4;
-  } else if (num_tokens <= 8) {
-    return 8;
-  } else {
-    // For num_tokens > 8, use multiples of 16.
-    return ((num_tokens + 15) / 16) * 16;
-  }
+  return kimi_eagle3_bucket_num_tokens(num_tokens);
 }
 
 std::optional<uint64_t>
