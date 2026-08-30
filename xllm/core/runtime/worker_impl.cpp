@@ -1146,8 +1146,9 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
   }
 
   std::vector<int32_t> graph_token_sizes = real_token_sizes;
-  const uint32_t canonical_bucket = kimi_eagle3_canonicalize_bucket(
-      context_.get_model_args(), options_, input_params);
+  const uint32_t canonical_bucket =
+      ::xllm::npu::kimi_eagle3_canonicalize_bucket(
+          context_.get_model_args(), options_, input_params);
   if (canonical_bucket > 0) {
     std::fill(graph_token_sizes.begin(),
               graph_token_sizes.end(),
