@@ -832,7 +832,10 @@ ModelOutput AclGraph::replay(CausalLM* model,
 
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
-  if (graph_paged_attention_tiling_data_.defined()) {
+  // Kimi MLA graph inputs are refreshed asynchronously on the worker stream,
+  // while capture can bind replay to a separate pooled stream.
+  if (graph_paged_attention_tiling_data_.defined() ||
+      model->supports_mla_graph_kv_bucketing()) {
     make_graph_wait_for_current_stream(stream);
   }
   const bool use_static_graph_tasks =
