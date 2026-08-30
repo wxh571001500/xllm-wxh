@@ -24,6 +24,7 @@ from xllm.python.layers.attention import (
     AttentionRuntimeLayer,
 )
 from xllm.python.model_executor.runners.eager import EagerRunner
+from xllm.python.models.dspark_accuracy import set_dspark_accuracy_context
 
 
 def _is_npu_device(device: torch.device) -> bool:
@@ -200,7 +201,7 @@ class ModelExecutor:
                 device,
                 max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
-                int(config.get("block_size", 128)),
+                int(config.get("block_size", 128)) or 128,
             )
         else:
             from xllm.python.model_executor.runners.inductor import InductorRunner
@@ -306,12 +307,8 @@ class ModelExecutor:
             num_decode_seqs=view.num_decode_seqs,
             num_prefill_seqs=view.num_prefill_seqs,
             has_initial_state=_to_device(view.has_initial_state),
-            num_accepted_tokens=_to_device(
-                getattr(view, "num_accepted_tokens", None), torch.int32
-            ),
-            spec_query_start_loc=_to_device(
-                getattr(view, "spec_query_start_loc", None), torch.int32
-            ),
+            num_accepted_tokens=_to_device(getattr(view, "num_accepted_tokens", None), torch.int32),
+            spec_query_start_loc=_to_device(getattr(view, "spec_query_start_loc", None), torch.int32),
             is_spec_verify=bool(getattr(view, "is_spec_verify", False)),
             graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
             empty_shard=bool(getattr(view, "empty_shard", False)),
@@ -324,7 +321,10 @@ class ModelExecutor:
         metadata: AttentionMetadata,
         inputs_embeds: torch.Tensor | None = None,
         kda_metadata: object | None = None,
+        is_graph_warmup: bool = False,
+        request_ids: tuple[str, ...] = (),
     ) -> torch.Tensor:
+        set_dspark_accuracy_context(is_graph_warmup, request_ids)
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
 

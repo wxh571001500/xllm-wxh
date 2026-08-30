@@ -22,10 +22,62 @@ interpreting those weights as Kimi's fused MLA projections.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch_npu
+
+
+def _tensor_checksum(tensor, name, layer, call_idx):
+    if tensor is None or not _debug_enabled():
+        return
+    torch.npu.synchronize()
+    # Read full tensor via small slices to avoid FRACTAL_NZ issues
+    t = tensor.detach()
+    if t.device.type in ("npu", "privateuseone"):
+        import torch_npu
+
+        try:
+            fmt = int(torch_npu.get_npu_format(t))
+            if fmt != 2:
+                t = torch_npu.npu_format_cast(t, 2)
+        except Exception:
+            pass
+        t = t.cpu().contiguous()
+    s = t.float()
+    print(
+        f"CSUM xl {name} L{layer} c{call_idx} shape={list(s.shape)} sum={s.sum().item():.6f} mean={s.mean().item():.6f} std={s.std().item():.6f} min={s.min().item():.6f} max={s.max().item():.6f} first5={s.flatten()[:5].tolist()}",
+        flush=True,
+    )
+
+
+_xllm_save_counter = [0]
+
+
+def _debug_enabled():
+    import os
+
+    return bool(os.getenv("XLLM_DSPARK_ACCURACY_DUMP_DIR"))
+
+
+def _save_full_tensor_xllm(tensor, name, dump_dir):
+    if tensor is None:
+        return
+    if tensor.device.type in ("npu", "privateuseone"):
+        torch.npu.synchronize()
+    if tensor.numel() < 5000000:
+        vals = tensor.detach().cpu().reshape(-1).tolist()
+        cpu_t = torch.tensor(vals, dtype=torch.float32).reshape(tensor.shape)
+    else:
+        cpu_t = tensor.detach().cpu().contiguous().clone()
+    os.makedirs(dump_dir, exist_ok=True)
+    call_idx = _xllm_save_counter[0]
+    fpath = os.path.join(dump_dir, f"xlhook_{name}_call{call_idx:04d}.pt")
+    torch.save(cpu_t, fpath)
+
+
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -33,9 +85,10 @@ from xllm.python import ops
 from xllm.python.layers import GatedMLP, RMSNorm, RotaryEmbedding
 from xllm.python.model_executor.forward_context import record_layer_event
 from xllm.python.models.base import PyModelBase
+from xllm.python.models.dspark_accuracy import dump_dspark_tensors, snapshot_for_dump
 from xllm.python.models.kimi_k3_text import (
-    _MergedStateDict,
     _layer_ids,
+    _MergedStateDict,
     _state_dict_sharded_tensor,
     _state_dict_tensor,
 )
@@ -53,8 +106,35 @@ class Qwen3DSparkConfig(Qwen3Config):
     mask_token_id: int = -1
 
     @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> "Qwen3DSparkConfig":
+    def from_dict(cls, config: dict[str, Any]) -> Qwen3DSparkConfig:
         base = Qwen3Config.from_dict(config)
+
+        # The C++ config bridge strips nested dicts (e.g. rope_parameters is
+        # serialized as -1), so recover YaRN RoPE from the raw config or
+        # fall back to the Kimi-K3-DSpark defaults.
+        rope_raw = config.get("rope_parameters") or config.get("rope_scaling")
+        if isinstance(rope_raw, dict) and rope_raw.get("rope_type", "default") == "yarn":
+            base.rope_type = "yarn"
+            base.rope_theta = float(rope_raw.get("rope_theta", base.rope_theta))
+            base.rope_scaling_factor = float(rope_raw.get("factor", rope_raw.get("scaling_factor", 1.0)))
+            base.rope_original_max_position_embeddings = int(rope_raw.get("original_max_position_embeddings", 0))
+            base.rope_beta_fast = int(rope_raw.get("beta_fast", 32))
+            base.rope_beta_slow = int(rope_raw.get("beta_slow", 1))
+            base.rope_mscale = float(rope_raw.get("mscale", 1.0))
+            base.rope_mscale_all_dim = float(rope_raw.get("mscale_all_dim", 0.0))
+        elif not isinstance(rope_raw, dict):
+            # C++ bridge stripped rope_parameters; apply Kimi-K3-DSpark YaRN defaults.
+            base.rope_type = "yarn"
+            # The C++ bridge fills rope_theta/rope_scaling_factor with its
+            # own defaults (1e6 / 0.0), so ignore them and use the known
+            # Kimi-K3-DSpark YaRN values from the checkpoint config.json.
+            base.rope_theta = 10000.0
+            base.rope_scaling_factor = 16.0
+            base.rope_original_max_position_embeddings = 65536
+            base.rope_beta_fast = 32
+            base.rope_beta_slow = 1
+            base.rope_mscale = 1.0
+            base.rope_mscale_all_dim = 0.0
 
         # vLLM derives the local tensor-parallel width from the active
         # parallel world, rather than from a checkpoint field.  Older xLLM
@@ -84,13 +164,9 @@ class Qwen3DSparkConfig(Qwen3Config):
             or config.get("dspark_target_layer_ids")
             or []
         )
-        configured_layers = int(
-            pick("dspark_num_target_layers", "num_target_layers", default=0) or 0
-        )
+        configured_layers = int(pick("dspark_num_target_layers", "num_target_layers", default=0) or 0)
         num_target_layers = len(target_ids) or configured_layers or base.n_layers
-        configured_hidden = int(
-            pick("dspark_target_hidden_size", "target_hidden_size", default=0) or 0
-        )
+        configured_hidden = int(pick("dspark_target_hidden_size", "target_hidden_size", default=0) or 0)
         target_hidden_size = configured_hidden or base.hidden_size
         mask_token_id = int(
             dflash.get(
@@ -102,19 +178,14 @@ class Qwen3DSparkConfig(Qwen3Config):
             **base.__dict__,
             target_hidden_size=target_hidden_size,
             num_target_layers=num_target_layers,
-            markov_rank=(
-                int(pick("markov_rank", "dspark_markov_rank", default=0) or 0) or 256
-            ),
+            markov_rank=(int(pick("markov_rank", "dspark_markov_rank", default=0) or 0) or 256),
             mask_token_id=mask_token_id,
         )
 
 
 def _copy_parameter(parameter: torch.Tensor, tensor: torch.Tensor, name: str) -> None:
     if parameter.shape != tensor.shape:
-        raise ValueError(
-            f"Qwen3 DSpark parameter {name} expects {tuple(parameter.shape)}, "
-            f"got {tuple(tensor.shape)}"
-        )
+        raise ValueError(f"Qwen3 DSpark parameter {name} expects {tuple(parameter.shape)}, got {tuple(tensor.shape)}")
     parameter.data.copy_(tensor.to(dtype=parameter.dtype, device=parameter.device))
 
 
@@ -140,12 +211,149 @@ def _first_sharded_tensor(
     return None
 
 
+def _rope_cos_sin(
+    positions: torch.Tensor,
+    rotary,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    positions = positions.to(torch.int64).contiguous()
+    cos_sin = rotary.cos_sin_cache[positions]
+    half = cos_sin.shape[-1] // 2
+    cos_half, sin_half = cos_sin[..., :half], cos_sin[..., half:]
+    cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1).unsqueeze(1)
+    sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1).unsqueeze(1)
+    return cos, sin
+
+
+class _RotaryAdapter:
+    """Adapter to expose cos_sin_cache for the interleaved rope helper."""
+
+    def __init__(self, cos_sin_cache: torch.Tensor) -> None:
+        self.cos_sin_cache = cos_sin_cache
+
+
+def _apply_interleaved_rope(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    rotary,
+) -> torch.Tensor:
+    cos, sin = _rope_cos_sin(positions, rotary)
+    if tensor.device.type in ("npu", "privateuseone"):
+        tokens, heads, dim = tensor.shape
+        return torch_npu.npu_interleave_rope(tensor.view(tokens, heads, 1, dim), cos, sin).view(tokens, heads, dim)
+    cos_sin = rotary.cos_sin_cache[positions.to(torch.int64).contiguous()]
+    half = cos_sin.shape[-1] // 2
+    cos_half, sin_half = cos_sin[..., :half], cos_sin[..., half:]
+    pairs = tensor.unflatten(-1, (-1, 2))
+    even, odd = pairs.unbind(dim=-1)
+    cos_half, sin_half = cos_half.unsqueeze(1), sin_half.unsqueeze(1)
+    return torch.stack((even * cos_half - odd * sin_half, odd * cos_half + even * sin_half), dim=-1).flatten(-2)
+
+
 class Qwen3DSparkAttention(Qwen3Attention):
     """Qwen3 attention with the non-causal runtime flag used by DSpark."""
 
     def __init__(self, cfg: Qwen3Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__(cfg, layer_id, dtype, device)
         self.attn.non_causal_block = True
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        mrope_section: list[int] | None = None,
+        trace_tensors: dict[str, torch.Tensor | None] | None = None,
+        layer_index: int = 0,
+    ) -> torch.Tensor:
+        global _xllm_save_counter
+        if layer_index == 0:
+            _xllm_save_counter[0] += 1
+        if layer_index == 0 and trace_tensors is not None:
+            w = self.qkv_proj.weight
+            if _debug_enabled():
+                print(
+                    f"DSpark FWD: qkv_proj.weight ptr={w.data_ptr()} first5={snapshot_for_dump(w)[0, :5].tolist()}",
+                    flush=True,
+                )
+        qkv = self.qkv_proj(hidden)
+        num_tokens = qkv.size(0)
+        q = qkv[:, : self.q_size]
+        k = qkv[:, self.q_size : self.q_size + self.kv_size]
+        v = qkv[:, self.q_size + self.kv_size :]
+
+        if trace_tensors is not None:
+            if layer_index == 0:
+                w = snapshot_for_dump(self.qkv_proj.weight)
+                qkv_s = snapshot_for_dump(qkv)
+            trace_tensors[f"draft.layer.{layer_index}.qkv_raw"] = snapshot_for_dump(qkv)
+            _tensor_checksum(qkv, "qkv_raw", layer_index, _xllm_save_counter[0])
+            trace_tensors[f"draft.layer.{layer_index}.q_raw"] = snapshot_for_dump(q)
+            trace_tensors[f"draft.layer.{layer_index}.k_raw"] = snapshot_for_dump(k)
+            # Also dump the actual weight used
+            trace_tensors[f"draft.layer.{layer_index}.qkv_weight"] = snapshot_for_dump(self.qkv_proj.weight)
+
+        # Per-head RMSNorm (decomposed to match vLLM DFlash attention).
+        q = (
+            torch.ops.xllm_ops.rms_norm(
+                q.reshape(num_tokens * self.num_heads, self.head_dim),
+                self.q_norm.weight,
+                self.q_norm.eps,
+            )
+            .view(num_tokens, self.q_size)
+            .clone()
+        )
+        k = (
+            torch.ops.xllm_ops.rms_norm(
+                k.reshape(num_tokens * self.num_kv_heads, self.head_dim),
+                self.k_norm.weight,
+                self.k_norm.eps,
+            )
+            .view(num_tokens, self.kv_size)
+            .clone()
+        )
+
+        if trace_tensors is not None:
+            trace_tensors[f"draft.layer.{layer_index}.q_normed"] = snapshot_for_dump(q)
+            trace_tensors[f"draft.layer.{layer_index}.k_normed"] = snapshot_for_dump(k)
+
+        # Apply RoPE using torch_npu._npu_rotary_embedding to match vLLM
+        q_rot = q.view(num_tokens, -1).contiguous()
+        k_rot = k.view(num_tokens, -1).contiguous()
+        torch_npu._npu_rotary_embedding(
+            positions,
+            q_rot,
+            k_rot,
+            self.head_dim,
+            cos_sin_cache,
+            True,
+        )
+        q = q_rot.view(num_tokens, self.q_size)
+        k = k_rot.view(num_tokens, self.kv_size)
+
+        if trace_tensors is not None:
+            _q_snap = snapshot_for_dump(q)
+            _k_snap = snapshot_for_dump(k)
+            trace_tensors[f"draft.layer.{layer_index}.q_rope"] = _q_snap
+            trace_tensors[f"draft.layer.{layer_index}.k_rope"] = _k_snap
+            _tensor_checksum(q, "q_rope", layer_index, _xllm_save_counter[0])
+            _tensor_checksum(k, "k_rope", layer_index, _xllm_save_counter[0])
+
+        attn_out = self.attn(q, k, v)
+
+        if trace_tensors is not None:
+            _attn_snap = snapshot_for_dump(attn_out)
+            trace_tensors[f"draft.layer.{layer_index}.attn_out"] = _attn_snap
+            _tensor_checksum(attn_out, "attn_out", layer_index, _xllm_save_counter[0])
+
+        out = self.o_proj(attn_out)
+
+        if trace_tensors is not None:
+            trace_tensors[f"draft.layer.{layer_index}.o_proj_out"] = snapshot_for_dump(out)
+            _tensor_checksum(out, "o_proj_out", layer_index, _xllm_save_counter[0])
+
+        return out
 
 
 class Qwen3DSparkDecoderLayer(nn.Module):
@@ -163,25 +371,49 @@ class Qwen3DSparkDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
+        trace_tensors: dict[str, torch.Tensor | None] | None = None,
+        layer_index: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden
             hidden = self.input_layernorm(hidden)
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
-        hidden = self.self_attn(positions, hidden, cos_sin_cache, None, None)
+
+        if trace_tensors is not None:
+            trace_tensors[f"draft.layer.{layer_index}.normed_input"] = snapshot_for_dump(hidden)
+            _tensor_checksum(hidden, "normed_input", layer_index, _xllm_save_counter[0])
+
+        hidden = self.self_attn(
+            positions,
+            hidden,
+            cos_sin_cache,
+            None,
+            None,
+            trace_tensors=trace_tensors,
+            layer_index=layer_index,
+        )
         hidden, residual = self.post_attention_layernorm(hidden, residual)
-        return self.mlp(hidden), residual
+
+        if trace_tensors is not None:
+            trace_tensors[f"draft.layer.{layer_index}.post_attn_normed"] = snapshot_for_dump(hidden)
+
+        hidden = self.mlp(hidden)
+        return hidden, residual
 
 
 def _neox_rope(tensor: torch.Tensor, positions: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
-    """Apply the NEOX half-split rotation used by Qwen3's RoPE table."""
+    """Apply the NEOX half-split rotation used by Qwen3's RoPE table.
+
+    Compute in float32 to match vLLM's Triton RoPE kernel precision."""
+    orig_dtype = tensor.dtype
     cos_sin = cache[positions.to(torch.int64).contiguous()]
     half = cos_sin.shape[-1] // 2
-    cos = cos_sin[..., :half].unsqueeze(1)
-    sin = cos_sin[..., half:].unsqueeze(1)
-    first, second = tensor[..., :half], tensor[..., half:]
-    return torch.cat((first * cos - second * sin, first * sin + second * cos), dim=-1)
+    cos = cos_sin[..., :half].unsqueeze(1).float()
+    sin = cos_sin[..., half:].unsqueeze(1).float()
+    first, second = tensor[..., :half].float(), tensor[..., half:].float()
+    result = torch.cat((first * cos - second * sin, first * sin + second * cos), dim=-1)
+    return result.to(orig_dtype)
 
 
 def _match_cache_heads(
@@ -191,10 +423,7 @@ def _match_cache_heads(
 ) -> torch.Tensor:
     """Validate the vLLM/xLLM local GQA head layout before cache insertion."""
     if cache.ndim < 3:
-        raise ValueError(
-            f"Qwen3 DSpark {name} cache must be at least 3D, "
-            f"got {tuple(cache.shape)}"
-        )
+        raise ValueError(f"Qwen3 DSpark {name} cache must be at least 3D, got {tuple(cache.shape)}")
     expected_heads = cache.shape[2]
     actual_heads = tensor.shape[1]
     if actual_heads == expected_heads:
@@ -221,16 +450,35 @@ class Qwen3DSparkModel(nn.Module):
             device=device,
         )
         self.hidden_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
-        self.rotary = RotaryEmbedding(
-            cfg.head_dim,
-            cfg.max_position_embeddings,
-            cfg.rope_theta,
-            dtype=dtype,
-            device=device,
-        )
-        self.layers = nn.ModuleList(
-            [Qwen3DSparkDecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)]
-        )
+        if cfg.rope_type == "yarn":
+            print(
+                f"DSpark: using YaRN RoPE, theta={cfg.rope_theta}, factor={cfg.rope_scaling_factor}, orig_max={cfg.rope_original_max_position_embeddings}",
+                flush=True,
+            )
+            from xllm.python.models.deepseek_v32 import DeepseekYarnRotaryEmbedding
+
+            self.rotary = DeepseekYarnRotaryEmbedding(
+                cfg.head_dim,
+                cfg.rope_original_max_position_embeddings or cfg.max_position_embeddings,
+                cfg.rope_scaling_factor,
+                cfg.rope_theta,
+                cfg.rope_beta_fast,
+                cfg.rope_beta_slow,
+                cfg.rope_mscale,
+                cfg.rope_mscale_all_dim,
+                dtype=dtype,
+                device=device,
+                cache_max_position_embeddings=cfg.max_position_embeddings,
+            )
+        else:
+            self.rotary = RotaryEmbedding(
+                cfg.head_dim,
+                cfg.max_position_embeddings,
+                cfg.rope_theta,
+                dtype=dtype,
+                device=device,
+            )
+        self.layers = nn.ModuleList([Qwen3DSparkDecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.markov_w1 = nn.Embedding(cfg.vocab_size, cfg.markov_rank, dtype=dtype, device=device)
         self.markov_w2 = nn.Linear(cfg.markov_rank, cfg.vocab_size, bias=False, dtype=dtype, device=device)
@@ -250,22 +498,58 @@ class Qwen3DSparkModel(nn.Module):
         self._fused_kv_bias = None
         self._k_norm_weights = None
 
+    _inject_call_count = 0
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Inject vLLM's input_ids for the first draft call to enable
+        # like-for-like precision comparison. Only active when dump is enabled.
+        if _debug_enabled():
+            inject_path = "/export/home/wangxiaohan17/wangxiaohan/vllm_draft_input_0.pt"
+            import os as _os
+
+            if _os.path.isfile(inject_path) and Qwen3DSparkModel._inject_call_count == 0:
+                Qwen3DSparkModel._inject_call_count += 1
+                inj = torch.load(inject_path, weights_only=False)
+                inj_ids = inj["input_ids"].to(device=input_ids.device, dtype=input_ids.dtype)
+                inj_pos = inj["positions"].to(device=positions.device, dtype=positions.dtype)
+                print(f"INJECT: overriding draft input_ids {input_ids.tolist()} -> {inj_ids.tolist()}", flush=True)
+                input_ids = inj_ids
+                positions = inj_pos
         if inputs_embeds is None:
             if self.embed_tokens is None:
                 raise RuntimeError("Qwen3 DSpark target embedding is not shared")
             inputs_embeds = self.embed_tokens(input_ids)
-        positions = positions.to(torch.int64).contiguous()
         hidden, residual = inputs_embeds, None
-        for layer in self.layers:
-            hidden, residual = layer(hidden, residual, positions, self.rotary.cos_sin_cache)
+        trace_tensors: dict[str, torch.Tensor | None] = {
+            "draft.input_ids": snapshot_for_dump(input_ids),
+            "draft.positions": snapshot_for_dump(positions),
+            "draft.inputs_embeds": snapshot_for_dump(inputs_embeds),
+            "draft.cos_sin_cache": snapshot_for_dump(self.rotary.cos_sin_cache),
+        }
+        positions = positions.to(torch.int64).contiguous()
+        for layer_index, layer in enumerate(self.layers):
+            hidden, residual = layer(
+                hidden,
+                residual,
+                positions,
+                self.rotary.cos_sin_cache,
+                trace_tensors,
+                layer_index,
+            )
+            trace_tensors[f"draft.layer.{layer_index}.hidden"] = snapshot_for_dump(hidden)
+            _tensor_checksum(hidden, "hidden", layer_index, _xllm_save_counter[0])
+            trace_tensors[f"draft.layer.{layer_index}.residual"] = snapshot_for_dump(residual)
+            _tensor_checksum(residual, "residual", layer_index, _xllm_save_counter[0])
             record_layer_event(layer.layer_id)
         hidden, _ = self.norm(hidden, residual)
+        trace_tensors["draft.final_hidden"] = snapshot_for_dump(hidden)
+        _tensor_checksum(hidden, "final_hidden", 0, _xllm_save_counter[0])
+        dump_dspark_tensors("draft_forward", trace_tensors)
         return hidden
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -277,10 +561,17 @@ class Qwen3DSparkModel(nn.Module):
         expected = self.context_proj.in_features
         if target_hidden.shape[-1] != expected:
             raise ValueError(
-                "Qwen3 DSpark context hidden size mismatch: "
-                f"expected {expected}, got {target_hidden.shape[-1]}"
+                f"Qwen3 DSpark context hidden size mismatch: expected {expected}, got {target_hidden.shape[-1]}"
             )
-        return self.context_proj(target_hidden)
+        projected = self.context_proj(target_hidden)
+        dump_dspark_tensors(
+            "context_projection",
+            {
+                "context.target_hidden": target_hidden,
+                "context.projected_hidden": projected,
+            },
+        )
+        return projected
 
     def _build_fused_kv_buffers(self) -> None:
         kv_weights: list[torch.Tensor] = []
@@ -293,8 +584,7 @@ class Qwen3DSparkModel(nn.Module):
         self._fused_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
         if self.layers[0].self_attn.qkv_proj.bias is not None:
             self._fused_kv_bias = torch.cat(
-                [layer.self_attn.qkv_proj.bias[layer.self_attn.q_size :]
-                 for layer in self.layers], dim=0
+                [layer.self_attn.qkv_proj.bias[layer.self_attn.q_size :] for layer in self.layers], dim=0
             ).contiguous()
         self._k_norm_weights = torch.stack(k_norm_weights, dim=0).contiguous()
 
@@ -318,29 +608,36 @@ class Qwen3DSparkModel(nn.Module):
         head_dim = self.cfg.head_dim
         # Match vLLM's DFlash layout exactly: project as [T, L, 2, H, D],
         # then make one contiguous layer-major copy [2, L, T, H, D].
-        fused = (
-            fused.view(tokens, num_layers, 2, num_kv_heads, head_dim)
-            .permute(2, 1, 0, 3, 4)
-            .contiguous()
-        )
+        fused = fused.view(tokens, num_layers, 2, num_kv_heads, head_dim).permute(2, 1, 0, 3, 4).contiguous()
         keys = fused[0]
         values = fused[1]
         # The K norm is layer-specific and is applied before the same NEOX
         # rotation used by the normal Qwen3 attention path.
-        norm_weights = self._k_norm_weights.to(
-            dtype=torch.float32, device=keys.device
-        )
-        variance = keys.float().pow(2).mean(dim=-1, keepdim=True)
-        keys = keys.float() * torch.rsqrt(
-            variance + self.layers[0].self_attn.q_norm.eps
-        )
-        keys = (keys * norm_weights.unsqueeze(1).unsqueeze(2)).to(dtype=fused.dtype)
-        rotated = []
+        # Use xllm_ops.rms_norm (NPU fused kernel, BF16) to match vLLM's
+        # ops.rms_norm precision instead of manual float32 computation.
+        k_eps = self.layers[0].self_attn.q_norm.eps
+        normed_keys = []
         for layer_id in range(num_layers):
-            rotated.append(
-                _neox_rope(keys[layer_id], positions, self.rotary.cos_sin_cache)
+            k_layer = keys[layer_id]
+            k_flat = k_layer.reshape(-1, head_dim)
+            k_normed = torch.ops.xllm_ops.rms_norm(
+                k_flat,
+                self._k_norm_weights[layer_id],
+                k_eps,
             )
-        keys = torch.stack(rotated, dim=0)
+            normed_keys.append(k_normed.view_as(k_layer))
+        keys = torch.stack(normed_keys, dim=0)
+        k_flat = keys.view(num_layers * tokens, -1).contiguous()
+        positions_repeated = positions.repeat(num_layers)
+        torch_npu._npu_rotary_embedding(
+            positions_repeated,
+            k_flat,
+            k_flat.clone(),
+            head_dim,
+            self.rotary.cos_sin_cache,
+            True,
+        )
+        keys = k_flat.view(num_layers, tokens, num_kv_heads, head_dim)
         for layer_id, (k_cache, v_cache, _) in enumerate(kv_caches):
             layer_key = _match_cache_heads(keys[layer_id], k_cache, "key")
             layer_value = _match_cache_heads(values[layer_id], v_cache, "value")
@@ -359,7 +656,17 @@ class Qwen3DSparkModel(nn.Module):
         return hidden
 
     def dspark_markov_bias(self, previous_token_ids: torch.Tensor) -> torch.Tensor:
-        return self.markov_w2(self.markov_w1(previous_token_ids))
+        markov_embed = self.markov_w1(previous_token_ids)
+        markov_bias = self.markov_w2(markov_embed)
+        dump_dspark_tensors(
+            "draft_markov",
+            {
+                "markov.previous_token_ids": previous_token_ids,
+                "markov.embedding": markov_embed,
+                "markov.bias": markov_bias,
+            },
+        )
+        return markov_bias
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [f"layers.{layer.layer_id}.self_attn" for layer in self.layers]
@@ -383,7 +690,15 @@ class Qwen3DSparkForCausalLM(PyModelBase):
             hidden = hidden.index_select(0, selected_idxes)
         if self.lm_head is None:
             raise RuntimeError("Qwen3 DSpark target LM head is not shared")
-        return self.lm_head(hidden)
+        logits = self.lm_head(hidden)
+        dump_dspark_tensors(
+            "draft_logits",
+            {
+                "draft.sample_hidden": hidden,
+                "draft.base_logits": logits,
+            },
+        )
+        return logits
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -422,6 +737,11 @@ class Qwen3DSparkForCausalLM(PyModelBase):
         # Qwen3DSparkConfig.from_dict, just as vLLM does.
         runtime_tp_size = tp_size if tp_size > 1 else cfg.tp_size
         runtime_tp_rank = tp_rank if tp_size > 1 else cfg.tp_rank
+        if _debug_enabled():
+            print(
+                f"DSpark load_weights: tp_rank={tp_rank} tp_size={tp_size} cfg.tp_rank={cfg.tp_rank} cfg.tp_size={cfg.tp_size} runtime_tp_rank={runtime_tp_rank} runtime_tp_size={runtime_tp_size}",
+                flush=True,
+            )
         tp_changed = (cfg.tp_size, cfg.tp_rank) != (runtime_tp_size, runtime_tp_rank)
         cfg.tp_size = runtime_tp_size
         cfg.tp_rank = runtime_tp_rank
@@ -467,8 +787,11 @@ class Qwen3DSparkForCausalLM(PyModelBase):
         cfg.target_hidden_size = context.shape[1] // target_layers
         if self.model.context_proj.weight.shape != context.shape:
             self.model.context_proj = nn.Linear(
-                context.shape[1], cfg.hidden_size, bias=False,
-                dtype=self.dtype, device=self.device,
+                context.shape[1],
+                cfg.hidden_size,
+                bias=False,
+                dtype=self.dtype,
+                device=self.device,
             )
         copy("model.context_proj.weight", context)
 
@@ -502,8 +825,7 @@ class Qwen3DSparkForCausalLM(PyModelBase):
                     raise ValueError("Qwen3 DSpark Markov head weights must be rank-2")
                 if tensor.shape[1] != markov_w2.shape[1]:
                     raise ValueError(
-                        "Qwen3 DSpark Markov head rank mismatch: "
-                        f"w1={tuple(tensor.shape)}, w2={tuple(markov_w2.shape)}"
+                        f"Qwen3 DSpark Markov head rank mismatch: w1={tuple(tensor.shape)}, w2={tuple(markov_w2.shape)}"
                     )
                 if self.model.markov_w1.weight.shape != tensor.shape:
                     self.model.markov_w1 = nn.Embedding(
@@ -523,21 +845,9 @@ class Qwen3DSparkForCausalLM(PyModelBase):
             copy(name, tensor)
 
         total_kv_heads = cfg.n_kv_heads
-        kv_replicas = (
-            runtime_tp_size // total_kv_heads
-            if total_kv_heads < runtime_tp_size
-            else 1
-        )
-        kv_rank = (
-            runtime_tp_rank // kv_replicas
-            if kv_replicas > 1
-            else runtime_tp_rank
-        )
-        kv_world = (
-            runtime_tp_size // kv_replicas
-            if kv_replicas > 1
-            else runtime_tp_size
-        )
+        kv_replicas = runtime_tp_size // total_kv_heads if total_kv_heads < runtime_tp_size else 1
+        kv_rank = runtime_tp_rank // kv_replicas if kv_replicas > 1 else runtime_tp_rank
+        kv_world = runtime_tp_size // kv_replicas if kv_replicas > 1 else runtime_tp_size
 
         def shard(layer_state: Any, names: tuple[str, ...], dim: int, kv: bool = False) -> torch.Tensor:
             tensor = _first_sharded_tensor(
@@ -576,8 +886,19 @@ class Qwen3DSparkForCausalLM(PyModelBase):
             q = shard(attention_state, ("q_proj.weight",), 0)
             k = shard(attention_state, ("k_proj.weight",), 0, kv=True)
             v = shard(attention_state, ("v_proj.weight",), 0, kv=True)
-            _copy_parameter(layer.self_attn.qkv_proj.weight, torch.cat((q, k, v), dim=0), "qkv_proj.weight")
+            qkv_weight = torch.cat((q, k, v), dim=0)
+            _copy_parameter(layer.self_attn.qkv_proj.weight, qkv_weight, "qkv_proj.weight")
             loaded.add(f"{prefix}self_attn.qkv_proj.weight")
+            if layer_id == layer_ids[0]:
+                actual_w = snapshot_for_dump(layer.self_attn.qkv_proj.weight)
+                if _debug_enabled():
+                    print(f"DSpark post_copy: qkv_proj.weight[0,:5]={actual_w[0, :5].tolist()}", flush=True)
+                if _debug_enabled():
+                    print(
+                        f"DSpark weight debug: layer={layer_id} q_shard={q.shape} k_shard={k.shape} v_shard={v.shape} qkv={qkv_weight.shape}",
+                        flush=True,
+                    )
+
             if cfg.attention_bias:
                 q_bias = shard(attention_state, ("q_proj.bias",), 0)
                 k_bias = shard(attention_state, ("k_proj.bias",), 0, kv=True)
@@ -606,6 +927,12 @@ class Qwen3DSparkForCausalLM(PyModelBase):
             loaded.update((f"{prefix}mlp.gate_up_proj.weight", f"{prefix}mlp.down_proj.weight"))
 
         self.model._build_fused_kv_buffers()
+        w = self.model.layers[0].self_attn.qkv_proj.weight
+        if _debug_enabled():
+            print(
+                f"DSpark END_LOAD: qkv_proj.weight ptr={w.data_ptr()} fmt={__import__('torch_npu').get_npu_format(w) if w.device.type in ('npu', 'privateuseone') else 'cpu'} first5={snapshot_for_dump(w)[0, :5].tolist()}",
+                flush=True,
+            )
         return loaded
 
 

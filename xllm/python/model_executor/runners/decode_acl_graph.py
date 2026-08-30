@@ -101,6 +101,8 @@ class DecodeAclGraphRunner(BaseRunner):
         super().__init__(model, attention_backend, device)
         self.max_batch = max_batch
         self.max_model_len = max_model_len
+        if page_size <= 0:
+            page_size = 128
         self.page_size = page_size
         self._graphs: dict[int, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
@@ -272,6 +274,7 @@ class DecodeAclGraphRunner(BaseRunner):
         device = input_ids.device
         if self._paged_kv_indices_buffer is None:
             page_size = self.page_size
+
             max_blocks_per_sequence = (self.max_model_len + page_size - 1) // page_size
             self._paged_kv_indices_buffer = torch.zeros(
                 self.max_batch * max_blocks_per_sequence,
@@ -530,7 +533,7 @@ class DecodeAclGraphRunner(BaseRunner):
         try:
             context = ForwardContext(self.attention_backend, self.device)
             with forward_context(context):
-                for _ in range(_CAPTURE_WARMUP_STEPS):
+                for _step in range(_CAPTURE_WARMUP_STEPS):
                     self.model(
                         entry.static_input_ids,
                         entry.static_positions,

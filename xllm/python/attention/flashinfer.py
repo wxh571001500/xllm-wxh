@@ -238,7 +238,25 @@ class FlashInferBackend(AttentionBackend):
         k_3d = k.view(-1, layer.num_kv_heads, layer.head_dim)
         v_3d = v.view(-1, layer.num_kv_heads, layer.head_dim)
 
+        if layer.layer_id == 0 and q_3d.shape[0] <= 20:
+            torch.npu.synchronize()
+            print(
+                f"XLLM_ATTN_EXEC layer={layer.layer_id} q_shape={list(q_3d.shape)} k_shape={list(k_3d.shape)} is_prefill={metadata.is_prefill} is_chunked={metadata.is_chunked_prefill} slot_mapping[:5]={metadata.slot_mapping[:5].tolist()}",
+                flush=True,
+            )
+            print(
+                f"XLLM_KV_CACHE k_cache[:1,:1,:1,:5]={k_cache[:1, :1, :1, :5].tolist()} v_cache[:1,:1,:1,:5]={v_cache[:1, :1, :1, :5].tolist()}",
+                flush=True,
+            )
+
         ops.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
+
+        if layer.layer_id == 0 and q_3d.shape[0] <= 20:
+            torch.npu.synchronize()
+            print(
+                f"XLLM_KV_CACHE_AFTER k_cache[:1,:1,:1,:5]={k_cache[:1, :1, :1, :5].tolist()} v_cache[:1,:1,:1,:5]={v_cache[:1, :1, :1, :5].tolist()}",
+                flush=True,
+            )
 
         if metadata.is_prefill:
             output = self._prefill_ragged_wrapper.run(q_3d, k_3d, v_3d)

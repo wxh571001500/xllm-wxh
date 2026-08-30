@@ -56,6 +56,13 @@ class Qwen3Config:
     intermediate_size: int = 3072
     rms_norm_eps: float = 1e-6
     rope_theta: float = 1e6
+    rope_type: str = "default"
+    rope_scaling_factor: float = 1.0
+    rope_original_max_position_embeddings: int = 0
+    rope_beta_fast: int = 32
+    rope_beta_slow: int = 1
+    rope_mscale: float = 1.0
+    rope_mscale_all_dim: float = 0.0
     max_position_embeddings: int = 40960
     vocab_size: int = 151936
     tie_word_embeddings: bool = True
@@ -74,6 +81,18 @@ class Qwen3Config:
                     return d[k]
             return default
 
+        rope_params = d.get("rope_parameters") or d.get("rope_scaling") or {}
+        if not isinstance(rope_params, dict):
+            rope_params = {}
+
+        def rpick(*keys, default=None):
+            for k in keys:
+                if k in rope_params and rope_params[k] is not None:
+                    return rope_params[k]
+                if k in d and d[k] is not None:
+                    return d[k]
+            return default
+
         hidden = int(pick("hidden_size", default=1024))
         n_heads = int(pick("n_heads", "num_attention_heads", default=16))
         return cls(
@@ -84,7 +103,14 @@ class Qwen3Config:
             head_dim=int(pick("head_dim", default=hidden // n_heads)),
             intermediate_size=int(pick("intermediate_size", default=3072)),
             rms_norm_eps=float(pick("rms_norm_eps", default=1e-6)),
-            rope_theta=float(pick("rope_theta", default=1e6)),
+            rope_theta=float(rpick("rope_theta", default=1e6)),
+            rope_type=str(rpick("rope_type", default="default")),
+            rope_scaling_factor=float(rpick("factor", "scaling_factor", default=1.0)),
+            rope_original_max_position_embeddings=int(rpick("original_max_position_embeddings", default=0)),
+            rope_beta_fast=int(rpick("beta_fast", default=32)),
+            rope_beta_slow=int(rpick("beta_slow", default=1)),
+            rope_mscale=float(rpick("mscale", default=1.0)),
+            rope_mscale_all_dim=float(rpick("mscale_all_dim", default=0.0)),
             max_position_embeddings=int(pick("max_position_embeddings", default=40960)),
             vocab_size=int(pick("vocab_size", default=151936)),
             tie_word_embeddings=bool(pick("tie_word_embeddings", default=True)),

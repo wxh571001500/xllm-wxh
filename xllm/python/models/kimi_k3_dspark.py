@@ -20,6 +20,7 @@ positional slice, no output gate, and non-causal speculative blocks.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -34,9 +35,14 @@ from xllm.python.layers.attention import AttentionRuntimeLayer
 from xllm.python.model_executor.forward_context import get_forward_context, record_layer_event
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import DeepseekYarnRotaryEmbedding, _yarn_get_mscale
+from xllm.python.models.dspark_accuracy import (
+    dump_dspark_tensors,
+    is_dspark_accuracy_dump_enabled,
+    snapshot_for_dump,
+)
 from xllm.python.models.kimi_k3_text import (
-    _MergedStateDict,
     _layer_ids,
+    _MergedStateDict,
     _state_dict_sharded_tensor,
     _state_dict_tensor,
 )
@@ -84,8 +90,11 @@ def _resize_context_projection(model: nn.Module, weight: torch.Tensor, target_hi
         return
     parameter = model.context_proj.weight
     model.context_proj = nn.Linear(
-        weight.shape[1], model.config.hidden_size, bias=False,
-        dtype=parameter.dtype, device=parameter.device,
+        weight.shape[1],
+        model.config.hidden_size,
+        bias=False,
+        dtype=parameter.dtype,
+        device=parameter.device,
     )
 
 
@@ -131,9 +140,7 @@ def _apply_interleaved_rope(
     cos, sin = _rope_cos_sin(positions, rotary)
     if tensor.device.type in ("npu", "privateuseone"):
         tokens, heads, dim = tensor.shape
-        return torch_npu.npu_interleave_rope(
-            tensor.view(tokens, heads, 1, dim), cos, sin
-        ).view(tokens, heads, dim)
+        return torch_npu.npu_interleave_rope(tensor.view(tokens, heads, 1, dim), cos, sin).view(tokens, heads, dim)
     cos_sin = rotary.cos_sin_cache[positions.to(torch.int64).contiguous()]
     half = cos_sin.shape[-1] // 2
     cos_half, sin_half = cos_sin[..., :half], cos_sin[..., half:]
@@ -179,9 +186,11 @@ class K3DSparkConfig:
                 if key in config and config[key] is not None:
                     return config[key]
             return default
+
         rope = config.get("rope_parameters", {})
         if not isinstance(rope, dict):
             rope = {}
+
         def rpick(*keys: str, default: Any = None) -> Any:
             for key in keys:
                 if key in rope and rope[key] is not None:
@@ -191,6 +200,7 @@ class K3DSparkConfig:
                 if key in config and config[key] is not None:
                     return config[key]
             return default
+
         dflash = config.get("dflash_config", {})
         if not isinstance(dflash, dict):
             dflash = {}
@@ -222,8 +232,10 @@ class K3DSparkConfig:
             rope_beta_slow=int(rpick("beta_slow", default=1)),
             rope_mscale=float(rpick("mscale", default=1.0)),
             rope_mscale_all_dim=float(rpick("mscale_all_dim", default=0.0)),
-            tp_size=int(pick("tp_size", default=1)), tp_rank=int(pick("tp_rank", default=0)),
-            dp_size=int(pick("dp_size", default=1)), dp_rank=int(pick("dp_rank", default=0)),
+            tp_size=int(pick("tp_size", default=1)),
+            tp_rank=int(pick("tp_rank", default=0)),
+            dp_size=int(pick("dp_size", default=1)),
+            dp_rank=int(pick("dp_rank", default=0)),
         )
 
     def validate(self) -> None:
@@ -283,11 +295,7 @@ class K3DSparkFusedQKVAProjection(nn.Module):
         query = _first_tensor(state_dict, ("q_a_proj.weight",))
         kv = _first_tensor(state_dict, ("kv_a_proj_with_mqa.weight",))
         if query is None or kv is None:
-            available = sorted(
-                name
-                for name in state_dict.keys()
-                if "proj" in name or "attn" in name
-            )
+            available = sorted(name for name in state_dict.keys() if "proj" in name or "attn" in name)
             raise KeyError(
                 "Kimi K3 DSpark q/kv A weights are incomplete: expected "
                 "q_a_proj.weight and kv_a_proj_with_mqa.weight, or "
@@ -378,7 +386,7 @@ class K3DSparkMLAAttention(AttentionRuntimeLayer, nn.Module):
         qkv_lora: torch.Tensor,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        compressed = qkv_lora[..., self.q_lora_rank:]
+        compressed = qkv_lora[..., self.q_lora_rank :]
         latent, rope = compressed.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent = self.kv_a_layernorm(latent).view(-1, 1, self.kv_lora_rank)
         return latent, _apply_interleaved_rope(rope.unsqueeze(1), positions, self.rotary)
@@ -386,9 +394,7 @@ class K3DSparkMLAAttention(AttentionRuntimeLayer, nn.Module):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         tokens = hidden_states.shape[0]
         qkv = self.fused_qkv_a_proj(hidden_states)
-        q = self.q_b_proj(
-            self.q_a_layernorm(qkv[..., : self.q_lora_rank])
-        ).view(
+        q = self.q_b_proj(self.q_a_layernorm(qkv[..., : self.q_lora_rank])).view(
             tokens,
             self.num_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -569,6 +575,10 @@ class K3DSparkModel(nn.Module):
         self.final_norm = RMSNorm(config.hidden_size, config.rms_norm_eps, dtype=dtype, device=device)
         self.markov_w1 = nn.Embedding(config.vocab_size, config.markov_rank, dtype=dtype, device=device)
         self.markov_w2 = nn.Linear(config.markov_rank, config.vocab_size, bias=False, dtype=dtype, device=device)
+        self._accuracy_base_logits: torch.Tensor | None = None
+        self._accuracy_markov_step = 0
+
+    _inject_call_count = 0
 
     def forward(
         self,
@@ -576,15 +586,36 @@ class K3DSparkModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Inject vLLM's input_ids for the first draft call to enable
+        # like-for-like precision comparison (debug only).
+        if is_dspark_accuracy_dump_enabled():
+            inject_path = os.getenv("XLLM_DSPARK_INJECT_PATH", "")
+            if inject_path and os.path.isfile(inject_path) and K3DSparkModel._inject_call_count == 0:
+                K3DSparkModel._inject_call_count += 1
+                inj = torch.load(inject_path, weights_only=False)
+                inj_ids = inj["input_ids"].to(device=input_ids.device, dtype=input_ids.dtype)
+                inj_pos = inj["positions"].to(device=positions.device, dtype=positions.dtype)
+                print(f"INJECT: overriding draft input_ids {input_ids.tolist()} -> {inj_ids.tolist()}", flush=True)
+                input_ids = inj_ids
+                positions = inj_pos
         if inputs_embeds is None:
             if self.embed_tokens is None:
                 raise RuntimeError("Kimi K3 DSpark target embedding is not shared")
             inputs_embeds = self.embed_tokens(input_ids)
         hidden, residual = inputs_embeds, None
-        for layer in self.layers:
+        trace_tensors: dict[str, torch.Tensor | None] = {
+            "draft.input_ids": snapshot_for_dump(input_ids),
+            "draft.positions": snapshot_for_dump(positions),
+            "draft.inputs_embeds": snapshot_for_dump(inputs_embeds),
+        }
+        for layer_index, layer in enumerate(self.layers):
             hidden, residual = layer(positions, hidden, residual)
+            trace_tensors[f"draft.layer.{layer_index}.hidden"] = snapshot_for_dump(hidden)
+            trace_tensors[f"draft.layer.{layer_index}.residual"] = snapshot_for_dump(residual)
             record_layer_event(layer.layer_id)
         hidden, _ = self.final_norm(hidden, residual)
+        trace_tensors["draft.final_hidden"] = snapshot_for_dump(hidden)
+        dump_dspark_tensors("draft_forward", trace_tensors)
         return hidden
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -599,11 +630,18 @@ class K3DSparkModel(nn.Module):
         expected = self.context_proj.in_features
         if target_hidden.shape[-1] != expected:
             raise ValueError(
-                "Kimi K3 DSpark context hidden size mismatch: "
-                f"expected {expected}, got {target_hidden.shape[-1]}"
+                f"Kimi K3 DSpark context hidden size mismatch: expected {expected}, got {target_hidden.shape[-1]}"
             )
         hidden = self.context_norm(self.context_proj(target_hidden))
-        return hidden.squeeze(0) if squeeze else hidden
+        output = hidden.squeeze(0) if squeeze else hidden
+        dump_dspark_tensors(
+            "context_projection",
+            {
+                "context.target_hidden": target_hidden,
+                "context.projected_hidden": output,
+            },
+        )
+        return output
 
     def write_context_kv(
         self,
@@ -615,12 +653,10 @@ class K3DSparkModel(nn.Module):
         if len(kv_caches) != len(self.layers):
             raise ValueError("Kimi K3 DSpark KV cache count must match draft layers")
         hidden = self.combine_hidden_states(target_hidden)
-        for layer, (latent_cache, rope_cache, _) in zip(
-            self.layers, kv_caches, strict=True
-        ):
+        for layer, (latent_cache, rope_cache, _) in zip(self.layers, kv_caches, strict=True):
             attention = layer.self_attn
             qkv_lora = attention.fused_qkv_a_proj(hidden)
-            raw_kv = qkv_lora[..., attention.q_lora_rank:].contiguous()
+            raw_kv = qkv_lora[..., attention.q_lora_rank :].contiguous()
             rope_cos, rope_sin = _rope_cos_sin(positions, attention.rotary)
             kernels.write_mla_kv_cache(
                 raw_kv,
@@ -637,7 +673,35 @@ class K3DSparkModel(nn.Module):
         return hidden
 
     def dspark_markov_bias(self, previous_token_ids: torch.Tensor) -> torch.Tensor:
-        return self.markov_w2(self.markov_w1(previous_token_ids))
+        markov_embed = self.markov_w1(previous_token_ids)
+        markov_bias = self.markov_w2(markov_embed)
+        corrected_logits = None
+        predicted_token_ids = None
+        if self._accuracy_base_logits is not None:
+            base_logits = self._accuracy_base_logits.view(
+                previous_token_ids.shape[0],
+                -1,
+                self._accuracy_base_logits.shape[-1],
+            )
+            if self._accuracy_markov_step < base_logits.shape[1]:
+                corrected_logits = base_logits[:, self._accuracy_markov_step] + markov_bias
+                predicted_token_ids = corrected_logits.argmax(dim=-1)
+                self._accuracy_markov_step += 1
+        dump_dspark_tensors(
+            "draft_markov",
+            {
+                "markov.previous_token_ids": previous_token_ids,
+                "markov.embedding": markov_embed,
+                "markov.bias": markov_bias,
+                "markov.corrected_logits": corrected_logits,
+                "markov.predicted_token_ids": predicted_token_ids,
+            },
+        )
+        return markov_bias
+
+    def set_accuracy_base_logits(self, base_logits: torch.Tensor) -> None:
+        self._accuracy_base_logits = base_logits
+        self._accuracy_markov_step = 0
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [f"layers.{layer.layer_id}.self_attn" for layer in self.layers]
@@ -661,7 +725,17 @@ class K3DSparkForCausalLM(PyModelBase):
             hidden = hidden.index_select(0, selected_idxes)
         if self.lm_head is None:
             raise RuntimeError("Kimi K3 DSpark target LM head is not shared")
-        return self.lm_head(hidden)
+        logits = self.lm_head(hidden)
+        if is_dspark_accuracy_dump_enabled():
+            self.model.set_accuracy_base_logits(logits)
+        dump_dspark_tensors(
+            "draft_logits",
+            {
+                "draft.sample_hidden": hidden,
+                "draft.base_logits": logits,
+            },
+        )
+        return logits
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

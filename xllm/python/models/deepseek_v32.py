@@ -71,11 +71,9 @@ def _yarn_find_correction_range(
     dim: int,
     base: float,
     max_position_embeddings: int,
-) -> tuple[int, int]:
+) -> tuple[float, float]:
     low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
     high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
-    low = math.floor(low)
-    high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)
 
 
@@ -115,10 +113,7 @@ class DeepseekYarnRotaryEmbedding(RotaryEmbedding):
             device,
         )
         t = torch.arange(
-            int(
-                cache_max_position_embeddings
-                or original_max_position_embeddings * scaling_factor
-            ),
+            int(cache_max_position_embeddings or original_max_position_embeddings * scaling_factor),
             dtype=torch.float32,
             device=device,
         )

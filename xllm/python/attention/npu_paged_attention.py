@@ -20,6 +20,7 @@ Prefill uses FIA TND with causal mask; decode uses FIA TND with block_table.
 
 from __future__ import annotations
 
+import os as _os
 from typing import TYPE_CHECKING
 
 import torch
@@ -38,6 +39,14 @@ from xllm.python.model_executor.forward_context import (
     AclGraphTask,
     get_forward_context,
 )
+
+_GRAPH_DEBUG = bool(_os.getenv("XLLM_GRAPH_DEBUG"))
+
+
+def _gd(msg):
+    if _GRAPH_DEBUG:
+        print(msg, flush=True)
+
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
@@ -267,10 +276,18 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # Write KV to paged cache (kernel expects [T, kv_heads, head_dim]).
         k_3d = k.view(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
         v_3d = v.view(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
-        ops.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
+
+        if metadata.slot_mapping is not None and metadata.slot_mapping.shape[0] >= num_tokens:
+            ops.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
 
         q_3d = q.view(num_tokens, self.num_heads, self.head_dim).contiguous()
 
+        # DSpark draft model uses non_causal_block flag; route to a
+        # dedicated decode path that uses the paged KV cache with
+        # correct seq lens for multi-token draft queries.
+        is_dspark_draft = getattr(layer, "non_causal_block", False)
+        if is_dspark_draft and not metadata.is_prefill:
+            return self._dspark_decode(q_3d, k_cache, v_cache, metadata, num_tokens)
         if metadata.is_prefill or metadata.is_chunked_prefill:
             return self._prefill(q_3d, k_3d, v_3d, metadata, num_tokens)
         return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
@@ -291,13 +308,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
         layer_id = layer.layer_id
         nope_cache, rope_cache, _ = self._kv_caches[layer_id]
 
-        torch_npu._npu_reshape_and_cache(
-            key=k_latent_3d,
-            value=k_pe_3d,
-            key_cache=nope_cache,
-            value_cache=rope_cache,
-            slot_indices=metadata.slot_mapping,
-        )
+        if metadata.slot_mapping is not None and metadata.slot_mapping.shape[0] >= k_latent_3d.shape[0]:
+            torch_npu._npu_reshape_and_cache(
+                key=k_latent_3d,
+                value=k_pe_3d,
+                key_cache=nope_cache,
+                value_cache=rope_cache,
+                slot_indices=metadata.slot_mapping,
+            )
         if topk is None:
             if unabsorbed_prefill is not None and self.use_unabsorbed_mla_prefill():
                 return self._mla_unabsorbed_prefill(
@@ -750,6 +768,12 @@ class NpuPagedAttentionBackend(AttentionBackend):
             sparse_mode=3,
             softmax_lse_flag=False,
         )
+        if bool(_os.getenv("XLLM_DSPARK_ACCURACY_DUMP_DIR")):
+            print(
+                f"DSPARK_ATTN: nt={num_tokens} kv_len={kv_len} q={actual_seq_q} kv={actual_seq_kv} scale={self.scale} bs={block_size} nh={self.num_heads} nkh={self.num_kv_heads} hd={self.head_dim}",
+                flush=True,
+            )
+
         return output.reshape(num_tokens, self.num_heads * self.head_dim)
 
     # ------------------------------------------------------------------
@@ -834,6 +858,71 @@ class NpuPagedAttentionBackend(AttentionBackend):
             block_size=block_size,
             softmax_lse_flag=False,
         )
+        if bool(_os.getenv("XLLM_DSPARK_ACCURACY_DUMP_DIR")):
+            print(
+                f"DSPARK_ATTN: nt={num_tokens} kv_len={kv_len} q={actual_seq_q} kv={actual_seq_kv} scale={self.scale} bs={block_size} nh={self.num_heads} nkh={self.num_kv_heads} hd={self.head_dim}",
+                flush=True,
+            )
+        return output.reshape(num_tokens, self.num_heads * self.head_dim)
+
+    def _dspark_decode(
+        self,
+        q_3d: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Decode path for DSpark draft model: uses paged KV cache with
+        non-causal attention and correct multi-token seq lens."""
+        block_size = k_cache.size(1)
+        k_flat = k_cache.view(k_cache.size(0), block_size, -1)
+        v_flat = v_cache.view(v_cache.size(0), block_size, -1)
+
+        # Build seq lens for the draft batch: 1 sequence with num_tokens queries
+        if isinstance(self._actual_seq_kv, list):
+            kv_len = self._actual_seq_kv[0] if self._actual_seq_kv else num_tokens
+        else:
+            kv_len = (
+                self._actual_seq_kv[0].item()
+                if self._actual_seq_kv is not None and self._actual_seq_kv.numel() > 0
+                else num_tokens
+            )
+
+        actual_seq_q = [num_tokens]
+        actual_seq_kv = [kv_len]
+
+        # Build a block_table for the draft model if none is available.
+        # The draft model's KV cache is filled sequentially from block 0.
+        block_table = self._block_table_i32
+        if block_table is None:
+            n_blocks = (kv_len + block_size - 1) // block_size
+            if n_blocks == 0:
+                n_blocks = 1
+            block_table = torch.arange(n_blocks, dtype=torch.int32, device=k_cache.device).unsqueeze(0)
+
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_3d,
+            k_flat,
+            v_flat,
+            pse_shift=None,
+            atten_mask=None,
+            actual_seq_lengths=actual_seq_q,
+            actual_seq_lengths_kv=actual_seq_kv,
+            block_table=block_table,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            input_layout="TND",
+            num_key_value_heads=self.num_kv_heads,
+            sparse_mode=0,
+            block_size=block_size,
+            softmax_lse_flag=False,
+        )
+        if bool(_os.getenv("XLLM_DSPARK_ACCURACY_DUMP_DIR")):
+            print(
+                f"DSPARK_ATTN: nt={num_tokens} kv_len={kv_len} q={actual_seq_q} kv={actual_seq_kv} scale={self.scale} bs={block_size} nh={self.num_heads} nkh={self.num_kv_heads} hd={self.head_dim} kernel=fia_v1",
+                flush=True,
+            )
         return output.reshape(num_tokens, self.num_heads * self.head_dim)
 
     # ------------------------------------------------------------------

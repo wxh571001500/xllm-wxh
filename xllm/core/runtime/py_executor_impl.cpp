@@ -405,7 +405,13 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
           ? py::object(py::cast(params.embedding.input_embedding))
           : py::object(py::none());
   py::object hidden_obj = py_executor_.attr("execute")(
-      tokens, positions, py_metadata, input_embedding, py_kda_metadata);
+      tokens,
+      positions,
+      py_metadata,
+      input_embedding,
+      py_kda_metadata,
+      params.meta.is_graph_warmup,
+      params.embedding.request_ids);
   py::object aux_obj = py_executor_.attr("aux_hidden_states")();
   torch::Tensor aux_hidden_states =
       aux_obj.is_none() ? torch::Tensor() : aux_obj.cast<torch::Tensor>();
