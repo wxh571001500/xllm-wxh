@@ -191,12 +191,6 @@ class GraphPersistentParam final {
   const int32_t* persistent_host_kv_seq_lens_data() const {
     return persistent_host_kv_seq_lens_.data();
   }
-  const int32_t* capture_host_q_seq_lens_data() const {
-    return capture_host_q_seq_lens_.data();
-  }
-  const int32_t* capture_host_kv_seq_lens_data() const {
-    return capture_host_kv_seq_lens_.data();
-  }
   bool need_update_attn_mask() const { return need_update_attn_mask_; }
   void set_need_update_attn_mask(bool value) { need_update_attn_mask_ = value; }
   bool need_update_attention_plan() const {
@@ -312,8 +306,6 @@ class GraphPersistentParam final {
   torch::Tensor expanded_kv_seq_lens_;
   std::vector<int32_t> persistent_host_q_seq_lens_;
   std::vector<int32_t> persistent_host_kv_seq_lens_;
-  std::vector<int32_t> capture_host_q_seq_lens_;
-  std::vector<int32_t> capture_host_kv_seq_lens_;
 
   // for deepseekv3.2
   torch::Tensor q_cu_seq_lens_;

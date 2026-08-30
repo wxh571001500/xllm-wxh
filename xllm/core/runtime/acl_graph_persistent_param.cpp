@@ -290,8 +290,6 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
                                        1);
     persistent_host_kv_seq_lens_.assign(static_cast<size_t>(metadata_capacity),
                                         1);
-    capture_host_q_seq_lens_.assign(static_cast<size_t>(metadata_capacity), 1);
-    capture_host_kv_seq_lens_.assign(static_cast<size_t>(metadata_capacity), 1);
   }
 
   // Block table tensors with maximum possible size
@@ -1605,52 +1603,27 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     graph_params->meta.actual_num_sequences =
         is_empty_dp_decode_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
     if (supports_mla_graph_kv_bucketing_) {
-      std::vector<int32_t> capture_host_kv_seq_lens_vec =
-          persistent_host_kv_seq_lens_;
-      std::vector<int32_t> capture_host_q_seq_lens_vec =
-          persistent_host_q_seq_lens_;
       const bool use_mla_capture_host_lens = for_capture && is_decode;
       if (use_mla_capture_host_lens) {
         const int32_t capture_kv_seq_len =
             get_mla_capture_kv_seq_len_bucket(params, options_);
-        std::fill(capture_host_kv_seq_lens_vec.begin(),
-                  capture_host_kv_seq_lens_vec.begin() + padded_batch_size,
+        std::fill(persistent_host_kv_seq_lens_.begin(),
+                  persistent_host_kv_seq_lens_.begin() + padded_batch_size,
                   capture_kv_seq_len);
-        std::fill(capture_host_q_seq_lens_vec.begin(),
-                  capture_host_q_seq_lens_vec.begin() + padded_batch_size,
+        std::fill(persistent_host_q_seq_lens_.begin(),
+                  persistent_host_q_seq_lens_.begin() + padded_batch_size,
                   1);
       }
-      CHECK_LE(static_cast<size_t>(padded_batch_size),
-               capture_host_kv_seq_lens_.size())
-          << "padded_batch_size exceeds capture host seq lens capacity";
-      std::copy(capture_host_kv_seq_lens_vec.begin(),
-                capture_host_kv_seq_lens_vec.begin() + padded_batch_size,
-                capture_host_kv_seq_lens_.begin());
-      std::copy(capture_host_q_seq_lens_vec.begin(),
-                capture_host_q_seq_lens_vec.begin() + padded_batch_size,
-                capture_host_q_seq_lens_.begin());
-      const int32_t* graph_kv_seq_lens_data =
-          use_mla_capture_host_lens ? capture_host_kv_seq_lens_data()
-                                    : persistent_host_kv_seq_lens_data();
-      const int32_t* graph_q_seq_lens_data =
-          use_mla_capture_host_lens ? capture_host_q_seq_lens_data()
-                                    : persistent_host_q_seq_lens_data();
-      const std::vector<int32_t>& graph_host_kv_seq_lens_vec =
-          use_mla_capture_host_lens ? capture_host_kv_seq_lens_vec
-                                    : persistent_host_kv_seq_lens_;
-      const std::vector<int32_t>& graph_host_q_seq_lens_vec =
-          use_mla_capture_host_lens ? capture_host_q_seq_lens_vec
-                                    : persistent_host_q_seq_lens_;
       graph_params->attention.host.kv_seq_lens.assign(
-          graph_host_kv_seq_lens_vec.begin(),
-          graph_host_kv_seq_lens_vec.begin() + padded_batch_size);
+          persistent_host_kv_seq_lens_.begin(),
+          persistent_host_kv_seq_lens_.begin() + padded_batch_size);
       graph_params->attention.host.q_seq_lens.assign(
-          graph_host_q_seq_lens_vec.begin(),
-          graph_host_q_seq_lens_vec.begin() + padded_batch_size);
+          persistent_host_q_seq_lens_.begin(),
+          persistent_host_q_seq_lens_.begin() + padded_batch_size);
       graph_params->attention.host.graph_kv_seq_lens_data =
-          graph_kv_seq_lens_data;
+          persistent_host_kv_seq_lens_data();
       graph_params->attention.host.graph_q_seq_lens_data =
-          graph_q_seq_lens_data;
+          persistent_host_q_seq_lens_data();
     } else {
       graph_params->attention.host.kv_seq_lens = padded_kv_seq_lens_vec;
       graph_params->attention.host.q_seq_lens = padded_q_seq_lens_vec;

@@ -24,6 +24,8 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
@@ -56,6 +58,15 @@ constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
 constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
+constexpr char kAclGraphReplayInputSyncEnv[] =
+    "XLLM_ACL_GRAPH_REPLAY_INPUT_SYNC";
+
+bool enable_acl_graph_replay_input_sync() {
+  const char* value = std::getenv(kAclGraphReplayInputSyncEnv);
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+         std::strcmp(value, "off") != 0 && std::strcmp(value, "false") != 0;
+}
+
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
                                         int64_t block_size) {
@@ -395,8 +406,6 @@ bool AclGraph::capture(CausalLM* model,
         << "ACL graph capture begin, bucket_num_tokens=" << bucket_num_tokens
         << ", actual_num_tokens=" << actual_num_tokens;
 
-    // Reuse one pool per graph slot so bucket captures can share allocator
-    // storage while the double-buffer slots remain independent.
     bool capture_started = false;
     try {
       graph_.capture_begin(
@@ -832,10 +841,8 @@ ModelOutput AclGraph::replay(CausalLM* model,
 
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
-  // Kimi MLA graph inputs are refreshed asynchronously on the worker stream,
-  // while capture can bind replay to a separate pooled stream.
   if (graph_paged_attention_tiling_data_.defined() ||
-      model->supports_mla_graph_kv_bucketing()) {
+      enable_acl_graph_replay_input_sync()) {
     make_graph_wait_for_current_stream(stream);
   }
   const bool use_static_graph_tasks =
@@ -1270,16 +1277,23 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   }
 
   // Graph doesn't exist for this bucket num_tokens, try to create it lazily
-  if (!active_slot.graph_capture_stream.has_value()) {
+  if (!use_kimi_k25_eagle3_acl_graph &&
+      !active_slot.graph_capture_stream.has_value()) {
     active_slot.graph_capture_stream =
         c10_npu::getStreamFromPool(/*isHighPriority=*/true, device_.index());
   }
-  auto graph =
-      std::make_shared<AclGraph>(active_persistent_param,
-                                 device_.index(),
-                                 active_slot.graph_capture_stream.value());
+  const c10_npu::NPUStream capture_stream =
+      use_kimi_k25_eagle3_acl_graph
+          ? c10_npu::getStreamFromPool(/*isHighPriority=*/true, device_.index())
+          : active_slot.graph_capture_stream.value();
+  auto graph = std::make_shared<AclGraph>(
+      active_persistent_param, device_.index(), capture_stream);
   VLOG(kGraphExecutorLogVerboseLevel)
       << "AclGraphExecutorImpl::run() in capture mode";
+  // The known-good Kimi path owns allocator state per graph variant.
+  const c10_npu::MempoolId_t graph_pool = use_kimi_k25_eagle3_acl_graph
+                                              ? c10_npu::MempoolId_t{0, 0}
+                                              : active_slot.graph_pool;
   const bool capture_success = graph->capture(model_,
                                               options_,
                                               tokens_tensor,
@@ -1287,7 +1301,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                               params_single,
                                               kv_caches,
                                               bucket_num_tokens,
-                                              active_slot.graph_pool);
+                                              graph_pool);
 
   CHECK(capture_success)
       << "Failed to capture ACL graph for bucket num_tokens: "
