@@ -3144,6 +3144,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   validate_input.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
+  input_params.is_spec_verify = false;
   torch::TensorOptions token_options = validate_input.token_ids.options();
   torch::TensorOptions position_options = validate_input.positions.options();
 
@@ -3168,8 +3169,9 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
       static_cast<size_t>(input.positions_host.numel())};
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
-      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
-      use_chunked_prefill_spec_verify_path();
+      !uses_embedded_eagle3_draft() &&
+      (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
+       use_chunked_prefill_spec_verify_path());
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(total_num_val_tokens);
   buf.out_positions.reserve(total_num_val_tokens);
@@ -3565,6 +3567,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
   validate_input.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
+  input_params.is_spec_verify = false;
   torch::TensorOptions token_options = validate_input.token_ids.options();
   torch::TensorOptions position_options = validate_input.positions.options();
 
@@ -3590,8 +3593,9 @@ void MTPWorkerImpl::prepare_validate_inputs(
       static_cast<size_t>(input.positions_host.numel())};
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
-      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
-      use_chunked_prefill_spec_verify_path();
+      !uses_embedded_eagle3_draft() &&
+      (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
+       use_chunked_prefill_spec_verify_path());
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(total_num_val_tokens);
   buf.out_positions.reserve(total_num_val_tokens);
@@ -3746,6 +3750,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
 
   const bool dp_enabled = parallel_args_.dp_size() > 1;
   const bool use_chunked_prefill =
+      !uses_embedded_eagle3_draft() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
