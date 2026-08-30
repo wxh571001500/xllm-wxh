@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <optional>
 
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
@@ -103,7 +104,8 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       : aux_capture_(
             context.get_model_args(),
             context.get_tensor_options(),
-            ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch()),
+            ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch(),
+            ::xllm::ExecutionConfig::get_instance().enable_graph()),
         device_(context.get_tensor_options().device()) {
     auto options = context.get_tensor_options();
     auto model_args = context.get_model_args();
@@ -141,6 +143,10 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     attn_mask_ = layer::AttentionMask(options.device(),
                                       options.dtype().toScalarType(),
                                       /*mask_value=*/mask_value);
+    if (aux_capture_.enabled() && num_speculative_tokens_ > 0) {
+      attn_mask_.warmup_free_mask(
+          num_speculative_tokens_ + 1, dtype_, device_);
+    }
     if (ModelConfig::get_instance().enable_fia_decode() &&
         num_speculative_tokens_ > 0) {
       kimi_k25_fia_decode_mask_ =
@@ -218,7 +224,10 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
       auto& layer = layers_[i];
       const int32_t layer_index = static_cast<int32_t>(i);
-      aux_capture_.capture_layer(layer_index, h, std::nullopt);
+      aux_capture_.capture_layer(layer_index,
+                                 h,
+                                 std::nullopt,
+                                 input_params.enable_graph);
       rolling_guard.before_layer(layer_index);
       layer(h,
             cos_pos,
@@ -231,7 +240,8 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       rolling_guard.after_layer(layer_index);
     }
     auto hidden_states = norm_(h, 0);
-    return aux_capture_.finalize(hidden_states);
+    return aux_capture_.finalize(
+        hidden_states, std::nullopt, input_params.enable_graph);
   }
 
   // load the weight from the checkpoint

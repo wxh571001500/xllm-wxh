@@ -1573,6 +1573,38 @@ TEST(AuxHiddenCaptureTest, PreservesConfiguredLayerOrderAndResidual) {
                            torch::full({3, 2}, 20.0f)));
 }
 
+TEST(AuxHiddenCaptureTest, ReturnsContiguousPerLayerViewsForGraphCapture) {
+  ModelArgs args;
+  args.hidden_size(2).layers_to_capture({2, 0});
+  AuxHiddenCapture capture(
+      args,
+      torch::TensorOptions().dtype(torch::kFloat32),
+      4,
+      /*enable_per_layer_buffer=*/true);
+
+  capture.capture_layer(/*layer_idx=*/0,
+                        torch::full({3, 2}, 10.0f),
+                        std::nullopt,
+                        /*use_per_layer_buffer=*/true);
+  capture.capture_layer(/*layer_idx=*/2,
+                        torch::full({3, 2}, 20.0f),
+                        std::nullopt,
+                        /*use_per_layer_buffer=*/true);
+  const ModelOutput output = capture.finalize(
+      torch::zeros({3, 2}),
+      std::nullopt,
+      /*use_per_layer_buffer=*/true);
+
+  EXPECT_FALSE(output.aux_hidden_states.defined());
+  ASSERT_EQ(output.aux_hidden_states_list.size(), 2);
+  EXPECT_TRUE(output.aux_hidden_states_list[0].is_contiguous());
+  EXPECT_TRUE(output.aux_hidden_states_list[1].is_contiguous());
+  EXPECT_TRUE(torch::equal(output.aux_hidden_states_list[0],
+                           torch::full({3, 2}, 20.0f)));
+  EXPECT_TRUE(torch::equal(output.aux_hidden_states_list[1],
+                           torch::full({3, 2}, 10.0f)));
+}
+
 TEST(DSparkWorkerInputTest, InvalidatesTargetAttentionMetadataOnly) {
   ModelInputParams params;
   params.attn_metadata = std::make_shared<layer::AttentionMetadata>();

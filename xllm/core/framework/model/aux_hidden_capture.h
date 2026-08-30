@@ -29,15 +29,17 @@ limitations under the License.
 
 namespace xllm {
 
-// Buffers the residual stream of selected layers into a
-// [tokens, hidden * num_captured] tensor for a spec draft (Eagle3,
-// DFlash/DSpark) to consume. A non-empty layers_to_capture is the sole capture
-// signal.
+// Buffers the residual stream of selected layers for a spec draft (Eagle3,
+// DFlash/DSpark) to consume. Eager execution uses a combined
+// [tokens, hidden * num_captured] buffer. Graph execution can use a separate
+// [num_captured, tokens, hidden] buffer to keep each captured layer contiguous.
+// A non-empty layers_to_capture is the sole capture signal.
 class AuxHiddenCapture final {
  public:
   AuxHiddenCapture(const ModelArgs& model_args,
                    const torch::TensorOptions& options,
-                   int64_t max_tokens_per_batch) {
+                   int64_t max_tokens_per_batch,
+                   bool enable_per_layer_buffer = false) {
     if (model_args.layers_to_capture().empty()) {
       return;
     }
@@ -46,13 +48,21 @@ class AuxHiddenCapture final {
         static_cast<int64_t>(layers_to_capture_.size());
     const int64_t aux_dim = model_args.hidden_size() * num_captured;
     buffer_ = torch::empty({max_tokens_per_batch, aux_dim}, options);
+    if (enable_per_layer_buffer) {
+      per_layer_buffer_ =
+          torch::empty({num_captured,
+                        max_tokens_per_batch,
+                        model_args.hidden_size()},
+                       options);
+    }
   }
 
   // Pass residual when the caller keeps `h` and residual as separate tensors
   // (intralayer add-norm); pass std::nullopt when `h` already carries the sum.
   void capture_layer(int32_t layer_idx,
                      const torch::Tensor& h,
-                     const std::optional<torch::Tensor>& residual) {
+                     const std::optional<torch::Tensor>& residual,
+                     bool use_per_layer_buffer = false) {
     const auto it = std::find(
         layers_to_capture_.begin(), layers_to_capture_.end(), layer_idx);
     if (it == layers_to_capture_.end()) {
@@ -62,9 +72,18 @@ class AuxHiddenCapture final {
     const int64_t hidden_size = h.size(-1);
     const int64_t slot_idx =
         static_cast<int64_t>(std::distance(layers_to_capture_.begin(), it));
-    torch::Tensor slot =
-        buffer_.slice(0, 0, num_tokens)
-            .slice(1, slot_idx * hidden_size, (slot_idx + 1) * hidden_size);
+    torch::Tensor slot;
+    if (use_per_layer_buffer) {
+      CHECK(per_layer_buffer_.defined())
+          << "per-layer aux hidden-state buffer is not allocated";
+      slot = per_layer_buffer_.select(/*dim=*/0, slot_idx)
+                 .slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens);
+    } else {
+      slot = buffer_.slice(0, 0, num_tokens)
+                 .slice(1,
+                        slot_idx * hidden_size,
+                        (slot_idx + 1) * hidden_size);
+    }
     torch::Tensor h_2d = h.reshape({num_tokens, hidden_size});
     if (residual.has_value()) {
       torch::add_out(
@@ -85,9 +104,26 @@ class AuxHiddenCapture final {
 
   ModelOutput finalize(
       const torch::Tensor& hidden_states,
-      const std::optional<torch::Tensor>& residual = std::nullopt) const {
+      const std::optional<torch::Tensor>& residual = std::nullopt,
+      bool use_per_layer_buffer = false) const {
     ModelOutput output(hidden_states, residual);
-    if (enabled()) {
+    if (!enabled()) {
+      return output;
+    }
+    if (use_per_layer_buffer) {
+      CHECK(per_layer_buffer_.defined())
+          << "per-layer aux hidden-state buffer is not allocated";
+      output.aux_hidden_states_list.reserve(layers_to_capture_.size());
+      for (int64_t slot_idx = 0;
+           slot_idx < static_cast<int64_t>(layers_to_capture_.size());
+           ++slot_idx) {
+        output.aux_hidden_states_list.push_back(
+            per_layer_buffer_.select(/*dim=*/0, slot_idx)
+                .slice(/*dim=*/0,
+                       /*start=*/0,
+                       /*end=*/hidden_states.size(0)));
+      }
+    } else {
       output.aux_hidden_states = buffer_.slice(0, 0, hidden_states.size(0));
     }
     return output;
@@ -97,6 +133,7 @@ class AuxHiddenCapture final {
   // Layer ids to capture; non-empty iff capture is enabled.
   std::vector<int32_t> layers_to_capture_;
   torch::Tensor buffer_;
+  torch::Tensor per_layer_buffer_;
 };
 
 }  // namespace xllm
