@@ -1282,24 +1282,30 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     }
   }
 
-  // Graph doesn't exist for this bucket num_tokens, try to create it lazily
-  if (!use_kimi_k25_eagle3_acl_graph &&
+  // MLA/FIA graphs keep host-side sequence metadata and backend workspace
+  // state tied to their capture. Give each such graph its own stream and
+  // allocator pool so another KV bucket cannot overwrite that state.
+  const bool use_mla_graph_isolation =
+      model_->supports_mla_graph_kv_bucketing();
+  // Graph doesn't exist for this bucket num_tokens, try to create it lazily.
+  if (!use_kimi_k25_eagle3_acl_graph && !use_mla_graph_isolation &&
       !active_slot.graph_capture_stream.has_value()) {
     active_slot.graph_capture_stream =
         c10_npu::getStreamFromPool(/*isHighPriority=*/true, device_.index());
   }
   const c10_npu::NPUStream capture_stream =
-      use_kimi_k25_eagle3_acl_graph
+      use_kimi_k25_eagle3_acl_graph || use_mla_graph_isolation
           ? c10_npu::getStreamFromPool(/*isHighPriority=*/true, device_.index())
           : active_slot.graph_capture_stream.value();
   auto graph = std::make_shared<AclGraph>(
       active_persistent_param, device_.index(), capture_stream);
   VLOG(kGraphExecutorLogVerboseLevel)
       << "AclGraphExecutorImpl::run() in capture mode";
-  // The known-good Kimi path owns allocator state per graph variant.
-  const c10_npu::MempoolId_t graph_pool = use_kimi_k25_eagle3_acl_graph
-                                              ? c10_npu::MempoolId_t{0, 0}
-                                              : active_slot.graph_pool;
+  // Isolated graph variants do not share allocator state.
+  const c10_npu::MempoolId_t graph_pool =
+      (use_kimi_k25_eagle3_acl_graph || use_mla_graph_isolation)
+          ? c10_npu::MempoolId_t{0, 0}
+          : active_slot.graph_pool;
   const bool capture_success = graph->capture(model_,
                                               options_,
                                               tokens_tensor,
