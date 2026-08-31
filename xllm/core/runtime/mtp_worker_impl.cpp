@@ -919,7 +919,7 @@ int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
 }
 
 bool MTPWorkerImpl::should_use_separate_draft_kv_cache_shape() const {
-  return uses_embedded_eagle3_draft();
+  return uses_embedded_eagle3_draft() || is_kimi_k25_eagle3_pair();
 }
 
 KVCacheShape MTPWorkerImpl::get_draft_kv_cache_shape(
@@ -972,6 +972,17 @@ bool MTPWorkerImpl::uses_embedded_eagle3_draft() const {
                                             impl_->context_.get_model_args());
 }
 
+bool MTPWorkerImpl::is_kimi_k25_eagle3_pair() const {
+  if (impl_ == nullptr || draft_impl_ == nullptr ||
+      impl_->get_status() == WorkerImpl::Status::UNINITIALIZED ||
+      draft_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
+    return false;
+  }
+  return impl_->context_.get_model_args().model_type() == "kimi_k25" &&
+         draft_impl_->context_.get_model_args().model_type() ==
+             "kimi_k25_eagle3";
+}
+
 bool MTPWorkerImpl::positions_are_decoupled_from_kv_length() const {
   if (impl_ == nullptr) {
     return false;
@@ -986,7 +997,21 @@ bool MTPWorkerImpl::requires_probability_based_validation() const {
 }
 
 bool MTPWorkerImpl::uses_step_major_validate_layout() const {
-  return uses_embedded_eagle3_draft();
+  // Kimi's ATB FIA speculative kernel consumes step-major rows and performs
+  // the step-major -> request-major transpose internally. This applies to
+  // both embedded and external Eagle3 drafts.
+  return uses_embedded_eagle3_draft() ||
+         (is_kimi_k25_eagle3_pair() &&
+          !use_chunked_prefill_spec_verify_path());
+}
+
+void MTPWorkerImpl::synchronize_kimi_eagle3_forward() {
+#if defined(USE_NPU)
+  if (is_kimi_k25_eagle3_pair()) {
+    const int32_t ret = compute_stream_->synchronize();
+    CHECK_EQ(ret, 0) << "failed to synchronize Kimi K2.5 Eagle3 forward";
+  }
+#endif
 }
 
 void MTPWorkerImpl::synchronize_embedded_eagle3_forward() {
@@ -1006,6 +1031,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
   std::optional<ForwardOutput> output = run_worker_no_sync_impl(
       worker, input, *prepare_stream_, *compute_stream_, processed_input);
   synchronize_embedded_eagle3_forward();
+  synchronize_kimi_eagle3_forward();
   if (uses_embedded_eagle3_draft()) {
     clear_mla_prefixcache_workspace(processed_input);
     if (output.has_value()) {
@@ -1034,13 +1060,12 @@ bool MTPWorkerImpl::supports_explicit_spec_verify_replay_update() const {
 }
 
 bool MTPWorkerImpl::requires_uniform_validate_width() const {
-  // Currently only Qwen3.5's GDN spec-verify kernel requires uniform width;
-  // this happens to coincide with the QWEN3_5_EXPANDED_VERIFY mode used by
-  // supports_explicit_spec_verify_replay_update, but the two are semantically
-  // distinct capabilities (graph-update capability vs. per-seq varlen kernel
-  // support).
+  // Qwen3.5's GDN spec-verify kernel and Kimi's FIA speculative decode both
+  // require a fixed validation width. This is distinct from the graph-update
+  // capability represented by supports_explicit_spec_verify_replay_update().
   return target_spec_verify_mode_ ==
-         mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
+             mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY ||
+         is_kimi_k25_eagle3_pair();
 }
 
 bool MTPWorkerImpl::should_use_explicit_spec_verify_replay_update(
@@ -1316,6 +1341,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
                                                          *compute_stream_,
                                                          draft_extend_prepared)
                                      .value());
+      synchronize_kimi_eagle3_forward();
     }
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
@@ -1803,6 +1829,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                                    *compute_stream_,
                                                    *compute_stream_,
                                                    draft_prepared[draft_idx]);
+        synchronize_kimi_eagle3_forward();
       }
     }
 
@@ -2333,6 +2360,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                                             target_prepared)
                         .value();
   }
+  synchronize_kimi_eagle3_forward();
   const double target_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               target_latency_ms / 1000.0);
@@ -3169,7 +3197,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
       static_cast<size_t>(input.positions_host.numel())};
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
-      !uses_embedded_eagle3_draft() &&
+      !uses_embedded_eagle3_draft() && !is_kimi_k25_eagle3_pair() &&
       (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
        use_chunked_prefill_spec_verify_path());
   specBuilder::DecodeBuildBuffers buf;
@@ -3593,7 +3621,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
       static_cast<size_t>(input.positions_host.numel())};
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
-      !uses_embedded_eagle3_draft() &&
+      !uses_embedded_eagle3_draft() && !is_kimi_k25_eagle3_pair() &&
       (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
        use_chunked_prefill_spec_verify_path());
   specBuilder::DecodeBuildBuffers buf;
@@ -3750,7 +3778,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
 
   const bool dp_enabled = parallel_args_.dp_size() > 1;
   const bool use_chunked_prefill =
-      !uses_embedded_eagle3_draft() &&
+      !uses_embedded_eagle3_draft() && !is_kimi_k25_eagle3_pair() &&
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
@@ -4206,8 +4234,7 @@ SampleOutput MTPWorkerImpl::validate(
               .to(torch::kBool)
               .to(draft_token_ids.device());
       torch::Tensor target_sampled_tokens =
-          target_output.sample_output.next_tokens
-              .view({batch_size, num_val_tokens})
+          target_next_tokens.view({batch_size, num_val_tokens})
               .slice(/*dim=*/1, /*start=*/0, /*end=*/num_val_tokens - 1);
       validation_draft_token_ids =
           torch::where(invalid_mask,
@@ -4228,8 +4255,7 @@ SampleOutput MTPWorkerImpl::validate(
 
     if (!invalid_draft.empty()) {
       torch::Tensor target_sampled_tokens =
-          target_output.sample_output.next_tokens.view(
-              {batch_size, num_val_tokens});
+          target_next_tokens.view({batch_size, num_val_tokens});
       for (int32_t seq_id = 0; seq_id < batch_size; ++seq_id) {
         int32_t first_invalid = -1;
         for (int32_t draft_idx = 0; draft_idx < num_val_tokens - 1;
@@ -4275,7 +4301,7 @@ SampleOutput MTPWorkerImpl::validate(
                                  num_val_tokens,
                                  pruning_masks);
     apply_pruned_prefix_lengths(sample_output,
-                                target_output.sample_output.next_tokens,
+                                target_next_tokens,
                                 num_speculative_tokens,
                                 pruning_masks);
   }
