@@ -841,7 +841,13 @@ ModelOutput AclGraph::replay(CausalLM* model,
 
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
+  // FIA/MLA graph setup consumes hostData-backed sequence-length arrays.
+  // Those arrays are refreshed on the worker stream before replay, so every
+  // MLA-bucketed graph must wait for that producer stream just like the
+  // original Kimi full path did. The environment flag remains useful for
+  // non-MLA graphs whose callers opt into the same synchronization.
   if (graph_paged_attention_tiling_data_.defined() ||
+      model->supports_mla_graph_kv_bucketing() ||
       enable_acl_graph_replay_input_sync()) {
     make_graph_wait_for_current_stream(stream);
   }
