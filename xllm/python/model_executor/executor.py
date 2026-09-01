@@ -46,8 +46,25 @@ def _create_attention_backend(
     first_attention: AttentionLayerSpec,
     device: torch.device,
     dtype: torch.dtype,
-    attention_kinds: set[str] | None = None,
+    attention_kinds: set[str] | dict | None = None,
 ) -> AttentionBackend:
+    config = attention_kinds if isinstance(attention_kinds, dict) else {}
+    if config.get("model_type") == "deepseek_v4" and _is_npu_device(device):
+        from xllm.python.attention.dsa_attention import DsaAttentionBackend
+
+        return DsaAttentionBackend(
+            compress_ratios=list(config.get("compress_ratios", [])),
+            window_size=int(config.get("window_size", 128)),
+            n_layers=int(config.get("n_layers", config.get("num_hidden_layers", 0))),
+            num_heads=first_attention.num_heads,
+            attn_head_dim=first_attention.head_dim,
+            index_topk=int(config.get("index_topk", 512)),
+            index_n_heads=int(config.get("index_n_heads", 64)),
+            index_head_dim=int(config.get("index_head_dim", 128)),
+            rope_head_dim=int(config.get("qk_rope_head_dim", 64)),
+            device=device,
+            dtype=dtype,
+        )
     if _is_npu_device(device):
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
@@ -154,7 +171,7 @@ class ModelExecutor:
             backend_spec,
             device,
             first_parameter.dtype,
-            {spec.kind for spec in layer_specs},
+            config,
         )
 
         execution_model = model.model

@@ -30,6 +30,7 @@ from xllm.python import ops
 from xllm.python.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
+    LayerCache,
     KVCache,
     MlaIndexContext,
     MlaUnabsorbedPrefill,
@@ -127,12 +128,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
         return 1 if cache is None else cache.shape[1]
 
     def _first_paged_cache(self) -> torch.Tensor | None:
-        for key_cache, _value_cache, _scale_cache in self._kv_caches:
+        for cache in self._kv_caches:
+            key_cache = cache.key if isinstance(cache, LayerCache) else cache[0]
             if key_cache is not None:
                 return key_cache
         return None
 
-    def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
+    def bind_kv_caches(self, kv_caches: list[KVCache | LayerCache]) -> None:
         self._kv_caches = kv_caches
 
     def prepare(
@@ -272,7 +274,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
         assert metadata is not None
 
         layer_id = layer.layer_id
-        k_cache, v_cache, _ = self._kv_caches[layer_id]
+        cache = self._kv_caches[layer_id]
+        k_cache = cache.key if isinstance(cache, LayerCache) else cache[0]
+        v_cache = cache.value if isinstance(cache, LayerCache) else cache[1]
         num_tokens = q.shape[0]
 
         # Write KV to paged cache (kernel expects [T, kv_heads, head_dim]).
@@ -302,7 +306,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
         metadata = self._metadata
         assert metadata is not None, "execute_mla called before prepare()"
         layer_id = layer.layer_id
-        nope_cache, rope_cache, _ = self._kv_caches[layer_id]
+        cache = self._kv_caches[layer_id]
+        nope_cache = cache.key if isinstance(cache, LayerCache) else cache[0]
+        rope_cache = cache.value if isinstance(cache, LayerCache) else cache[1]
 
         torch_npu._npu_reshape_and_cache(
             key=k_latent_3d,
@@ -352,7 +358,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
     def mla_index_context(self, layer: Attention) -> MlaIndexContext:
         metadata = self._metadata
         assert metadata is not None, "mla_index_context called before prepare()"
-        _, _, index_cache = self._kv_caches[layer.layer_id]
+        cache = self._kv_caches[layer.layer_id]
+        index_cache = cache.index if isinstance(cache, LayerCache) else cache[2]
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=metadata.slot_mapping,

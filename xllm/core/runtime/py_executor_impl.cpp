@@ -27,6 +27,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
+#include "core/runtime/py_attention_metadata.h"
 #include "models/py_model_bridge.h"
 
 namespace py = pybind11;
@@ -34,6 +35,17 @@ namespace py = pybind11;
 namespace xllm {
 
 namespace {
+
+py::object optional_tensor(const torch::Tensor& tensor) {
+  return tensor.defined() ? py::cast(tensor) : py::none();
+}
+
+py::object optional_tensor(const std::optional<torch::Tensor>& tensor) {
+  if (!tensor.has_value() || !tensor->defined()) {
+    return py::none();
+  }
+  return py::cast(*tensor);
+}
 
 class AttentionMetadataView final {
  public:
@@ -212,7 +224,8 @@ class KimiK3KDAMetadataView final {
 }  // namespace
 
 PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
-  py::class_<AttentionMetadataView>(m, "AttentionMetadataView")
+  register_attention_metadata_views(m);
+  py::class_<AttentionMetadataView>(m, "LegacyAttentionMetadataView")
       .def_property_readonly("slot_mapping",
                              &AttentionMetadataView::slot_mapping)
       .def_property_readonly("paged_kv_indptr",
@@ -311,7 +324,17 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
     py::list kv_caches_py;
     for (auto& kv : kv_caches) {
       kv_caches_py.append(py::make_tuple(
-          kv.get_k_cache(), kv.get_v_cache(), kv.get_index_cache()));
+          optional_tensor(kv.get_k_cache()),
+          optional_tensor(kv.get_v_cache()),
+          optional_tensor(kv.get_index_cache()),
+          optional_tensor(kv.get_conv_cache()),
+          optional_tensor(kv.get_ssm_cache()),
+          optional_tensor(kv.get_swa_cache()),
+          optional_tensor(kv.get_compress_kv_state()),
+          optional_tensor(kv.get_compress_score_state()),
+          optional_tensor(kv.get_compress_index_kv_state()),
+          optional_tensor(kv.get_compress_index_score_state()),
+          optional_tensor(kv.get_indexer_cache_scale())));
     }
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
 
@@ -338,7 +361,7 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         << "KV cache layer count changed after initial bind";
   }
 
-  py::object py_metadata = py::cast(AttentionMetadataView(attn_metadata));
+  py::object py_metadata = py::cast(PyAttentionMetadataView(attn_metadata, params));
 
   // Per-step KDA scheduling info (linear-state slots, query_start_loc,
   // has_initial_state, decode/prefill split). None for non-KDA models.
