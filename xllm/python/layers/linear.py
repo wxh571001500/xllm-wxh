@@ -329,6 +329,15 @@ class RowParallelLinear(_LinearBase):
         self.reduce_results = reduce_results
         self._weight_is_transposed = False
 
+    def process_weights_after_loading(self) -> None:
+        """Prepare the weight layout selected by the active device backend.
+
+        Compatibility shim for existing model code (qwen3, deepseek_v32/v4, glm5_2).
+        Calls both quantization finalization and NPU format conversion.
+        """
+        self.finish_weight_loading()
+        self.format_npu_weight_()
+
     def format_npu_weight_(self) -> None:
         """Store the weight as ``[K, N]`` FRACTAL_NZ for non-transposed matmul."""
         if self.quant_method is not None:

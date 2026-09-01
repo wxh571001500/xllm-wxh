@@ -18,10 +18,8 @@ from __future__ import annotations
 
 import itertools
 import math
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -32,136 +30,10 @@ from xllm.python import ops
 from xllm.python.layers import ColumnParallelLinear, RowParallelLinear
 
 
-_DUMP_CALL_INDEX = 0
-
-
-def _dump_enabled() -> bool:
-    return os.getenv("KIMI_K3_VIT_DUMP", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-class _KimiK3VitDump:
-    def __init__(self, rank: int, world_size: int) -> None:
-        global _DUMP_CALL_INDEX
-
-        self.enabled = _dump_enabled()
-        self.rank = rank
-        self.world_size = world_size
-        self.call_index = _DUMP_CALL_INDEX
-        _DUMP_CALL_INDEX += 1
-        self._hooks: list[Any] = []
-        self._payload: dict[str, Any] = {
-            "framework": "xllm",
-            "rank": rank,
-            "world_size": world_size,
-            "call_index": self.call_index,
-            "tensors": {},
-        }
-
-    def record(self, name: str, tensor: torch.Tensor, full: bool = False) -> None:
-        if not self.enabled:
-            return
-        detached = tensor.detach()
-        row_count = detached.shape[0] if detached.ndim > 0 else 1
-        if full or row_count <= 3:
-            row_indices = torch.arange(row_count, dtype=torch.int64)
-            values = detached
-        else:
-            indices = sorted({0, row_count // 2, row_count - 1})
-            device_indices = torch.tensor(
-                indices,
-                dtype=torch.int64,
-                device=detached.device,
-            )
-            row_indices = torch.tensor(indices, dtype=torch.int64)
-            values = detached.index_select(0, device_indices)
-        if values.is_floating_point():
-            values = values.float()
-        self._payload["tensors"][name] = {
-            "shape": list(detached.shape),
-            "dtype": str(detached.dtype),
-            "row_indices": row_indices,
-            "values": values.cpu(),
-        }
-
-    def install_hooks(self, vision_tower: nn.Module) -> None:
-        if not self.enabled:
-            return
-
-        def _register(module: nn.Module, name: str) -> None:
-            def _hook(
-                unused_module: nn.Module,
-                unused_inputs: tuple[Any, ...],
-                output: torch.Tensor,
-            ) -> None:
-                del unused_module, unused_inputs
-                self.record(name, output)
-
-            self._hooks.append(module.register_forward_hook(_hook))
-
-        def _register_input(module: nn.Module, name: str) -> None:
-            def _pre_hook(
-                unused_module: nn.Module,
-                inputs: tuple[Any, ...],
-            ) -> None:
-                del unused_module
-                self.record(name, inputs[0])
-
-            self._hooks.append(module.register_forward_pre_hook(_pre_hook))
-
-        _register(vision_tower.patch_embed, "patch_embed")
-        for layer_index, block in enumerate(vision_tower.encoder.blocks):
-            _register(block, f"encoder.block.{layer_index}")
-        first_block = vision_tower.encoder.blocks[0]
-        self.record("encoder.block.0.weight.norm0", first_block.norm0.weight)
-        self.record("encoder.block.0.weight.qkv", first_block.wqkv.weight)
-        self.record("encoder.block.0.weight.wo", first_block.wo.weight)
-        self.record("encoder.block.0.weight.norm1", first_block.norm1.weight)
-        self.record("encoder.block.0.weight.fc0", first_block.mlp.fc0.weight)
-        self.record("encoder.block.0.weight.fc1", first_block.mlp.fc1.weight)
-        _register(first_block.norm0, "encoder.block.0.norm0")
-        _register(first_block.wqkv, "encoder.block.0.qkv")
-        _register_input(first_block.wo, "encoder.block.0.attention_output")
-        _register(first_block.wo, "encoder.block.0.wo")
-        _register(first_block.norm1, "encoder.block.0.norm1")
-        _register(first_block.mlp.fc0, "encoder.block.0.fc0")
-        _register_input(first_block.mlp.fc1, "encoder.block.0.activation")
-        _register(first_block.mlp.fc1, "encoder.block.0.fc1")
-        _register(vision_tower.encoder.final_layernorm, "encoder.final_layernorm")
-
-    def remove_hooks(self) -> None:
-        for hook in self._hooks:
-            hook.remove()
-        self._hooks.clear()
-
-    def save(self) -> None:
-        if not self.enabled:
-            return
-        dump_dir = Path(
-            os.getenv(
-                "KIMI_K3_VIT_DUMP_DIR",
-                "/export/home/wangxiaohan17/wangxiaohan/xllm-k3-dump",
-            )
-        )
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        dump_path = dump_dir / (
-            f"call_{self.call_index:04d}_rank_{self.rank:03d}.pt"
-        )
-        torch.save(self._payload, dump_path)
-
-
 def _grid_thw_list(
     grid_thws: torch.Tensor | Sequence[Sequence[int]],
 ) -> list[tuple[int, int, int]]:
-    values = (
-        grid_thws.detach().cpu().tolist()
-        if isinstance(grid_thws, torch.Tensor)
-        else grid_thws
-    )
+    values = grid_thws.detach().cpu().tolist() if isinstance(grid_thws, torch.Tensor) else grid_thws
     grids: list[tuple[int, int, int]] = []
     for grid in values:
         if len(grid) != 3:
@@ -184,12 +56,8 @@ def _apply_rope(
         raise ValueError("Kimi K3 RoPE head dimension must be even")
 
     frequency_pairs = frequencies.unsqueeze(-2)
-    query_complex = torch.view_as_complex(
-        query.float().reshape(*query.shape[:-1], -1, 2)
-    )
-    key_complex = torch.view_as_complex(
-        key.float().reshape(*key.shape[:-1], -1, 2)
-    )
+    query_complex = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
+    key_complex = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
     query_out = torch.view_as_real(query_complex * frequency_pairs).flatten(-2)
     key_out = torch.view_as_real(key_complex * frequency_pairs).flatten(-2)
     return query_out.to(query.dtype), key_out.to(key.dtype)
@@ -227,15 +95,13 @@ class KimiK3VisionConfig:
     encoder_dp_rank: int = 0
 
     @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> "KimiK3VisionConfig":
+    def from_dict(cls, config: dict[str, Any]) -> KimiK3VisionConfig:
         raw = config.get("vision_config", config)
         if not isinstance(raw, dict):
             raise TypeError("Kimi K3 vision_config must be a dictionary")
 
         merge_kernel_size = raw.get("merge_kernel_size", (2, 2))
-        if not isinstance(merge_kernel_size, Sequence) or isinstance(
-            merge_kernel_size, str
-        ):
+        if not isinstance(merge_kernel_size, Sequence) or isinstance(merge_kernel_size, str):
             raise TypeError("Kimi K3 merge_kernel_size must be a sequence")
         if len(merge_kernel_size) != 2:
             raise ValueError("Kimi K3 merge_kernel_size must contain two values")
@@ -250,18 +116,14 @@ class KimiK3VisionConfig:
             patch_size=int(raw.get("patch_size", 14)),
             in_channels=int(raw.get("in_chans", raw.get("in_channels", 3))),
             hidden_size=hidden_size,
-            intermediate_size=int(
-                raw.get("vt_intermediate_size", raw.get("intermediate_size", 4096))
-            ),
+            intermediate_size=int(raw.get("vt_intermediate_size", raw.get("intermediate_size", 4096))),
             num_attention_heads=int(
                 raw.get(
                     "vt_num_attention_heads",
                     raw.get("num_attention_heads", 12),
                 )
             ),
-            num_hidden_layers=int(
-                raw.get("vt_num_hidden_layers", raw.get("num_hidden_layers", 27))
-            ),
+            num_hidden_layers=int(raw.get("vt_num_hidden_layers", raw.get("num_hidden_layers", 27))),
             qkv_hidden_size=int(raw.get("qkv_hidden_size", 1536)),
             init_pos_emb_height=int(raw.get("init_pos_emb_height", 64)),
             init_pos_emb_width=int(raw.get("init_pos_emb_width", 64)),
@@ -278,12 +140,8 @@ class KimiK3VisionConfig:
                 int(merge_kernel_size[1]),
             ),
             merge_type=str(raw.get("merge_type", "sd2_tpool")),
-            mm_hidden_size=(
-                hidden_size if mm_hidden_size is None else int(mm_hidden_size)
-            ),
-            text_hidden_size=int(
-                raw.get("text_hidden_size", text_config.get("hidden_size", 7168))
-            ),
+            mm_hidden_size=(hidden_size if mm_hidden_size is None else int(mm_hidden_size)),
+            text_hidden_size=int(raw.get("text_hidden_size", text_config.get("hidden_size", 7168))),
             mm_projector_type=str(raw.get("mm_projector_type", "patchmergerv2")),
             projector_hidden_act=str(raw.get("projector_hidden_act", "gelu")),
             projector_ln_eps=float(raw.get("projector_ln_eps", 1e-5)),
@@ -302,18 +160,18 @@ class KimiK3VisionConfig:
             raise ValueError("Kimi K3 vision projection sizes must be positive")
         if self.num_hidden_layers <= 0:
             raise ValueError("Kimi K3 vision layer count must be positive")
-        if min(
-            self.init_pos_emb_height,
-            self.init_pos_emb_width,
-            self.init_pos_emb_time,
-        ) <= 0:
+        if (
+            min(
+                self.init_pos_emb_height,
+                self.init_pos_emb_width,
+                self.init_pos_emb_time,
+            )
+            <= 0
+        ):
             raise ValueError("Kimi K3 initial position dimensions must be positive")
         if self.tp_size <= 0 or not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("Kimi K3 TP rank and size are invalid")
-        if (
-            self.encoder_dp_size <= 0
-            or not 0 <= self.encoder_dp_rank < self.encoder_dp_size
-        ):
+        if self.encoder_dp_size <= 0 or not 0 <= self.encoder_dp_rank < self.encoder_dp_size:
             raise ValueError("Kimi K3 encoder DP rank and size are invalid")
         if self.num_attention_heads <= 0:
             raise ValueError("Kimi K3 vision head count must be positive")
@@ -332,27 +190,19 @@ class KimiK3VisionConfig:
         if self.mlp_type != "mlp2":
             raise ValueError(f"Unsupported Kimi K3 MLP: {self.mlp_type}")
         if self.pos_emb_type != "divided_fixed":
-            raise ValueError(
-                f"Unsupported Kimi K3 position embedding: {self.pos_emb_type}"
-            )
+            raise ValueError(f"Unsupported Kimi K3 position embedding: {self.pos_emb_type}")
         if self.merge_type != "sd2_tpool":
             raise ValueError(f"Unsupported Kimi K3 merge type: {self.merge_type}")
         if self.mm_projector_type != "patchmergerv2":
-            raise ValueError(
-                f"Unsupported Kimi K3 projector: {self.mm_projector_type}"
-            )
+            raise ValueError(f"Unsupported Kimi K3 projector: {self.mm_projector_type}")
         if self.projector_hidden_act != "gelu":
-            raise ValueError(
-                f"Unsupported Kimi K3 projector activation: {self.projector_hidden_act}"
-            )
+            raise ValueError(f"Unsupported Kimi K3 projector activation: {self.projector_hidden_act}")
         if any(size <= 0 for size in self.merge_kernel_size):
             raise ValueError("Kimi K3 merge dimensions must be positive")
         if self.mm_hidden_size != self.hidden_size:
             raise ValueError("Kimi K3 projector input must match vision hidden size")
         if self.text_hidden_size <= 0 or self.projector_ln_eps <= 0:
-            raise ValueError(
-                "Kimi K3 projector dimensions and epsilon must be positive"
-            )
+            raise ValueError("Kimi K3 projector dimensions and epsilon must be positive")
 
 
 class KimiK3VisionPosEmbDivided(nn.Module):
@@ -367,9 +217,7 @@ class KimiK3VisionPosEmbDivided(nn.Module):
         self.width = config.init_pos_emb_width
         self.num_frames = config.init_pos_emb_time
         self.dim = config.hidden_size
-        self.weight = nn.Parameter(
-            torch.empty(self.height, self.width, self.dim, dtype=dtype, device=device)
-        )
+        self.weight = nn.Parameter(torch.empty(self.height, self.width, self.dim, dtype=dtype, device=device))
         nn.init.normal_(self.weight)
 
         float_options = {"dtype": torch.float32, "device": device}
@@ -392,18 +240,21 @@ class KimiK3VisionPosEmbDivided(nn.Module):
         position_embeddings: list[torch.Tensor] = []
         for time, height, width in _grid_thw_list(grid_thws):
             if time > self.num_frames:
-                raise ValueError(
-                    f"Kimi K3 grid time {time} exceeds {self.num_frames}"
-                )
+                raise ValueError(f"Kimi K3 grid time {time} exceeds {self.num_frames}")
             if height == self.height and width == self.width:
                 spatial = self.weight.flatten(0, 1)
             else:
-                spatial = F.interpolate(
-                    self.weight.permute(2, 0, 1).unsqueeze(0),
-                    size=(height, width),
-                    mode="bicubic",
-                    align_corners=False,
-                ).squeeze(0).permute(1, 2, 0).flatten(0, 1)
+                spatial = (
+                    F.interpolate(
+                        self.weight.permute(2, 0, 1).unsqueeze(0),
+                        size=(height, width),
+                        mode="bicubic",
+                        align_corners=False,
+                    )
+                    .squeeze(0)
+                    .permute(1, 2, 0)
+                    .flatten(0, 1)
+                )
             if time > 1:
                 spatial = spatial.unsqueeze(0).repeat(time, 1, 1)
                 spatial = spatial + self.time_weight[:time]
@@ -413,10 +264,7 @@ class KimiK3VisionPosEmbDivided(nn.Module):
             return hidden_states
         positions = torch.cat(position_embeddings, dim=0).to(hidden_states)
         if positions.shape != hidden_states.shape:
-            raise ValueError(
-                f"Kimi K3 positions {positions.shape} do not match "
-                f"patches {hidden_states.shape}"
-            )
+            raise ValueError(f"Kimi K3 positions {positions.shape} do not match patches {hidden_states.shape}")
         return hidden_states + positions
 
 
@@ -495,12 +343,9 @@ class KimiK3VisionRotaryEmbedding(nn.Module):
         for time, height, width in _grid_thw_list(grid_thws):
             if height > self.max_height or width > self.max_width:
                 raise ValueError(
-                    f"Kimi K3 grid {(height, width)} exceeds RoPE cache "
-                    f"{(self.max_height, self.max_width)}"
+                    f"Kimi K3 grid {(height, width)} exceeds RoPE cache {(self.max_height, self.max_width)}"
                 )
-            frequencies = self._frequencies[:height, :width].reshape(
-                -1, self.dim // 2
-            )
+            frequencies = self._frequencies[:height, :width].reshape(-1, self.dim // 2)
             outputs.append(frequencies.repeat(time, 1))
         if not outputs:
             return torch.empty(0, self.dim // 2, dtype=torch.complex64, device=device)
@@ -614,10 +459,7 @@ class KimiK3VisionEncoder(nn.Module):
         head_dim = config.qkv_hidden_size // config.num_attention_heads
         self.rope_2d = KimiK3VisionRotaryEmbedding(head_dim)
         self.blocks = nn.ModuleList(
-            [
-                KimiK3VisionEncoderLayer(config, dtype, device)
-                for _ in range(config.num_hidden_layers)
-            ]
+            [KimiK3VisionEncoderLayer(config, dtype, device) for _ in range(config.num_hidden_layers)]
         )
         self.final_layernorm = nn.RMSNorm(
             config.hidden_size,
@@ -651,10 +493,7 @@ def tpool_patch_merger(
     offset = 0
     for time, height, width in _grid_thw_list(grid_thws):
         if height % merge_height != 0 or width % merge_width != 0:
-            raise ValueError(
-                f"Kimi K3 grid {(height, width)} is not divisible by "
-                f"merge kernel {merge_kernel_size}"
-            )
+            raise ValueError(f"Kimi K3 grid {(height, width)} is not divisible by merge kernel {merge_kernel_size}")
         length = time * height * width
         sequence = hidden_states[offset : offset + length].reshape(
             time,
@@ -674,9 +513,7 @@ def tpool_patch_merger(
         )
         offset += length
     if offset != hidden_states.shape[0]:
-        raise ValueError(
-            f"Kimi K3 grids cover {offset} tokens, got {hidden_states.shape[0]}"
-        )
+        raise ValueError(f"Kimi K3 grids cover {offset} tokens, got {hidden_states.shape[0]}")
     return outputs
 
 
@@ -737,7 +574,6 @@ def _run_data_parallel_vision_tower(
     grid_thws: torch.Tensor | Sequence[Sequence[int]],
     rank: int,
     world_size: int,
-    dump: _KimiK3VitDump,
 ) -> list[torch.Tensor]:
     grids = _grid_thw_list(grid_thws)
     if not grids:
@@ -745,54 +581,25 @@ def _run_data_parallel_vision_tower(
 
     patches_per_image = [math.prod(grid) for grid in grids]
     cumulative_patches = [0, *itertools.accumulate(patches_per_image)]
-    image_to_rank, image_counts, grouped_patch_counts = (
-        _get_load_balance_assignment(patches_per_image, world_size)
-    )
+    image_to_rank, image_counts, grouped_patch_counts = _get_load_balance_assignment(patches_per_image, world_size)
     cumulative_image_counts = [0, *itertools.accumulate(image_counts)]
-    local_image_indices = image_to_rank[
-        cumulative_image_counts[rank] : cumulative_image_counts[rank + 1]
-    ]
+    local_image_indices = image_to_rank[cumulative_image_counts[rank] : cumulative_image_counts[rank + 1]]
     local_grids = [grids[index] for index in local_image_indices]
 
     if local_image_indices:
         local_pixel_values = torch.cat(
-            [
-                pixel_values[
-                    cumulative_patches[index] : cumulative_patches[index + 1]
-                ]
-                for index in local_image_indices
-            ],
+            [pixel_values[cumulative_patches[index] : cumulative_patches[index + 1]] for index in local_image_indices],
             dim=0,
         )
     else:
         local_pixel_values = pixel_values.new_empty((0, *pixel_values.shape[1:]))
-
-    dump.record(
-        "distribution.image_to_rank",
-        torch.tensor(image_to_rank, dtype=torch.int64),
-        full=True,
-    )
-    dump.record(
-        "distribution.local_image_indices",
-        torch.tensor(local_image_indices, dtype=torch.int64),
-        full=True,
-    )
-    dump.record(
-        "distribution.local_grid_thws",
-        torch.tensor(local_grids, dtype=torch.int64).reshape(-1, 3),
-        full=True,
-    )
-    dump.record("local_pixel_values", local_pixel_values, full=True)
 
     merge_size = math.prod(vision_tower.merge_kernel_size)
     if local_image_indices:
         local_outputs = vision_tower(local_pixel_values, local_grids)
         local_embeddings = torch.cat(local_outputs, dim=0)
     else:
-        local_embeddings = pixel_values.new_empty(
-            (0, merge_size, vision_tower.config.hidden_size)
-        )
-    dump.record("local_tower_output", local_embeddings, full=True)
+        local_embeddings = pixel_values.new_empty((0, merge_size, vision_tower.config.hidden_size))
 
     max_embeddings_per_rank = max(grouped_patch_counts) // merge_size
     padding_size = max_embeddings_per_rank - local_embeddings.shape[0]
@@ -826,15 +633,11 @@ def _run_data_parallel_vision_tower(
     outputs: list[torch.Tensor | None] = [None] * len(grids)
     assignment_offset = 0
     for source_rank in range(world_size):
-        rank_image_indices = image_to_rank[
-            assignment_offset : assignment_offset + image_counts[source_rank]
-        ]
+        rank_image_indices = image_to_rank[assignment_offset : assignment_offset + image_counts[source_rank]]
         embedding_offset = 0
         for image_index in rank_image_indices:
             output_length = output_lengths[image_index]
-            outputs[image_index] = rank_embeddings[source_rank][
-                embedding_offset : embedding_offset + output_length
-            ]
+            outputs[image_index] = rank_embeddings[source_rank][embedding_offset : embedding_offset + output_length]
             embedding_offset += output_length
         assignment_offset += image_counts[source_rank]
 
@@ -904,11 +707,7 @@ class KimiK3VisionModel(nn.Module):
         self.config = KimiK3VisionConfig.from_dict(config)
         self.config.validate()
         dtype_value = config.get("dtype") or config.get("torch_dtype") or "bfloat16"
-        dtype = (
-            dtype_value
-            if isinstance(dtype_value, torch.dtype)
-            else getattr(torch, dtype_value)
-        )
+        dtype = dtype_value if isinstance(dtype_value, torch.dtype) else getattr(torch, dtype_value)
         device = torch.device(config.get("device", "cuda"))
         self.vision_tower = KimiK3VisionTower(self.config, dtype, device)
         self.mm_projector = KimiK3MultiModalProjector(self.config, dtype, device)
@@ -918,44 +717,24 @@ class KimiK3VisionModel(nn.Module):
         pixel_values: torch.Tensor,
         grid_thws: torch.Tensor | Sequence[Sequence[int]],
     ) -> list[torch.Tensor]:
-        dump = _KimiK3VitDump(
-            self.config.encoder_dp_rank,
-            self.config.encoder_dp_size,
-        )
         reference = next(self.parameters())
         pixel_values = pixel_values.to(
             device=reference.device,
             dtype=reference.dtype,
         )
-        dump.record("vit_input.pixel_values", pixel_values, full=True)
-        dump.record(
-            "vit_input.grid_thws",
-            torch.as_tensor(grid_thws),
-            full=True,
+        tower_outputs = _run_data_parallel_vision_tower(
+            self.vision_tower,
+            pixel_values,
+            grid_thws,
+            self.config.encoder_dp_rank,
+            self.config.encoder_dp_size,
         )
-        dump.install_hooks(self.vision_tower)
-        try:
-            tower_outputs = _run_data_parallel_vision_tower(
-                self.vision_tower,
-                pixel_values,
-                grid_thws,
-                self.config.encoder_dp_rank,
-                self.config.encoder_dp_size,
-                dump,
-            )
-        finally:
-            dump.remove_hooks()
         if not tower_outputs:
-            dump.save()
             return []
         lengths = [output.shape[0] for output in tower_outputs]
         gathered_tower_output = torch.cat(tower_outputs, dim=0)
-        dump.record("gathered_tower_output", gathered_tower_output, full=True)
         projected = self.mm_projector(gathered_tower_output)
-        outputs = list(projected.split(lengths, dim=0))
-        dump.record("vit_output", torch.cat(outputs, dim=0), full=True)
-        dump.save()
-        return outputs
+        return list(projected.split(lengths, dim=0))
 
     def load_weights(
         self,
@@ -963,13 +742,8 @@ class KimiK3VisionModel(nn.Module):
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
-        if (
-            tp_rank != self.config.encoder_dp_rank
-            or tp_size != self.config.encoder_dp_size
-        ):
-            raise ValueError(
-                "Kimi K3 loader rank/size must match encoder DP construction"
-            )
+        if tp_rank != self.config.encoder_dp_rank or tp_size != self.config.encoder_dp_size:
+            raise ValueError("Kimi K3 loader rank/size must match encoder DP construction")
         rot_proj_name = "mm_projector.rot_proj.weight"
         if (
             _find_tensor(
@@ -985,17 +759,10 @@ class KimiK3VisionModel(nn.Module):
             checkpoint_names = _checkpoint_names(name)
             tensor = _find_tensor(state_dicts, checkpoint_names)
             if tensor is None:
-                raise KeyError(
-                    f"Kimi K3 checkpoint tensor not found: {checkpoint_names[0]}"
-                )
+                raise KeyError(f"Kimi K3 checkpoint tensor not found: {checkpoint_names[0]}")
             if tensor.shape != parameter.shape:
-                raise ValueError(
-                    f"Kimi K3 weight {name} expects {parameter.shape}, "
-                    f"got {tensor.shape}"
-                )
-            parameter.data.copy_(
-                tensor.to(dtype=parameter.dtype, device=parameter.device)
-            )
+                raise ValueError(f"Kimi K3 weight {name} expects {parameter.shape}, got {tensor.shape}")
+            parameter.data.copy_(tensor.to(dtype=parameter.dtype, device=parameter.device))
             loaded.add(name)
         return loaded
 
@@ -1032,10 +799,7 @@ def _shard_tensor(
     if world_size == 1:
         return tensor
     if tensor.shape[dim] % world_size != 0:
-        raise ValueError(
-            f"Kimi K3 weight dimension {tensor.shape[dim]} is not divisible by "
-            f"tp_size {world_size}"
-        )
+        raise ValueError(f"Kimi K3 weight dimension {tensor.shape[dim]} is not divisible by tp_size {world_size}")
     shard_size = tensor.shape[dim] // world_size
     return tensor.narrow(dim, rank * shard_size, shard_size).contiguous()
 

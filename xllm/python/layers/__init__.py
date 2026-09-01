@@ -22,25 +22,47 @@ touch the kernel backends directly. The dependency direction is
 
 from xllm.python.layers.attention import Attention
 from xllm.python.layers.embedding import HiddenParallelEmbedding
-from xllm.python.layers.layernorm import RMSNorm
+from xllm.python.layers.fused_moe import FusedMoE
+from xllm.python.layers.gated_mlp import GatedMLP
+from xllm.python.layers.layernorm import GemmaRMSNorm, RMSNorm
 from xllm.python.layers.linear import (
     ColumnParallelLinear,
     LinearMethod,
     RowParallelLinear,
     W8A8DynamicLinearMethod,
 )
-from xllm.python.layers.moe import (
-    GroupedTopKRouter,
-    KimiK3MoE,
-    MoE,
-    MoERunner,
-    RoutedExperts,
-    TensorParallelCommMethod,
-)
 from xllm.python.layers.rotary_embedding import RotaryEmbedding
+
+
+# Kimi K3 MoE classes are imported on-demand to avoid forcing distributed
+# dependencies on models that don't use them.
+def __getattr__(name: str):
+    if name in {
+        "GroupedTopKRouter",
+        "KimiK3MoE",
+        "MoE",
+        "MoERunner",
+        "RoutedExperts",
+        "TensorParallelCommMethod",
+    }:
+        from xllm.python.layers.moe import (
+            GroupedTopKRouter,
+            KimiK3MoE,
+            MoE,
+            MoERunner,
+            RoutedExperts,
+            TensorParallelCommMethod,
+        )
+
+        return locals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "Attention",
+    "FusedMoE",
+    "GatedMLP",
+    "GemmaRMSNorm",
     "RMSNorm",
     "RotaryEmbedding",
     "ColumnParallelLinear",
