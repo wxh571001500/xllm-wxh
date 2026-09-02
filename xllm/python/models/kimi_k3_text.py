@@ -55,19 +55,14 @@ if TYPE_CHECKING:
 
 
 def _tp_rank_from_device(device: object) -> int:
-    """Extract TP rank from device string (e.g., 'npu:3' -> 3).
+    """Extract TP rank from device (e.g., 'npu:3' -> 3).
 
-    Raises ValueError if the device string does not include a rank suffix.
-    Silent fallback to rank 0 would cause multiple workers to claim the same
-    rank, leading to all-gather/all-reduce hangs or incorrect sharding.
+    Raises ValueError if the device does not include a rank index.
     """
-    value = str(device)
-    if ":" not in value:
-        raise ValueError(f"Device string must include rank suffix (e.g., 'npu:0'), got: {value!r}")
-    try:
-        return int(value.rsplit(":", 1)[-1])
-    except ValueError as e:
-        raise ValueError(f"Invalid device rank in {value!r}") from e
+    dev = torch.device(device)
+    if dev.index is None:
+        raise ValueError(f"Device must include rank index (e.g., 'npu:0'), got: {device!r}")
+    return dev.index
 
 
 def _resolve_dp_rank(config: dict[str, Any]) -> int:
@@ -582,22 +577,30 @@ class KimiK3MLP(nn.Module):
         self.situ_linear_beta = config.activation_situ_linear_beta
         self._loaded_components: set[str] = set()
 
-    def _activation(self, tensor: torch.Tensor) -> torch.Tensor:
+        # Resolve activation function once at construction to avoid repeated
+        # string lookups in the hot path.
         if self.hidden_act == "situ":
-            width = tensor.shape[-1] // 2
-            gate, up = tensor[..., :width], tensor[..., width:]
-            gate = gate.float()
-            up = up.float()
-            gate = self.situ_beta * torch.tanh(gate / self.situ_beta) * torch.sigmoid(gate)
-            if self.situ_linear_beta is not None:
-                up = self.situ_linear_beta * torch.tanh(up / self.situ_linear_beta)
-            return (gate * up).to(tensor.dtype)
-        if self.hidden_act == "silu":
-            return ops.silu_and_mul(tensor)
-        raise ValueError(f"Unsupported Kimi K3 activation: {self.hidden_act}")
+            self._activation_fn = self._situ_activation
+        elif self.hidden_act == "silu":
+            self._activation_fn = self._silu_activation
+        else:
+            raise ValueError(f"Unsupported Kimi K3 activation: {self.hidden_act}")
+
+    def _situ_activation(self, tensor: torch.Tensor) -> torch.Tensor:
+        width = tensor.shape[-1] // 2
+        gate, up = tensor[..., :width], tensor[..., width:]
+        gate = gate.float()
+        up = up.float()
+        gate = self.situ_beta * torch.tanh(gate / self.situ_beta) * torch.sigmoid(gate)
+        if self.situ_linear_beta is not None:
+            up = self.situ_linear_beta * torch.tanh(up / self.situ_linear_beta)
+        return (gate * up).to(tensor.dtype)
+
+    def _silu_activation(self, tensor: torch.Tensor) -> torch.Tensor:
+        return ops.silu_and_mul(tensor)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        activated = self._activation(self.gate_up_proj(hidden_states))
+        activated = self._activation_fn(self.gate_up_proj(hidden_states))
         return self.down_proj(activated)
 
     def load_weight(

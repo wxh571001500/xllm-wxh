@@ -347,7 +347,8 @@ def all_reduce_(x: torch.Tensor, group_name: str = "tp") -> None:
     if buffer is None:
         dist.all_reduce(x, group=group)
         return
-    flat = x.view(-1)
+    # Avoid creating a new view if tensor is already flat
+    flat = x if x.ndim == 1 else x.view(-1)
     buffer.copy_(flat)
     torch.ops.symm_mem.one_shot_all_reduce_out(buffer, "sum", group.group_name, flat)
 
