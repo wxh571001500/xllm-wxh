@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -27,6 +28,7 @@ import torch.distributed as dist
 
 _GROUP_TIMEOUT = timedelta(minutes=5)
 _contexts: dict[str, _ParallelContext] = {}
+_contexts_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -206,14 +208,17 @@ def init_parallel_groups(
         device=device_key,
         group_specs=normalized_specs,
     )
-    context = _contexts.get(device_key)
-    if context is not None:
-        if context.topology != topology:
-            raise RuntimeError(
-                f"parallel groups for {device_key} are already initialized "
-                f"with {context.topology}, requested {topology}"
-            )
-        return context.groups
+
+    # Thread-safe access to global context cache
+    with _contexts_lock:
+        context = _contexts.get(device_key)
+        if context is not None:
+            if context.topology != topology:
+                raise RuntimeError(
+                    f"parallel groups for {device_key} are already initialized "
+                    f"with {context.topology}, requested {topology}"
+                )
+            return context.groups
 
     store = None
     if world_size > 1:
@@ -253,11 +258,12 @@ def init_parallel_groups(
             raise ValueError(f"cyclic process-group aliases: {aliases}")
         unresolved_aliases = remaining
 
-    _contexts[device_key] = _ParallelContext(
-        topology=topology,
-        store=store,
-        groups=groups,
-    )
+    with _contexts_lock:
+        _contexts[device_key] = _ParallelContext(
+            topology=topology,
+            store=store,
+            groups=groups,
+        )
 
     # Bridge into the collectives registry so the xllm_ops::* custom ops
     # (all_gather / all_reduce_ / ...) used by the shared Python layers resolve
