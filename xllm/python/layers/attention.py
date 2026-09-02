@@ -58,8 +58,13 @@ class AttentionRuntimeLayer:
         )
 
 
-class Attention(AttentionRuntimeLayer, nn.Module):
-    """Thin attention layer that dispatches to the current backend."""
+class Attention(nn.Module):
+    """Thin attention layer that dispatches to the current backend.
+
+    Note: AttentionRuntimeLayer is a separate mixin for models that need
+    runtime layer specs (e.g., Kimi K3). Standard Attention does not inherit
+    it to avoid breaking existing models that use different attribute names.
+    """
 
     def __init__(
         self,
