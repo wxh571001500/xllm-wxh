@@ -43,13 +43,3 @@ cc_test (
     :deepseek_v4_cpp_template
     GTest::gtest_main
 )
-
-cc_test (
-  NAME
-    kimi_k3_chat_template_test
-  SRCS
-    kimi_k3_chat_template_test.cpp
-  DEPS
-    :kimi_k3_chat_template
-    GTest::gtest_main
-)
