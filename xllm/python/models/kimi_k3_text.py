@@ -86,9 +86,7 @@ def _resolve_dp_rank(config: dict[str, Any]) -> int:
 
 def _copy_parameter(parameter: torch.Tensor, tensor: torch.Tensor) -> None:
     if parameter.shape != tensor.shape:
-        raise ValueError(
-            f"Kimi K3 parameter expects {parameter.shape}, got {tensor.shape}"
-        )
+        raise ValueError(f"Kimi K3 parameter expects {parameter.shape}, got {tensor.shape}")
     parameter.data.copy_(tensor.to(dtype=parameter.dtype, device=parameter.device))
 
 
@@ -113,10 +111,7 @@ def _state_dict_sharded_tensor(
     if tp_size == 1:
         return tensor
     if tensor.shape[dim] % tp_size != 0:
-        raise ValueError(
-            f"Kimi K3 tensor dimension {tensor.shape[dim]} is not divisible "
-            f"by tp_size {tp_size}"
-        )
+        raise ValueError(f"Kimi K3 tensor dimension {tensor.shape[dim]} is not divisible by tp_size {tp_size}")
     shard_size = tensor.shape[dim] // tp_size
     return tensor.narrow(dim, tp_rank * shard_size, shard_size).contiguous()
 
@@ -196,11 +191,7 @@ class _MergedStateDict:
     def get_dict_with_prefix(self, prefix: str) -> _MergedStateDict:
         if not prefix:
             return _MergedStateDict(index=dict(self._ensure_index()))
-        index = {
-            name[len(prefix):]: entry
-            for name, entry in self._ensure_index().items()
-            if name.startswith(prefix)
-        }
+        index = {name[len(prefix) :]: entry for name, entry in self._ensure_index().items() if name.startswith(prefix)}
         return _MergedStateDict(index=index)
 
     def get_dict_with_prefixes(self, prefixes: list[str]) -> _MergedStateDict:
@@ -290,11 +281,7 @@ class KimiK3TextConfig:
         n_heads = int(pick("n_heads", "num_attention_heads", default=96))
         hidden_size = int(pick("hidden_size", default=7168))
         configured_head_dim = pick("head_dim")
-        head_dim = int(
-            linear_attention.get("head_dim", 128)
-            if configured_head_dim is None
-            else configured_head_dim
-        )
+        head_dim = int(linear_attention.get("head_dim", 128) if configured_head_dim is None else configured_head_dim)
         _ws = int(config.get("world_size", raw.get("world_size", 0)) or 0)
         _dp = int(config.get("dp_size", raw.get("dp_size", 1)) or 1)
         _tp = int(config.get("tp_size") or raw.get("tp_size") or 0)
@@ -313,9 +300,7 @@ class KimiK3TextConfig:
             intermediate_size=int(pick("intermediate_size", default=33792)),
             vocab_size=int(pick("vocab_size", default=163840)),
             rms_norm_eps=float(pick("rms_norm_eps", default=1e-5)),
-            max_position_embeddings=int(
-                pick("max_position_embeddings", default=1048576)
-            ),
+            max_position_embeddings=int(pick("max_position_embeddings", default=1048576)),
             hidden_act=str(pick("hidden_act", default="situ")),
             tie_word_embeddings=bool(pick("tie_word_embeddings", default=False)),
             first_k_dense_replace=int(pick("first_k_dense_replace", default=1)),
@@ -346,9 +331,7 @@ class KimiK3TextConfig:
                 else int(pick("routed_expert_hidden_size", default=3584))
             ),
             moe_renormalize=bool(pick("moe_renormalize", "norm_topk_prob", default=True)),
-            moe_router_activation_func=str(
-                pick("moe_router_activation_func", default="sigmoid")
-            ),
+            moe_router_activation_func=str(pick("moe_router_activation_func", default="sigmoid")),
             routed_scaling_factor=float(pick("routed_scaling_factor", default=1.0)),
             latent_moe_use_norm=bool(pick("latent_moe_use_norm", default=True)),
             activation_situ_beta=(
@@ -370,13 +353,9 @@ class KimiK3TextConfig:
             mla_use_nope=bool(pick("mla_use_nope", default=True)),
             mla_use_rope=bool(pick("mla_use_rope", default=False)),
             mla_use_output_gate=bool(pick("mla_use_output_gate", default=True)),
-            num_nextn_predict_layers=int(
-                pick("num_nextn_predict_layers", default=0)
-            ),
+            num_nextn_predict_layers=int(pick("num_nextn_predict_layers", default=0)),
             logit_scale=(
-                None
-                if pick("logit_scale", default=None) is None
-                else float(pick("logit_scale", default=None))
+                None if pick("logit_scale", default=None) is None else float(pick("logit_scale", default=None))
             ),
             linear_attn_config=dict(linear_attention),
             quantize_type=str(config.get("quantize_type", "")),
@@ -406,12 +385,8 @@ class KimiK3TextConfig:
             ep_size=int(config.get("ep_size", raw.get("ep_size", 1))),
             dp_size=int(config.get("dp_size", raw.get("dp_size", 1))),
             dp_rank=_resolve_dp_rank(config),
-            moe_comm_type=str(
-                pick("moe_comm_type", "moe_communication", default="all_gather")
-            ),
-            mc2_tokens_capacity=int(
-                pick("mc2_tokens_capacity", default=512)
-            ),
+            moe_comm_type=str(pick("moe_comm_type", "moe_communication", default="all_gather")),
+            mc2_tokens_capacity=int(pick("mc2_tokens_capacity", default=512)),
             enable_flashcomm1=bool(pick("enable_flashcomm1", default=False)),
             enable_prefix_cache=bool(pick("enable_prefix_cache", default=True)),
         )
@@ -442,16 +417,9 @@ class KimiK3TextConfig:
         if not 0 <= self.dp_rank < self.dp_size:
             raise ValueError("Kimi K3 DP rank and size are invalid")
         if self.ep_size > 1 and self.dp_size != self.ep_size:
-            supported = (
-                self.dp_size == 1
-                and self.tp_size == self.ep_size
-                and self.world_size == self.ep_size
-            )
+            supported = self.dp_size == 1 and self.tp_size == self.ep_size and self.world_size == self.ep_size
             if not supported:
-                raise ValueError(
-                    "Kimi K3 supports EP with either dp=ep or "
-                    "dp=1, attention_tp=ep"
-                )
+                raise ValueError("Kimi K3 supports EP with either dp=ep or dp=1, attention_tp=ep")
         MoECommType.from_value(self.moe_comm_type)
         if self.moe_layer_freq <= 0 or self.first_k_dense_replace < 0:
             raise ValueError("Kimi K3 MoE layer placement is invalid")
@@ -459,17 +427,12 @@ class KimiK3TextConfig:
             raise ValueError("Kimi K3 attn_res_block_size must be positive")
         if self.activation_situ_beta is not None and self.activation_situ_beta <= 0:
             raise ValueError("Kimi K3 activation_situ_beta must be positive")
-        if (
-            self.activation_situ_linear_beta is not None
-            and self.activation_situ_linear_beta <= 0
-        ):
+        if self.activation_situ_linear_beta is not None and self.activation_situ_linear_beta <= 0:
             raise ValueError("Kimi K3 activation_situ_linear_beta must be positive")
         if self.hidden_act not in ("situ", "silu"):
             raise ValueError(f"Unsupported Kimi K3 activation: {self.hidden_act}")
         if self.moe_router_activation_func not in ("sigmoid", "softmax"):
-            raise ValueError(
-                "Kimi K3 router activation must be sigmoid or softmax"
-            )
+            raise ValueError("Kimi K3 router activation must be sigmoid or softmax")
         if self.num_experts is not None:
             if self.num_experts_per_token is None or self.moe_intermediate_size is None:
                 raise ValueError("Kimi K3 MoE dimensions are incomplete")
@@ -478,20 +441,14 @@ class KimiK3TextConfig:
             if self.moe_intermediate_size % self.tp_size != 0:
                 raise ValueError("Kimi K3 MoE intermediate_size must divide tp_size")
             if not 0 < self.num_experts_per_token <= self.num_experts:
-                raise ValueError(
-                    "Kimi K3 num_experts_per_token must be within num_experts"
-                )
+                raise ValueError("Kimi K3 num_experts_per_token must be within num_experts")
             if self.use_grouped_topk:
                 if self.num_expert_group <= 0:
                     raise ValueError("Kimi K3 num_expert_group must be positive")
                 if self.num_experts % self.num_expert_group != 0:
-                    raise ValueError(
-                        "Kimi K3 experts must divide evenly into expert groups"
-                    )
+                    raise ValueError("Kimi K3 experts must divide evenly into expert groups")
                 if not 0 < self.topk_group <= self.num_expert_group:
-                    raise ValueError(
-                        "Kimi K3 topk_group must be within expert groups"
-                    )
+                    raise ValueError("Kimi K3 topk_group must be within expert groups")
         if self.num_nextn_predict_layers < 0:
             raise ValueError("Kimi K3 num_nextn_predict_layers must be non-negative")
         if self.logit_scale is not None and self.logit_scale <= 0:
@@ -512,13 +469,8 @@ class KimiK3TextConfig:
             raise ValueError("Kimi K3 MLA does not apply RoPE")
         if not self.mla_use_output_gate:
             raise ValueError("Kimi K3 MLA requires output gating")
-        kda_layers = tuple(
-            int(layer) for layer in self.linear_attn_config.get("kda_layers", ())
-        )
-        full_attn_layers = tuple(
-            int(layer)
-            for layer in self.linear_attn_config.get("full_attn_layers", ())
-        )
+        kda_layers = tuple(int(layer) for layer in self.linear_attn_config.get("kda_layers", ()))
+        full_attn_layers = tuple(int(layer) for layer in self.linear_attn_config.get("full_attn_layers", ()))
         layer_numbers = kda_layers + full_attn_layers
         if len(set(layer_numbers)) != len(layer_numbers):
             raise ValueError("Kimi K3 attention layer lists must not overlap or repeat")
@@ -528,29 +480,17 @@ class KimiK3TextConfig:
             raise ValueError("Kimi K3 kda_layers and full_attn_layers must cover all layers")
         if self.uses_quantized_weights:
             if self.quant_version != "1.0.0":
-                raise ValueError(
-                    "Kimi K3 W4A8 weights require quant_version 1.0.0"
-                )
+                raise ValueError("Kimi K3 W4A8 weights require quant_version 1.0.0")
             if self.quant_group_size != 0:
-                raise ValueError(
-                    "Kimi K3 currently supports per-channel W4A8 weights only"
-                )
-            if (
-                self.num_experts is None
-                or self.routed_expert_hidden_size is None
-                or self.moe_intermediate_size is None
-            ):
+                raise ValueError("Kimi K3 currently supports per-channel W4A8 weights only")
+            if self.num_experts is None or self.routed_expert_hidden_size is None or self.moe_intermediate_size is None:
                 raise ValueError("Kimi K3 W4A8 requires routed experts")
             if 16 % self.tp_size != 0:
                 raise ValueError("Kimi K3 W4A8 scale_bias requires tp_size <= 16")
             if self.routed_expert_hidden_size % 2 != 0:
-                raise ValueError(
-                    "Kimi K3 W4A8 routed hidden size must be even"
-                )
+                raise ValueError("Kimi K3 W4A8 routed hidden size must be even")
             if self.moe_intermediate_size % (2 * self.tp_size) != 0:
-                raise ValueError(
-                    "Kimi K3 W4A8 expert size must be divisible by 2 * tp_size"
-                )
+                raise ValueError("Kimi K3 W4A8 expert size must be divisible by 2 * tp_size")
 
     @property
     def uses_quantized_weights(self) -> bool:
@@ -628,9 +568,7 @@ class KimiK3MLP(nn.Module):
             dtype=dtype,
             device=device,
             reduce_results=reduce_results,
-            quant_method=(
-                W8A8DynamicLinearMethod() if self.quantized else None
-            ),
+            quant_method=(W8A8DynamicLinearMethod() if self.quantized else None),
         )
         self.reduce_results = reduce_results
         self.hidden_act = config.hidden_act
@@ -669,11 +607,7 @@ class KimiK3MLP(nn.Module):
                 return False
             target_tensor = getattr(self.gate_up_proj, suffix)
             half = target_tensor.shape[0] // 2
-            target = (
-                target_tensor.data[:half]
-                if projection == "gate_proj"
-                else target_tensor.data[half:]
-            )
+            target = target_tensor.data[:half] if projection == "gate_proj" else target_tensor.data[half:]
             _copy_parameter(target, tensor)
             self._loaded_components.add(f"{projection}.{suffix}")
             return True
@@ -689,9 +623,7 @@ class KimiK3MLP(nn.Module):
             if suffix != "weight":
                 return False
             _copy_parameter(self.gate_up_proj.weight, tensor)
-            self._loaded_components.update(
-                {"gate_proj.weight", "up_proj.weight"}
-            )
+            self._loaded_components.update({"gate_proj.weight", "up_proj.weight"})
             return True
         if projection == "down_proj" and separator:
             if self.quantized:
@@ -764,9 +696,7 @@ class KimiK3MLP(nn.Module):
         if self.quantized:
             suffixes.extend(["weight_scale", "weight_offset"])
         required = {
-            f"{projection}.{suffix}"
-            for projection in ("gate_proj", "up_proj", "down_proj")
-            for suffix in suffixes
+            f"{projection}.{suffix}" for projection in ("gate_proj", "up_proj", "down_proj") for suffix in suffixes
         }
         if "gate_up_proj.weight" in self._loaded_components:
             required.difference_update({"gate_proj.weight", "up_proj.weight"})
@@ -833,9 +763,7 @@ class KimiK3FusedQKVAProjection(nn.Module):
             offset = self.query_size
             size = self.key_value_size
         else:
-            raise KeyError(
-                f"Unsupported Kimi K3 fused projection: {projection_name}"
-            )
+            raise KeyError(f"Unsupported Kimi K3 fused projection: {projection_name}")
 
         target = getattr(self.projection, suffix)
         target_slice = target.data.narrow(0, offset, size)
@@ -877,10 +805,7 @@ class KimiK3FusedQKVAProjection(nn.Module):
         }
         missing = required.difference(self._loaded_components)
         if missing:
-            raise KeyError(
-                "Kimi K3 fused q/kv A projection weights are missing: "
-                f"{sorted(missing)}"
-            )
+            raise KeyError(f"Kimi K3 fused q/kv A projection weights are missing: {sorted(missing)}")
         if self.quantized:
             self.projection.finish_weight_loading()
 
@@ -963,12 +888,8 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
                 dtype=dtype,
                 device=device,
             )
-        self.q_a_layernorm = RMSNorm(
-            config.q_lora_rank, config.rms_norm_eps, dtype=dtype, device=device
-        )
-        self.kv_a_layernorm = RMSNorm(
-            config.kv_lora_rank, config.rms_norm_eps, dtype=dtype, device=device
-        )
+        self.q_a_layernorm = RMSNorm(config.q_lora_rank, config.rms_norm_eps, dtype=dtype, device=device)
+        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, config.rms_norm_eps, dtype=dtype, device=device)
         self.kv_b_proj = ColumnParallelLinear(
             config.kv_lora_rank,
             num_heads * (config.qk_nope_head_dim + config.v_head_dim),
@@ -1011,7 +932,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
                 dtype=dtype,
                 device=device,
             ),
-          persistent=False,
+            persistent=False,
         )
         self._loaded_components: set[str] = set()
 
@@ -1027,20 +948,12 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
             dim=-1,
         )
         q_c = self.q_a_layernorm(q_lora)
-        q = self.q_b_proj(q_c).view(
-            num_tokens, self.num_heads_local, self.query_head_dim
-        )
-        q_nope, q_pe = q.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
+        q = self.q_b_proj(q_c).view(num_tokens, self.num_heads_local, self.query_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK).transpose(0, 1)
 
-        k_latent_raw, k_pe = compressed_kv.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-        k_latent = self.kv_a_layernorm(k_latent_raw).view(
-            num_tokens, 1, self.kv_lora_rank
-        )
+        k_latent_raw, k_pe = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_latent = self.kv_a_layernorm(k_latent_raw).view(num_tokens, 1, self.kv_lora_rank)
         backend = get_forward_context().attention_backend
         unabsorbed_prefill = None
         if backend.use_unabsorbed_mla_prefill():
@@ -1095,9 +1008,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         tensor = (
             _state_dict_tensor(state_dict, name)
             if shard_dim is None
-            else _state_dict_sharded_tensor(
-                state_dict, name, shard_dim, tp_rank, tp_size
-            )
+            else _state_dict_sharded_tensor(state_dict, name, shard_dim, tp_rank, tp_size)
         )
         if tensor is None:
             return set()
@@ -1109,16 +1020,12 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
             scale = (
                 _state_dict_tensor(state_dict, scale_name)
                 if shard_dim is None
-                else _state_dict_sharded_tensor(
-                    state_dict, scale_name, 0, tp_rank, tp_size
-                )
+                else _state_dict_sharded_tensor(state_dict, scale_name, 0, tp_rank, tp_size)
             )
             offset = (
                 _state_dict_tensor(state_dict, offset_name)
                 if shard_dim is None
-                else _state_dict_sharded_tensor(
-                    state_dict, offset_name, 0, tp_rank, tp_size
-                )
+                else _state_dict_sharded_tensor(state_dict, offset_name, 0, tp_rank, tp_size)
             )
             missing = [
                 companion_name
@@ -1129,10 +1036,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
                 if companion is None
             ]
             if missing:
-                raise KeyError(
-                    f"Kimi K3 quantized MLA weight {name} is missing "
-                    f"companions: {missing}"
-                )
+                raise KeyError(f"Kimi K3 quantized MLA weight {name} is missing companions: {missing}")
             tensor = (tensor.float() - offset.float()) * scale.float()
             loaded.update((scale_name, offset_name))
 
@@ -1156,10 +1060,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         for suffix in ("weight", "weight_scale", "weight_offset"):
             name = f"{projection}.{suffix}"
             if not state_dict.has(name):
-                raise KeyError(
-                    f"Kimi K3 quantized MLA weight {weight_name} is missing "
-                    f"companion: {name}"
-                )
+                raise KeyError(f"Kimi K3 quantized MLA weight {weight_name} is missing companion: {name}")
             tensor = (
                 state_dict.get_sharded_tensor(name, 0, tp_rank, tp_size)
                 if shard_output
@@ -1239,9 +1140,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         required = set(self._REPLICATED + self._COLUMN_SHARDED + ("o_proj.weight",))
         if self.quantized:
             required.update(
-                f"{projection}.{suffix}"
-                for projection in ("q_b_proj",)
-                for suffix in ("weight_scale", "weight_offset")
+                f"{projection}.{suffix}" for projection in ("q_b_proj",) for suffix in ("weight_scale", "weight_offset")
             )
         missing = required.difference(self._loaded_components)
         if missing:
@@ -1254,9 +1153,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
             self.qk_nope_head_dim + self.v_head_dim,
             self.kv_lora_rank,
         )
-        w_uk, w_uv = weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=1
-        )
+        w_uk, w_uv = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         self.W_UK.copy_(w_uk.contiguous())
         self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
         self.o_proj.format_npu_weight_()
@@ -1283,9 +1180,7 @@ class KimiK3KDARuntime:
         self.metadata: KimiK3KDAMetadata | None = None
         self.caches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
-    def require(self, layer_id: int) -> tuple[
-        KimiK3KDAMetadata, torch.Tensor, torch.Tensor
-    ]:
+    def require(self, layer_id: int) -> tuple[KimiK3KDAMetadata, torch.Tensor, torch.Tensor]:
         if self.metadata is None or layer_id not in self.caches:
             raise RuntimeError(
                 "KDA runtime is not initialized: the executor must set "
@@ -1326,9 +1221,7 @@ def _apply_attention_residual(
 ) -> torch.Tensor:
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_float = values.float()
-    normed = values_float * torch.rsqrt(
-        values_float.square().mean(dim=-1, keepdim=True) + norm.eps
-    )
+    normed = values_float * torch.rsqrt(values_float.square().mean(dim=-1, keepdim=True) + norm.eps)
     normed = normed * norm.weight.float()
     scores = F.linear(normed, projection.weight.float()).squeeze(-1)
     probabilities = torch.softmax(scores, dim=-1).unsqueeze(-1)
@@ -1339,9 +1232,7 @@ def _flashcomm1_pad_size(num_tokens: int, tp_size: int) -> int:
     return (-num_tokens) % tp_size
 
 
-def _flashcomm1_gather(
-    shard: torch.Tensor, num_tokens: int, tp_size: int
-) -> torch.Tensor:
+def _flashcomm1_gather(shard: torch.Tensor, num_tokens: int, tp_size: int) -> torch.Tensor:
     """All-gather a sequence-parallel shard back to the full ``num_tokens`` rows."""
     full = ops.all_gather(shard, dim=0, world_size=tp_size, group_name="tp")
     return full[:num_tokens]
@@ -1358,15 +1249,27 @@ def _flashcomm1_reduce_scatter(partial: torch.Tensor, tp_size: int) -> torch.Ten
     return ops.reduce_scatter(partial, dim=0, world_size=tp_size, group_name="tp")
 
 
-def _flashcomm1_shard(
-    full: torch.Tensor, num_tokens: int, tp_size: int, tp_rank: int
-) -> torch.Tensor:
+def _flashcomm1_shard(full: torch.Tensor, num_tokens: int, tp_size: int, tp_rank: int) -> torch.Tensor:
     """Take this rank's token shard of an already-replicated full tensor."""
     pad = _flashcomm1_pad_size(num_tokens, tp_size)
     if pad > 0:
         full = F.pad(full, (0, 0, 0, pad))
     shard = full.shape[0] // tp_size
     return full[tp_rank * shard : (tp_rank + 1) * shard].contiguous()
+
+
+def _sp_active(sp_flag: bool) -> bool:
+    """FlashComm1 sequence-parallel is prefill-only (matching the C++ gate).
+    During ACL graph capture/warmup (decode) it must be disabled so that
+    graph-incompatible collective ops (TP all-gather/reduce-scatter) are
+    not recorded into the static graph."""
+    if not sp_flag:
+        return False
+    try:
+        ctx = get_forward_context()
+        return ctx.acl_graph is None and not ctx.graph_warmup
+    except RuntimeError:
+        return True
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -1519,6 +1422,7 @@ class KimiK3DecoderLayer(nn.Module):
         # them and shard their outputs back.
         num_tokens = positions.shape[0]
         prefix_sum: torch.Tensor | None = hidden_states
+        sp = _sp_active(self._sp)
         if block_residual.shape[1] > 0:
             hidden_states = _apply_attention_residual(
                 prefix_sum,
@@ -1530,24 +1434,14 @@ class KimiK3DecoderLayer(nn.Module):
             block_residual = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
             prefix_sum = None
         hidden_states = self.input_layernorm(hidden_states)
-        attention_input = (
-            _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
-            if self._sp
-            else hidden_states
-        )
+        attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if sp else hidden_states
         if self.is_kda:
-            metadata, conv_state, recurrent_state = self.kda_runtime.require(
-                self.layer_id
-            )
-            attention_output = self.self_attn(
-                attention_input, metadata, conv_state, recurrent_state
-            )
+            metadata, conv_state, recurrent_state = self.kda_runtime.require(self.layer_id)
+            attention_output = self.self_attn(attention_input, metadata, conv_state, recurrent_state)
         else:
             attention_output = self.self_attn(attention_input, positions)
-        if self._sp:
-            attention_output = _flashcomm1_reduce_scatter(
-                attention_output, self.tp_size
-            )
+        if sp:
+            attention_output = _flashcomm1_reduce_scatter(attention_output, self.tp_size)
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         hidden_states = _apply_attention_residual(
             prefix_sum,
@@ -1559,7 +1453,7 @@ class KimiK3DecoderLayer(nn.Module):
         if hasattr(self, "block_sparse_moe"):
             # The MoE keeps its own replicated TP/EP reductions, so gather to
             # full tokens and shard the result back.
-            if self._sp:
+            if sp:
                 moe_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_shard(
                     self.block_sparse_moe(moe_input),
@@ -1570,11 +1464,9 @@ class KimiK3DecoderLayer(nn.Module):
             else:
                 hidden_states = self.block_sparse_moe(hidden_states)
         else:
-            if self._sp:
+            if sp:
                 mlp_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
-                hidden_states = _flashcomm1_reduce_scatter(
-                    self.mlp(mlp_input), self.tp_size
-                )
+                hidden_states = _flashcomm1_reduce_scatter(self.mlp(mlp_input), self.tp_size)
             else:
                 hidden_states = self.mlp(hidden_states)
         return prefix_sum + hidden_states, block_residual
@@ -1605,11 +1497,7 @@ class KimiK3DecoderLayer(nn.Module):
             # KDA applies its own TP sharding, so hand it the full tensors.
             consumed = self.self_attn.load_weights(
                 "self_attn",
-                lambda name: (
-                    state_dict.get_tensor(name)
-                    if state_dict.has(name)
-                    else None
-                ),
+                lambda name: (state_dict.get_tensor(name) if state_dict.has(name) else None),
             )
             self.self_attn.process_weights_after_loading()
             for name in consumed:
@@ -1664,10 +1552,7 @@ class KimiK3DecoderLayer(nn.Module):
         }
         missing = required.difference(self._loaded_components)
         if missing:
-            raise KeyError(
-                f"Kimi K3 decoder layer {self.layer_id} weights are missing: "
-                f"{sorted(missing)}"
-            )
+            raise KeyError(f"Kimi K3 decoder layer {self.layer_id} weights are missing: {sorted(missing)}")
         if isinstance(self.self_attn, KimiK3MLAAttention):
             self.self_attn.finish_weight_loading()
         if hasattr(self, "mlp"):
@@ -1689,10 +1574,7 @@ class KimiK3TextModel(nn.Module):
         )
         self.kda_runtime = KimiK3KDARuntime()
         self.layers = nn.ModuleList(
-            [
-                KimiK3DecoderLayer(config, i, dtype, device, self.kda_runtime)
-                for i in range(config.n_layers)
-            ]
+            [KimiK3DecoderLayer(config, i, dtype, device, self.kda_runtime) for i in range(config.n_layers)]
         )
         self.output_attn_res_norm = RMSNorm(
             config.hidden_size,
@@ -1722,22 +1604,15 @@ class KimiK3TextModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = (
-            self.embed_tokens(input_ids)
-            if inputs_embeds is None
-            else inputs_embeds
-        )
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         num_tokens = hidden_states.shape[0]
-        if self._sp:
+        sp = _sp_active(self._sp)
+        if sp:
             # FlashComm1: shard the token dimension so the residual trunk runs
             # sequence-parallel; the embedding output is replicated, so this is
             # a local slice.
-            hidden_states = _flashcomm1_shard(
-                hidden_states, num_tokens, self.tp_size, self.tp_rank
-            )
-        block_residual = hidden_states.new_zeros(
-            (hidden_states.shape[0], 0, hidden_states.shape[-1])
-        )
+            hidden_states = _flashcomm1_shard(hidden_states, num_tokens, self.tp_size, self.tp_rank)
+        block_residual = hidden_states.new_zeros((hidden_states.shape[0], 0, hidden_states.shape[-1]))
         for layer in self.layers:
             hidden_states, block_residual = layer(hidden_states, positions, block_residual)
         hidden_states = _apply_attention_residual(
@@ -1746,10 +1621,8 @@ class KimiK3TextModel(nn.Module):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
         )
-        if self._sp:
-            hidden_states = _flashcomm1_gather(
-                hidden_states, num_tokens, self.tp_size
-            )
+        if sp:
+            hidden_states = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
         return self.norm(hidden_states)
 
     def load_weights(
@@ -1833,9 +1706,7 @@ class KimiK3ForCausalLM(PyModelBase):
             self.cfg.tp_rank = int(_tp_rank_override)
         else:
             _dev_rank = _tp_rank_from_device(config.get("device", "npu:0"))
-            self.cfg.tp_rank = (
-                _dev_rank % self.cfg.tp_size if self.cfg.tp_size > 0 else 0
-            )
+            self.cfg.tp_rank = _dev_rank % self.cfg.tp_size if self.cfg.tp_size > 0 else 0
         self.cfg.validate()
         self.dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         self.device = torch.device(config.get("device", "cuda"))
@@ -1892,13 +1763,11 @@ class KimiK3ForCausalLM(PyModelBase):
         tp_rank = self.cfg.tp_rank
         tp_size = self.cfg.tp_size
         loaded: set[str] = set()
-        
+
         # A single layer's tensors are spread across shards, so merge every
         # shard into one cross-shard view and load each weight exactly once.
         merged = _MergedStateDict(list(state_dicts))
-        model_state_dict = merged.get_dict_with_prefixes(
-            ["language_model.model.", "model.", ""]
-        )
+        model_state_dict = merged.get_dict_with_prefixes(["language_model.model.", "model.", ""])
         loaded.update(self.model.load_weights(model_state_dict, tp_rank, tp_size))
 
         if self.cfg.tie_word_embeddings:
