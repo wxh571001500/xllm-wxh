@@ -82,6 +82,10 @@ class ForwardContext:
     # (cp_size <= 1) or the step is decode (CP is prefill-only in v1). Typed as
     # object to avoid a circular import with model_executor.cp_utils.CpContext.
     cp_context: object | None = None
+    # True during ACL-graph warmup steps (eager execution before capture).
+    # MoE prepare uses this to skip the blocking EP token-count all-gather,
+    # since decode warmup pads every DP rank to the same static bucket.
+    graph_warmup: bool = False
 
 
 _current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)

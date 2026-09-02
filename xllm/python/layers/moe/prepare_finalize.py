@@ -28,7 +28,8 @@ from xllm.python.model_executor.forward_context import get_forward_context
 
 def _in_acl_graph_capture() -> bool:
     try:
-        return get_forward_context().acl_graph is not None
+        ctx = get_forward_context()
+        return ctx.acl_graph is not None or ctx.graph_warmup
     except RuntimeError:
         return False
 
@@ -196,6 +197,15 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         if pad_size > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
             router_logits = F.pad(router_logits, (0, 0, 0, pad_size))
+        if _in_acl_graph_capture():
+            # Skip cross-node EP all_gather during graph warmup/capture.
+            # Each rank's padded shard is the static input; the real EP
+            # communication happens during capture inside torch.npu.graph().
+            return MoEPrepareOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                padded_hidden_states_shape=hidden_states.shape,
+            )
         hidden_states = ops.all_gather(
             hidden_states,
             dim=0,
@@ -221,6 +231,9 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         padded_hidden_states_shape: torch.Size | None = None,
     ) -> torch.Tensor:
         del padded_hidden_states_shape
+        if _in_acl_graph_capture():
+            # Skip cross-node EP reduce_scatter during graph warmup/capture.
+            return self._reduce_tp(hidden_states, reduce_results)
         if self._config.partitions_replicated_input:
             if self._config.ep_size > 1:
                 ops.all_reduce_(

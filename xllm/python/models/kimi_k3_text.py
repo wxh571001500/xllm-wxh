@@ -1267,6 +1267,20 @@ def _flashcomm1_shard(full: torch.Tensor, num_tokens: int, tp_size: int, tp_rank
     return full[tp_rank * shard : (tp_rank + 1) * shard].contiguous()
 
 
+def _sp_active(sp_flag: bool) -> bool:
+    """FlashComm1 sequence-parallel is prefill-only (matching the C++ gate).
+    During ACL graph capture/warmup (decode) it must be disabled so that
+    graph-incompatible collective ops (TP all-gather/reduce-scatter) are
+    not recorded into the static graph."""
+    if not sp_flag:
+        return False
+    try:
+        ctx = get_forward_context()
+        return ctx.acl_graph is None and not ctx.graph_warmup
+    except RuntimeError:
+        return True
+
+
 class KimiK3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1417,6 +1431,7 @@ class KimiK3DecoderLayer(nn.Module):
         # them and shard their outputs back.
         num_tokens = positions.shape[0]
         prefix_sum: torch.Tensor | None = hidden_states
+        sp = _sp_active(self._sp)
         if block_residual.shape[1] > 0:
             hidden_states = _apply_attention_residual(
                 prefix_sum,
@@ -1428,13 +1443,13 @@ class KimiK3DecoderLayer(nn.Module):
             block_residual = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
             prefix_sum = None
         hidden_states = self.input_layernorm(hidden_states)
-        attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if self._sp else hidden_states
+        attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if sp else hidden_states
         if self.is_kda:
             metadata, conv_state, recurrent_state = self.kda_runtime.require(self.layer_id)
             attention_output = self.self_attn(attention_input, metadata, conv_state, recurrent_state)
         else:
             attention_output = self.self_attn(attention_input, positions)
-        if self._sp:
+        if sp:
             attention_output = _flashcomm1_reduce_scatter(attention_output, self.tp_size)
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         hidden_states = _apply_attention_residual(
@@ -1447,7 +1462,7 @@ class KimiK3DecoderLayer(nn.Module):
         if hasattr(self, "block_sparse_moe"):
             # The MoE keeps its own replicated TP/EP reductions, so gather to
             # full tokens and shard the result back.
-            if self._sp:
+            if sp:
                 moe_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_shard(
                     self.block_sparse_moe(moe_input),
@@ -1458,7 +1473,7 @@ class KimiK3DecoderLayer(nn.Module):
             else:
                 hidden_states = self.block_sparse_moe(hidden_states)
         else:
-            if self._sp:
+            if sp:
                 mlp_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_reduce_scatter(self.mlp(mlp_input), self.tp_size)
             else:
@@ -1600,7 +1615,8 @@ class KimiK3TextModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         num_tokens = hidden_states.shape[0]
-        if self._sp:
+        sp = _sp_active(self._sp)
+        if sp:
             # FlashComm1: shard the token dimension so the residual trunk runs
             # sequence-parallel; the embedding output is replicated, so this is
             # a local slice.
@@ -1614,7 +1630,7 @@ class KimiK3TextModel(nn.Module):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
         )
-        if self._sp:
+        if sp:
             hidden_states = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
         return self.norm(hidden_states)
 

@@ -537,7 +537,11 @@ class DecodeAclGraphRunner(BaseRunner):
             previous_kda_metadata = self._kda_runtime.metadata
             self._kda_runtime.metadata = entry.static_kda_metadata
         try:
-            context = ForwardContext(self.attention_backend, self.device)
+            context = ForwardContext(
+                self.attention_backend,
+                self.device,
+                graph_warmup=True,
+            )
             with forward_context(context):
                 for _ in range(_CAPTURE_WARMUP_STEPS):
                     self.model(
