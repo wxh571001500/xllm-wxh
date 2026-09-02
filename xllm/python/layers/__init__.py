@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reusable model layers (RMSNorm, rotary embedding, tensor-parallel linear /
-embedding).
+"""Reusable and backend-owned layers for Python model execution.
 
 Layers depend only on the op dispatch layer (:mod:`python.ops`); they never
 touch the kernel backends directly. The dependency direction is
 ``models -> layers -> ops -> kernels``.
+Simple layers use the active :mod:`python.kernels` package directly. Complex
+models whose native fusion boundaries differ by backend (e.g. Ascend vs CUDA)
+select a kernel set at construction time.
 """
 
 from xllm.python.layers.attention import Attention
@@ -33,30 +35,22 @@ from xllm.python.layers.linear import (
 )
 from xllm.python.layers.rotary_embedding import RotaryEmbedding
 
+# MoE classes are imported at module level but only exported when available.
+# This avoids __getattr__ race conditions while keeping distributed dependencies
+# optional for non-K3 models.
+try:
+    from xllm.python.layers.moe import (
+        GroupedTopKRouter,
+        KimiK3MoE,
+        MoE,
+        MoERunner,
+        RoutedExperts,
+        TensorParallelCommMethod,
+    )
 
-# Kimi K3 MoE classes are imported on-demand to avoid forcing distributed
-# dependencies on models that don't use them.
-def __getattr__(name: str):
-    if name in {
-        "GroupedTopKRouter",
-        "KimiK3MoE",
-        "MoE",
-        "MoERunner",
-        "RoutedExperts",
-        "TensorParallelCommMethod",
-    }:
-        from xllm.python.layers.moe import (
-            GroupedTopKRouter,
-            KimiK3MoE,
-            MoE,
-            MoERunner,
-            RoutedExperts,
-            TensorParallelCommMethod,
-        )
-
-        return locals()[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
+    _MOE_AVAILABLE = True
+except ImportError:
+    _MOE_AVAILABLE = False
 
 __all__ = [
     "Attention",
@@ -70,10 +64,17 @@ __all__ = [
     "RowParallelLinear",
     "W8A8DynamicLinearMethod",
     "HiddenParallelEmbedding",
-    "GroupedTopKRouter",
-    "KimiK3MoE",
-    "MoE",
-    "MoERunner",
-    "RoutedExperts",
-    "TensorParallelCommMethod",
 ]
+
+# Add MoE classes to __all__ only if successfully imported
+if _MOE_AVAILABLE:
+    __all__.extend(
+        [
+            "GroupedTopKRouter",
+            "KimiK3MoE",
+            "MoE",
+            "MoERunner",
+            "RoutedExperts",
+            "TensorParallelCommMethod",
+        ]
+    )
