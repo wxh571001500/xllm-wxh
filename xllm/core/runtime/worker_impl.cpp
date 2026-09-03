@@ -2485,6 +2485,28 @@ void WorkerImpl::clear_hierarchy_kv_cache_transfer() {
   hierarchy_kv_cache_producer_stream_ = nullptr;
 }
 
+void WorkerImpl::register_hierarchy_kv_cache(
+    HierarchyKVCacheTransfer& transfer,
+    HierarchyKVCacheTransfer::CacheRole role,
+    const Stream* producer_stream) {
+  CHECK(hierarchy_kv_cache_transfer_context_.has_value())
+      << "Hierarchy KV cache transfer context is not initialized.";
+  CHECK(producer_stream != nullptr) << "Producer stream must not be null.";
+  CHECK(!kv_caches_.empty()) << "kv_caches is not initialized.";
+
+  HierarchyKVCacheTransfer::CacheRegistration registration;
+  registration.role = role;
+  registration.device_kv_caches = &kv_caches_;
+  registration.kv_cache_shape =
+      hierarchy_kv_cache_transfer_context_->kv_cache_shape;
+  registration.create_options =
+      hierarchy_kv_cache_transfer_context_->create_options;
+  registration.producer_stream = producer_stream;
+  registration.store_key_component =
+      role == HierarchyKVCacheTransfer::CacheRole::TARGET ? "main" : "draft";
+  transfer.register_cache(std::move(registration));
+}
+
 void WorkerImpl::prepare_mla_prefixcache_inputs(
     ModelInputParams& input_params) {
   const bool has_prefixcache_metadata =
