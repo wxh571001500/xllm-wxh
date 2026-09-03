@@ -110,8 +110,9 @@ inline ToolCallResult process_tool_calls(
   ToolCallResult result;
 
   function_call::FunctionCallParser parser(tools, parser_format);
+  const auto* detector = parser.get_detector();
 
-  if (!parser.has_tool_call(text) && parser_format != "kimi_k3") {
+  if (!parser.has_tool_call(text) && !detector->supports_reasoning_output()) {
     result.text = std::move(text);
     result.finish_reason = std::move(finish_reason);
     return result;
@@ -122,11 +123,11 @@ inline ToolCallResult process_tool_calls(
     result.text = std::move(parsed_text);
 
     const bool has_emitted_calls = !call_info_list.empty();
-    if ((parser_format != "kimi_k3" || has_emitted_calls) &&
-        finish_reason == "stop") {
-      result.finish_reason = "tool_calls";
-    } else {
+    if ((detector->supports_reasoning_output() && !has_emitted_calls) ||
+        finish_reason != "stop") {
       result.finish_reason = std::move(finish_reason);
+    } else {
+      result.finish_reason = "tool_calls";
     }
 
     google::protobuf::RepeatedPtrField<proto::ToolCall> tool_calls;
@@ -148,7 +149,9 @@ inline ToolCallResult process_tool_calls(
       tool_calls.AddAllocated(tool_call);
     }
 
-    if (parser_format != "kimi_k3" || !tool_calls.empty()) {
+    if (detector->supports_reasoning_output() && tool_calls.empty()) {
+      // Don't set tool_calls for reasoning-only output
+    } else {
       result.tool_calls = std::move(tool_calls);
     }
   } catch (const std::exception& e) {

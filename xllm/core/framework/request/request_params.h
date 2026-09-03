@@ -131,7 +131,9 @@ struct RequestParams {
   // whether to skip special tokens in the output text. default = true.
   bool skip_special_tokens = true;
 
-  void prepare_kimi_k3_chat_params();
+  // Prepares chat template parameters from request parameters.
+  // Processes tool_choice and reasoning_effort into chat_template_kwargs.
+  void prepare_chat_template_params();
 
   std::optional<std::string> reasoning_effort;
 

@@ -701,17 +701,13 @@ bool RequestParams::verify_params(OutputCallback callback) const {
   return true;
 }
 
-
-void RequestParams::prepare_kimi_k3_chat_params() {
-  skip_special_tokens = false;
+void RequestParams::prepare_chat_template_params() {
   if (!chat_template_kwargs.contains("tool_choice")) {
-    std::string prompt_tool_choice =
-        tools.empty() ? "none" : tool_choice;
+    std::string prompt_tool_choice = tools.empty() ? "none" : tool_choice;
     if (!tool_choice.empty() && tool_choice.front() == '{') {
       const nlohmann::json named_choice =
           nlohmann::json::parse(tool_choice, nullptr, false);
-      if (named_choice.is_object() &&
-          named_choice.contains("function") &&
+      if (named_choice.is_object() && named_choice.contains("function") &&
           named_choice["function"].is_object() &&
           named_choice["function"].contains("name") &&
           named_choice["function"]["name"].is_string()) {

@@ -39,6 +39,13 @@ class KimiK3Detector final : public BaseFormatDetector {
       const std::string& new_text,
       const std::vector<JsonTool>& tools) override;
 
+  // K3 may produce reasoning output even without tools, using the same format
+  // as tool calls.
+  bool supports_reasoning_output() const override { return true; }
+
+  // K3 requires special tokens to be preserved for correct parsing.
+  bool needs_special_tokens_for_parsing() const override { return true; }
+
  private:
   size_t streamed_content_size_ = 0;
   size_t streamed_call_count_ = 0;

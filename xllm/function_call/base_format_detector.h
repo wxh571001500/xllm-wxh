@@ -54,6 +54,15 @@ class BaseFormatDetector {
       const std::string& new_text,
       const std::vector<JsonTool>& tools);
 
+  // Capability query methods for model-specific behaviors
+  // Returns true if this detector may produce output even without tools
+  // (e.g., reasoning content in the same format as tool calls).
+  virtual bool supports_reasoning_output() const { return false; }
+
+  // Returns true if this detector requires special tokens to be preserved
+  // during parsing (skip_special_tokens = false).
+  virtual bool needs_special_tokens_for_parsing() const { return false; }
+
   std::vector<std::unordered_map<std::string, std::string>> prev_tool_call_arr_;
 
   std::vector<std::string> streamed_args_for_tool_;

@@ -427,9 +427,18 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
     }
 
     // handle tool call output
-    if ((!tools.empty() || tool_call_parser_format == "kimi_k3") &&
-        !tool_call_parser_format.empty() &&
-        !cur_text.empty()) {
+    bool should_process_tool_calls = false;
+    if (!tool_call_parser_format.empty() && !cur_text.empty()) {
+      if (!tools.empty()) {
+        should_process_tool_calls = true;
+      } else {
+        // Check if the parser supports reasoning output without tools
+        function_call::FunctionCallParser parser({}, tool_call_parser_format);
+        should_process_tool_calls =
+            parser.get_detector()->supports_reasoning_output();
+      }
+    }
+    if (should_process_tool_calls) {
       auto* arena = response.GetArena();
       auto result =
           api_service::process_tool_calls(cur_text,
@@ -646,8 +655,9 @@ void ChatServiceImpl::process_async_rpc_impl(
   }
 
   RequestParams request_params(rpc_request, "", "");
-  if (tool_call_parser_format_ == "kimi_k3") {
-    request_params.prepare_kimi_k3_chat_params();
+  if (request_params.reasoning_effort.has_value() ||
+      !request_params.tool_choice.empty()) {
+    request_params.prepare_chat_template_params();
   }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
@@ -691,10 +701,17 @@ void ChatServiceImpl::process_async_rpc_impl(
   // Preserve parser-relevant special tokens in decoded output
   // so tool call detectors can match their control markers.
   // Aligns with vLLM parser adjust_request behavior.
-  if ((!tool_call_parser_format_.empty() && !request_params.tools.empty()) ||
-      tool_call_parser_format_ == "kimi_k3" ||
-      reasoning_parser_format_ == "kimi_k3") {
-    request_params.skip_special_tokens = false;
+  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+    function_call::FunctionCallParser parser({}, tool_call_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
+  }
+  if (!reasoning_parser_format_.empty()) {
+    function_call::FunctionCallParser parser({}, reasoning_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
   }
 
   master_->handle_request(std::move(messages),
@@ -741,8 +758,9 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
-  if (tool_call_parser_format_ == "kimi_k3") {
-    request_params.prepare_kimi_k3_chat_params();
+  if (request_params.reasoning_effort.has_value() ||
+      !request_params.tool_choice.empty()) {
+    request_params.prepare_chat_template_params();
   }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
@@ -788,10 +806,17 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     request_params.decode_address = rpc_request.routing().decode_name();
   }
 
-  if ((!tool_call_parser_format_.empty() && !request_params.tools.empty()) ||
-      tool_call_parser_format_ == "kimi_k3" ||
-      reasoning_parser_format_ == "kimi_k3") {
-    request_params.skip_special_tokens = false;
+  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+    function_call::FunctionCallParser parser({}, tool_call_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
+  }
+  if (!reasoning_parser_format_.empty()) {
+    function_call::FunctionCallParser parser({}, reasoning_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
   }
 
   const bool is_force_reasoning = get_enable_thinking_from_request(
@@ -892,8 +917,9 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
 
-  if (tool_call_parser_format_ == "kimi_k3") {
-    request_params.prepare_kimi_k3_chat_params();
+  if (request_params.reasoning_effort.has_value() ||
+      !request_params.tool_choice.empty()) {
+    request_params.prepare_chat_template_params();
   }
 
   std::vector<Message> messages;
