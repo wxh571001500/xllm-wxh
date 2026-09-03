@@ -44,6 +44,27 @@ void share_python_model_weights(py::object& draft_model,
 
 namespace xllm {
 
+namespace {
+
+py::object optional_tensor(const torch::Tensor& tensor) {
+  return tensor.defined() ? py::cast(tensor) : py::none();
+}
+
+py::list build_python_kv_caches(std::vector<KVCache>& kv_caches) {
+  py::list python_caches;
+  for (KVCache& kv_cache : kv_caches) {
+    python_caches.append(
+        py::make_tuple(optional_tensor(kv_cache.get_k_cache()),
+                       optional_tensor(kv_cache.get_v_cache()),
+                       optional_tensor(kv_cache.get_index_cache()),
+                       optional_tensor(kv_cache.get_conv_cache()),
+                       optional_tensor(kv_cache.get_ssm_cache())));
+  }
+  return python_caches;
+}
+
+}  // namespace
+
 PyCausalLM::PyCausalLM(const ModelContext& context)
     : model_args_(context.get_model_args()),
       options_(context.get_tensor_options()),
@@ -86,10 +107,6 @@ py::dict PyCausalLM::build_config_dict(
     py::object config_file = builtins.attr("open")(config_path, "r");
     d = json.attr("load")(config_file).cast<py::dict>();
     config_file.attr("close")();
-    d["quantize_type"] = quant_args_.quantize_type();
-    d["quant_method"] = quant_args_.quant_method();
-    d["quant_group_size"] = quant_args_.group_size();
-    d["quant_version"] = quant_args_.quant_version();
   }
   PyDictVisitor visitor(d);
   visit_properties(model_args_, visitor);
@@ -102,6 +119,14 @@ py::dict PyCausalLM::build_config_dict(
   d["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();
   return d;
+}
+
+const py::object& PyCausalLM::get_or_build_python_kv_caches(
+    std::vector<KVCache>& kv_caches) {
+  if (!python_kv_caches_) {
+    python_kv_caches_ = build_python_kv_caches(kv_caches);
+  }
+  return python_kv_caches_;
 }
 
 void PyCausalLM::load_model(std::unique_ptr<ModelLoader> loader) {
@@ -138,6 +163,67 @@ torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
                             : py::object(py::none());
   py::object out = py_model_.attr("compute_logits")(hidden_states, selected);
   return out.cast<torch::Tensor>();
+}
+
+ModelOutput PyCausalLM::write_context_kv(
+    const torch::Tensor& target_hidden,
+    const torch::Tensor& positions,
+    const torch::Tensor& device_cache_slots,
+    std::vector<KVCache>& kv_caches,
+    const ModelInputParams& input_params) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::object layer_synchronizer = py::none();
+#if defined(USE_NPU)
+  if (input_params.parallel.layer_synchronizer != nullptr) {
+    layer_synchronizer = py::cast(input_params.parallel.layer_synchronizer);
+  }
+#endif
+  const py::object& python_kv_caches = get_or_build_python_kv_caches(kv_caches);
+  py::object output = py_model_.attr("write_context_kv")(target_hidden,
+                                                         positions,
+                                                         device_cache_slots,
+                                                         python_kv_caches,
+                                                         layer_synchronizer);
+  if (output.is_none()) {
+    return ModelOutput();
+  }
+  return ModelOutput(output.cast<torch::Tensor>());
+}
+
+torch::Tensor PyCausalLM::dspark_markov_bias(
+    const torch::Tensor& previous_token_ids) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  return py_model_.attr("dspark_markov_bias")(previous_token_ids)
+      .cast<torch::Tensor>();
+}
+
+torch::Tensor PyCausalLM::dspark_confidence_probs(
+    const torch::Tensor& hidden_all,
+    const torch::Tensor& prev_matrix) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::object previous =
+      prev_matrix.defined() ? py::cast(prev_matrix) : py::none();
+  return py_model_.attr("dspark_confidence_probs")(hidden_all, previous)
+      .cast<torch::Tensor>();
+}
+
+bool PyCausalLM::has_dspark_confidence_head() const {
+  py::gil_scoped_acquire gil;
+  return py_model_.attr("has_dspark_confidence_head")().cast<bool>();
+}
+
+bool PyCausalLM::share_weights_from(CausalLM& source) {
+  auto* source_model = dynamic_cast<PyCausalLM*>(&source);
+  if (source_model == nullptr) {
+    return false;
+  }
+
+  py::gil_scoped_acquire gil;
+  detail::share_python_model_weights(py_model_, source_model->py_model_);
+  return true;
 }
 
 }  // namespace xllm
