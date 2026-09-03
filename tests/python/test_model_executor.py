@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,34 +21,36 @@ validation, and execution routing — using CPU mocks so no GPU/NPU required.
 from __future__ import annotations
 
 import sys
+import types
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from torch import nn
+import torch.nn as nn
 
-# The xllm.python package auto-registers models on import, which triggers
-# torch.ops.xllm_ops lookups that require the C++ binary. We bypass this
-# by mocking the ops and registry modules before importing executor.
-_mock_ops = MagicMock()
-sys.modules.setdefault("xllm.python.ops", _mock_ops)
-sys.modules.setdefault("xllm.python.ops.compute", _mock_ops)
-
-from xllm.python.attention.backend import (
+# conftest.py stands in for xllm.python, whose import would bind the active
+# platform's kernel package and reach for operators from the C++ binary.
+from xllm.python.attention.backend import (  # noqa: E402
     AttentionBackend,
     AttentionMetadata,
-    KVCache,
+    LayerCache,
+    normalize_layer_caches,
 )
-from xllm.python.layers.attention import Attention
-from xllm.python.model_executor.executor import (
+from xllm.python.layers.attention import Attention  # noqa: E402
+from xllm.python.model_executor.executor import (  # noqa: E402
     ModelExecutor,
-    _acl_graph_unsupported_reason,
     _create_attention_backend,
-    _is_npu_device,
     _resolve_graph_backend,
 )
-from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
+from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
+    DecodeAclGraphRunner,
+)
+from xllm.python.model_executor.runners.decode_cuda_graph import (  # noqa: E402
+    DecodeCudaGraphRunner,
+    _decode_graph_buckets,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,10 +62,10 @@ class StubAttentionBackend(AttentionBackend):
 
     def __init__(self, **kwargs):
         self.init_kwargs = kwargs
-        self._kv_caches: list[KVCache] = []
+        self._kv_caches: list[LayerCache] = []
         self._prepared = False
 
-    def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
+    def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         self._kv_caches = kv_caches
 
     def prepare(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
@@ -81,8 +83,19 @@ class StubAttentionBackend(AttentionBackend):
         return 1
 
 
+class _PagedStubAttentionBackend(StubAttentionBackend):
+    @property
+    def page_size(self) -> int:
+        return 4
+
+
 def _make_attention_layer(
-    num_heads=8, num_kv_heads=2, head_dim=64, scale=0.125, sliding_window=0, layer_id=0,
+    num_heads=8,
+    num_kv_heads=2,
+    head_dim=64,
+    scale=0.125,
+    sliding_window=0,
+    layer_id=0,
 ) -> Attention:
     return Attention(
         num_heads=num_heads,
@@ -100,9 +113,7 @@ class _FakeModel(nn.Module):
     def __init__(self, num_layers: int = 2, device: str = "cpu", **attn_kwargs):
         super().__init__()
         self.model = nn.Linear(1, 1)  # execution_model placeholder
-        self.layers = nn.ModuleList(
-            [_make_attention_layer(layer_id=i, **attn_kwargs) for i in range(num_layers)]
-        )
+        self.layers = nn.ModuleList([_make_attention_layer(layer_id=i, **attn_kwargs) for i in range(num_layers)])
         self._param = nn.Parameter(torch.zeros(1, device=device))
 
     def forward(self, input_ids, positions):
@@ -130,281 +141,18 @@ class _FakeModelNoAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Tests: _is_npu_device
-# ---------------------------------------------------------------------------
-
-
-class TestIsNpuDevice:
-    def test_npu_type(self):
-        assert _is_npu_device(torch.device("npu")) is True
-
-    def test_privateuseone_type(self):
-        assert _is_npu_device(torch.device("privateuseone")) is True
-
-    def test_cuda_type(self):
-        assert _is_npu_device(torch.device("cuda")) is False
-
-    def test_cpu_type(self):
-        assert _is_npu_device(torch.device("cpu")) is False
-
-
-# ---------------------------------------------------------------------------
 # Tests: graph backend resolution
 # ---------------------------------------------------------------------------
 
 
 class TestNpuGraphBackendResolution:
-    def test_enable_graph_selects_aclgraph_on_npu(self):
-        config = {"enable_graph": True, "python_graph_backend": "off"}
-
-        assert (
-            _resolve_graph_backend(config, torch.device("npu"))
-            == "aclgraph"
-        )
-
-
-class TestAclGraphCapability:
-    @pytest.mark.parametrize(
-        ("kind", "message"),
-        [("linear", "runtime state"), ("mla", "MHA attention only")],
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
     )
-    def test_non_kimi_attention_kind_is_rejected(self, kind, message):
-        layer = MagicMock(attention_kind=kind)
-
-        assert message in _acl_graph_unsupported_reason([layer])
-
-    @pytest.mark.parametrize("kind", ["mha", "mla", "linear"])
-    def test_kimi_attention_kinds_are_supported(self, kind):
-        layer = MagicMock(attention_kind=kind)
-
-        assert (
-            _acl_graph_unsupported_reason(
-                [layer], supports_kimi_k3_graph=True
-            )
-            is None
-        )
-
-    def test_unknown_kimi_attention_kind_is_rejected(self):
-        layer = MagicMock(attention_kind="unknown")
-
-        assert "unknown" in _acl_graph_unsupported_reason(
-            [layer], supports_kimi_k3_graph=True
-        )
-
-    def test_mha_is_supported(self):
-        layer = MagicMock(attention_kind="mha")
-
-        assert _acl_graph_unsupported_reason([layer]) is None
-
-
-class TestKimiK3AclGraphMetadata:
-    def test_warmup_uses_bucket_local_kda_metadata_and_restores_runtime(self):
-        runner = DecodeAclGraphRunner.__new__(DecodeAclGraphRunner)
-        original_metadata = object()
-        runner._kda_runtime = SimpleNamespace(metadata=original_metadata)
-        runner._warmed_up = False
-        runner.max_batch = 4
-        runner.page_size = 128
-        observed = []
-
-        def record_execute(input_ids, _positions, _metadata, inputs_embeds):
-            observed.append(
-                (
-                    input_ids.shape[0],
-                    runner._kda_runtime.metadata,
-                    inputs_embeds,
-                )
-            )
-
-        runner.execute = record_execute
-        runner.warmup(torch.device("cpu"), torch.int32)
-
-        assert [batch_size for batch_size, _, _ in observed] == [1, 2, 4]
-        for batch_size, metadata, inputs_embeds in observed:
-            assert metadata.num_decode_seqs == batch_size
-            assert metadata.num_prefill_seqs == 0
-            assert metadata.query_start_loc.tolist() == list(
-                range(batch_size + 1)
-            )
-            assert metadata.state_indices.tolist() == [-1] * batch_size
-            assert inputs_embeds is None
-        assert runner._kda_runtime.metadata is original_metadata
-
-    def test_fill_entry_copies_real_kda_slots_and_pads_empty_rows(self):
-        runner = DecodeAclGraphRunner.__new__(DecodeAclGraphRunner)
-        dynamic_kda = SimpleNamespace(
-            state_indices=torch.tensor([11, 17], dtype=torch.int64),
-            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
-            num_decode_seqs=2,
-            num_prefill_seqs=0,
-        )
-        runner._kda_runtime = SimpleNamespace(metadata=dynamic_kda)
-        runner._fill_host_metadata = MagicMock()
-        static_metadata = SimpleNamespace(
-            slot_mapping=torch.zeros(4, dtype=torch.int32),
-            kv_cu_seq_lens=torch.zeros(5, dtype=torch.int32),
-            paged_kv_indptr=torch.zeros(5, dtype=torch.int32),
-            paged_kv_indices=torch.zeros(4, dtype=torch.int32),
-            paged_kv_last_page_len=torch.zeros(4, dtype=torch.int32),
-            block_table=None,
-        )
-        entry = SimpleNamespace(
-            batch_size=4,
-            static_input_ids=torch.zeros(4, dtype=torch.int32),
-            static_inputs_embeds=torch.full((4, 3), 99.0),
-            static_positions=torch.zeros(4, dtype=torch.int32),
-            static_metadata=static_metadata,
-            kv_seq_lens_delta=torch.zeros(4, dtype=torch.int32),
-            static_kda_metadata=SimpleNamespace(
-                state_indices=torch.full((4,), 99, dtype=torch.int64),
-                query_start_loc=torch.full((5,), 99, dtype=torch.int32),
-            ),
-        )
-        metadata = SimpleNamespace(
-            slot_mapping=torch.zeros(2, dtype=torch.int32),
-            kv_cu_seq_lens=torch.arange(3, dtype=torch.int32),
-            paged_kv_indptr=torch.arange(3, dtype=torch.int32),
-            paged_kv_indices=torch.zeros(2, dtype=torch.int32),
-            paged_kv_last_page_len=torch.ones(2, dtype=torch.int32),
-            block_table=None,
-        )
-
-        runner._fill_entry(
-            entry,
-            torch.tensor([3, 5], dtype=torch.int32),
-            torch.tensor([7, 9], dtype=torch.int64),
-            metadata,
-            batch_size=2,
-            inputs_embeds=torch.tensor(
-                [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
-            ),
-        )
-
-        assert entry.static_kda_metadata.state_indices.tolist() == [11, 17, -1, -1]
-        assert entry.static_kda_metadata.query_start_loc.tolist() == [0, 1, 2, 2, 2]
-        assert entry.static_inputs_embeds.tolist() == [
-            [1.0, 2.0, 3.0],
-            [4.0, 5.0, 6.0],
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-        ]
-        runner._fill_host_metadata.assert_called_once_with(entry, metadata, 2)
-
-    def test_fill_entry_maps_empty_dp_shard_to_kda_pad_slot(self):
-        runner = DecodeAclGraphRunner.__new__(DecodeAclGraphRunner)
-        runner._kda_runtime = SimpleNamespace(
-            metadata=SimpleNamespace(
-                state_indices=torch.tensor([-1], dtype=torch.int64),
-                query_start_loc=torch.tensor([0], dtype=torch.int64),
-                num_decode_seqs=0,
-                num_prefill_seqs=0,
-                empty_shard=True,
-            )
-        )
-        runner._fill_host_metadata = MagicMock()
-        static_metadata = SimpleNamespace(
-            slot_mapping=torch.zeros(4, dtype=torch.int32),
-            kv_cu_seq_lens=torch.zeros(5, dtype=torch.int32),
-            paged_kv_indptr=torch.zeros(5, dtype=torch.int32),
-            paged_kv_indices=torch.zeros(4, dtype=torch.int32),
-            paged_kv_last_page_len=torch.zeros(4, dtype=torch.int32),
-            block_table=None,
-        )
-        entry = SimpleNamespace(
-            batch_size=4,
-            static_input_ids=torch.zeros(4, dtype=torch.int32),
-            static_inputs_embeds=None,
-            static_positions=torch.zeros(4, dtype=torch.int32),
-            static_metadata=static_metadata,
-            kv_seq_lens_delta=torch.zeros(4, dtype=torch.int32),
-            static_kda_metadata=SimpleNamespace(
-                state_indices=torch.full((4,), 99, dtype=torch.int64),
-                query_start_loc=torch.full((5,), 99, dtype=torch.int32),
-            ),
-        )
-        metadata = SimpleNamespace(
-            slot_mapping=torch.zeros(1, dtype=torch.int32),
-            kv_cu_seq_lens=torch.zeros(2, dtype=torch.int32),
-            paged_kv_indptr=torch.zeros(2, dtype=torch.int32),
-            paged_kv_indices=torch.zeros(1, dtype=torch.int32),
-            paged_kv_last_page_len=torch.ones(1, dtype=torch.int32),
-            block_table=None,
-        )
-
-        runner._fill_entry(
-            entry,
-            torch.ones(1, dtype=torch.int32),
-            torch.zeros(1, dtype=torch.int32),
-            metadata,
-            batch_size=1,
-            inputs_embeds=None,
-        )
-
-        assert entry.static_kda_metadata.state_indices.tolist() == [-1] * 4
-        assert entry.static_kda_metadata.query_start_loc.tolist() == [0, 1, 1, 1, 1]
-        runner._fill_host_metadata.assert_called_once_with(entry, metadata, 1)
-
-    def test_host_metadata_uses_zero_length_for_padded_fia_rows(self):
-        runner = DecodeAclGraphRunner.__new__(DecodeAclGraphRunner)
-        runner.page_size = 128
-        entry = SimpleNamespace(
-            batch_size=2,
-            host_seq_lens=torch.empty(2, dtype=torch.int32),
-            host_block_counts=torch.empty(2, dtype=torch.int32),
-            static_metadata=SimpleNamespace(
-                kv_seq_lens_host=torch.zeros(3, dtype=torch.int32),
-                paged_kv_indptr_host=torch.zeros(3, dtype=torch.int32),
-                paged_kv_last_page_len_host=torch.ones(2, dtype=torch.int32),
-            ),
-        )
-        metadata = SimpleNamespace(
-            kv_seq_lens_host=torch.tensor([90], dtype=torch.int32)
-        )
-
-        runner._fill_host_metadata(entry, metadata, batch_size=1)
-
-        assert entry.host_seq_lens.tolist() == [90, 0]
-        assert entry.static_metadata.kv_seq_lens_host.tolist() == [0, 90, 90]
-        assert entry.static_metadata.paged_kv_indptr_host.tolist() == [0, 1, 1]
-        assert entry.static_metadata.paged_kv_last_page_len_host.tolist() == [90, 1]
-
-    def test_global_dp_token_count_selects_shared_decode_bucket(self):
-        runner = DecodeAclGraphRunner.__new__(DecodeAclGraphRunner)
-        runner.max_batch = 8
-        runner._kda_runtime = SimpleNamespace(
-            metadata=SimpleNamespace(graph_num_tokens=3)
-        )
-
-        can_execute = runner.can_execute(
-            torch.tensor([1], dtype=torch.int32),
-            SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
-        )
-
-        assert can_execute
-
-    def test_host_metadata_accepts_empty_dp_shard_lengths(self):
-        runner = DecodeAclGraphRunner.__new__(DecodeAclGraphRunner)
-        runner.page_size = 128
-        entry = SimpleNamespace(
-            batch_size=4,
-            host_seq_lens=torch.empty(4, dtype=torch.int32),
-            host_block_counts=torch.empty(4, dtype=torch.int32),
-            static_metadata=SimpleNamespace(
-                kv_seq_lens_host=torch.zeros(5, dtype=torch.int32),
-                paged_kv_indptr_host=torch.zeros(5, dtype=torch.int32),
-                paged_kv_last_page_len_host=torch.ones(4, dtype=torch.int32),
-            ),
-        )
-        metadata = SimpleNamespace(
-            kv_seq_lens_host=torch.tensor([0, 0], dtype=torch.int32)
-        )
-
-        runner._fill_host_metadata(entry, metadata, batch_size=1)
-
-        assert entry.host_seq_lens.tolist() == [0, 0, 0, 0]
-        assert entry.static_metadata.kv_seq_lens_host.tolist() == [0, 0, 0, 0, 0]
-        assert entry.static_metadata.paged_kv_indptr_host.tolist() == [0, 0, 0, 0, 0]
-        assert entry.static_metadata.paged_kv_last_page_len_host.tolist() == [1, 1, 1, 1]
+    def test_enable_graph_selects_aclgraph_on_npu(self, _mock_is_npu):
+        config = {"enable_graph": True, "python_graph_backend": "off"}
+        assert _resolve_graph_backend(config) == "aclgraph"
 
 
 # ---------------------------------------------------------------------------
@@ -414,35 +162,68 @@ class TestKimiK3AclGraphMetadata:
 
 class TestCreateAttentionBackend:
     @patch(
-        "xllm.python.model_executor.executor._is_npu_device", return_value=True
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
+    def test_deepseek_v4_creates_dsa_backend(self, _mock_is_npu):
+        attn = _make_attention_layer(head_dim=512)
+        module = types.ModuleType("xllm.python.attention.dsa_attention")
+        module.DsaAttentionBackend = StubAttentionBackend
+        config = {
+            "model_type": "deepseek_v4",
+            "compress_ratios": [1, 4, 128],
+            "num_hidden_layers": 3,
+            "window_size": 128,
+            "index_topk": 512,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "qk_rope_head_dim": 64,
+        }
+        with patch.dict(sys.modules, {module.__name__: module}):
+            backend = _create_attention_backend(attn, torch.device("npu"), torch.bfloat16, config)
+
+        assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["attn_head_dim"] == 512
+        assert backend.init_kwargs["n_layers"] == 3
+        assert backend.init_kwargs["compress_ratios"] == [1, 4, 128]
+
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
     )
     @patch(
         "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
         StubAttentionBackend,
     )
     def test_npu_device_creates_npu_backend(self, _mock_is_npu):
-        attn = _make_attention_layer().attention_layer_spec()
+        attn = _make_attention_layer(num_kv_heads=1, head_dim=256)
         backend = _create_attention_backend(
-            attn, torch.device("npu"), torch.float16
+            attn,
+            torch.device("npu"),
+            torch.float16,
+            {"enable_mla": False},
         )
         assert isinstance(backend, StubAttentionBackend)
         assert backend.init_kwargs["num_heads"] == 8
-        assert backend.init_kwargs["num_kv_heads"] == 2
-        assert backend.init_kwargs["head_dim"] == 64
-        assert backend.init_kwargs["has_mha_layers"]
+        assert backend.init_kwargs["num_kv_heads"] == 1
+        assert backend.init_kwargs["head_dim"] == 256
+        assert backend.init_kwargs["is_mla"] is False
 
     @patch(
-        "xllm.python.model_executor.executor._is_npu_device", return_value=False
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=False,
     )
     @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
+        "xllm.python.model_executor.executor.current_platform.is_cuda",
+        return_value=True,
     )
-    def test_cuda_device_creates_flashinfer_backend(self, mock_create, _mock_is_npu):
-        mock_create.return_value = StubAttentionBackend(num_heads=8)
-        # Verify the factory would be called (we can't import flashinfer in NPU env)
-        from xllm.python.model_executor.executor import _is_npu_device
-
-        assert _is_npu_device(torch.device("cuda")) is False
+    def test_cuda_device_creates_flashinfer_backend(self, _mock_is_cuda, _mock_is_npu):
+        attn = _make_attention_layer()
+        module = types.ModuleType("xllm.python.attention.flashinfer")
+        module.FlashInferBackend = StubAttentionBackend
+        with patch.dict(sys.modules, {module.__name__: module}):
+            backend = _create_attention_backend(attn, torch.device("cuda"), torch.float16)
+        assert isinstance(backend, StubAttentionBackend)
 
 
 # ---------------------------------------------------------------------------
@@ -470,40 +251,17 @@ class TestModelExecutorConstruction:
     )
     def test_no_attention_layers_raises(self, _mock_backend):
         model = _FakeModelNoAttention()
-        with pytest.raises(ValueError, match="runtime attention layer"):
+        with pytest.raises(ValueError, match="does not contain an Attention layer"):
             ModelExecutor(model, {}, max_seqs_per_batch=4)
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
         return_value=StubAttentionBackend(),
     )
-    def test_heterogeneous_attention_is_registered(self, _mock_backend):
+    def test_heterogeneous_attention_raises(self, _mock_backend):
         model = _FakeModelHeterogeneous()
-        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
-
-        assert [spec.num_heads for spec in executor._attention_layer_specs] == [8, 4]
-
-    @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-        return_value=StubAttentionBackend(),
-    )
-    def test_duplicate_layer_ids_raise(self, _mock_backend):
-        model = _FakeModel(num_layers=2)
-        model.layers[1].layer_id = 0
-        with pytest.raises(ValueError, match="must be unique"):
+        with pytest.raises(ValueError, match="identical attention configuration"):
             ModelExecutor(model, {}, max_seqs_per_batch=4)
-
-    @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-        return_value=StubAttentionBackend(),
-    )
-    def test_sparse_physical_layer_id_is_registered(self, _mock_backend):
-        model = _FakeModel(num_layers=1)
-        model.layers[0].layer_id = 3
-
-        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
-
-        assert [spec.layer_id for spec in executor._attention_layer_specs] == [3]
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
@@ -512,16 +270,566 @@ class TestModelExecutorConstruction:
     def test_graph_backend_off_variants(self, _mock_backend):
         for off_value in ("off", "", "none", "0"):
             model = _FakeModel(num_layers=1)
-            executor = ModelExecutor(
-                model, {"python_graph_backend": off_value}, max_seqs_per_batch=4
-            )
+            executor = ModelExecutor(model, {"python_graph_backend": off_value}, max_seqs_per_batch=4)
             assert executor.decode_graph_runner is None
             assert executor.inductor_runner is None
+
+    @patch("xllm.python.model_executor.runners.decode_cuda_graph.DecodeCudaGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_data_parallel_cuda_graph_is_supported(self, mock_create, mock_graph_runner):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+
+        ModelExecutor(
+            model,
+            {
+                "dp_size": 2,
+                "dp_rank": 1,
+                "max_position_embeddings": 128,
+                "python_graph_backend": "cudagraphs",
+            },
+            max_seqs_per_batch=4,
+        )
+
+        mock_graph_runner.assert_called_once_with(
+            model.model,
+            mock_create.return_value,
+            torch.device("cpu"),
+            4,
+            128,
+            2,
+            1,
+        )
+
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_data_parallel_rejects_unsupported_graph_backend(self, mock_create):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+
+        with pytest.raises(NotImplementedError, match="supports cudagraphs and aclgraph only"):
+            ModelExecutor(
+                model,
+                {
+                    "dp_size": 2,
+                    "max_position_embeddings": 128,
+                    "python_graph_backend": "inductor",
+                },
+                max_seqs_per_batch=4,
+            )
+
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_acl_graph_capacity_respects_decode_batch_limit(
+        self,
+        mock_create,
+        mock_graph_runner,
+    ):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+
+        ModelExecutor(
+            model,
+            {
+                "max_position_embeddings": 128,
+                "python_graph_backend": "aclgraph",
+            },
+            max_seqs_per_batch=256,
+            num_decoding_tokens=4,
+            acl_graph_decode_batch_size_limit=16,
+        )
+
+        mock_graph_runner.assert_called_once_with(
+            model.model,
+            mock_create.return_value,
+            torch.device("cpu"),
+            64,
+            128,
+            1,
+            0,
+            16,
+            4,
+        )
+
+
+class TestDecodeCudaGraphDataParallelKeys:
+    @staticmethod
+    def _runner(dp_rank: int = 0) -> DecodeCudaGraphRunner:
+        runner = object.__new__(DecodeCudaGraphRunner)
+        runner.max_batch = 16
+        runner.dp_size = 2
+        runner.dp_rank = dp_rank
+        runner._graphs = {}
+        return runner
+
+    @staticmethod
+    def _metadata(token_counts: list[int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            is_prefill=False,
+            is_chunked_prefill=False,
+            dp_token_counts=token_counts,
+        )
+
+    def test_graph_key_uses_global_max_data_parallel_bucket(self):
+        runner = self._runner()
+        input_ids = torch.zeros(3, dtype=torch.int32)
+
+        first = runner._graph_key(input_ids, self._metadata([3, 1]))
+        second = runner._graph_key(input_ids, self._metadata([3, 2]))
+
+        assert first == (4, (4, 4))
+        assert second == first
+
+    def test_data_parallel_warmup_uses_local_batch_capacity(self):
+        assert _decode_graph_buckets(16, 2) == [1, 2, 4, 8]
+        assert _decode_graph_buckets(20, 2) == [1, 2, 4, 8, 16]
+
+    def test_single_rank_graph_key_reuses_padded_bucket(self):
+        runner = self._runner()
+        runner.dp_size = 1
+        runner.dp_rank = 0
+
+        first = runner._graph_key(torch.zeros(3, dtype=torch.int32), self._metadata([3]))
+        second = runner._graph_key(torch.zeros(4, dtype=torch.int32), self._metadata([4]))
+
+        assert first == (4, (4,))
+        assert second == first
+
+    def test_graph_key_accepts_empty_data_parallel_rank(self):
+        runner = self._runner(dp_rank=1)
+        input_ids = torch.zeros(1, dtype=torch.int32)
+
+        assert runner._graph_key(input_ids, self._metadata([5, 0])) == (
+            8,
+            (8, 8),
+        )
+
+    def test_graph_key_rejects_unbalanced_unwarmed_bucket(self):
+        runner = self._runner()
+        input_ids = torch.zeros(9, dtype=torch.int32)
+
+        assert runner._graph_key(input_ids, self._metadata([9, 7])) is None
+
+    def test_can_execute_requires_warmed_graph(self):
+        runner = self._runner()
+        input_ids = torch.zeros(3, dtype=torch.int32)
+        metadata = self._metadata([3, 1])
+        graph_key = runner._graph_key(input_ids, metadata)
+
+        assert not runner.can_execute(input_ids, metadata)
+        runner._graphs[graph_key] = object()
+        assert runner.can_execute(input_ids, metadata)
+
+    @pytest.mark.parametrize("token_counts", ([3], [3, -1], [3, 2]))
+    def test_graph_key_rejects_invalid_data_parallel_metadata(self, token_counts):
+        runner = self._runner(dp_rank=1)
+        input_ids = torch.zeros(1, dtype=torch.int32)
+
+        with pytest.raises(RuntimeError):
+            runner._graph_key(input_ids, self._metadata(token_counts))
+
+
+# ---------------------------------------------------------------------------
+# Tests: DecodeAclGraphRunner speculative metadata
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeAclGraphSpeculativeMetadata:
+    @staticmethod
+    def _runner() -> DecodeAclGraphRunner:
+        return DecodeAclGraphRunner(
+            nn.Identity(),
+            _PagedStubAttentionBackend(),
+            torch.device("cpu"),
+            max_batch=4,
+            max_model_len=8,
+        )
+
+    @staticmethod
+    def _metadata() -> SimpleNamespace:
+        return SimpleNamespace(
+            slot_mapping=torch.arange(4, dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
+            paged_kv_indices=torch.tensor([10, 10, 20, 21, 20, 21], dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([3, 4, 3, 4], dtype=torch.int32),
+            q_cu_seq_lens=torch.tensor([0, 2, 4], dtype=torch.int32),
+            kv_cu_seq_lens=torch.tensor([0, 4, 12], dtype=torch.int32),
+            kv_seq_lens_host=torch.tensor([4, 8], dtype=torch.int32),
+            kv_seq_lens_host_values=[4, 8],
+            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            kv_seq_lens=torch.tensor([4, 8], dtype=torch.int32),
+            q_seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+            expanded_decode_metadata=SimpleNamespace(
+                enabled=True,
+                kv_seq_lens=torch.tensor([3, 4, 7, 8], dtype=torch.int32),
+                block_table=torch.tensor(
+                    [[10, 11], [10, 11], [20, 21], [20, 21]],
+                    dtype=torch.int32,
+                ),
+                paged_kv_indptr=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
+                paged_kv_indices=torch.tensor([10, 10, 20, 21, 20, 21], dtype=torch.int32),
+                paged_kv_last_page_len=torch.tensor([3, 4, 3, 4], dtype=torch.int32),
+                paged_attention_tiling_data=None,
+                kv_seq_lens_host=torch.tensor([3, 4, 7, 8], dtype=torch.int32),
+                kv_seq_lens_host_values=[3, 4, 7, 8],
+            ),
+            is_prefill=False,
+            is_chunked_prefill=True,
+        )
+
+    def test_expanded_metadata_selects_matching_paged_kv_rows(self) -> None:
+        runner = self._runner()
+        (
+            block_table,
+            kv_seq_lens,
+            _,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+        ) = runner._decode_metadata(self._metadata())
+
+        assert block_table.tolist() == [
+            [10, 11],
+            [10, 11],
+            [20, 21],
+            [20, 21],
+        ]
+        assert kv_seq_lens.tolist() == [3, 4, 7, 8]
+        assert paged_kv_indptr.tolist() == [0, 1, 2, 4, 6]
+        assert paged_kv_indices.tolist() == [10, 10, 20, 21, 20, 21]
+        assert paged_kv_last_page_len.tolist() == [3, 4, 3, 4]
+
+    def test_decode_metadata_rebuilds_token_row_paging_metadata(self) -> None:
+        metadata = self._metadata()
+        metadata.expanded_decode_metadata = None
+        metadata.slot_mapping = torch.arange(4, dtype=torch.int32)
+        metadata.block_table = torch.tensor(
+            [[10, 11], [10, 11], [20, 21], [20, 21]],
+            dtype=torch.int32,
+        )
+        metadata.kv_seq_lens = torch.tensor([3, 4, 7, 8], dtype=torch.int32)
+        metadata.kv_seq_lens_host_values = [3, 4, 7, 8]
+        metadata.paged_kv_indptr = torch.tensor([0, 1, 3], dtype=torch.int32)
+        metadata.paged_kv_indices = torch.tensor([10, 20, 21], dtype=torch.int32)
+        metadata.paged_kv_last_page_len = torch.tensor([4, 4], dtype=torch.int32)
+
+        (
+            _,
+            _,
+            _,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+        ) = self._runner()._decode_metadata(metadata)
+
+        assert paged_kv_indptr.tolist() == [0, 1, 2, 4, 6]
+        assert paged_kv_indices.tolist() == [10, 10, 20, 21, 20, 21]
+        assert paged_kv_last_page_len.tolist() == [3, 4, 3, 4]
+
+    def test_expanded_chunked_verify_can_use_decode_graph(self) -> None:
+        runner = self._runner()
+        input_ids = torch.arange(4, dtype=torch.int32)
+
+        assert runner.can_execute(input_ids, self._metadata())
+
+    def test_decode_batch_limit_uses_speculative_tokens_and_dp_global_max(
+        self,
+    ) -> None:
+        runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            _PagedStubAttentionBackend(),
+            torch.device("cpu"),
+            max_batch=64,
+            max_model_len=8,
+            decode_batch_size_limit=16,
+            num_decoding_tokens=4,
+        )
+        metadata = SimpleNamespace(dp_token_counts=(32, 64))
+
+        assert runner._decode_batch_sizes(
+            torch.zeros(32, dtype=torch.int32),
+            metadata,
+        ) == (8, 16)
+
+    def test_mtp3_batch_eight_uses_32_row_graph_bucket(self) -> None:
+        runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            _PagedStubAttentionBackend(),
+            torch.device("cpu"),
+            max_batch=64,
+            max_model_len=8,
+            decode_batch_size_limit=16,
+            num_decoding_tokens=4,
+        )
+        metadata = SimpleNamespace(
+            is_prefill=False,
+            is_chunked_prefill=False,
+            dp_token_counts=(),
+        )
+
+        with patch.object(
+            runner,
+            "_has_compatible_decode_metadata",
+            return_value=True,
+        ):
+            assert runner.can_execute(
+                torch.zeros(32, dtype=torch.int32),
+                metadata,
+            )
+
+    def test_warmup_captures_with_scheduler_metadata_once(self) -> None:
+        runner = self._runner()
+        input_ids = torch.arange(4, dtype=torch.int32)
+        positions = torch.arange(4, dtype=torch.int32)
+        metadata = self._metadata()
+        graph_key = runner._graph_key(
+            padded_batch_size=4,
+            is_expanded=True,
+            input_embedding=None,
+        )
+
+        with patch.object(runner, "_prepare_graph_entry") as prepare:
+            runner.warmup(input_ids, positions, metadata)
+            prepare.assert_called_once_with(
+                input_ids,
+                positions,
+                metadata,
+                None,
+            )
+
+            runner._graphs[graph_key] = object()
+            runner.warmup(input_ids, positions, metadata)
+            prepare.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            (
+                "block_table",
+                torch.arange(8, dtype=torch.int32),
+                "block_table must be two-dimensional",
+            ),
+            (
+                "kv_seq_lens",
+                torch.tensor([3, 4, 7], dtype=torch.int32),
+                "kv_seq_lens must contain one value per sequence",
+            ),
+            (
+                "kv_seq_lens_host",
+                torch.tensor([3, 4, 7], dtype=torch.int32),
+                "kv_seq_lens_host must contain one value per sequence",
+            ),
+            (
+                "paged_kv_indptr",
+                torch.tensor([0, 1, 2, 4], dtype=torch.int32),
+                "paged_kv_indptr must contain one offset per sequence",
+            ),
+            (
+                "paged_kv_indices",
+                torch.tensor([[10, 10], [20, 21]], dtype=torch.int32),
+                "paged_kv_indices must be a non-empty flat page list",
+            ),
+            (
+                "paged_kv_last_page_len",
+                torch.tensor([3, 4, 3], dtype=torch.int32),
+                "paged_kv_last_page_len must contain one value per sequence",
+            ),
+        ],
+    )
+    def test_expanded_metadata_shape_mismatch_fails(
+        self,
+        field: str,
+        value: torch.Tensor,
+        message: str,
+    ) -> None:
+        metadata = self._metadata()
+        setattr(metadata.expanded_decode_metadata, field, value)
+
+        with pytest.raises(RuntimeError, match=message):
+            self._runner()._decode_metadata(metadata)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            (
+                "paged_kv_indptr",
+                torch.tensor([1, 1, 2, 4, 6], dtype=torch.int32),
+                "must start at zero",
+            ),
+            (
+                "paged_kv_indptr",
+                torch.tensor([0, 2, 1, 4, 6], dtype=torch.int32),
+                "must be monotonic",
+            ),
+            (
+                "paged_kv_indptr",
+                torch.tensor([0, 1, 2, 4, 5], dtype=torch.int32),
+                "terminal page offset must match page count",
+            ),
+            (
+                "paged_kv_last_page_len",
+                torch.tensor([3, 4, 0, 4], dtype=torch.int32),
+                "last-page lengths must be positive",
+            ),
+            (
+                "paged_kv_last_page_len",
+                torch.tensor([3, 4, 5, 4], dtype=torch.int32),
+                "must not exceed block size",
+            ),
+        ],
+    )
+    def test_expanded_paged_metadata_invariant_fails(
+        self,
+        field: str,
+        value: torch.Tensor,
+        message: str,
+    ) -> None:
+        metadata = self._metadata()
+        setattr(metadata.expanded_decode_metadata, field, value)
+
+        with pytest.raises(RuntimeError, match=message):
+            self._runner()._decode_metadata(metadata)
+
+    def test_expanded_page_count_exceeding_capacity_fails(self) -> None:
+        metadata = self._metadata()
+        metadata.expanded_decode_metadata.kv_seq_lens_host_values = [3, 4, 7, 9]
+
+        with pytest.raises(RuntimeError, match="exceeds block-table capacity"):
+            self._runner()._decode_metadata(metadata)
+
+    @pytest.mark.parametrize(
+        ("input_ids", "slot_mapping", "message"),
+        [
+            (
+                torch.arange(3, dtype=torch.int32),
+                torch.arange(4, dtype=torch.int32),
+                "input_ids must contain one token per metadata row",
+            ),
+            (
+                torch.arange(4, dtype=torch.int32),
+                torch.arange(3, dtype=torch.int32),
+                "slot_mapping must contain one slot per token",
+            ),
+        ],
+    )
+    def test_token_layout_mismatch_fails(
+        self,
+        input_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        message: str,
+    ) -> None:
+        with pytest.raises(RuntimeError, match=message):
+            self._runner()._validate_decode_token_layout(
+                input_ids,
+                torch.arange(4, dtype=torch.int32),
+                slot_mapping,
+                metadata_row_count=4,
+            )
+
+    def test_replay_returns_static_output_view(self) -> None:
+        runner = self._runner()
+        batch_size = 3
+        padded_batch_size = 4
+        static_output = torch.arange(12).reshape(padded_batch_size, 3)
+        graph = MagicMock()
+        entry = SimpleNamespace(
+            graph=graph,
+            static_output=static_output,
+            static_metadata=SimpleNamespace(),
+            graph_tasks=[],
+            execution_state=SimpleNamespace(persistent_buffers={}),
+        )
+        graph_key = runner._graph_key(
+            padded_batch_size,
+            is_expanded=False,
+            input_embedding=None,
+        )
+        runner._graphs[graph_key] = entry
+
+        replay_stream = MagicMock()
+        update_stream = MagicMock()
+        replay_done_event = MagicMock()
+        current_stream = MagicMock()
+        runner._stream = replay_stream
+        runner._update_stream = update_stream
+        runner._replay_done_event = replay_done_event
+        fake_npu = SimpleNamespace(
+            current_stream=MagicMock(return_value=current_stream),
+            stream=MagicMock(return_value=nullcontext()),
+        )
+        metadata = SimpleNamespace(expanded_decode_metadata=None)
+
+        with (
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch.object(
+                runner,
+                "_prepare_graph_entry",
+                return_value=entry,
+            ),
+        ):
+            output = runner.execute(
+                torch.arange(batch_size, dtype=torch.int32),
+                torch.arange(batch_size, dtype=torch.int32),
+                metadata,
+            )
+
+        assert output.shape == (batch_size, 3)
+        assert output.data_ptr() == static_output.data_ptr()
+        output[0, 0] = -1
+        assert static_output[0, 0].item() == -1
+        replay_stream.wait_stream.assert_called_once_with(current_stream)
+        current_stream.wait_stream.assert_called_once_with(replay_stream)
+        graph.replay.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor.bind_kv_caches
 # ---------------------------------------------------------------------------
+
+
+class TestNormalizeLayerCaches:
+    def test_legacy_five_slot_cache_keeps_generic_layout(self):
+        tensors = tuple(torch.full((1,), value) for value in range(1, 6))
+
+        cache = normalize_layer_caches([tensors])[0]
+
+        assert cache.key is tensors[0]
+        assert cache.value is tensors[1]
+        assert cache.index is tensors[2]
+        assert cache.conv is tensors[3]
+        assert cache.ssm is tensors[4]
+        assert cache.swa is None
+        assert cache.compress_kv_state is None
+        assert cache.compress_score_state is None
+        assert cache.compress_index_kv_state is None
+        assert cache.compress_index_score_state is None
+        assert cache.indexer_scale is None
+
+    def test_deepseek_v4_eleven_slot_cache_maps_all_slots(self):
+        tensors = tuple(torch.full((1,), value) for value in range(1, 12))
+
+        cache = normalize_layer_caches([tensors])[0]
+
+        assert (
+            cache.key,
+            cache.value,
+            cache.index,
+            cache.conv,
+            cache.ssm,
+            cache.swa,
+            cache.compress_kv_state,
+            cache.compress_score_state,
+            cache.compress_index_kv_state,
+            cache.compress_index_score_state,
+            cache.indexer_scale,
+        ) == tensors
+
+    def test_empty_deepseek_v4_slots_are_normalized_to_none(self):
+        cache = normalize_layer_caches([(torch.ones(1), torch.ones(1), *(torch.empty(0),) * 9)])[0]
+
+        assert cache.key is not None
+        assert cache.value is not None
+        assert cache.index is None
+        assert cache.indexer_scale is None
 
 
 class TestBindKvCaches:
@@ -547,52 +855,8 @@ class TestBindKvCaches:
         executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
 
         kv = (torch.zeros(1), torch.zeros(1))
-        with pytest.raises(ValueError, match="does not cover"):
+        with pytest.raises(ValueError, match="layer count does not match"):
             executor.bind_kv_caches([kv])
-
-    @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-    )
-    def test_sparse_layer_binds_physical_cache_list(self, mock_create):
-        backend = StubAttentionBackend()
-        mock_create.return_value = backend
-        model = _FakeModel(num_layers=1)
-        model.layers[0].layer_id = 3
-        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
-
-        kv = (torch.zeros(1), torch.zeros(1))
-        kv_caches = [kv, kv, kv, kv]
-        executor.bind_kv_caches(kv_caches)
-
-        assert backend._kv_caches is kv_caches
-
-    @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-    )
-    def test_sparse_layer_rejects_runtime_only_cache_list(self, mock_create):
-        mock_create.return_value = StubAttentionBackend()
-        model = _FakeModel(num_layers=1)
-        model.layers[0].layer_id = 3
-        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
-
-        kv = (torch.zeros(1), torch.zeros(1))
-        with pytest.raises(ValueError, match="does not cover"):
-            executor.bind_kv_caches([kv])
-
-    @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-    )
-    def test_contiguous_layers_accept_extra_physical_caches(self, mock_create):
-        backend = StubAttentionBackend()
-        mock_create.return_value = backend
-        model = _FakeModel(num_layers=2)
-        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
-
-        kv = (torch.zeros(1), torch.zeros(1))
-        kv_caches = [kv, kv, kv]
-        executor.bind_kv_caches(kv_caches)
-
-        assert backend._kv_caches is kv_caches
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
@@ -614,69 +878,6 @@ class TestBindKvCaches:
 
 
 class TestExecuteRouting:
-    def test_dp_decode_graph_is_enabled_for_empty_shard_when_metadata_is_valid(self):
-        executor = object.__new__(ModelExecutor)
-        executor._dp_size = 2
-
-        metadata = SimpleNamespace(
-            dp_metadata_valid=True,
-            all_dp_decode=True,
-        )
-
-        assert executor._all_dp_decode(metadata)
-
-    def test_dp_decode_graph_is_enabled_when_every_shard_decodes(self):
-        executor = object.__new__(ModelExecutor)
-        executor._dp_size = 2
-
-        metadata = SimpleNamespace(
-            dp_metadata_valid=True,
-            all_dp_decode=True,
-        )
-
-        assert executor._all_dp_decode(metadata)
-
-    def test_dp_decode_graph_falls_back_for_invalid_metadata(self):
-        executor = object.__new__(ModelExecutor)
-        executor._dp_size = 2
-
-        assert not executor._all_dp_decode(
-            SimpleNamespace(dp_metadata_valid=False, all_dp_decode=True)
-        )
-
-    def test_dp_decode_graph_falls_back_for_mixed_phase(self):
-        executor = object.__new__(ModelExecutor)
-        executor._dp_size = 2
-
-        assert not executor._all_dp_decode(
-            SimpleNamespace(dp_metadata_valid=True, all_dp_decode=False)
-        )
-
-    def test_tp_decode_graph_is_enabled(self):
-        executor = object.__new__(ModelExecutor)
-        executor._dp_size = 1
-
-        assert executor._all_dp_decode(None)
-
-    @patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-    )
-    @patch(
-        "xllm.python.model_executor.executor._resolve_graph_backend",
-        return_value="aclgraph",
-    )
-    def test_kimi_acl_graph_accepts_dp(self, _mock_resolve, mock_create):
-        mock_create.return_value = StubAttentionBackend()
-        model = _FakeModel(num_layers=1)
-        model.model.kda_runtime = object()
-
-        executor = ModelExecutor(
-            model,
-            {"dp_size": 2, "max_position_embeddings": 128},
-            max_seqs_per_batch=4,
-        )
-        assert executor.decode_graph_runner is not None
-
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
     )
@@ -702,10 +903,18 @@ class TestExecuteRouting:
 
         metadata = MagicMock(spec=AttentionMetadata)
         executor.eager_runner = MagicMock()
-        executor.eager_runner.execute.return_value = torch.ones(5)
+        grad_enabled = None
+
+        def execute(*_args):
+            nonlocal grad_enabled
+            grad_enabled = torch.is_grad_enabled()
+            return torch.ones(5)
+
+        executor.eager_runner.execute.side_effect = execute
 
         result = executor.execute(torch.zeros(1), torch.zeros(1), metadata)
         executor.eager_runner.execute.assert_called_once()
+        assert grad_enabled is False
         assert torch.equal(result, torch.ones(5))
 
     @patch(
@@ -730,24 +939,34 @@ class TestExecuteRouting:
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
     )
-    def test_prefill_forward_stays_eager_after_decode_graph_warmup(
-        self, mock_create
-    ):
+    def test_acl_graph_warmup_uses_scheduler_inputs(self, mock_create):
         mock_create.return_value = StubAttentionBackend()
-        executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
+        model = _FakeModel(num_layers=1)
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+
         kv = (torch.zeros(1), torch.zeros(1))
         executor.bind_kv_caches([kv])
 
+        input_ids = torch.zeros(4, dtype=torch.int32)
+        positions = torch.arange(4, dtype=torch.int32)
         metadata = MagicMock(spec=AttentionMetadata)
-        executor.decode_graph_runner = MagicMock()
-        executor.decode_graph_runner.can_execute.return_value = False
-        executor.eager_runner = MagicMock()
-        executor.eager_runner.execute.return_value = torch.ones(2)
+        graph_runner = MagicMock()
+        graph_runner.can_execute.return_value = True
+        graph_runner.execute.return_value = torch.ones(4)
+        executor.decode_graph_runner = graph_runner
 
-        result = executor.execute(torch.zeros(1), torch.zeros(1), metadata)
+        result = executor.execute(input_ids, positions, metadata)
 
-        executor.decode_graph_runner.can_execute.assert_called_once()
-        executor.decode_graph_runner.warmup.assert_called_once()
-        executor.decode_graph_runner.execute.assert_not_called()
-        executor.eager_runner.execute.assert_called_once()
-        assert torch.equal(result, torch.ones(2))
+        graph_runner.warmup.assert_called_once_with(
+            input_ids,
+            positions,
+            metadata,
+            None,
+        )
+        graph_runner.execute.assert_called_once_with(
+            input_ids,
+            positions,
+            metadata,
+            None,
+        )
+        assert torch.equal(result, torch.ones(4))
