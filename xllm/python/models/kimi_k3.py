@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,9 +37,7 @@ class KimiK3ForConditionalGeneration(PyCausalVLMBase):
     def supports_prefix_cache(self) -> bool:
         return self.language_model.supports_prefix_cache
 
-    def encode_multimodal(
-        self, pixel_values: torch.Tensor, grid_thws: torch.Tensor
-    ) -> list[torch.Tensor]:
+    def encode_multimodal(self, pixel_values: torch.Tensor, grid_thws: torch.Tensor) -> list[torch.Tensor]:
         return self.vision_model(pixel_values, grid_thws)
 
     def get_input_embeddings(
@@ -56,13 +54,9 @@ class KimiK3ForConditionalGeneration(PyCausalVLMBase):
         inputs_embeds[multimodal_mask] = multimodal_embeds
         return inputs_embeds
 
-    def load_weights(
-        self, state_dicts: list[Any], tp_rank: int, tp_size: int
-    ) -> set[str]:
+    def load_weights(self, state_dicts: list[Any], tp_rank: int, tp_size: int) -> set[str]:
         loaded = self.vision_model.load_weights(state_dicts, tp_rank, tp_size)
-        loaded.update(
-            self.language_model.load_weights(state_dicts, tp_rank, tp_size)
-        )
+        loaded.update(self.language_model.load_weights(state_dicts, tp_rank, tp_size))
         return loaded
 
 

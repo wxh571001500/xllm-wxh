@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -111,9 +111,9 @@ std::unordered_map<std::string, std::string> parse_attributes(
     if (result.contains(key)) {
       throw std::runtime_error("Duplicate XTML attribute.");
     }
-    result.emplace(key,
-                   decode_attribute(attributes.substr(
-                       value_start, quote - value_start)));
+    result.emplace(
+        key,
+        decode_attribute(attributes.substr(value_start, quote - value_start)));
     cursor = quote + 1;
   }
   return result;
@@ -152,8 +152,7 @@ void require_attributes(
   }
 }
 
-size_t partial_marker_overlap(std::string_view text,
-                              std::string_view marker) {
+size_t partial_marker_overlap(std::string_view text, std::string_view marker) {
   const size_t maximum = std::min(text.size(), marker.size() - 1);
   for (size_t overlap = maximum; overlap > 0; --overlap) {
     if (text.substr(text.size() - overlap) == marker.substr(0, overlap)) {
@@ -177,22 +176,22 @@ void skip_whitespace(std::string_view text, size_t* cursor) {
 
 nlohmann::json parse_json_value(std::string_view value) {
   std::unordered_map<int, std::unordered_set<std::string>> keys_by_depth;
-  auto reject_duplicate_keys =
-      [&keys_by_depth](int depth,
-                       nlohmann::json::parse_event_t event,
-                       nlohmann::json& parsed_value) {
-        if (event == nlohmann::json::parse_event_t::object_start) {
-          keys_by_depth[depth].clear();
-        } else if (event == nlohmann::json::parse_event_t::key) {
-          const std::string key = parsed_value.get<std::string>();
-          if (!keys_by_depth[depth].insert(key).second) {
-            throw std::runtime_error("Duplicate JSON key in K3 arguments.");
-          }
-        } else if (event == nlohmann::json::parse_event_t::object_end) {
-          keys_by_depth.erase(depth);
-        }
-        return true;
-      };
+  auto reject_duplicate_keys = [&keys_by_depth](
+                                   int depth,
+                                   nlohmann::json::parse_event_t event,
+                                   nlohmann::json& parsed_value) {
+    if (event == nlohmann::json::parse_event_t::object_start) {
+      keys_by_depth[depth].clear();
+    } else if (event == nlohmann::json::parse_event_t::key) {
+      const std::string key = parsed_value.get<std::string>();
+      if (!keys_by_depth[depth].insert(key).second) {
+        throw std::runtime_error("Duplicate JSON key in K3 arguments.");
+      }
+    } else if (event == nlohmann::json::parse_event_t::object_end) {
+      keys_by_depth.erase(depth);
+    }
+    return true;
+  };
   const nlohmann::json parsed = nlohmann::json::parse(
       value.begin(), value.end(), reject_duplicate_keys, false);
   if (parsed.is_discarded()) {
@@ -208,12 +207,11 @@ nlohmann::json parse_typed_argument(std::string_view value,
   }
 
   nlohmann::json parsed = parse_json_value(value);
-  const bool valid =
-      (type == "number" && parsed.is_number()) ||
-      (type == "boolean" && parsed.is_boolean()) ||
-      (type == "null" && parsed.is_null()) ||
-      (type == "object" && parsed.is_object()) ||
-      (type == "array" && parsed.is_array());
+  const bool valid = (type == "number" && parsed.is_number()) ||
+                     (type == "boolean" && parsed.is_boolean()) ||
+                     (type == "null" && parsed.is_null()) ||
+                     (type == "object" && parsed.is_object()) ||
+                     (type == "array" && parsed.is_array());
   if (!valid) {
     throw std::runtime_error("K3 typed argument has an invalid value.");
   }
@@ -379,11 +377,11 @@ ParseSnapshot parse_snapshot(const std::string& text,
     for (const JsonTool& tool : tools) {
       allowed_tool_names.insert(tool.function.name);
     }
-    snapshot.calls = parse_calls(
-        std::string_view(text).substr(tools_body_start,
-                                      tools_end - tools_body_start),
-        allowed_tool_names,
-        !tools.empty());
+    snapshot.calls =
+        parse_calls(std::string_view(text).substr(tools_body_start,
+                                                  tools_end - tools_body_start),
+                    allowed_tool_names,
+                    !tools.empty());
     cursor = tools_end + kToolsEnd.size();
   } else if (!final && kToolsStart.starts_with(tail)) {
     return snapshot;

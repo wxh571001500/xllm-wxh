@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -191,20 +191,14 @@ class AdaptiveMoECommMethod(MoECommMethod):
             quantized,
             device,
         )
-        self._all_to_all = (
-            AllToAllCommMethod(config, num_experts, quantized)
-            if config.ep_size > 1
-            else None
-        )
+        self._all_to_all = AllToAllCommMethod(config, num_experts, quantized) if config.ep_size > 1 else None
         has_mc2 = hasattr(torch_npu, "npu_moe_distribute_dispatch") and hasattr(
             torch_npu,
             "npu_moe_distribute_combine",
         )
         self._mc2 = (
             MC2CommMethod(config, num_experts, quantized, device)
-            if config.ep_size > 1
-            and device.type in ("npu", "privateuseone")
-            and has_mc2
+            if config.ep_size > 1 and device.type in ("npu", "privateuseone") and has_mc2
             else None
         )
         self._active: MoECommMethod | None = None
@@ -214,9 +208,7 @@ class AdaptiveMoECommMethod(MoECommMethod):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> MoEPrepareOutput:
-        if self._mc2 is not None and (
-            hidden_states.shape[0] <= self._config.mc2_tokens_capacity
-        ):
+        if self._mc2 is not None and (hidden_states.shape[0] <= self._config.mc2_tokens_capacity):
             self._active = self._mc2
         elif self._all_to_all is not None:
             self._active = self._all_to_all

@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -53,31 +53,21 @@ class FlashInferBackend(AttentionBackend):
         self.sliding_window = sliding_window
         self.dtype = dtype
 
-        self._decode_workspace = torch.empty(
-            _WORKSPACE_SIZE, dtype=torch.uint8, device=device
+        self._decode_workspace = torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
+        self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(self._decode_workspace, "NHD")
+        self._prefill_ragged_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device),
+            "NHD",
         )
-        self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self._decode_workspace, "NHD"
-        )
-        self._prefill_ragged_wrapper = (
-            flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-                torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device),
-                "NHD",
-            )
-        )
-        self._prefill_paged_wrapper = (
-            flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device),
-                "NHD",
-            )
+        self._prefill_paged_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device),
+            "NHD",
         )
 
         self._kv_caches: list[KVCache] = []
         self._metadata: AttentionMetadata | None = None
         self._active_decode_wrapper = self._decode_wrapper
-        self._graph_decode_wrappers: dict[
-            int, flashinfer.BatchDecodeWithPagedKVCacheWrapper
-        ] = {}
+        self._graph_decode_wrappers: dict[int, flashinfer.BatchDecodeWithPagedKVCacheWrapper] = {}
         self._graph_decode_buffer_ptrs: dict[int, tuple[int, int, int]] = {}
         self._planned_graph_batches: set[int] = set()
 
@@ -205,9 +195,7 @@ class FlashInferBackend(AttentionBackend):
             global_override_indptr_cpu=indptr_host,
         )
 
-    def _get_graph_decode_wrapper(
-        self, metadata: AttentionMetadata, batch_size: int
-    ):
+    def _get_graph_decode_wrapper(self, metadata: AttentionMetadata, batch_size: int):
         wrapper = self._graph_decode_wrappers.get(batch_size)
         if wrapper is None:
             wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -219,14 +207,10 @@ class FlashInferBackend(AttentionBackend):
                 paged_kv_last_page_len_buffer=metadata.paged_kv_last_page_len,
             )
             self._graph_decode_wrappers[batch_size] = wrapper
-            self._graph_decode_buffer_ptrs[batch_size] = self._buffer_ptrs(
-                metadata
-            )
+            self._graph_decode_buffer_ptrs[batch_size] = self._buffer_ptrs(metadata)
             return wrapper
 
-        if self._graph_decode_buffer_ptrs[batch_size] != self._buffer_ptrs(
-            metadata
-        ):
+        if self._graph_decode_buffer_ptrs[batch_size] != self._buffer_ptrs(metadata):
             raise RuntimeError("decode CUDA graph metadata address changed")
         return wrapper
 
@@ -243,7 +227,7 @@ class FlashInferBackend(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: "Attention",
+        layer: Attention,
     ) -> torch.Tensor:
         metadata = self._metadata
         if metadata is None:
@@ -254,9 +238,7 @@ class FlashInferBackend(AttentionBackend):
         k_3d = k.view(-1, layer.num_kv_heads, layer.head_dim)
         v_3d = v.view(-1, layer.num_kv_heads, layer.head_dim)
 
-        ops.reshape_paged_cache(
-            metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache
-        )
+        ops.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
 
         if metadata.is_prefill:
             output = self._prefill_ragged_wrapper.run(q_3d, k_3d, v_3d)

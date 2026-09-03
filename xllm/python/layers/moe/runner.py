@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,7 +23,6 @@ import torch
 from xllm.python.layers.moe.communication import MoECommMethod
 from xllm.python.layers.moe.experts import RoutedExperts
 from xllm.python.layers.moe.router import MoERouter
-
 
 TensorTransform = Callable[[torch.Tensor], torch.Tensor]
 
@@ -68,24 +67,16 @@ class MoERunner:
         routed_output = self.comm_method.finalize(
             hidden_states=fused_result.routed_out,
             reduce_results=self._reduce_routed_results(),
-            padded_hidden_states_shape=(
-                prepare_output.padded_hidden_states_shape
-            ),
+            padded_hidden_states_shape=(prepare_output.padded_hidden_states_shape),
         )
         if routed_output_transform is not None:
-            routed_output = self._unwrap_tensor(
-                routed_output_transform(routed_output)
-            )
+            routed_output = self._unwrap_tensor(routed_output_transform(routed_output))
 
         shared_output = None
         if shared_experts is not None:
             shared_output = self._unwrap_tensor(shared_experts(shared_input))
             shared_output = self._finalize_shared_expert_output(shared_output)
-        output = (
-            routed_output
-            if shared_output is None
-            else routed_output + shared_output
-        )
+        output = routed_output if shared_output is None else routed_output + shared_output
         return self._finalize_output(output)
 
     def _reduce_routed_results(self) -> bool:

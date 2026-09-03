@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -33,11 +33,7 @@ def _is_npu_device(device: torch.device) -> bool:
 def _resolve_graph_backend(config: dict, device: torch.device) -> str:
     graph_backend = str(config.get("python_graph_backend", "off")).lower()
     graph_disabled = graph_backend in ("", "off", "none", "0")
-    if (
-        graph_disabled
-        and config.get("enable_graph", False)
-        and _is_npu_device(device)
-    ):
+    if graph_disabled and config.get("enable_graph", False) and _is_npu_device(device):
         return "aclgraph"
     return graph_backend
 
@@ -69,6 +65,7 @@ def _create_attention_backend(
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
         )
+
         return NpuPagedAttentionBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -77,14 +74,11 @@ def _create_attention_backend(
             sliding_window=first_attention.sliding_window,
             device=device,
             dtype=dtype,
-            has_mha_layers=(
-                first_attention.kind == "mha"
-                if attention_kinds is None
-                else "mha" in attention_kinds
-            ),
+            has_mha_layers=(first_attention.kind == "mha" if attention_kinds is None else "mha" in attention_kinds),
         )
     if device.type == "cuda":
         from xllm.python.attention.flashinfer import FlashInferBackend
+
         if first_attention.kind != "mha":
             raise NotImplementedError("CUDA Python backend does not support MLA")
         return FlashInferBackend(
@@ -96,9 +90,7 @@ def _create_attention_backend(
             device=device,
             dtype=dtype,
         )
-    raise NotImplementedError(
-        f"No attention backend available for device type '{device.type}'"
-    )
+    raise NotImplementedError(f"No attention backend available for device type '{device.type}'")
 
 
 def _acl_graph_unsupported_reason(
@@ -131,25 +123,16 @@ class ModelExecutor:
         self._kv_bound = False
 
         attention_layers = sorted(
-            (
-                module
-                for module in model.modules()
-                if isinstance(module, AttentionRuntimeLayer)
-            ),
+            (module for module in model.modules() if isinstance(module, AttentionRuntimeLayer)),
             key=lambda layer: layer.layer_id,
         )
         if not attention_layers:
-            raise ValueError(
-                "Python model does not contain a runtime attention layer"
-            )
+            raise ValueError("Python model does not contain a runtime attention layer")
 
         layer_specs = [layer.attention_layer_spec() for layer in attention_layers]
         layer_ids = [spec.layer_id for spec in layer_specs]
         if len(set(layer_ids)) != len(layer_ids):
-            raise ValueError(
-                "Runtime attention layer ids must be unique: "
-                f"got {layer_ids}"
-            )
+            raise ValueError(f"Runtime attention layer ids must be unique: got {layer_ids}")
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
@@ -195,6 +178,7 @@ class ModelExecutor:
             from xllm.python.model_executor.runners.decode_cuda_graph import (
                 DecodeCudaGraphRunner,
             )
+
             self.decode_graph_runner = DecodeCudaGraphRunner(
                 execution_model,
                 self.attention_backend,
@@ -212,6 +196,7 @@ class ModelExecutor:
             from xllm.python.model_executor.runners.decode_acl_graph import (
                 DecodeAclGraphRunner,
             )
+
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
@@ -222,9 +207,8 @@ class ModelExecutor:
             )
         else:
             from xllm.python.model_executor.runners.inductor import InductorRunner
-            self.inductor_runner = InductorRunner(
-                execution_model, self.attention_backend, device, graph_backend
-            )
+
+            self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
 
     @staticmethod
     def _attention_config(
@@ -243,9 +227,7 @@ class ModelExecutor:
         # list may therefore contain slots for layers not present in a truncated
         # runtime model, including KDA conv/SSM slots that the paged-KV backend
         # never indexes directly.
-        highest_layer_id = max(
-            spec.layer_id for spec in self._attention_layer_specs
-        )
+        highest_layer_id = max(spec.layer_id for spec in self._attention_layer_specs)
         if len(kv_caches) <= highest_layer_id:
             raise ValueError(
                 "KV cache list does not cover runtime physical-layer KV caches: "
@@ -256,9 +238,7 @@ class ModelExecutor:
         self.attention_backend.bind_kv_caches(kv_caches)
         self._kv_bound = True
 
-    def bind_kda_caches(
-        self, kda_caches: list[tuple[int, torch.Tensor, torch.Tensor]]
-    ) -> None:
+    def bind_kda_caches(self, kda_caches: list[tuple[int, torch.Tensor, torch.Tensor]]) -> None:
         """Bind linear-attention (KDA) conv/recurrent caches by decoder layer id.
 
         Each entry is ``(layer_id, conv_state, recurrent_state)``. No-op for
@@ -288,9 +268,7 @@ class ModelExecutor:
         # actual tokens and do not touch conv/recurrent caches.
         if view.num_decode_seqs + view.num_prefill_seqs == 0 and num_tokens > 0:
             kda_runtime.metadata = KimiK3KDAMetadata(
-                query_start_loc=torch.zeros(
-                    1, dtype=torch.int64, device=self._device
-                ),
+                query_start_loc=torch.zeros(1, dtype=torch.int64, device=self._device),
                 state_indices=torch.full(
                     (num_tokens,),
                     PAD_SLOT_ID,
@@ -354,9 +332,7 @@ class ModelExecutor:
                 input_ids.dtype,
                 inputs_embeds,
             )
-            if graph_runner.can_execute(input_ids, metadata) and self._all_dp_decode(
-                kda_metadata
-            ):
+            if graph_runner.can_execute(input_ids, metadata) and self._all_dp_decode(kda_metadata):
                 return graph_runner.execute(
                     input_ids,
                     positions,
@@ -364,9 +340,7 @@ class ModelExecutor:
                     inputs_embeds,
                 )
         if inputs_embeds is not None:
-            return self.eager_runner.execute(
-                input_ids, positions, metadata, inputs_embeds
-            )
+            return self.eager_runner.execute(input_ids, positions, metadata, inputs_embeds)
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(input_ids, positions, metadata)
         return self.eager_runner.execute(input_ids, positions, metadata)

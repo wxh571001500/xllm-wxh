@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -89,7 +89,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: "Attention",
+        layer: Attention,
     ) -> torch.Tensor:
         pass
 
@@ -109,7 +109,7 @@ class AttentionBackend(ABC):
         q_pe: torch.Tensor,
         k_latent: torch.Tensor,
         k_pe: torch.Tensor,
-        layer: "Attention",
+        layer: Attention,
         topk: torch.Tensor | None = None,
         unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
     ) -> torch.Tensor:
@@ -122,15 +122,13 @@ class AttentionBackend(ABC):
         LightningIndexer; otherwise a dense MLA path is requested.
         """
         del unabsorbed_prefill
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support MLA"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support MLA")
 
     def use_unabsorbed_mla_prefill(self) -> bool:
         """Return whether the current step accepts unabsorbed MLA inputs."""
         return False
 
-    def mla_index_context(self, layer: "Attention") -> MlaIndexContext:
+    def mla_index_context(self, layer: Attention) -> MlaIndexContext:
         """Public hook for an optional LightningIndexer.
 
         Hands out the paged index cache view (third ``KVCache`` slot) plus the
@@ -138,6 +136,4 @@ class AttentionBackend(ABC):
         touches ``backend._metadata`` / ``backend._kv_caches`` directly.
         Backends that do not support the sparse MLA indexer raise.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support MLA indexer"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support MLA indexer")

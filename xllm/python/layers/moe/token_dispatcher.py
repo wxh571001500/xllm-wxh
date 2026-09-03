@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -106,10 +106,7 @@ class NativeTokenDispatcher(MoETokenDispatcher):
         num_tokens = hidden_states.shape[0]
         top_k = routing.topk_ids.shape[1]
         token_indices = (
-            torch.arange(num_tokens, device=hidden_states.device)
-            .unsqueeze(1)
-            .expand(num_tokens, top_k)
-            .reshape(-1)
+            torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand(num_tokens, top_k).reshape(-1)
         )
         expert_ids = routing.topk_ids.reshape(-1).to(torch.int64)
         local_mask = expert_ids.ge(self._first_expert_id) & expert_ids.lt(
@@ -148,12 +145,8 @@ class NativeTokenDispatcher(MoETokenDispatcher):
     ) -> torch.Tensor:
         if not isinstance(combine_metadata, _NativeCombineMetadata):
             raise TypeError("Native dispatcher received incompatible metadata")
-        output = hidden_states.new_zeros(
-            (combine_metadata.num_tokens, hidden_states.shape[-1])
-        )
-        weighted_output = hidden_states * combine_metadata.routing_weights.to(
-            hidden_states
-        ).unsqueeze(-1)
+        output = hidden_states.new_zeros((combine_metadata.num_tokens, hidden_states.shape[-1]))
+        weighted_output = hidden_states * combine_metadata.routing_weights.to(hidden_states).unsqueeze(-1)
         output.index_add_(
             0,
             combine_metadata.token_indices,
@@ -188,9 +181,7 @@ class FusedAllGatherTokenDispatcher(MoETokenDispatcher):
         local_mask = routing.topk_ids.ge(self._first_expert_id) & routing.topk_ids.lt(
             self._first_expert_id + self._num_local_experts
         )
-        routing_weights = routing.topk_weights * local_mask.to(
-            routing.topk_weights.dtype
-        )
+        routing_weights = routing.topk_weights * local_mask.to(routing.topk_weights.dtype)
         num_tokens = hidden_states.shape[0]
         (
             sorted_hidden_states,
@@ -262,10 +253,7 @@ class AllToAllTokenDispatcher(MoETokenDispatcher):
         num_tokens = hidden_states.shape[0]
         top_k = routing.topk_ids.shape[1]
         token_indices = (
-            torch.arange(num_tokens, device=hidden_states.device)
-            .unsqueeze(1)
-            .expand(num_tokens, top_k)
-            .reshape(-1)
+            torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand(num_tokens, top_k).reshape(-1)
         )
         expert_ids = routing.topk_ids.reshape(-1).to(torch.int64)
         routing_weights = routing.topk_weights.reshape(-1)
@@ -288,19 +276,12 @@ class AllToAllTokenDispatcher(MoETokenDispatcher):
             world_size=self._config.ep_size,
             group_name=self._config.ep_group_name,
         ).view(self._config.ep_size, self._num_experts)
-        input_splits = (
-            local_counts.view(self._config.ep_size, self._num_local_experts)
-            .sum(dim=1)
-            .to("cpu")
-            .tolist()
-        )
+        input_splits = local_counts.view(self._config.ep_size, self._num_local_experts).sum(dim=1).to("cpu").tolist()
         local_slice = slice(
             self._first_expert_id,
             self._first_expert_id + self._num_local_experts,
         )
-        output_splits = (
-            global_counts[:, local_slice].sum(dim=1).to("cpu").tolist()
-        )
+        output_splits = global_counts[:, local_slice].sum(dim=1).to("cpu").tolist()
         received_hidden_states = ops.all_to_all_single(
             sent_hidden_states,
             output_split_sizes=output_splits,
@@ -329,9 +310,7 @@ class AllToAllTokenDispatcher(MoETokenDispatcher):
         if self._quantized:
             if grouped_hidden_states.device.type not in ("npu", "privateuseone"):
                 raise RuntimeError("Quantized All2All MoE requires an NPU")
-            grouped_hidden_states, dynamic_scale = torch_npu.npu_dynamic_quant(
-                grouped_hidden_states
-            )
+            grouped_hidden_states, dynamic_scale = torch_npu.npu_dynamic_quant(grouped_hidden_states)
         return MoETokenDispatchOutput(
             hidden_states=grouped_hidden_states,
             group_list=group_list,
@@ -364,12 +343,8 @@ class AllToAllTokenDispatcher(MoETokenDispatcher):
             input_split_sizes=combine_metadata.output_splits,
             group_name=self._config.ep_group_name,
         )
-        output = returned.new_zeros(
-            (combine_metadata.num_tokens, returned.shape[-1])
-        )
-        weighted = returned * combine_metadata.routing_weights.to(
-            returned.dtype
-        ).unsqueeze(-1)
+        output = returned.new_zeros((combine_metadata.num_tokens, returned.shape[-1]))
+        weighted = returned * combine_metadata.routing_weights.to(returned.dtype).unsqueeze(-1)
         output.index_add_(0, combine_metadata.token_indices, weighted)
         return output
 
@@ -401,9 +376,7 @@ class MC2TokenDispatcher(MoETokenDispatcher):
         elif hasattr(process_group, "get_hccl_comm_name"):
             backend = process_group
         else:
-            raise RuntimeError(
-                "MC2 MoE requires an HCCL process-group backend"
-            )
+            raise RuntimeError("MC2 MoE requires an HCCL process-group backend")
         self._group_name = backend.get_hccl_comm_name(group.local_rank)
 
     def token_dispatch(

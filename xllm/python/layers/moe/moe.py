@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -79,9 +79,7 @@ class MoE(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.zeros(num_experts, dtype=dtype, device=device)
-        )
+        self.gate.e_score_correction_bias = nn.Parameter(torch.zeros(num_experts, dtype=dtype, device=device))
         self.experts = experts
         self.shared_experts = shared_experts
         self._router = GroupedTopKRouter(router_config)
@@ -134,19 +132,14 @@ class MoE(nn.Module):
         if name == "gate.weight":
             target = self.gate.weight
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"MoE gate expects {target.shape}, got {tensor.shape}"
-                )
+                raise ValueError(f"MoE gate expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add(name)
             return True
         if name in ("e_score_correction_bias", "gate.e_score_correction_bias"):
             target = self.gate.e_score_correction_bias
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"MoE correction bias expects {target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"MoE correction bias expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add("gate.e_score_correction_bias")
             return True
@@ -154,7 +147,7 @@ class MoE(nn.Module):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -197,9 +190,7 @@ class MoE(nn.Module):
         return self.shared_experts, self.experts
 
     def finish_weight_loading(self) -> None:
-        missing = self._required_weight_names().difference(
-            self._loaded_components
-        )
+        missing = self._required_weight_names().difference(self._loaded_components)
         if missing:
             raise KeyError(f"MoE weights are missing: {sorted(missing)}")
         for module in self._weight_modules_to_finalize():
@@ -280,14 +271,10 @@ class KimiK3MoE(MoE):
                 dp_rank = int(getattr(config, "rank", tp_rank)) // tp_size
                 tp_group_name = "tp"
             else:
-                world_size = int(
-                    getattr(config, "world_size", tp_size * ep_size)
-                )
+                world_size = int(getattr(config, "world_size", tp_size * ep_size))
                 global_rank = int(getattr(config, "rank", tp_rank))
                 if world_size % ep_size != 0:
-                    raise ValueError(
-                        "Kimi K3 world size must divide MoE EP size"
-                    )
+                    raise ValueError("Kimi K3 world size must divide MoE EP size")
                 moe_tp_size = world_size // ep_size
                 moe_tp_rank = global_rank % moe_tp_size
                 ep_rank = global_rank // moe_tp_size
@@ -299,12 +286,8 @@ class KimiK3MoE(MoE):
             ep_rank=ep_rank,
             dp_size=dp_size,
             dp_rank=dp_rank,
-            comm_type=MoECommType.from_value(
-                getattr(config, "moe_comm_type", "all_gather")
-            ),
-            mc2_tokens_capacity=int(
-                getattr(config, "mc2_tokens_capacity", 512)
-            ),
+            comm_type=MoECommType.from_value(getattr(config, "moe_comm_type", "all_gather")),
+            mc2_tokens_capacity=int(getattr(config, "mc2_tokens_capacity", 512)),
             tp_group_name=tp_group_name,
             input_tp_size=input_tp_size,
             input_tp_rank=input_tp_rank,
@@ -431,20 +414,14 @@ class KimiK3MoE(MoE):
                 return False
             target = module.weight
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"Kimi K3 weight {name} expects {target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"Kimi K3 weight {name} expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add(name)
             return True
         if name == "routed_expert_norm.weight" and self.routed_expert_norm is not None:
             target = self.routed_expert_norm.weight
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"Kimi K3 weight {name} expects {target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"Kimi K3 weight {name} expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add(name)
             return True
@@ -452,7 +429,7 @@ class KimiK3MoE(MoE):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -472,9 +449,7 @@ class KimiK3MoE(MoE):
                 self.tp_rank,
                 self.tp_size,
             )
-            loaded.update(
-                f"shared_experts.{name}" for name in child_loaded
-            )
+            loaded.update(f"shared_experts.{name}" for name in child_loaded)
 
         experts_state_dict = state_dict.get_dict_with_prefix("experts.")
         if experts_state_dict.size() > 0:
@@ -494,10 +469,7 @@ class KimiK3MoE(MoE):
                 "routed_expert_down_proj",
                 "routed_expert_up_proj",
             ):
-                direct_names.extend(
-                    f"{projection}.{suffix}"
-                    for suffix in ("weight_scale", "weight_offset")
-                )
+                direct_names.extend(f"{projection}.{suffix}" for suffix in ("weight_scale", "weight_offset"))
         if self.routed_expert_norm is not None:
             direct_names.append("routed_expert_norm.weight")
         for name in direct_names:
@@ -521,10 +493,7 @@ class KimiK3MoE(MoE):
                 "routed_expert_down_proj",
                 "routed_expert_up_proj",
             ):
-                required.update(
-                    f"{projection}.{suffix}"
-                    for suffix in ("weight_scale", "weight_offset")
-                )
+                required.update(f"{projection}.{suffix}" for suffix in ("weight_scale", "weight_offset"))
         if self.routed_expert_norm is not None:
             required.add("routed_expert_norm.weight")
         return required

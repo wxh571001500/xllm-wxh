@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -73,24 +73,15 @@ class MoEParallelConfig:
         if self.mc2_tokens_capacity <= 0:
             raise ValueError("MoE MC2 token capacity must be positive")
         input_tp_size = self.input_tp_size or self.tp_size
-        input_tp_rank = (
-            self.tp_rank if self.input_tp_rank < 0 else self.input_tp_rank
-        )
+        input_tp_rank = self.tp_rank if self.input_tp_rank < 0 else self.input_tp_rank
         object.__setattr__(self, "input_tp_size", input_tp_size)
         object.__setattr__(self, "input_tp_rank", input_tp_rank)
         if input_tp_size <= 0 or not 0 <= input_tp_rank < input_tp_size:
             raise ValueError("MoE input TP rank and size are invalid")
         if input_tp_size != self.tp_size:
-            supported = (
-                self.dp_size == 1
-                and self.tp_size == 1
-                and input_tp_size == self.ep_size
-            )
+            supported = self.dp_size == 1 and self.tp_size == 1 and input_tp_size == self.ep_size
             if not supported:
-                raise ValueError(
-                    "MoE currently supports distinct input TP only for "
-                    "dp=1, moe_tp=1, and input_tp=ep"
-                )
+                raise ValueError("MoE currently supports distinct input TP only for dp=1, moe_tp=1, and input_tp=ep")
 
     @property
     def partitions_replicated_input(self) -> bool:

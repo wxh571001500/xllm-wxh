@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,12 +19,11 @@ from __future__ import annotations
 import ctypes
 import importlib.metadata
 import os
-from pathlib import Path
 import threading
+from pathlib import Path
 from typing import Any
 
 import torch
-
 
 _CUSTOM_OP_HANDLES: list[Any] = []
 _CUSTOM_OP_LOCK = threading.Lock()
@@ -48,22 +47,16 @@ def ensure_ascend_custom_ops(required_ops: tuple[str, ...]) -> None:
         try:
             distribution = importlib.metadata.distribution("vllm-ascend")
         except importlib.metadata.PackageNotFoundError as error:
-            raise RuntimeError(
-                "Fused Ascend execution requires the vllm-ascend package"
-            ) from error
+            raise RuntimeError("Fused Ascend execution requires the vllm-ascend package") from error
 
         package_dir = Path(distribution.locate_file("vllm_ascend"))
-        vendor_dir = (
-            package_dir / "_cann_ops_custom" / "vendors" / "custom_transformer"
-        )
+        vendor_dir = package_dir / "_cann_ops_custom" / "vendors" / "custom_transformer"
         vendor_library = vendor_dir / "op_api" / "lib" / "libcust_opapi.so"
         kernels_library = package_dir / "libvllm_ascend_kernels.so"
         extension_paths = sorted(package_dir.glob("vllm_ascend_C.*.so"))
         required_paths = (vendor_library, kernels_library)
         if not extension_paths or any(not path.is_file() for path in required_paths):
-            raise RuntimeError(
-                "Installed vllm-ascend does not contain the required custom op libraries"
-            )
+            raise RuntimeError("Installed vllm-ascend does not contain the required custom op libraries")
 
         _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", str(vendor_dir))
         _CUSTOM_OP_HANDLES.extend(
@@ -74,11 +67,6 @@ def ensure_ascend_custom_ops(required_ops: tuple[str, ...]) -> None:
         )
         torch.ops.load_library(str(extension_paths[0]))
 
-        missing_ops = [
-            name for name in required_ops if not hasattr(torch.ops._C_ascend, name)
-        ]
+        missing_ops = [name for name in required_ops if not hasattr(torch.ops._C_ascend, name)]
         if missing_ops:
-            raise RuntimeError(
-                "vllm-ascend did not register required fused Ascend ops: "
-                f"{missing_ops}"
-            )
+            raise RuntimeError(f"vllm-ascend did not register required fused Ascend ops: {missing_ops}")

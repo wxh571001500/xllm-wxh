@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -33,12 +33,8 @@ from xllm.python import ops
 
 def _copy_parameter(parameter: torch.Tensor, tensor: torch.Tensor) -> None:
     if parameter.shape != tensor.shape:
-        raise ValueError(
-            f"Linear parameter expects {parameter.shape}, got {tensor.shape}"
-        )
-    parameter.data.copy_(
-        tensor.to(dtype=parameter.dtype, device=parameter.device)
-    )
+        raise ValueError(f"Linear parameter expects {parameter.shape}, got {tensor.shape}")
+    parameter.data.copy_(tensor.to(dtype=parameter.dtype, device=parameter.device))
 
 
 class LinearMethod(ABC):
@@ -126,12 +122,8 @@ class W8A8DynamicLinearMethod(LinearMethod):
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         if not layer._weights_processed:
-            raise RuntimeError(
-                "W8A8 dynamic weights have not finished loading"
-            )
-        quantized, per_token_scale = torch.ops.npu.npu_dynamic_quant(
-            hidden_states
-        )
+            raise RuntimeError("W8A8 dynamic weights have not finished loading")
+        quantized, per_token_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
         return ops.quant_matmul(
             quantized,
             layer.weight,
@@ -164,12 +156,8 @@ class W8A8DynamicLinearMethod(LinearMethod):
         if layer._weights_processed:
             return
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight_scale.data = (
-            layer.weight_scale.data.flatten().contiguous()
-        )
-        layer.weight_offset.data = (
-            layer.weight_offset.data.flatten().contiguous()
-        )
+        layer.weight_scale.data = layer.weight_scale.data.flatten().contiguous()
+        layer.weight_offset.data = layer.weight_offset.data.flatten().contiguous()
         # aclnnQuantMatmulV4 currently limits a single output dimension to
         # 65535. Model-specific splitting should live in the owning module,
         # rather than changing the behavior of every shared W8A8 linear.
@@ -216,9 +204,7 @@ class _LinearBase(nn.Module):
                 device,
             )
         if bias:
-            self.bias = nn.Parameter(
-                torch.empty(out_features, dtype=dtype, device=device)
-            )
+            self.bias = nn.Parameter(torch.empty(out_features, dtype=dtype, device=device))
         else:
             self.register_parameter("bias", None)
 

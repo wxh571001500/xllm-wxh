@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -323,18 +323,18 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   if (!kv_bound_) {
     py::list kv_caches_py;
     for (auto& kv : kv_caches) {
-      kv_caches_py.append(py::make_tuple(
-          optional_tensor(kv.get_k_cache()),
-          optional_tensor(kv.get_v_cache()),
-          optional_tensor(kv.get_index_cache()),
-          optional_tensor(kv.get_conv_cache()),
-          optional_tensor(kv.get_ssm_cache()),
-          optional_tensor(kv.get_swa_cache()),
-          optional_tensor(kv.get_compress_kv_state()),
-          optional_tensor(kv.get_compress_score_state()),
-          optional_tensor(kv.get_compress_index_kv_state()),
-          optional_tensor(kv.get_compress_index_score_state()),
-          optional_tensor(kv.get_indexer_cache_scale())));
+      kv_caches_py.append(
+          py::make_tuple(optional_tensor(kv.get_k_cache()),
+                         optional_tensor(kv.get_v_cache()),
+                         optional_tensor(kv.get_index_cache()),
+                         optional_tensor(kv.get_conv_cache()),
+                         optional_tensor(kv.get_ssm_cache()),
+                         optional_tensor(kv.get_swa_cache()),
+                         optional_tensor(kv.get_compress_kv_state()),
+                         optional_tensor(kv.get_compress_score_state()),
+                         optional_tensor(kv.get_compress_index_kv_state()),
+                         optional_tensor(kv.get_compress_index_score_state()),
+                         optional_tensor(kv.get_indexer_cache_scale())));
     }
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
 
@@ -361,7 +361,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         << "KV cache layer count changed after initial bind";
   }
 
-  py::object py_metadata = py::cast(PyAttentionMetadataView(attn_metadata, params));
+  py::object py_metadata =
+      py::cast(PyAttentionMetadataView(attn_metadata, params));
 
   // Per-step KDA scheduling info (linear-state slots, query_start_loc,
   // has_initial_state, decode/prefill split). None for non-KDA models.

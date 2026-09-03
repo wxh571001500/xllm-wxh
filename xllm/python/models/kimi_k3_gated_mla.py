@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -107,12 +107,8 @@ class KimiK3GatedMLA(nn.Module):
         kv_head_dim = config.qk_nope_head_dim + config.v_head_dim
         output_size = config.num_attention_heads * config.v_head_dim
 
-        self.q_a_proj = nn.Linear(
-            config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype, device=device
-        )
-        self.q_a_layernorm = _RMSNorm(
-            config.q_lora_rank, config.rms_norm_eps, dtype, device
-        )
+        self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype, device=device)
+        self.q_a_layernorm = _RMSNorm(config.q_lora_rank, config.rms_norm_eps, dtype, device)
         self.q_b_proj = nn.Linear(
             config.q_lora_rank,
             config.num_attention_heads * query_head_dim,
@@ -127,9 +123,7 @@ class KimiK3GatedMLA(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.kv_a_layernorm = _RMSNorm(
-            config.kv_lora_rank, config.rms_norm_eps, dtype, device
-        )
+        self.kv_a_layernorm = _RMSNorm(config.kv_lora_rank, config.rms_norm_eps, dtype, device)
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
             config.num_attention_heads * kv_head_dim,
@@ -137,12 +131,8 @@ class KimiK3GatedMLA(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.g_proj = nn.Linear(
-            config.hidden_size, output_size, bias=False, dtype=dtype, device=device
-        )
-        self.o_proj = nn.Linear(
-            output_size, config.hidden_size, bias=False, dtype=dtype, device=device
-        )
+        self.g_proj = nn.Linear(config.hidden_size, output_size, bias=False, dtype=dtype, device=device)
+        self.o_proj = nn.Linear(output_size, config.hidden_size, bias=False, dtype=dtype, device=device)
 
     def load_checkpoint_weights(
         self,
@@ -172,19 +162,11 @@ class KimiK3GatedMLA(nn.Module):
                 scale = weights.get(scale_name)
                 offset = weights.get(offset_name)
                 if scale is None or offset is None:
-                    raise KeyError(
-                        "quantized Kimi K3 weight requires scale and offset: "
-                        f"{scale_name}, {offset_name}"
-                    )
+                    raise KeyError(f"quantized Kimi K3 weight requires scale and offset: {scale_name}, {offset_name}")
                 if scale.shape not in ((tensor.shape[0],), (tensor.shape[0], 1)):
-                    raise ValueError(
-                        f"unsupported scale shape for {checkpoint_name}: "
-                        f"{tuple(scale.shape)}"
-                    )
+                    raise ValueError(f"unsupported scale shape for {checkpoint_name}: {tuple(scale.shape)}")
                 if offset.shape != scale.shape:
-                    raise ValueError(
-                        f"offset shape for {checkpoint_name} must match scale shape"
-                    )
+                    raise ValueError(f"offset shape for {checkpoint_name} must match scale shape")
                 # Kimi K3 W8A8_DYNAMIC stores one scale and zero point per
                 # output channel. The current checkpoint has all-zero offsets.
                 if scale.ndim == 1:
@@ -195,9 +177,7 @@ class KimiK3GatedMLA(nn.Module):
         if missing:
             raise KeyError(f"missing Kimi K3 Gated-MLA weights: {missing}")
 
-    def _project_qkv(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         config = self.config
         num_tokens = hidden_states.shape[0]
         query = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
@@ -209,12 +189,8 @@ class KimiK3GatedMLA(nn.Module):
         )
         key_value = self.kv_b_proj(self.kv_a_layernorm(kv_latent))
         key_value = key_value.view(num_tokens, config.num_attention_heads, -1)
-        key_nope, value = key_value.split(
-            [config.qk_nope_head_dim, config.v_head_dim], dim=-1
-        )
-        key_position_independent = key_position_independent.unsqueeze(1).expand(
-            -1, config.num_attention_heads, -1
-        )
+        key_nope, value = key_value.split([config.qk_nope_head_dim, config.v_head_dim], dim=-1)
+        key_position_independent = key_position_independent.unsqueeze(1).expand(-1, config.num_attention_heads, -1)
         key = torch.cat([key_nope, key_position_independent], dim=-1)
         return query, key, value
 
@@ -234,9 +210,7 @@ class KimiK3GatedMLA(nn.Module):
             sequence_value = value[start:end].transpose(0, 1)
             scores = torch.matmul(sequence_query, sequence_key.transpose(-1, -2))
             scores = scores * self.scale
-            mask = torch.ones(
-                length, length, dtype=torch.bool, device=query.device
-            ).triu(diagonal=1)
+            mask = torch.ones(length, length, dtype=torch.bool, device=query.device).triu(diagonal=1)
             scores = scores.masked_fill(mask, -math.inf)
             probabilities = F.softmax(scores.float(), dim=-1).to(value.dtype)
             outputs.append(torch.matmul(probabilities, sequence_value).transpose(0, 1))
@@ -258,10 +232,7 @@ class KimiK3GatedMLA(nn.Module):
         sequence_lengths: Sequence[int] | None = None,
     ) -> torch.Tensor:
         if hidden_states.ndim != 2 or hidden_states.shape[-1] != self.config.hidden_size:
-            raise ValueError(
-                "Kimi K3 Gated-MLA hidden states must have shape "
-                f"[tokens, {self.config.hidden_size}]"
-            )
+            raise ValueError(f"Kimi K3 Gated-MLA hidden states must have shape [tokens, {self.config.hidden_size}]")
         num_tokens = hidden_states.shape[0]
         lengths = [num_tokens] if sequence_lengths is None else list(sequence_lengths)
         if not lengths or any(length <= 0 for length in lengths):
