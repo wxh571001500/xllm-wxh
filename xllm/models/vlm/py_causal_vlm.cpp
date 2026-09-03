@@ -39,6 +39,8 @@ PyCausalVLM::PyCausalVLM(const ModelContext& context)
     : model_args_(context.get_model_args()),
       options_(context.get_tensor_options()),
       device_(context.get_tensor_options().device()) {
+  LOG(INFO) << "PyCausalVLM constructor: model_type="
+            << model_args_.model_type();
   ensure_python_interpreter();
 
   const ParallelArgs& parallel_args = context.get_parallel_args();
@@ -46,18 +48,26 @@ PyCausalVLM::PyCausalVLM(const ModelContext& context)
   tp_size_ = (tp_group_ != nullptr) ? tp_group_->world_size() : 1;
   tp_rank_ = (tp_group_ != nullptr) ? tp_group_->rank() : 0;
 
+  LOG(INFO) << "Acquiring GIL and initializing Python process groups";
   py::gil_scoped_acquire gil;
   init_python_process_groups(parallel_args, device_);
 
+  LOG(INFO) << "Calling initialize_runtime()";
   py::module_ xllm_python = py::module_::import("xllm.python");
   xllm_python.attr("initialize_runtime")();
 
+  LOG(INFO) << "Importing registry and getting model class for: "
+            << context.get_model_args().model_type();
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(
       py::str(context.get_model_args().model_type()));
+  LOG(INFO) << "Building config dict";
   config_dict_ = build_config_dict(parallel_args, context.get_quant_args());
+  LOG(INFO) << "Creating Python model instance";
   py_model_ = model_cls(config_dict_);
+  LOG(INFO) << "Setting model to eval mode";
   py_model_.attr("eval")();
+  LOG(INFO) << "PyCausalVLM constructor completed successfully";
 }
 
 PyCausalVLM::~PyCausalVLM() {

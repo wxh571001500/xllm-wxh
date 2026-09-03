@@ -657,9 +657,21 @@ std::unique_ptr<CausalLM> create_rec_model(const ModelContext& context) {
 
 std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
   const auto& model_impl = context.get_model_impl();
+  LOG(INFO) << "create_vlm_model: model_type="
+            << context.get_model_args().model_type()
+            << ", model_impl=" << model_impl;
 #if defined(USE_CUDA) || defined(USE_NPU)
   if (ModelConfig::is_python_model_impl(model_impl)) {
-    return std::make_unique<PyCausalVLM>(context);
+    LOG(INFO) << "Creating PyCausalVLM for model_type="
+              << context.get_model_args().model_type();
+    try {
+      auto model = std::make_unique<PyCausalVLM>(context);
+      LOG(INFO) << "Successfully created PyCausalVLM";
+      return model;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Failed to create PyCausalVLM: " << e.what();
+      return nullptr;
+    }
   }
 #else
   if (ModelConfig::is_python_model_impl(model_impl)) {
