@@ -86,10 +86,10 @@ py::dict PyCausalLM::build_config_dict(
     py::object config_file = builtins.attr("open")(config_path, "r");
     d = json.attr("load")(config_file).cast<py::dict>();
     config_file.attr("close")();
-    d["quantize_type"] = quant_args.quantize_type();
-    d["quant_method"] = quant_args.quant_method();
-    d["quant_group_size"] = quant_args.group_size();
-    d["quant_version"] = quant_args.quant_version();
+    d["quantize_type"] = quant_args_.quantize_type();
+    d["quant_method"] = quant_args_.quant_method();
+    d["quant_group_size"] = quant_args_.group_size();
+    d["quant_version"] = quant_args_.quant_version();
   }
   PyDictVisitor visitor(d);
   visit_properties(model_args_, visitor);

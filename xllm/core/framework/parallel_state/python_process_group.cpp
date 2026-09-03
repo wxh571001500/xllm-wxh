@@ -76,6 +76,27 @@ std::vector<int32_t> strided_group_ranks(int32_t global_rank,
   return ranks;
 }
 
+std::vector<int32_t> compute_cp_group_ranks(int32_t global_rank,
+                                            int32_t world_size,
+                                            int32_t dp_size,
+                                            int32_t cp_size) {
+  // CP group rank layout: dp_rank * (cp_size * tp_size) + cp_rank * tp_size +
+  // tp_rank
+  const int32_t tp_size = world_size / dp_size;
+  const int32_t attention_tp_size = tp_size / cp_size;
+
+  const int32_t dp_rank = global_rank / tp_size;
+  const int32_t tp_rank = global_rank % attention_tp_size;
+  const int32_t cp_rank = (global_rank % tp_size) / attention_tp_size;
+
+  std::vector<int32_t> ranks;
+  ranks.reserve(cp_size);
+  for (int32_t i = 0; i < cp_size; ++i) {
+    ranks.emplace_back(dp_rank * tp_size + i * attention_tp_size + tp_rank);
+  }
+  return ranks;
+}
+
 const PythonProcessGroupSpec& find_group_spec(
     const std::vector<PythonProcessGroupSpec>& specs,
     const std::string& name) {
@@ -145,11 +166,10 @@ std::vector<PythonProcessGroupSpec> build_python_process_group_specs(
   if (cp_size == 1) {
     specs.emplace_back(make_alias_spec("cp", find_group_spec(specs, "single")));
   } else {
-    specs.emplace_back(
-        make_group_spec("cp",
-                        parallel_state::compute_cp_group_ranks(
-                            global_rank, world_size, dp_size, cp_size),
-                        global_rank));
+    specs.emplace_back(make_group_spec(
+        "cp",
+        compute_cp_group_ranks(global_rank, world_size, dp_size, cp_size),
+        global_rank));
   }
 
   if (ep_size == 1) {
