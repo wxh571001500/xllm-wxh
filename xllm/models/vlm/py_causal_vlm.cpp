@@ -49,6 +49,9 @@ PyCausalVLM::PyCausalVLM(const ModelContext& context)
   py::gil_scoped_acquire gil;
   init_python_process_groups(parallel_args, device_);
 
+  py::module_ xllm_python = py::module_::import("xllm.python");
+  xllm_python.attr("initialize_runtime")();
+
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(
       py::str(context.get_model_args().model_type()));
