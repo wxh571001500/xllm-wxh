@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib.metadata
 import os
 import platform
-import re
 import subprocess
 import sys
 import tempfile
@@ -73,27 +72,6 @@ def _installed_version() -> str | None:
         return None
 
 
-def _major_minor(version: str) -> tuple[int, int] | None:
-    match = re.match(r"^(\d+)\.(\d+)", version)
-    if match is None:
-        return None
-    return int(match.group(1)), int(match.group(2))
-
-
-def _installed_torch_version() -> str | None:
-    try:
-        return importlib.metadata.version("torch")
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def _is_compatible_with_torch(torch_npu_version: str) -> bool:
-    torch_version = _installed_torch_version()
-    if torch_version is None:
-        return False
-    return _major_minor(torch_version) == _major_minor(torch_npu_version)
-
-
 def _resolve_wheel(cann_version: str, arch: str) -> str:
     key = (cann_version, arch)
     url = TORCH_NPU_WHEELS.get(key)
@@ -127,19 +105,11 @@ def _download_and_install(wheel_url: str) -> None:
 
 
 def ensure_torch_npu_ready() -> None:
-    """Ensure torch_npu matches the installed PyTorch major/minor version."""
+    """Ensure torch_npu matches REQUIRED_VERSION; install or upgrade if not."""
     installed = _installed_version()
-    if installed is not None and _is_compatible_with_torch(installed):
+    if installed is not None and REQUIRED_VERSION in installed:
         logger.info(f"torch_npu {installed} is ready.")
         return
-
-    torch_version = _installed_torch_version()
-    if torch_version is not None and _major_minor(torch_version) != (2, 9):
-        raise RuntimeError(
-            f"No bundled torch_npu wheel matches torch {torch_version}. "
-            "Install a torch_npu wheel with the same major/minor version "
-            "before building xLLM."
-        )
 
     cann_version = _get_cann_version()
     arch = _get_arch()
