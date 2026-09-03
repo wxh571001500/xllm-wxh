@@ -102,6 +102,7 @@ struct ParallelArgs {
                int32_t sp_size,
                int32_t cfg_size,
                int32_t vae_size,
+               int32_t text_encoder_tp_size,
                ProcessGroup* process_group)
       : rank_(rank),
         world_size_(world_size),
@@ -110,6 +111,7 @@ struct ParallelArgs {
         sp_size_(sp_size),
         cfg_size_(cfg_size),
         vae_size_(vae_size),
+        text_encoder_tp_size_(text_encoder_tp_size),
         process_group_(process_group) {}
 
   int32_t get_group_size_by_type(const std::string& group_type) const {
@@ -125,6 +127,8 @@ struct ParallelArgs {
       return ep_size();
     } else if (group_type == "vae") {
       return vae_size();
+    } else if (group_type == "text_encoder_tp") {
+      return text_encoder_tp_size();
     } else if (group_type == "cp") {
       return cp_size();
     } else {
@@ -146,10 +150,14 @@ struct ParallelArgs {
   // ep size
   PROPERTY(int32_t, ep_size) = 1;
 
-  // cp size
+  // Public configuration name for PCP size. See ContextParallelTopology for
+  // the configuration-to-topology mapping.
   PROPERTY(int32_t, cp_size) = 1;
 
-  // Derived: CP rank of the current process within its DP group.
+  PROPERTY(int32_t, layerwise_split_size) = 1;
+
+  // Derived PCP rank of the current process within its DP group. The public
+  // cp_rank name is retained for compatibility.
   // rank layout: dp_rank * (cp_size * tp_size) + cp_rank * tp_size + tp_rank
   [[nodiscard]] int32_t cp_rank() const noexcept {
     if (cp_size_ <= 1) {
@@ -159,7 +167,8 @@ struct ParallelArgs {
     return (rank_ % (cp_size_ * tp_sz)) / tp_sz;
   }
 
-  // 0 means follow cp_size; prefer kv_split_size_effective().
+  // Public configuration name for DCP size. 0 means follow cp_size; prefer
+  // kv_split_size_effective().
   PROPERTY(int32_t, kv_split_size) = 0;
 
   [[nodiscard]] int32_t kv_split_size_effective() const noexcept {
@@ -171,6 +180,11 @@ struct ParallelArgs {
     if (kv <= 1) {
       return 0;
     }
+
+    if (dcp_group_ != nullptr) {
+      return dcp_group_->rank();
+    }
+
     return rank_ / (world_size_ / kv);
   }
 
@@ -185,6 +199,9 @@ struct ParallelArgs {
 
   // cfg size
   PROPERTY(int32_t, vae_size) = 1;
+
+  // text encoder tensor parallel size
+  PROPERTY(int32_t, text_encoder_tp_size) = 1;
 
   // atb hccl mapping json data
   PROPERTY(nlohmann::json, mapping_data);
@@ -210,14 +227,22 @@ struct ParallelArgs {
   ProcessGroup* lm_head_group_ = nullptr;
   ProcessGroup* encoder_dp_group_ = nullptr;
   ProcessGroup* single_rank_group_ = nullptr;
-  // CP ProcessGroup for prefill AllGather (NPU standalone; MLU aliases TP).
+  // PCP ProcessGroup for prefill AllGather (NPU standalone; MLU aliases TP).
   ProcessGroup* cp_group_ = nullptr;
+  // DCP ProcessGroup is authoritative for KV ownership, kv_split_rank, and
+  // decode merge.
+  ProcessGroup* dcp_group_ = nullptr;
   ProcessGroup* moe_ep_group_ = nullptr;
+  // Dedicated group for EPLB weight migration. It has the same rank set as
+  // moe_ep_group_ but isolates migration P2P from forward collectives.
+  ProcessGroup* eplb_group_ = nullptr;
+  // Dedicated group for fused MC2 dispatch/combine. It has the same rank set
+  // as moe_ep_group_ but isolates MC2 collectives from regular MoE EP traffic.
+  ProcessGroup* mc2_group_ = nullptr;
   ProcessGroup* moe_tp_group_ = nullptr;
 
-  // PyTorch creates its own process groups from the native topology. These
-  // fields reserve one world-scoped TCPStore endpoint after the native
-  // process-group port range and describe every group containing this rank.
+  // Python process groups reuse the native world TCPStore. PrefixStore keeps
+  // the bootstrap keys for each logical group independent.
   std::string python_rendezvous_host_;
   int32_t python_rendezvous_port_ = 0;
   std::vector<PythonProcessGroupSpec> python_process_group_specs_;
@@ -228,6 +253,7 @@ struct ParallelArgs {
   ProcessGroup* dit_cfg_group_ = nullptr;
   ProcessGroup* dit_dp_group_ = nullptr;
   ProcessGroup* dit_vae_group_ = nullptr;
+  ProcessGroup* dit_text_encoder_tp_group_ = nullptr;
 };
 
 }  // namespace xllm

@@ -51,6 +51,10 @@ class VLMWorkerImpl : public WorkerImpl {
   ForwardInput update_input_by_last_step_output_for_schedule_overlap(
       ForwardInput& input) override;
 
+  std::optional<ForwardOutput> execute_no_sync_on_stream(
+      const ForwardInput& input,
+      Stream& compute_stream) override;
+
  private:
   enum class ForwardSyncPolicy : int8_t {
     LEGACY = 0,
@@ -59,10 +63,12 @@ class VLMWorkerImpl : public WorkerImpl {
 
   std::optional<ForwardOutput> execute_no_sync_on_stream(
       const ForwardInput& input,
-      Stream& compute_stream);
+      Stream& compute_stream,
+      bool record_ready_event);
   std::optional<ForwardOutput> step_internal(
       const ForwardInput& input,
-      ForwardSyncPolicy sync_policy = ForwardSyncPolicy::LEGACY);
+      ForwardSyncPolicy sync_policy = ForwardSyncPolicy::LEGACY,
+      bool record_ready_event = true);
 };
 
 }  // namespace xllm

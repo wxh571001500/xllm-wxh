@@ -64,7 +64,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
 
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(py::str(module_name));
-  config_dict_ = build_config_dict(parallel_args, context.get_quant_args());
+  config_dict_ = build_config_dict(parallel_args);
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();
 }
@@ -75,8 +75,8 @@ PyCausalLM::~PyCausalLM() {
   config_dict_ = py::object();
 }
 
-py::dict PyCausalLM::build_config_dict(const ParallelArgs& parallel_args,
-                                       const QuantArgs& quant_args) const {
+py::dict PyCausalLM::build_config_dict(
+    const ParallelArgs& parallel_args) const {
   py::dict d;
   if (model_args_.model_type() == "kimi_k3") {
     py::module_ json = py::module_::import("json");
