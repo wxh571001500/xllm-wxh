@@ -25,13 +25,14 @@ limitations under the License.
 #include <optional>
 #include <utility>
 
+#include "common/macros.h"
 #include "common/metrics.h"
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/load_config.h"
 #include "framework/kv_cache/kv_cache.h"
-#include "framework/kv_cache/linear_state_restore.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/model_registry.h"
+#include "runtime/params_utils.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
@@ -39,7 +40,7 @@ namespace xllm {
 
 namespace {
 
-void wait_input_ready_event(const ForwardInput& input, const Stream& stream) {
+void wait_input_ready_events(const ForwardInput& input, const Stream& stream) {
   CHECK(stream.wait_event(input.metadata_ready_event))
       << "failed to wait ForwardInput metadata ready event";
 }
@@ -51,6 +52,18 @@ StreamEventPtr record_current_stream_event(const Device& device) {
     stream->synchronize();
   }
   return event;
+}
+
+torch::Tensor select_hidden_rows(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& selected_idxes) {
+  if (!hidden_states.defined() || !selected_idxes.defined() ||
+      selected_idxes.numel() == 0) {
+    return torch::Tensor();
+  }
+  torch::Tensor idxes = selected_idxes.to(
+      torch::dtype(torch::kLong).device(hidden_states.device()),
+      /*non_blocking=*/false);
+  return hidden_states.index_select(/*dim=*/0, idxes).contiguous();
 }
 
 }  // namespace
@@ -67,7 +80,6 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
 
   // initialize model
   context.set_encoder_embedding_mode(false);
-  context.set_model_impl(ModelConfig::get_instance().model_impl());
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(
@@ -76,74 +88,130 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
 }
 
 std::optional<ForwardOutput> VLMWorkerImpl::step(const ForwardInput& input) {
-  std::unique_ptr<Stream> stream = device_.current_stream();
-  wait_input_ready_event(input, *stream);
-  return step_internal(input, ForwardSyncPolicy::LEGACY);
-}
-
-std::optional<ForwardOutput> VLMWorkerImpl::step_for_schedule_overlap(
-    const ForwardInput& input) {
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
 #if defined(USE_NPU)
-  if (has_linear_attention_layers(context_.get_model_args())) {
-    c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
-    auto& mutable_params = const_cast<ModelInputParams&>(input.input_params);
-    restore_linear_state_slots(kv_caches_,
-                               mutable_params.linear_state_cache_ops,
-                               mutable_params.parallel.has_initial_state);
-  }
+    if (!enable_schedule_overlap()) {
+      aclrtStream current_stream =
+          c10_npu::getCurrentNPUStream(device_.index()).stream();
+      atb::Context* atb_context =
+          const_cast<atb::Context*>(context_.get_atb_context());
+      atb_context->SetExecuteStream(current_stream);
+      std::unique_ptr<Stream> stream = device_.current_stream();
+      wait_input_ready_events(input, *stream);
+      return step_internal(input, ForwardSyncPolicy::LEGACY);
+    } else {
+      SET_ATB_EXECUTE_STREAM(compute_stream_, device_, context_);
+      wait_input_ready_events(input, *compute_stream_);
+      return step_internal(input, ForwardSyncPolicy::LEGACY);
+    }
+#else
+    std::unique_ptr<Stream> stream = device_.current_stream();
+    wait_input_ready_events(input, *stream);
+    return step_internal(input, ForwardSyncPolicy::LEGACY);
 #endif
-  return execute_no_sync_on_stream(input, *compute_stream_);
-}
-
-ForwardInput
-VLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
-    ForwardInput& input) {
-  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-  CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
-      << "failed to wait last step output ready event";
-  return update_input_by_last_step_output(input);
+  }
+  std::unique_ptr<Stream> stream = device_.current_stream();
+  wait_input_ready_events(input, *stream);
+  return step_internal(input, ForwardSyncPolicy::LEGACY);
 }
 
 std::optional<ForwardOutput> VLMWorkerImpl::execute_no_sync_on_stream(
     const ForwardInput& input,
     Stream& compute_stream) {
+  return execute_no_sync_on_stream(
+      input, compute_stream, /*record_ready_event=*/true);
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::execute_no_sync_on_stream(
+    const ForwardInput& input,
+    Stream& compute_stream,
+    bool record_ready_event) {
+  const ForwardSyncPolicy sync_policy = ForwardSyncPolicy::NO_SYNC;
   c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
-  wait_input_ready_event(input, compute_stream);
-  return step_internal(input, ForwardSyncPolicy::NO_SYNC);
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
+#if defined(USE_NPU)
+    if (!enable_schedule_overlap()) {
+      aclrtStream current_acl_stream =
+          c10_npu::getCurrentNPUStream(device_.index()).stream();
+      atb::Context* atb_context =
+          const_cast<atb::Context*>(context_.get_atb_context());
+      atb_context->SetExecuteStream(current_acl_stream);
+      wait_input_ready_events(input, compute_stream);
+      return step_internal(input, sync_policy, record_ready_event);
+    } else {
+      SET_ATB_EXECUTE_STREAM((&compute_stream), device_, context_);
+      wait_input_ready_events(input, compute_stream);
+      return step_internal(input, sync_policy, record_ready_event);
+    }
+#else
+    wait_input_ready_events(input, compute_stream);
+    return step_internal(input, sync_policy, record_ready_event);
+#endif
+  }
+  wait_input_ready_events(input, compute_stream);
+  return step_internal(input, sync_policy, record_ready_event);
 }
 
 std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     const ForwardInput& input,
-    ForwardSyncPolicy sync_policy) {
+    ForwardSyncPolicy sync_policy,
+    bool record_ready_event) {
   Timer timer;
   const bool empty_shard =
       input.input_params.meta.num_sequences == 0 &&
       (!input.token_ids.defined() || input.token_ids.numel() == 0);
-  const bool needs_collective_participation =
-      parallel_args_.ep_size() > 1 || !parallel_args_.mapping_data().empty();
-  if (empty_shard && !needs_collective_participation) {
+  if (empty_shard) {
     return ForwardOutput{};
   }
 
+  // TODO guojinrong, to adapt multi stream parallel later
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
   auto& sampling_params = input.sampling_params;
+  const bool has_aux_hidden_states = model_output.aux_hidden_states.defined();
   torch::Tensor logits;
+  torch::Tensor lm_head_selected_token_idxes;
+  torch::Tensor selected_hidden_from_lm_head;
+  torch::Tensor selected_aux_hidden;
+  torch::Tensor selected_hidden_for_target_cache;
   if (sampling_params.selected_token_idxes.defined()) {
-    logits = model_->logits(model_output.hidden_states,
-                            sampling_params.selected_token_idxes);
+    lm_head_selected_token_idxes = choose_lm_head_selected_token_idxes(
+        sampling_params.selected_token_idxes,
+        input.input_params,
+        context_.get_parallel_args(),
+        model_output.hidden_states.size(0),
+        model_output.hidden_states.device());
+    if (options_.enable_speculative_decode()) {
+      logits = model_->logits(model_output.hidden_states,
+                              lm_head_selected_token_idxes,
+                              selected_hidden_from_lm_head);
+      if (has_aux_hidden_states) {
+        selected_aux_hidden = select_hidden_rows(model_output.aux_hidden_states,
+                                                 lm_head_selected_token_idxes);
+      } else if (selected_hidden_from_lm_head.defined()) {
+        selected_hidden_for_target_cache = selected_hidden_from_lm_head;
+      } else if (!input.input_params.meta.batch_forward_type.is_decode() &&
+                 !is_spec_draft_) {
+        selected_hidden_for_target_cache = select_hidden_rows(
+            has_aux_hidden_states ? model_output.aux_hidden_states
+                                  : model_output.hidden_states,
+            lm_head_selected_token_idxes);
+      }
+    } else {
+      logits = model_->logits(model_output.hidden_states,
+                              lm_head_selected_token_idxes);
+    }
   }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
       !options_.enable_speculative_decode()) {
-    if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-      return std::nullopt;
+    if (sync_policy == ForwardSyncPolicy::LEGACY) {
+      auto ret = device_.synchronize_default_stream();
+      (void)ret;
     }
-    int32_t ret = device_.synchronize_default_stream();
-    CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
     return std::nullopt;
   }
 
@@ -162,15 +230,59 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     output.max_top_logprobs = sampling_params.max_top_logprobs;
   }
 
+  if (options_.enable_speculative_decode()) {
+    torch::Tensor embeddings;
+    if (has_aux_hidden_states) {
+      embeddings = model_output.aux_hidden_states;
+    } else {
+      embeddings = model_output.hidden_states;
+    }
+    if (!input.input_params.meta.batch_forward_type.is_decode() &&
+        !is_spec_draft_) {
+      output.sample_output.embeddings = embeddings;
+      if (selected_hidden_for_target_cache.defined()) {
+        output.sample_output.selected_embeddings =
+            selected_hidden_for_target_cache;
+      }
+    } else if (sampling_params.selected_token_idxes.defined()) {
+      if (selected_aux_hidden.defined()) {
+        output.sample_output.embeddings = selected_aux_hidden;
+      } else if (selected_hidden_from_lm_head.defined()) {
+        output.sample_output.embeddings = selected_hidden_from_lm_head;
+      } else {
+        output.sample_output.embeddings =
+            select_hidden_rows(embeddings, lm_head_selected_token_idxes);
+      }
+    }
+  }
+
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-    output.retained_inputs.push_back(std::make_shared<ForwardInput>(input));
-    output.ready_event = record_current_stream_event(device_);
+    output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
+    if (record_ready_event && enable_schedule_overlap()) {
+      output.ready_event = record_current_stream_event(device_);
+    }
     return output;
   }
 
-  int32_t ret = device_.synchronize_default_stream();
-  CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
+  auto ret = device_.synchronize_default_stream();
+  (void)ret;
   return output;
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::step_for_schedule_overlap(
+    const ForwardInput& input) {
+  // VLM has no linear-attention recurrent state to restore, so the LLM
+  // worker's slot-restore preamble is unnecessary here.
+  return execute_no_sync_on_stream(input, *compute_stream_);
+}
+
+ForwardInput
+VLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
+    ForwardInput& input) {
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
+      << "failed to wait last step output ready event";
+  return update_input_by_last_step_output(input);
 }
 
 }  // namespace xllm

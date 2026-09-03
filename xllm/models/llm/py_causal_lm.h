@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <pybind11/pybind11.h>
 #include <torch/torch.h>
 
@@ -22,21 +23,25 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/causal_lm.h"
+#include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model_context.h"
-#include "models/py_model_bridge.h"
-
-namespace xllm::detail {
-void share_python_model_weights(pybind11::object& draft_model,
-                                const pybind11::object& target_model);
-}  // namespace xllm::detail
 
 namespace xllm {
 
 class ProcessGroup;
 
-class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM,
-                                                         public PyModelBridge {
+namespace detail {
+void share_python_model_weights(pybind11::object& draft_model,
+                                const pybind11::object& target_model);
+}  // namespace detail
+
+// Inherits CausalVLM so that ``--backend vlm --model_impl python`` can route a
+// Python VLM (e.g. Qwen3-VL) through the VLM engine while PyExecutorImpl drives
+// it. The CausalVLM ``encode`` / ``get_input_embeddings`` virtuals are stubbed:
+// in the Python path, PyExecutorImpl::run calls the Python model's own
+// encode/get_input_embeddings via pybind (they are never reached here).
+class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
  public:
   explicit PyCausalLM(const ModelContext& context);
   ~PyCausalLM() override;
@@ -46,8 +51,37 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& parameters) override;
 
+  MMDict encode(const ModelInputParams& parameters) override {
+    LOG(FATAL) << "PyCausalLM::encode must not be called directly; "
+               << "PyExecutorImpl drives the Python model's encode via pybind.";
+    return MMDict{};
+  }
+
+  torch::Tensor get_input_embeddings(
+      const torch::Tensor& input_ids,
+      const ModelInputParams& input_params) override {
+    LOG(FATAL) << "PyCausalLM::get_input_embeddings must not be called "
+               << "directly; PyExecutorImpl drives it via pybind.";
+    return torch::Tensor();
+  }
+
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) override;
+
+  ModelOutput write_context_kv(const torch::Tensor& target_hidden,
+                               const torch::Tensor& positions,
+                               const torch::Tensor& device_cache_slots,
+                               std::vector<KVCache>& kv_caches,
+                               const ModelInputParams& input_params) override;
+
+  torch::Tensor dspark_markov_bias(
+      const torch::Tensor& previous_token_ids) override;
+
+  torch::Tensor dspark_confidence_probs(
+      const torch::Tensor& hidden_all,
+      const torch::Tensor& prev_matrix) override;
+
+  bool has_dspark_confidence_head() const override;
 
   void load_model(std::unique_ptr<ModelLoader> loader) override;
 
@@ -57,12 +91,20 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM,
   void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
   void update_expert_weight(int32_t) override {}
 
-  pybind11::object& python_model() override { return py_model_; }
-  const pybind11::object& config_dict() const override { return config_dict_; }
+  bool share_weights_from(CausalLM& source) override;
+
+  void tp_all_reduce(torch::Tensor& tensor);
+  torch::Tensor tp_all_gather(const torch::Tensor& tensor, int64_t dim);
+  void moe_tp_all_reduce(torch::Tensor& tensor);
+  void moe_ep_all_reduce(torch::Tensor& tensor);
+
+  pybind11::object& python_model() { return py_model_; }
+  const pybind11::object& config_dict() const { return config_dict_; }
 
  private:
-  pybind11::dict build_config_dict(const ParallelArgs& parallel_args,
-                                   const QuantArgs& quant_args) const;
+  pybind11::dict build_config_dict(const ParallelArgs& parallel_args) const;
+  const pybind11::object& get_or_build_python_kv_caches(
+      std::vector<KVCache>& kv_caches);
 
   ModelArgs model_args_;
   torch::TensorOptions options_;
@@ -71,10 +113,21 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM,
 
   int64_t tp_size_ = 1;
   int64_t tp_rank_ = 0;
+  int64_t dp_size_ = 1;
+  int64_t dp_rank_ = 0;
+  int64_t moe_tp_size_ = 1;
+  int64_t moe_tp_rank_ = 0;
+  int64_t ep_size_ = 1;
+  int64_t ep_rank_ = 0;
+  int64_t cp_size_ = 1;
+  int64_t cp_rank_ = 0;
   ProcessGroup* tp_group_ = nullptr;
+  ProcessGroup* moe_tp_group_ = nullptr;
+  ProcessGroup* moe_ep_group_ = nullptr;
 
   pybind11::object py_model_;
   pybind11::object config_dict_;
+  pybind11::object python_kv_caches_;
 };
 
 }  // namespace xllm
