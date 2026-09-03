@@ -49,18 +49,3 @@
 * Use the review workflow, checklist, severity rules, and output format defined in [code-review/SKILL.md](.agents/skills/code-review/SKILL.md).
 * Apply the Google C++/Python Style Guide only when the project-specific style guide does not define the rule.
 * Focus the review on the requested diff or changed files. Do not comment on unrelated code.
-
-## Commit Messages
-
-Every commit subject line MUST follow the conventional-commit format:
-
-`<type>: <subject>.`
-
-* `<type>` is one of: `feat`, `bugfix`, `docs`, `test`, `refactor`, `chore`, `style`, `revert`, `perf`, `model`, `build`.
-* A colon and a single space separate the type from the subject (`feat: `, not `feat:` or `feat :`).
-* The subject uses lowercase letters only; do not capitalize the first word.
-* The subject contains no fewer than four words.
-* The subject ends with a period (`.`).
-* Keep the body on the lines below, separated from the subject by one blank line.
-
-Example: `bugfix: resolve merge compilation errors.`
