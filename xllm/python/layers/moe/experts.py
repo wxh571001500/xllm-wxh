@@ -160,28 +160,26 @@ class UnquantizedRoutedExperts(RoutedExperts):
             return hidden_states.new_empty((0, self.hidden_size))
         if dispatch_output.group_list.numel() != self.num_experts:
             raise ValueError("MoE group_list must contain one value per expert")
-        if dispatch_output.group_list_type == 1:
-            group_boundaries = dispatch_output.group_list.cumsum(dim=0)
-        elif dispatch_output.group_list_type == 0:
-            group_boundaries = dispatch_output.group_list
-        else:
-            raise ValueError(f"Unsupported MoE group_list_type: {dispatch_output.group_list_type}")
-
-        expert_outputs: list[torch.Tensor] = []
-        group_start = 0
-        for expert_id, group_end_tensor in enumerate(group_boundaries):
-            group_end = int(group_end_tensor.item())
-            if group_end == group_start:
-                continue
-            expert_input = hidden_states[group_start:group_end]
-            gate_up = F.linear(expert_input, self.w13_weight[expert_id])
-            expert_output = self.activation(gate_up)
-            expert_output = F.linear(expert_output, self.w2_weight[expert_id])
-            expert_outputs.append(expert_output)
-            group_start = group_end
-        if group_start != hidden_states.shape[0]:
-            raise ValueError("MoE group_list does not match dispatched tokens")
-        return torch.cat(expert_outputs, dim=0)
+        gate_up = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w13_weight],
+            split_item=2,
+            group_list_type=dispatch_output.group_list_type,
+            group_type=0,
+            group_list=dispatch_output.group_list,
+            output_dtype=hidden_states.dtype,
+        )[0]
+        activated = self.activation(gate_up)
+        expert_output = torch_npu.npu_grouped_matmul(
+            x=[activated],
+            weight=[self.w2_weight],
+            split_item=2,
+            group_list_type=dispatch_output.group_list_type,
+            group_type=0,
+            group_list=dispatch_output.group_list,
+            output_dtype=hidden_states.dtype,
+        )[0]
+        return expert_output
 
     def load_weight(self, name: str, tensor: torch.Tensor) -> bool:
         packed_name = name.removesuffix(".weight")
