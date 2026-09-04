@@ -132,9 +132,13 @@ WorkerService::WorkerService(runtime::Options options,
 WorkerService::~WorkerService() = default;
 
 void WorkerService::record_speculative_metrics_from_output(
-    const torch::Tensor& next_tokens) {
-  if (!options_.enable_speculative_decode() || !next_tokens.defined() ||
-      next_tokens.dim() != 2 || next_tokens.numel() == 0) {
+    const torch::Tensor& next_tokens,
+    bool is_graph_warmup) {
+  // Synthetic graph-warmup batches carry no real accept/reject signal; skip
+  // them so they do not pollute the cumulative acceptance stats.
+  if (is_graph_warmup || !options_.enable_speculative_decode() ||
+      !next_tokens.defined() || next_tokens.dim() != 2 ||
+      next_tokens.numel() == 0) {
     return;
   }
   // DFlash / DSpark record metrics inline in their own worker
@@ -331,7 +335,8 @@ void WorkerService::step(
         } else {
           stream_->synchronize();
         }
-        record_speculative_metrics_from_output(next_tokens);
+        record_speculative_metrics_from_output(
+            next_tokens, forward_outputs.value().is_graph_warmup);
       }
     }
   } else {
@@ -962,7 +967,8 @@ void WorkerService::GetLastStepResult(
                 device_.index());
 #endif
           }
-          record_speculative_metrics_from_output(next_tokens);
+          record_speculative_metrics_from_output(
+              next_tokens, forward_output.is_graph_warmup);
 
           if (next_tokens.defined() || !dit_images.empty() ||
               !dit_text_output.empty() ||

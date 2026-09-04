@@ -173,7 +173,8 @@ class WorkerService : public proto::DistributeWorker {
             torch::Tensor& out_tokens,
             torch::Tensor& out_logprobs,
             std::vector<JsonObjectOutputError>& json_object_errors);
-  void record_speculative_metrics_from_output(const torch::Tensor& next_tokens);
+  void record_speculative_metrics_from_output(const torch::Tensor& next_tokens,
+                                              bool is_graph_warmup);
   DISALLOW_COPY_AND_ASSIGN(WorkerService);
 
  private:
