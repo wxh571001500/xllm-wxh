@@ -223,14 +223,36 @@ def init_parallel_groups(
     store = None
     if world_size > 1:
         os.environ.pop("RANK_TABLE_FILE", None)
-        store = dist.TCPStore(
-            host,
-            port,
-            -1,
-            rank == 0,
-            _GROUP_TIMEOUT,
-            wait_for_workers=False,
-        )
+        # Add delay for non-rank-0 processes to ensure rank 0 creates server first
+        import time
+
+        if rank != 0:
+            time.sleep(5)
+
+        # Retry mechanism for TCPStore creation
+        max_retries = 3
+        retry_delay = 2
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                store = dist.TCPStore(
+                    host,
+                    port,
+                    -1,
+                    rank == 0,
+                    _GROUP_TIMEOUT,
+                    wait_for_workers=False,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                if rank != 0 and attempt < max_retries - 1:
+                    # Non-rank-0 processes retry if server not ready
+                    time.sleep(retry_delay)
+                else:
+                    raise
+        if store is None and last_error is not None:
+            raise last_error
 
     groups: dict[str, ParallelGroup] = {}
     for spec in normalized_specs:

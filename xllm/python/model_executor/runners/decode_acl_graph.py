@@ -157,8 +157,12 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 if self._kda_runtime is not None:
                     self._kda_runtime.metadata = self._new_kda_metadata(batch_size, device)
+                # VLM prefill passes host-computed embeddings, but pure decode
+                # intentionally re-enters through token IDs so embed_tokens
+                # runs inside the stable ACL-graph input buffer. Capture that
+                # decode mode for models which own an embedding layer.
                 warmup_embeds = None
-                if inputs_embeds is not None:
+                if not hasattr(self.model, "embed_tokens") and inputs_embeds is not None:
                     warmup_embeds = torch.zeros(
                         batch_size,
                         inputs_embeds.shape[-1],

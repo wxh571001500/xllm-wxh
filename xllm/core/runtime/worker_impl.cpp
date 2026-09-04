@@ -76,6 +76,7 @@ limitations under the License.
 #include "platform/cuda_profiler.h"
 #endif
 #include "core/distributed_runtime/master.h"
+#include "core/framework/parallel_state/python_process_group.h"
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/eplb/eplb_utils.h"
 #include "framework/kv_cache/kv_cache.h"
@@ -2112,6 +2113,18 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 
   if (options_.is_draft_engine() || is_spec_draft_) {
     disable_layerwise_split_for_draft(&parallel_args_);
+  }
+
+  // Build Python process group specs for Python models
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    parallel_args_.python_process_group_specs_ =
+        build_python_process_group_specs(parallel_args_.rank(),
+                                         parallel_args_.world_size(),
+                                         parallel_args_.dp_size(),
+                                         parallel_args_.ep_size(),
+                                         parallel_args_.cp_size(),
+                                         /*enable_encoder_dp=*/false);
   }
 
   // create model context

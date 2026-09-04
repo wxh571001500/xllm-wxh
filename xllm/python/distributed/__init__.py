@@ -25,7 +25,11 @@ from xllm.python.distributed.collectives import (
     cp_world_size,
     init_process_group,
     init_tp_group,
+    moe_ep_all_reduce,
+    moe_tp_all_reduce,
     reduce_scatter,
+    tp_all_gather,
+    tp_all_reduce,
     tp_rank,
 )
 from xllm.python.distributed.parallel_state import (
@@ -47,6 +51,10 @@ __all__ = [
     "all_gather_variable",
     "reduce_scatter",
     "all_to_all_single",
+    "tp_all_reduce",
+    "tp_all_gather",
+    "moe_tp_all_reduce",
+    "moe_ep_all_reduce",
     "ParallelGroup",
     "get_parallel_group",
     "init_parallel_groups",

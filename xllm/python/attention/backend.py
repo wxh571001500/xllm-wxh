@@ -75,6 +75,7 @@ _LAYER_CACHE_SLOTS = (
 )
 
 LayerCacheInput = LayerCache | tuple[torch.Tensor | None, ...]
+KVCache = LayerCacheInput
 
 
 def normalize_layer_caches(caches: Sequence[LayerCacheInput]) -> list[LayerCache]:
@@ -155,6 +156,15 @@ class MlaPreprocessContext:
     kv_cache: torch.Tensor
     rope_cache: torch.Tensor
     slot_mapping: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MlaUnabsorbedPrefill:
+    """Unabsorbed MLA tensors used by model-specific prefill paths."""
+
+    query_nope: torch.Tensor
+    key_nope: torch.Tensor
+    value: torch.Tensor
 
 
 @dataclass(frozen=True)
