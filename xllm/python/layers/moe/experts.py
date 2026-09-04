@@ -24,11 +24,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
 
+from xllm.python.ascend_custom_ops import ensure_ascend_custom_ops
 from xllm.python.layers.moe.types import (
     MoEExpertsConfig,
     MoETokenDispatchOutput,
 )
-from xllm.python.ascend_custom_ops import ensure_ascend_custom_ops
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
@@ -51,7 +51,7 @@ def _select_tensor_shard(
 
 
 def _load_packed_expert_shard(
-    state_dict: "StateDict",
+    state_dict: StateDict,
     name: str,
     config: MoEExpertsConfig,
     tp_dim: int | None,
@@ -89,7 +89,7 @@ class RoutedExperts(nn.Module, ABC):
     @abstractmethod
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -160,31 +160,26 @@ class UnquantizedRoutedExperts(RoutedExperts):
             return hidden_states.new_empty((0, self.hidden_size))
         if dispatch_output.group_list.numel() != self.num_experts:
             raise ValueError("MoE group_list must contain one value per expert")
-        if dispatch_output.group_list_type == 1:
-            group_boundaries = dispatch_output.group_list.cumsum(dim=0)
-        elif dispatch_output.group_list_type == 0:
-            group_boundaries = dispatch_output.group_list
-        else:
-            raise ValueError(
-                f"Unsupported MoE group_list_type: "
-                f"{dispatch_output.group_list_type}"
-            )
-
-        expert_outputs: list[torch.Tensor] = []
-        group_start = 0
-        for expert_id, group_end_tensor in enumerate(group_boundaries):
-            group_end = int(group_end_tensor.item())
-            if group_end == group_start:
-                continue
-            expert_input = hidden_states[group_start:group_end]
-            gate_up = F.linear(expert_input, self.w13_weight[expert_id])
-            expert_output = self.activation(gate_up)
-            expert_output = F.linear(expert_output, self.w2_weight[expert_id])
-            expert_outputs.append(expert_output)
-            group_start = group_end
-        if group_start != hidden_states.shape[0]:
-            raise ValueError("MoE group_list does not match dispatched tokens")
-        return torch.cat(expert_outputs, dim=0)
+        gate_up = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w13_weight],
+            split_item=2,
+            group_list_type=dispatch_output.group_list_type,
+            group_type=0,
+            group_list=dispatch_output.group_list,
+            output_dtype=hidden_states.dtype,
+        )[0]
+        activated = self.activation(gate_up)
+        expert_output = torch_npu.npu_grouped_matmul(
+            x=[activated],
+            weight=[self.w2_weight],
+            split_item=2,
+            group_list_type=dispatch_output.group_list_type,
+            group_type=0,
+            group_list=dispatch_output.group_list,
+            output_dtype=hidden_states.dtype,
+        )[0]
+        return expert_output
 
     def load_weight(self, name: str, tensor: torch.Tensor) -> bool:
         packed_name = name.removesuffix(".weight")
@@ -195,10 +190,7 @@ class UnquantizedRoutedExperts(RoutedExperts):
         packed_target = packed_targets.get(packed_name)
         if packed_target is not None:
             if tensor.shape != packed_target.shape:
-                raise ValueError(
-                    f"MoE {packed_name} expects {packed_target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"MoE {packed_name} expects {packed_target.shape}, got {tensor.shape}")
             packed_target.data.copy_(tensor.to(packed_target))
             self._packed_loaded.add(packed_name)
             return True
@@ -210,9 +202,7 @@ class UnquantizedRoutedExperts(RoutedExperts):
             expert_id = int(parts[0])
         except ValueError:
             return False
-        if not self.first_expert_id <= expert_id < (
-            self.first_expert_id + self.num_experts
-        ):
+        if not self.first_expert_id <= expert_id < (self.first_expert_id + self.num_experts):
             return False
         local_expert_id = expert_id - self.first_expert_id
         projection_group = {
@@ -236,9 +226,7 @@ class UnquantizedRoutedExperts(RoutedExperts):
         else:
             target = self.w2_weight.data[local_expert_id]
         if tensor.shape != target.shape:
-            raise ValueError(
-                f"MoE expert {name} expects {target.shape}, got {tensor.shape}"
-            )
+            raise ValueError(f"MoE expert {name} expects {target.shape}, got {tensor.shape}")
         target.copy_(tensor.to(target))
         projection_index = {"gate": 0, "up": 1, "down": 2}[projection_group]
         self._loaded_mask[local_expert_id, projection_index] = True
@@ -246,7 +234,7 @@ class UnquantizedRoutedExperts(RoutedExperts):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -268,15 +256,9 @@ class UnquantizedRoutedExperts(RoutedExperts):
                     expert_id = int(parts[0])
                 except ValueError:
                     continue
-                if not self.first_expert_id <= expert_id < (
-                    self.first_expert_id + self.num_experts
-                ):
+                if not self.first_expert_id <= expert_id < (self.first_expert_id + self.num_experts):
                     continue
-                shard_dim = (
-                    0
-                    if parts[1] in ("w1", "w3", "gate_proj", "up_proj")
-                    else 1
-                )
+                shard_dim = 0 if parts[1] in ("w1", "w3", "gate_proj", "up_proj") else 1
                 tensor = state_dict.get_sharded_tensor(
                     name,
                     shard_dim,
@@ -294,9 +276,7 @@ class UnquantizedRoutedExperts(RoutedExperts):
             required_packed = {"w13_weight", "w2_weight"}
             missing = required_packed.difference(self._packed_loaded)
             if missing:
-                raise KeyError(
-                    f"Packed expert weights are missing: {sorted(missing)}"
-                )
+                raise KeyError(f"Packed expert weights are missing: {sorted(missing)}")
             return
         if not bool(self._loaded_mask.all()):
             raise KeyError("Routed expert weights are incomplete")
@@ -372,11 +352,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
             raise ValueError("MoE expert intermediate size must divide tp_size")
         self._config = config
         intermediate_per_rank = config.intermediate_size // config.tp_size
-        if (
-            intermediate_per_rank % 2 != 0
-            or config.hidden_size % 2 != 0
-            or 16 % config.tp_size != 0
-        ):
+        if intermediate_per_rank % 2 != 0 or config.hidden_size % 2 != 0 or 16 % config.tp_size != 0:
             raise ValueError("Packed W4A8 expert dimensions are invalid")
         self.global_num_experts = config.num_experts
         self.num_experts = config.num_local_experts
@@ -529,18 +505,10 @@ class FusedW4A8RoutedExperts(RoutedExperts):
             )
         self.w13_weight.data = self.w13_weight.data.view(torch.int32).contiguous()
         self.w2_weight.data = self.w2_weight.data.view(torch.int32).contiguous()
-        self.w13_weight_scale.data = self._encode_per_channel_scale(
-            self.w13_weight_scale.data
-        ).squeeze(1)
-        self.w2_weight_scale.data = self._encode_per_channel_scale(
-            self.w2_weight_scale.data
-        )
-        self.w13_scale_bias.data = (
-            self.w13_scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
-        )
-        self.w2_scale_bias.data = (
-            self.w2_scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
-        )
+        self.w13_weight_scale.data = self._encode_per_channel_scale(self.w13_weight_scale.data).squeeze(1)
+        self.w2_weight_scale.data = self._encode_per_channel_scale(self.w2_weight_scale.data)
+        self.w13_scale_bias.data = self.w13_scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
+        self.w2_scale_bias.data = self.w2_scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
         self._runtime_weights_ready = True
 
     def load_weight(self, name: str, tensor: torch.Tensor) -> bool:
@@ -558,10 +526,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
         packed_target = packed_targets.get(packed_name)
         if packed_target is not None:
             if tensor.shape != packed_target.shape:
-                raise ValueError(
-                    f"MoE {packed_name} expects {packed_target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"MoE {packed_name} expects {packed_target.shape}, got {tensor.shape}")
             packed_target.data.copy_(tensor.to(packed_target))
             self._packed_loaded.add(packed_name)
             return True
@@ -573,9 +538,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
             expert_id = int(parts[0])
         except ValueError:
             return False
-        if not self.first_expert_id <= expert_id < (
-            self.first_expert_id + self.num_experts
-        ):
+        if not self.first_expert_id <= expert_id < (self.first_expert_id + self.num_experts):
             return False
         local_expert_id = expert_id - self.first_expert_id
         projection_group = {
@@ -606,9 +569,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
                 return False
             target = target_tensor.data[local_expert_id]
         if tensor.shape != target.shape:
-            raise ValueError(
-                f"MoE expert {name} expects {target.shape}, got {tensor.shape}"
-            )
+            raise ValueError(f"MoE expert {name} expects {target.shape}, got {tensor.shape}")
         target.copy_(tensor.to(target))
         projection_index = {"gate": 0, "up": 1, "down": 2}[projection_group]
         suffix_index = {
@@ -642,7 +603,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -688,9 +649,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
                     expert_id = int(parts[0])
                 except ValueError:
                     continue
-                if not self.first_expert_id <= expert_id < (
-                    self.first_expert_id + self.num_experts
-                ):
+                if not self.first_expert_id <= expert_id < (self.first_expert_id + self.num_experts):
                     continue
                 projection = parts[1]
                 suffix = parts[2]
@@ -730,9 +689,7 @@ class FusedW4A8RoutedExperts(RoutedExperts):
             }
             missing = required_packed.difference(self._packed_loaded)
             if missing:
-                raise KeyError(
-                    f"Packed expert weights are missing: {sorted(missing)}"
-                )
+                raise KeyError(f"Packed expert weights are missing: {sorted(missing)}")
         elif not bool(self._loaded_mask.all()):
             raise KeyError("Routed expert weights are incomplete")
 
