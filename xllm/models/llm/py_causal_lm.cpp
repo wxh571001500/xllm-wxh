@@ -35,10 +35,17 @@ namespace py = pybind11;
 namespace xllm::detail {
 void share_python_model_weights(py::object& draft_model,
                                 const py::object& target_model) {
-  draft_model.attr("lm_head") = target_model.attr("lm_head");
+  // DSpark's draft model has its own lm_head; only share when the draft
+  // carries None (block-diffusion models).
+  if (draft_model.attr("lm_head").is_none()) {
+    draft_model.attr("lm_head") = target_model.attr("lm_head");
+  }
   py::object draft_body = draft_model.attr("model");
   py::object target_body = target_model.attr("model");
-  draft_body.attr("embed_tokens") = target_body.attr("embed_tokens");
+  // Same for embed_tokens.
+  if (draft_body.attr("embed_tokens").is_none()) {
+    draft_body.attr("embed_tokens") = target_body.attr("embed_tokens");
+  }
 }
 }  // namespace xllm::detail
 
@@ -115,7 +122,16 @@ py::dict PyCausalLM::build_config_dict(
   d["device"] = c10::str(device_);
   d["tp_size"] = tp_size_;
   d["tp_rank"] = tp_rank_;
-  d["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
+  // Block-diffusion drafts and aux-hidden-capture models (EAGLE-3, Medusa)
+  // require eager execution; graph mode would freeze the captured hidden
+  // states at warmup values.
+  const bool requires_eager_execution =
+      !model_args_.layers_to_capture().empty() ||
+      model_args_.model_type() == "DFlashDraftModel" ||
+      model_args_.model_type() == "DSparkDraftModel";
+  d["enable_graph"] = requires_eager_execution
+                          ? false
+                          : ExecutionConfig::get_instance().enable_graph();
   d["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();
   return d;
@@ -143,6 +159,14 @@ void PyCausalLM::load_model(std::unique_ptr<ModelLoader> loader) {
   py_model_.attr("load_weights")(py_state_dicts,
                                  static_cast<int32_t>(tp_rank_),
                                  static_cast<int32_t>(tp_size_));
+  const std::string& reference_model_path =
+      loader->reference_model_weights_path();
+  if (!reference_model_path.empty()) {
+    // Quantized reference models (e.g. QuaRot) transform the residual basis the
+    // draft trained against; fuse that transform into the draft's weights.
+    py_model_.attr("adapt_weights_for_reference_model")(
+        py::str(reference_model_path));
+  }
 }
 
 ModelOutput PyCausalLM::forward(const torch::Tensor& tokens,

@@ -216,7 +216,9 @@ constexpr char kTorchBackend[] = "TORCH";
 bool is_torch_only_model_type(const std::string& model_type) {
   static const std::unordered_set<std::string> kTorchOnlyModelTypes = {
       "deepseek_v4",
+      "deepseek_v4_dspark",
       "deepseek_v4_mtp",
+      "glm5_next",
       "qwen3_5",
       "qwen3_5_text",
       "qwen3_5_moe",
@@ -226,7 +228,8 @@ bool is_torch_only_model_type(const std::string& model_type) {
       "qwen3_next",
       "minimax_m2",
       "kimi_k3"};
-  return kTorchOnlyModelTypes.count(model_type) != 0;
+  return kTorchOnlyModelTypes.count(model_type) != 0 ||
+         is_dflash2_draft_model_type(model_type);
 }
 #endif
 
@@ -262,8 +265,11 @@ bool resolve_model_registration(const std::string& model_type,
     effective_backend =
         is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
   } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
-             model_type == "deepseek_v32") {
-    // qwen3/qwen3_moe/deepseek_v32 support both backends.
+             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
+             model_type == "qwen3_vl" || model_type == "deepseek_v32_mtp") {
+    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl/deepseek_v32_mtp
+    // support both backends. qwen3_vl on TORCH is used by the Python model
+    // executor (--model_impl=python implements its own ViT + deepstack).
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
@@ -287,6 +293,12 @@ bool resolve_model_registration(const std::string& model_type,
     *resolved_name = "qwen3_atb";
   } else if (model_type == "qwen3_moe" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_moe_atb";
+  } else if (model_type == "qwen2" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen2_atb";
+  } else if (model_type == "qwen2_5_vl" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen2_5_vl_atb";
+  } else if (model_type == "qwen3_vl" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen3_vl_atb";
   } else {
     *resolved_name = model_type;
   }
@@ -314,9 +326,16 @@ bool resolve_model_registration_name(const std::string& model_type,
 }
 
 bool is_npu_model_cp_capable(const std::string& resolved_name) {
+  // Registers model-side CP capability for master-side validation. Note this
+  // is not the same switch as the worker-side NpuCpPlan gate: deepseek_v4 and
+  // deepseek_v4_mtp own their CP split inside the model (TORCH backend) and
+  // deliberately keep model_supports_model_cp() false so the worker does not
+  // shard a second time.
   static const std::unordered_set<std::string> kCpCapableModels = {
       "deepseek_v32",
       "deepseek_v32_mtp",
+      "deepseek_v4",
+      "deepseek_v4_mtp",
       "glm_moe_dsa",
       "glm_moe_dsa_mtp",
   };
@@ -326,8 +345,21 @@ bool is_npu_model_cp_capable(const std::string& resolved_name) {
       ModelRegistry::register_cp_sharding_mode(name, CpShardingMode::MODEL);
     }
   });
-  return ModelRegistry::get_cp_sharding_mode(resolved_name) ==
-         CpShardingMode::MODEL;
+  return kCpCapableModels.contains(resolved_name);
+}
+
+bool is_mlu_model_cp_capable(const std::string& resolved_name) {
+  static const std::unordered_set<std::string> kCpCapableModels = {
+      "deepseek_v4",
+      "glm_moe_dsa",
+  };
+  static std::once_flag once;
+  std::call_once(once, []() {
+    for (const std::string& name : kCpCapableModels) {
+      ModelRegistry::register_cp_sharding_mode(name, CpShardingMode::MODEL);
+    }
+  });
+  return kCpCapableModels.contains(resolved_name);
 }
 
 ModelRegistry* ModelRegistry::get_instance() {

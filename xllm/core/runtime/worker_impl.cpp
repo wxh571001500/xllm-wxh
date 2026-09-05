@@ -152,24 +152,36 @@ class ScopedAtenLoadThreads {
   bool active_ = false;
 };
 
-// Hooks run before a layer, so output layer L is captured at L + 1.
 std::vector<int32_t> read_capture_layer_ids(
     const std::string& model_weights_path) {
   JsonReader reader;
   const std::string config_path = model_weights_path + "/config.json";
   CHECK(reader.parse(config_path))
       << "Failed to parse block-diffusion draft config: " << config_path;
-  std::vector<int32_t> capture_layer_ids;
-  for (int32_t layer_id : reader.value_or<std::vector<int32_t>>(
-           std::vector<std::string>{"dspark_target_layer_ids",
-                                    "target_layer_ids",
-                                    "dflash_config.target_layer_ids"},
-           std::vector<int32_t>{})) {
-    capture_layer_ids.emplace_back(layer_id + 1);
+
+  // Legacy xLLM/vLLM draft configs already use 0-based post-layer output
+  // indices, which match ModelArgs::layers_to_capture directly.
+  std::vector<int32_t> capture_layer_ids =
+      reader.value_or<std::vector<int32_t>>(
+          std::vector<std::string>{"dspark_target_layer_ids",
+                                   "target_layer_ids",
+                                   "dflash_config.target_layer_ids"},
+          std::vector<int32_t>{});
+  if (!capture_layer_ids.empty()) {
+    return capture_layer_ids;
+  }
+
+  // Speculators uses hidden-state boundary indices (0=embedding, N=after
+  // decoder N-1); shift to xLLM's 0-based post-layer capture contract.
+  capture_layer_ids = reader.value_or<std::vector<int32_t>>(
+      "aux_hidden_state_layer_ids", std::vector<int32_t>{});
+  for (int32_t& layer_id : capture_layer_ids) {
+    --layer_id;
   }
   CHECK(!capture_layer_ids.empty())
       << "Block-diffusion draft config requires dspark_target_layer_ids, "
-         "target_layer_ids, or dflash_config.target_layer_ids: "
+         "target_layer_ids, dflash_config.target_layer_ids, or "
+         "aux_hidden_state_layer_ids: "
       << config_path;
   return capture_layer_ids;
 }
@@ -774,7 +786,8 @@ bool WorkerImpl::can_prepare_npu_graph_decode_input(
   return !options_.enable_speculative_decode() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph_double_buffer() &&
-         enable_schedule_overlap() && options_.backend() == "llm" &&
+         enable_schedule_overlap() &&
+         (options_.backend() == "llm" || options_.backend() == "vlm") &&
          input_params.meta.batch_forward_type.has_decode();
 #else
   (void)input_params;
@@ -789,7 +802,7 @@ bool WorkerImpl::can_prepare_without_compute_stream_wait(
   return !options_.enable_speculative_decode() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph_double_buffer() &&
-         options_.backend() == "llm";
+         (options_.backend() == "llm" || options_.backend() == "vlm");
 #else
   (void)input_params;
   return false;
@@ -1349,7 +1362,15 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_CUDA) || \
     defined(USE_MUSA)
-    if (has_linear_attention_layers(context_.get_model_args())) {
+    // SpeculativeWorkerImpl carries the target model context but delegates
+    // target/draft execution to its inner workers and therefore owns no KV
+    // cache itself.  In particular, a Qwen3.5/3.8 target advertises linear
+    // attention while the outer DFlash worker's kv_caches_ is empty.  Let the
+    // inner target worker (which owns the recurrent cache) perform preparation
+    // and restore; attempting it here would treat target cache operations as
+    // draft operations and fail discover_num_slots().
+    if (!kv_caches_.empty() &&
+        has_linear_attention_layers(context_.get_model_args())) {
       prepare_input_params_for_linear_attention(input_params);
       // Under schedule_overlap chunked prefill the previous chunk's forward
       // runs on compute_stream_ from a worker thread that may not have
@@ -1967,6 +1988,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   device_.set_seed(random_seed);
 
   auto model_loader = ModelLoader::create(model_weights_path);
+  if (options_.is_draft_engine() && !options_.model_path().empty() &&
+      options_.model_path() != model_weights_path) {
+    model_loader->set_reference_model_weights_path(options_.model_path());
+  }
   model_weights_path_ = std::move(model_weights_path);
 
   auto args = model_loader->model_args();
@@ -2067,7 +2092,8 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
       SpeculativeConfig::requires_aux_hidden_capture(speculative_algorithm) &&
       args.layers_to_capture().empty()) {
     const int32_t num_layers = static_cast<int32_t>(args.n_layers());
-    args.layers_to_capture({2, num_layers / 2, num_layers - 3});
+    // EAGLE-3 low/mid/high default, as 0-based post-layer output indices.
+    args.layers_to_capture({1, num_layers / 2 - 1, num_layers - 4});
   }
 #else
   if (options_.enable_speculative_decode()) {
