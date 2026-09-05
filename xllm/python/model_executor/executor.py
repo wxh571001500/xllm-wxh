@@ -18,6 +18,7 @@ import torch
 from torch import nn
 
 from scripts.logger import logger
+from xllm.python import distributed
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, KVCache
 from xllm.python.layers.attention import (
     AttentionLayerSpec,
@@ -43,6 +44,7 @@ def _create_attention_backend(
     device: torch.device,
     dtype: torch.dtype,
     attention_kinds: set[str] | dict | None = None,
+    max_num_reqs: int = 1,
 ) -> AttentionBackend:
     config = attention_kinds if isinstance(attention_kinds, dict) else {}
     if config.get("model_type") == "deepseek_v4" and _is_npu_device(device):
@@ -62,6 +64,26 @@ def _create_attention_backend(
             dtype=dtype,
         )
     if _is_npu_device(device):
+        dcp_group = distributed.dcp_group(device)
+        if dcp_group is not None and dcp_group.size() > 1:
+            from xllm.python.attention.sfa_dcp_backend import (
+                SfaDcpAttentionBackend,
+                dcp_layer_options,
+            )
+
+            index_topk = dcp_layer_options(first_attention)
+            return SfaDcpAttentionBackend(
+                num_heads=first_attention.num_heads,
+                num_kv_heads=first_attention.num_kv_heads,
+                head_dim=first_attention.head_dim,
+                scale=first_attention.scale,
+                sliding_window=first_attention.sliding_window,
+                device=device,
+                dtype=dtype,
+                dcp_group=dcp_group,
+                index_topk=index_topk,
+                max_num_reqs=max(max_num_reqs, 1),
+            )
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
         )
@@ -155,6 +177,7 @@ class ModelExecutor:
             device,
             first_parameter.dtype,
             config,
+            max_seqs_per_batch,
         )
 
         execution_model = model.model

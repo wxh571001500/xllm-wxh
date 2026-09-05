@@ -1064,47 +1064,6 @@ void WorkerImpl::sanitize_json_object_error_inputs(ForwardInput& input) {
       << error;
 }
 
-#if defined(USE_NPU)
-torch::Tensor WorkerImpl::recompute_new_cache_slots(const ForwardInput& input) {
-  auto old_cache_slots = input.input_params.attention.device.new_cache_slots;
-  int64_t numel = old_cache_slots.numel();
-  // The logical block stride that BlockManager hands out is
-  // `block_size * kv_split_size_effective` (see llm_engine init). When KV is
-  // not split (kv_split_size == 1) the stride collapses back to block_size.
-  const int32_t kv_split_size = parallel_args_.kv_split_size_effective();
-  const int32_t block_size_total = options_.block_size() * kv_split_size;
-  // KV-shard ownership predicate: block whose sub-index inside the logical
-  // block matches this rank's KV-split rank (degenerates to "this rank only"
-  // when kv_split_size == 1, since sub_block_idx is always 0 there).
-  const int32_t owner_kv_split_rank = parallel_args_.kv_split_rank();
-
-  torch::Tensor indices = torch::arange(numel, torch::kCPU);
-  torch::Tensor block_offset = indices % block_size_total;
-  torch::Tensor sub_block_idx =
-      torch::floor_divide(block_offset, options_.block_size());
-  torch::Tensor mask = (sub_block_idx == owner_kv_split_rank);
-  torch::Tensor valid_indices = torch::nonzero(mask).squeeze();
-
-  torch::Tensor new_cache_slots = torch::full_like(old_cache_slots, -1);
-  if (valid_indices.numel() > 0) {
-    const torch::Device slots_device = old_cache_slots.device();
-    torch::Tensor valid_indices_on_device =
-        valid_indices.to(slots_device, /*non_blocking=*/false);
-    torch::Tensor old_slotid =
-        old_cache_slots.index_select(0, valid_indices_on_device)
-            .to(torch::kInt);
-    torch::Tensor block_id = torch::floor_divide(old_slotid, block_size_total);
-    torch::Tensor block_offset_mod = old_slotid % options_.block_size();
-    torch::Tensor new_slotid =
-        block_id * options_.block_size() + block_offset_mod;
-    new_cache_slots.index_put_({valid_indices_on_device},
-                               new_slotid.to(new_cache_slots.scalar_type()));
-  }
-  return new_cache_slots;
-}
-
-#endif
-
 bool WorkerImpl::model_supports_model_cp() const {
   if (model_cp_capable_computed_) {
     return model_cp_capable_;
@@ -1622,8 +1581,11 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
 
     // run the model on the given input in working thread
     if (!enable_schedule_overlap()) {
-      const auto output = this->step(input);
-      promise.setValue(output);
+      auto output = this->step(input);
+      if (output.has_value()) {
+        output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
+      }
+      promise.setValue(std::move(output));
     } else {
       if (input.token_ids.numel() > 0 &&
           input.input_params.meta.batch_forward_type.has_decode()) {
@@ -1645,6 +1607,7 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
       }
 #endif
       if (output.has_value()) {
+        output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
         output->json_object_errors.insert(output->json_object_errors.end(),
                                           input.json_object_errors.begin(),
                                           input.json_object_errors.end());
@@ -2366,6 +2329,99 @@ uint32_t WorkerImpl::transfer_kv_blocks(
         batch_id, block_transfer_info);
   }
   return 0;
+}
+
+std::shared_ptr<HierarchyKVCacheTransfer>
+WorkerImpl::create_hierarchy_kv_cache_transfer() {
+  CHECK_GT(options_.host_blocks_factor(), 1.0)
+      << "Hierarchy KV cache transfer requires Host cache blocks.";
+  CHECK_GT(options_.dp_size(), 0u);
+  CHECK_EQ(options_.world_size() % options_.dp_size(), 0u);
+  CHECK_GT(options_.cp_size(), 0u);
+  const uint32_t dp_local_size =
+      static_cast<uint32_t>(options_.world_size() / options_.dp_size());
+  CHECK_EQ(dp_local_size % options_.cp_size(), 0u);
+  const bool mlu_overlap = options_.cp_size() > 1 &&
+                           Platform::uses_model_cp_sharding() &&
+                           Platform::is_mlu();
+  const uint32_t tp_size =
+      mlu_overlap ? dp_local_size : dp_local_size / options_.cp_size();
+  CHECK_GT(tp_size, 0u);
+  const int32_t worker_rank = context_.get_parallel_args().rank();
+  CHECK_GE(worker_rank, 0);
+  const uint32_t worker_id = static_cast<uint32_t>(worker_rank);
+  HierarchyKVCacheTransfer::Options transfer_options;
+  transfer_options.tp_rank(worker_id % tp_size)
+      .tp_size(tp_size)
+      .layers(context_.get_model_args().n_layers())
+      .host_blocks_factor(options_.host_blocks_factor())
+      .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())
+      .enable_mla(options_.enable_mla())
+      .enable_kvcache_store(options_.enable_kvcache_store())
+      .store_protocol(options_.store_protocol())
+      .store_master_server_address(options_.store_master_server_address())
+      .store_metadata_server(options_.store_metadata_server())
+      .store_local_hostname(options_.store_local_hostname())
+      .store_namespace(options_.model_id())
+      .store_worker_id(worker_id);
+  return std::make_shared<HierarchyKVCacheTransfer>(transfer_options, device_);
+}
+
+void WorkerImpl::bind_hierarchy_kv_cache_transfer(
+    std::shared_ptr<HierarchyKVCacheTransfer> transfer,
+    HierarchyKVCacheTransfer::CacheRole role,
+    const Stream* producer_stream,
+    std::string store_key_component) {
+  CHECK(producer_stream != nullptr) << "Producer stream must not be null.";
+  set_hierarchy_kv_cache_transfer(std::move(transfer));
+  hierarchy_kv_cache_role_ = role;
+  hierarchy_kv_cache_producer_stream_ = producer_stream;
+  hierarchy_kv_cache_store_key_component_ = std::move(store_key_component);
+}
+
+void WorkerImpl::register_hierarchy_kv_cache(
+    HierarchyKVCacheTransfer& transfer,
+    HierarchyKVCacheTransfer::CacheRole role,
+    const Stream* producer_stream) {
+  CHECK(hierarchy_kv_cache_transfer_context_.has_value())
+      << "Hierarchy KV cache transfer context is not initialized.";
+  CHECK(producer_stream != nullptr) << "Producer stream must not be null.";
+  CHECK(!kv_caches_.empty()) << "kv_caches is not initialized.";
+
+  HierarchyKVCacheTransfer::CacheRegistration registration;
+  registration.role = role;
+  registration.device_kv_caches = &kv_caches_;
+  registration.kv_cache_shape =
+      hierarchy_kv_cache_transfer_context_->kv_cache_shape;
+  registration.create_options =
+      hierarchy_kv_cache_transfer_context_->create_options;
+  registration.producer_stream = producer_stream;
+  registration.store_key_component = hierarchy_kv_cache_store_key_component_;
+  if (registration.store_key_component.empty()) {
+    registration.store_key_component =
+        role == HierarchyKVCacheTransfer::CacheRole::TARGET ? "main" : "draft";
+  }
+  transfer.register_cache(std::move(registration));
+}
+
+void WorkerImpl::set_hierarchy_kv_cache_transfer(
+    std::shared_ptr<HierarchyKVCacheTransfer> transfer) {
+  CHECK(transfer != nullptr) << "Hierarchy KV cache transfer must not be null.";
+  CHECK(hierarchy_kv_cache_transfer_ == nullptr)
+      << "Hierarchy KV cache transfer is already initialized.";
+  hierarchy_kv_cache_transfer_ = std::move(transfer);
+}
+
+std::shared_ptr<HierarchyKVCacheTransfer>
+WorkerImpl::get_hierarchy_kv_cache_transfer() const {
+  return hierarchy_kv_cache_transfer_;
+}
+
+void WorkerImpl::clear_hierarchy_kv_cache_transfer() {
+  hierarchy_kv_cache_transfer_.reset();
+  hierarchy_kv_cache_role_.reset();
+  hierarchy_kv_cache_producer_stream_ = nullptr;
+  hierarchy_kv_cache_store_key_component_.clear();
 }
 
 void WorkerImpl::set_hierarchy_layer_synchronizer(

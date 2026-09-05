@@ -20,8 +20,7 @@ GLM-5.2 structural deltas live here:
 
   * cross-layer top-k sharing -- ``indexer_types`` marks full/shared layers;
     shared layers skip the indexer and reuse the previous full layer's top-k.
-  * indexer ``wq_b`` is W8A8 (not bf16 ``nn.Linear``) and ``weights_proj``
-    stays fp32.
+  * indexer ``wq_b`` is W8A8 (not bf16 ``nn.Linear``).
   * indexer RoPE is configurable (``indexer_rope_interleave``); DSV3.2's
     indexer uses half-rotate only.
   * per-layer MLP type comes from ``mlp_layer_types`` (not a single
@@ -40,6 +39,12 @@ import torch.nn as nn
 
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import MlaIndexContext
+
+# The AICPU tiling of ``aclnnQuantLightningIndexer`` requires
+# ``num_heads_q / num_heads_k == 64``. GLM-5.2 uses ``index_n_heads=32`` and
+# ``num_heads_k=1``, so we pad Q / q_scale / weights along the head axis to
+# 64 heads (padded weights are zero, keeping ``score = sum_h w[h]*q[h]*k``
+# mathematically identical). Pure-Python workaround limited to this file.
 from xllm.python.layers import (
     Attention,
     ColumnParallelLinear,
@@ -61,12 +66,20 @@ from xllm.python.models.deepseek_v32 import (
 from xllm.python.models.deepseek_v32 import (
     W8A8StaticLinear,
     _apply_half_rope,
+    _create_hadamard_matrix,
     _gather_interleave_cos_sin,
     _interleave_rope_with,
     _tp_rank_from_device,
     _yarn_get_mscale,
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader, effective_moe_tp, mla_head_split
+
+# aclnnQuantLightningIndexer tiling hard-requires n_heads_q / n_heads_k == 64
+# (G_SIZE_LIMIT in third_party/xllm_ops/.../quant_lightning_indexer_tiling.h). The
+# xllm_ops kernel fixes matmul M=256 tile with head_dim=128, kv_head=1 for DSV3.2/DSV4
+# shapes; other gSize values are neither exposed nor tested. GLM-5.2 is 32/1 and pads Q
+# up to 64 heads at the caller (see Glm52Indexer._pad_q_heads_to_kernel_gsize).
+_QLI_KERNEL_GSIZE = 64
 
 
 @dataclass
@@ -422,7 +435,7 @@ class Glm52MLAAttention(Attention):
 
 
 class Glm52Indexer(nn.Module):
-    """GLM-5.2 DSA lightning indexer (wq_b W8A8, weights_proj fp32, configurable RoPE)."""
+    """GLM-5.2 DSA lightning indexer (wq_b W8A8, configurable RoPE)."""
 
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
@@ -433,11 +446,49 @@ class Glm52Indexer(nn.Module):
         self.indexer_rope_interleave = cfg.indexer_rope_interleave
         self.wq_b = W8A8StaticLinear(cfg.q_lora_rank, self.n_head * self.head_dim, device)
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim, bias=False, dtype=dtype, device=device)
-        self.weights_proj = nn.Linear(cfg.hidden_size, self.n_head, bias=False, dtype=torch.float32, device=device)
+        self.weights_proj = nn.Linear(cfg.hidden_size, self.n_head, bias=False, dtype=dtype, device=device)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype, device=device)
+        self.register_buffer(
+            "hadamard",
+            _create_hadamard_matrix(self.head_dim, dtype, device),
+            persistent=False,
+        )
 
     def process_weights_after_loading(self) -> None:
         self.wq_b.process_weights_after_loading()
+
+    def _pad_q_heads_to_kernel_gsize(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        required_q_heads: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # aclnnQuantLightningIndexer tiling hard-requires n_heads_q/n_heads_k == 64
+        # (G_SIZE_LIMIT in quant_lightning_indexer_tiling.h; xllm_ops kernel hard-codes
+        # matmul M=256 tile, head_dim=128 and kv_head=1 for DSV3.2/DSV4 shapes). GLM-5.2
+        # is index_n_heads=32 / kv_head=1, so pad Q from 32 to 64 heads to satisfy the
+        # kernel. The score sum_h(w_h * q_h . k) is mathematically unchanged: padded Q
+        # rows are zero, so q_h . k = 0 for h >= n_head; padded weights are zero so those
+        # zero terms cannot contribute even if the kernel processed them differently.
+        pad_heads = required_q_heads - self.n_head
+        if pad_heads == 0:
+            return q, q_scale, weights
+        if pad_heads < 0:
+            raise RuntimeError(f"Glm52Indexer expected index_n_heads<={required_q_heads}, got {self.n_head}")
+        q = torch.cat(
+            [q, torch.zeros((q.size(0), pad_heads, q.size(2)), dtype=q.dtype, device=q.device)],
+            dim=1,
+        )
+        q_scale = torch.cat(
+            [q_scale, torch.zeros((q_scale.size(0), pad_heads), dtype=q_scale.dtype, device=q_scale.device)],
+            dim=1,
+        )
+        weights = torch.cat(
+            [weights, torch.zeros((weights.size(0), pad_heads), dtype=weights.dtype, device=weights.device)],
+            dim=1,
+        )
+        return q, q_scale, weights
 
     def select_qli(
         self,
@@ -463,12 +514,49 @@ class Glm52Indexer(nn.Module):
             k_pe = _interleave_rope_with(k_pe.unsqueeze(1), cos, sin).squeeze(1)
         else:
             q_pe = _apply_half_rope(cos_sin_cache, q_pe, positions)
-            k_pe = _apply_half_rope(k_pe.unsqueeze(1), cos_sin_cache, positions).squeeze(1)
+            k_pe = _apply_half_rope(cos_sin_cache, k_pe.unsqueeze(1), positions).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
+        weights = self.weights_proj(hidden)
+
+        use_quant_indexer = (
+            index_cache is not None and index_cache.dtype == torch.int8 and ctx.index_cache_scale is not None
+        )
+        if use_quant_indexer:
+            rotation_scale = self.head_dim**-0.5
+            q = torch.matmul(q, self.hadamard) * rotation_scale
+            k = torch.matmul(k, self.hadamard) * rotation_scale
+            q, q_scale = kernels.dynamic_quant(q)
+            k, k_scale = kernels.dynamic_quant(k)
+            assert q_scale is not None
+            assert k_scale is not None
+            q_scale = q_scale.to(torch.float16)
+            k_scale = k_scale.unsqueeze(-1).to(torch.float16)
+            ctx.update_index_cache(k, k_scale)
+            weight_scale = self.head_dim**-0.5 * self.n_head**-0.5
+            # xLLM stores one index key per source token.
+            cmp_ratio = 1
+
+            required_q_heads = index_cache.size(2) * _QLI_KERNEL_GSIZE
+            q, q_scale, weights_padded = self._pad_q_heads_to_kernel_gsize(q, q_scale, weights, required_q_heads)
+
+            qli_metadata = ctx.get_quant_indexer_metadata(required_q_heads, self.head_dim, self.topk, cmp_ratio)
+            return kernels.quant_lightning_indexer(
+                q,
+                index_cache,
+                (weights_padded * weight_scale).to(torch.float16),
+                q_scale,
+                ctx.index_cache_scale,
+                qli_metadata,
+                actual_seq_q,
+                actual_seq_kv,
+                block_table,
+                self.topk,
+                cmp_ratio,
+            )
+
         if index_cache is not None and slot_mapping is not None:
             ctx.update_index_cache(k, None)
-        weights = self.weights_proj(hidden.to(torch.float32)).to(torch.bfloat16)
         topk = kernels.lightning_indexer(
             q,
             index_cache,

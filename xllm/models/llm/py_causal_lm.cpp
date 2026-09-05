@@ -85,7 +85,10 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
   tp_rank_ = (tp_group_ != nullptr) ? tp_group_->rank() : 0;
 
   py::gil_scoped_acquire gil;
-  init_python_process_groups(parallel_args, device_);
+  // deepseek_v4 has its own process group initialization
+  if (model_args_.model_type() != "deepseek_v4") {
+    init_python_process_groups(parallel_args, device_);
+  }
   const std::string module_name = context.get_model_args().model_type().empty()
                                       ? std::string("Qwen3ForCausalLM")
                                       : context.get_model_args().model_type();

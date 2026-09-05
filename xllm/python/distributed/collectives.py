@@ -31,14 +31,14 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed import ProcessGroup
 
-_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp"))
-# ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
-# ``moe_ep`` and ``cp`` stride across those blocks. Both layouts follow from how
-# the caller derives a rank within each group, so a group's full membership is
-# determined by its own size and needs no extra information from the caller.
-# ``cp`` strides by the attention TP size: ranks sharing a (dp, tp) slot but
-# holding different sequence shards form one CP group, matching the C++
-# compute_cp_group_ranks layout (rank = dp*cp*tp + cp_rank*tp + tp_rank).
+_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "dcp"))
+# ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while
+# ``dp``, ``moe_ep``, ``cp`` and ``dcp`` stride across those blocks. Both
+# layouts follow from how the caller derives a rank within each group, so a
+# group's full membership is determined by its own size and needs no extra
+# information from the caller.
+# ``dcp`` matches ParallelArgs::kv_split_rank when cp_size == 1:
+# rank_in_group = global_rank / (world / dcp_size).
 _CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp"))
 
 _groups = {}
@@ -246,11 +246,7 @@ def cp_rank(device: torch.device | str) -> int:
 
 
 def cp_world_size(device: torch.device | str) -> int:
-    """Size of the CP group for ``device`` (1 when no CP group exists).
-
-    Lets the attention backend detect at runtime whether KV is sharded across a
-    CP group (DCP decode) without threading cp_size through the forward call.
-    """
+    """Size of the CP group for ``device`` (1 when no CP group exists)."""
     group = _groups.get(("cp", str(torch.device(device))))
     return group.size() if group is not None else 1
 
@@ -293,6 +289,10 @@ def moe_ep_all_reduce(x: torch.Tensor) -> None:
         op(x)
         return
     all_reduce_(x, "moe_ep")
+
+
+def dcp_group(device: torch.device | str) -> ProcessGroup | None:
+    return _groups.get(("dcp", str(torch.device(device))))
 
 
 # A one-shot symmetric-memory reduction is an ordinary kernel on the current
@@ -497,6 +497,7 @@ __all__ = [
     "tp_rank",
     "cp_rank",
     "cp_world_size",
+    "dcp_group",
     "all_reduce_",
     "all_gather",
     "all_gather_variable",

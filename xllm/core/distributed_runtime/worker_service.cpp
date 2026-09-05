@@ -132,9 +132,13 @@ WorkerService::WorkerService(runtime::Options options,
 WorkerService::~WorkerService() = default;
 
 void WorkerService::record_speculative_metrics_from_output(
-    const torch::Tensor& next_tokens) {
-  if (!options_.enable_speculative_decode() || !next_tokens.defined() ||
-      next_tokens.dim() != 2 || next_tokens.numel() == 0) {
+    const torch::Tensor& next_tokens,
+    bool is_graph_warmup) {
+  // Synthetic graph-warmup batches carry no real accept/reject signal; skip
+  // them so they do not pollute the cumulative acceptance stats.
+  if (is_graph_warmup || !options_.enable_speculative_decode() ||
+      !next_tokens.defined() || next_tokens.dim() != 2 ||
+      next_tokens.numel() == 0) {
     return;
   }
   // DFlash / DSpark record metrics inline in their own worker
@@ -182,8 +186,26 @@ void WorkerService::record_speculative_metrics_from_output(
   const double total_drafts = COUNTER_VALUE(speculative_num_drafts_total);
   if (total_drafts > 0) {
     GAUGE_SET(
-        speculative_mean_tokens_per_decode_step,
+        speculative_mean_acceptance_length,
         COUNTER_VALUE(speculative_num_committed_tokens_total) / total_drafts);
+  }
+  // Per-position conditional acceptance rate = P(accept position i | position
+  // i-1 accepted) = accepted_per_pos[i] / accepted_per_pos[i-1]; position 0
+  // divides by the total draft count. Read from the global counters so multi-DP
+  // writers converge on one aggregate.
+  double prev_accepted = total_drafts;
+  for (int64_t position = 0; position < effective_speculative_tokens;
+       ++position) {
+    const std::string& position_label =
+        speculative_position_labels_[static_cast<size_t>(position)];
+    const double cur_accepted = MULTI_COUNTER_VALUE(
+        speculative_num_accepted_tokens_per_pos, position_label);
+    if (prev_accepted > 0) {
+      MULTI_GAUGE_SET(speculative_conditional_acceptance_rate_per_pos,
+                      position_label,
+                      cur_accepted / prev_accepted);
+    }
+    prev_accepted = cur_accepted;
   }
 }
 
@@ -313,7 +335,8 @@ void WorkerService::step(
         } else {
           stream_->synchronize();
         }
-        record_speculative_metrics_from_output(next_tokens);
+        record_speculative_metrics_from_output(
+            next_tokens, forward_outputs.value().is_graph_warmup);
       }
     }
   } else {
@@ -944,7 +967,8 @@ void WorkerService::GetLastStepResult(
                 device_.index());
 #endif
           }
-          record_speculative_metrics_from_output(next_tokens);
+          record_speculative_metrics_from_output(
+              next_tokens, forward_output.is_graph_warmup);
 
           if (next_tokens.defined() || !dit_images.empty() ||
               !dit_text_output.empty() ||
