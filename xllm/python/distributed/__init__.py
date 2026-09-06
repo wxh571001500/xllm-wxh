@@ -1,4 +1,4 @@
-# Copyright 2026 The xLLM Authors.
+# Copyright 2026 The xLLM Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ from xllm.python.distributed.collectives import (
     all_gather,
     all_gather_variable,
     all_reduce_,
+    all_to_all_single,
     cp_rank,
     cp_world_size,
     dcp_group,
@@ -27,9 +28,17 @@ from xllm.python.distributed.collectives import (
     init_tp_group,
     moe_ep_all_reduce,
     moe_tp_all_reduce,
+    reduce_scatter,
     tp_all_gather,
     tp_all_reduce,
     tp_rank,
+)
+from xllm.python.distributed.parallel_state import (
+    ParallelGroup,
+    get_parallel_group,
+    init_parallel_groups,
+    parallel_group_rank,
+    parallel_group_world_size,
 )
 
 __all__ = [
@@ -38,12 +47,19 @@ __all__ = [
     "tp_rank",
     "cp_rank",
     "cp_world_size",
+    "all_reduce_",
+    "all_gather",
+    "all_gather_variable",
+    "reduce_scatter",
+    "all_to_all_single",
     "tp_all_reduce",
     "tp_all_gather",
     "moe_tp_all_reduce",
     "moe_ep_all_reduce",
     "dcp_group",
-    "all_reduce_",
-    "all_gather",
-    "all_gather_variable",
+    "ParallelGroup",
+    "get_parallel_group",
+    "init_parallel_groups",
+    "parallel_group_rank",
+    "parallel_group_world_size",
 ]
