@@ -53,15 +53,14 @@ int64_t get_kimi_k25_moe_max_dp_token_count(
   if (input_params.parallel.dp_global_token_nums.empty()) {
     return std::max<int64_t>(0, num_tokens);
   }
-  auto max_token_count = std::max_element(
-      input_params.parallel.dp_global_token_nums.begin(),
-      input_params.parallel.dp_global_token_nums.end());
+  auto max_token_count =
+      std::max_element(input_params.parallel.dp_global_token_nums.begin(),
+                       input_params.parallel.dp_global_token_nums.end());
   CHECK(max_token_count != input_params.parallel.dp_global_token_nums.end());
   return std::max<int64_t>(0, *max_token_count);
 }
 
-void disable_kimi_k25_moe_mc2(
-    atb_speed::deepseekV2::DecoderLayerParam& param) {
+void disable_kimi_k25_moe_mc2(atb_speed::deepseekV2::DecoderLayerParam& param) {
   param.enableAllToAllMC2 = false;
 }
 
@@ -95,9 +94,7 @@ torch::Tensor shard_merged_gate_up_for_ep1(const torch::Tensor& tensor,
   const int64_t shard_offset = static_cast<int64_t>(rank) * shard_size;
   return torch::cat(
              {tensor.narrow(0, shard_offset, shard_size),
-              tensor.narrow(0,
-                            projection_size + shard_offset,
-                            shard_size)},
+              tensor.narrow(0, projection_size + shard_offset, shard_size)},
              0)
       .contiguous();
 }
@@ -108,11 +105,10 @@ torch::Tensor shard_down_for_ep1(const torch::Tensor& tensor,
   CHECK(tensor.defined());
   CHECK_GT(tensor.dim(), 1);
   CHECK_EQ(tensor.size(1) % world_size, 0)
-      << "Shared expert down projection cannot be sharded across "
-      << world_size << " ranks, shape=" << tensor.sizes();
+      << "Shared expert down projection cannot be sharded across " << world_size
+      << " ranks, shape=" << tensor.sizes();
   const int64_t shard_size = tensor.size(1) / world_size;
-  return tensor
-      .narrow(1, static_cast<int64_t>(rank) * shard_size, shard_size)
+  return tensor.narrow(1, static_cast<int64_t>(rank) * shard_size, shard_size)
       .contiguous();
 }
 
@@ -223,13 +219,12 @@ enum DecoderLayerTensorId : int {
 
 static const uint64_t WEIGHT_COUNT_PER_LAYER = 84;
 
-constexpr int32_t kPrefillEp1WeightIds[] = {
-    IN_MLP_GATEUP_WEIGHT_SHARED_EXPERT,
-    IN_MLP_GATEUP_OFFSET_SHARED_EXPERT,
-    IN_MLP_GATEUP_SCALE_SHARED_EXPERT,
-    IN_MLP_DOWN_WEIGHT_SHARED_EXPERT,
-    IN_BLOCK_SPARSE_MOE_GATE_WEIGHT,
-    IN_BLOCK_SPARSE_MOE_GATE_BIAS};
+constexpr int32_t kPrefillEp1WeightIds[] = {IN_MLP_GATEUP_WEIGHT_SHARED_EXPERT,
+                                            IN_MLP_GATEUP_OFFSET_SHARED_EXPERT,
+                                            IN_MLP_GATEUP_SCALE_SHARED_EXPERT,
+                                            IN_MLP_DOWN_WEIGHT_SHARED_EXPERT,
+                                            IN_BLOCK_SPARSE_MOE_GATE_WEIGHT,
+                                            IN_BLOCK_SPARSE_MOE_GATE_BIAS};
 
 NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
     const ModelContext& context,
@@ -262,14 +257,13 @@ NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
   auto quant_args = context.get_quant_args();
   auto options = context.get_tensor_options();
   uses_deepseek_v2_mla_graph_ = uses_deepseek_v2_mla_graph(model_args);
-  use_kimi_k25_fia_decode_ =
-      ModelConfig::get_instance().enable_fia_decode();
+  const bool is_w4a8_dynamic = quantize_type_ == "w4a8_dynamic";
+  use_kimi_k25_fia_decode_ = ModelConfig::get_instance().enable_fia_decode();
   use_kimi_k25_moe_gating_topk_ =
       ModelConfig::get_instance().enable_moe_gating_topk() &&
       quantize_type_ == "w8a8_dynamic";
-  use_kimi_k25_moe_mc2_ =
-      ModelConfig::get_instance().enable_moe_mc2() &&
-      quantize_type_ == "w8a8_dynamic";
+  use_kimi_k25_moe_mc2_ = ModelConfig::get_instance().enable_moe_mc2() &&
+                          (quantize_type_ == "w8a8_dynamic" || is_w4a8_dynamic);
   use_kimi_k25_moe_prefill_ep1_ =
       ModelConfig::get_instance().enable_moe_prefill_ep1() &&
       quantize_type_ == "w8a8_dynamic" &&
@@ -486,8 +480,12 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_attention_parameters(
   param.qkRopeHeadDim = args.qk_rope_head_dim();
   param.kvLoraRank = args.kv_lora_rank();
   param.softmaxScale = sm_scale_;
-  if (quantize_type_ == "w8a8_dynamic" && num_speculative_tokens_ == 0) {
-    param.enableMlaPreprocess = param.isBF16 ? false : true;
+  // W4A8 uses static W8A8 attention projections. The fused MLA-preprocess
+  // operation is required by the Kimi FIA decode path.
+  if ((quantize_type_ == "w8a8_dynamic" && num_speculative_tokens_ == 0) ||
+      (quantize_type_ == "w4a8_dynamic" && num_speculative_tokens_ > 0)) {
+    param.enableMlaPreprocess =
+        quantize_type_ == "w4a8_dynamic" ? true : (param.isBF16 ? false : true);
   } else {
     param.enableMlaPreprocess = false;
   }
@@ -614,8 +612,7 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_parallel_parameters(
 
   param.enableAllToAllMC2 = (param.expertParallelDegree == 2);
   if (ModelConfig::get_instance().enable_moe_mc2()) {
-    param.enableAllToAllMC2 =
-        param.enableAllToAllMC2 && use_kimi_k25_moe_mc2_;
+    param.enableAllToAllMC2 = param.enableAllToAllMC2 && use_kimi_k25_moe_mc2_;
   }
   param.enableGatherPreNorm = true;
   param.enableExtraOprojTp = false;  // TODO
@@ -986,8 +983,7 @@ void NpuDeepseekV2DecoderLayerImpl::prepare_prefill_ep1_weights() {
 void NpuDeepseekV2DecoderLayerImpl::bind_prefill_ep1_weights(
     atb_speed::Model::Node& node) {
   for (int32_t weight_id : kPrefillEp1WeightIds) {
-    node.inTensors.at(weight_id) =
-        &atb_prefill_ep1_weight_tensors_[weight_id];
+    node.inTensors.at(weight_id) = &atb_prefill_ep1_weight_tensors_[weight_id];
   }
 }
 
@@ -1162,9 +1158,9 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
     if ((!use_deepseek_v2_graph_mla && use_graph_decode) ||
         !enable_custom_mla ||
         (!use_deepseek_v2_graph_mla && num_tokens >= kNumTokensLimit)) {
-      atb_speed::Model::Node& decode_node =
-          use_kimi_k25_moe_decode_alltoall ? decode_alltoall_node_
-                                           : decode_node_;
+      atb_speed::Model::Node& decode_node = use_kimi_k25_moe_decode_alltoall
+                                                ? decode_alltoall_node_
+                                                : decode_node_;
       build_node_variant_pack(decode_node,
                               x,
                               cos_pos,
@@ -1177,9 +1173,9 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
       LOG_IF(FATAL, st != 0)
           << model_name_ << "execute decode layer fail, error code: " << st;
     } else {
-      atb_speed::Model::Node& decode_mla_node =
-          use_kimi_k25_moe_decode_alltoall ? decode_mla_alltoall_node_
-                                           : decode_mla_node_;
+      atb_speed::Model::Node& decode_mla_node = use_kimi_k25_moe_decode_alltoall
+                                                    ? decode_mla_alltoall_node_
+                                                    : decode_mla_node_;
       build_node_variant_pack(decode_mla_node,
                               x,
                               cos_pos,
@@ -1241,10 +1237,10 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
   // set micro batch 0 input part
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensor_;
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
-      atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
-          dp_ep_padding.expert_array(),
-          tensor_placeholder_,
-          "dp_ep_padding.expert_array"));
+      atb_speed::Utils::AtTensor2Tensor(
+          device_tensor_or_empty_placeholder(dp_ep_padding.expert_array(),
+                                             tensor_placeholder_,
+                                             "dp_ep_padding.expert_array"));
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 2) =
       atb_speed::Utils::AtTensor2Tensor(expert_group_);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 3) =
@@ -1267,8 +1263,7 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
 
   const bool use_prefill_q_cu_seq_lens =
-      is_prefill &&
-      input_params.attention.device.q_cu_seq_lens.defined() &&
+      is_prefill && input_params.attention.device.q_cu_seq_lens.defined() &&
       input_params.attention.device.q_cu_seq_lens.storage().data() != nullptr &&
       !input_params.attention.host.q_cu_seq_lens.empty();
   if (!input_params.attention.device.block_tables.defined() ||
@@ -1375,20 +1370,20 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
   }
 
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 18) =
-      atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
-          dp_ep_padding.attn_padding_idx(),
-          tensor_placeholder_,
-          "dp_ep_padding.attn_padding_idx"));
+      atb_speed::Utils::AtTensor2Tensor(
+          device_tensor_or_empty_placeholder(dp_ep_padding.attn_padding_idx(),
+                                             tensor_placeholder_,
+                                             "dp_ep_padding.attn_padding_idx"));
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 19) =
       atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
           dp_ep_padding.attn_unpadding_idx(),
           tensor_placeholder_,
           "dp_ep_padding.attn_unpadding_idx"));
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 20) =
-      atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
-          dp_ep_padding.ffn_padding_idx(),
-          tensor_placeholder_,
-          "dp_ep_padding.ffn_padding_idx"));
+      atb_speed::Utils::AtTensor2Tensor(
+          device_tensor_or_empty_placeholder(dp_ep_padding.ffn_padding_idx(),
+                                             tensor_placeholder_,
+                                             "dp_ep_padding.ffn_padding_idx"));
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 21) =
       atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
           dp_ep_padding.ffn_unpadding_idx(),
@@ -1409,25 +1404,25 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 25) =
       atb_speed::Utils::AtTensor2Tensor(at_in_device_expert_count_);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 26) =
-      atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
-          dp_ep_padding.padding_idx(),
-          tensor_placeholder_,
-          "dp_ep_padding.padding_idx"));
+      atb_speed::Utils::AtTensor2Tensor(
+          device_tensor_or_empty_placeholder(dp_ep_padding.padding_idx(),
+                                             tensor_placeholder_,
+                                             "dp_ep_padding.padding_idx"));
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 27) =
-      atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
-          dp_ep_padding.un_padding_idx(),
-          tensor_placeholder_,
-          "dp_ep_padding.un_padding_idx"));
+      atb_speed::Utils::AtTensor2Tensor(
+          device_tensor_or_empty_placeholder(dp_ep_padding.un_padding_idx(),
+                                             tensor_placeholder_,
+                                             "dp_ep_padding.un_padding_idx"));
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 28) =
-      atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
-          dp_ep_padding.dynamic_ep_idx(),
-          tensor_placeholder_,
-          "dp_ep_padding.dynamic_ep_idx"));
+      atb_speed::Utils::AtTensor2Tensor(
+          device_tensor_or_empty_placeholder(dp_ep_padding.dynamic_ep_idx(),
+                                             tensor_placeholder_,
+                                             "dp_ep_padding.dynamic_ep_idx"));
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 29) =
-      atb_speed::Utils::AtTensor2Tensor(device_tensor_or_empty_placeholder(
-          dp_ep_padding.moe_idx(),
-          tensor_placeholder_,
-          "dp_ep_padding.moe_idx"));
+      atb_speed::Utils::AtTensor2Tensor(
+          device_tensor_or_empty_placeholder(dp_ep_padding.moe_idx(),
+                                             tensor_placeholder_,
+                                             "dp_ep_padding.moe_idx"));
   int offset = 30;
   if (::xllm::EPLBConfig::get_instance().enable_eplb() &&
       layer_id_ >= decode_param_.firstKDenseReplace) {
@@ -1475,11 +1470,10 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
               : const_cast<int32_t*>(
                     input_params.attention.host.ring_cache_seqlen.data());
     } else {
-      LOG(FATAL)
-          << "DeepSeekV2 chunked prefill ATB operation must expose "
-          << "MLA history inputs, input_num="
-          << node.variantPack.inTensors.size()
-          << ", required_last_index=" << prefixcache_input_idx + 3;
+      LOG(FATAL) << "DeepSeekV2 chunked prefill ATB operation must expose "
+                 << "MLA history inputs, input_num="
+                 << node.variantPack.inTensors.size()
+                 << ", required_last_index=" << prefixcache_input_idx + 3;
     }
   }
 
