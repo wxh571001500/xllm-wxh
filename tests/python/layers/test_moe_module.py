@@ -143,13 +143,13 @@ class TestMoEConfigurations:
         assert MoECommType.ALL_GATHER.value == "all_gather"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-class TestMoECUDA:
-    """Test MoE module on CUDA device."""
+@pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not available")
+class TestMoENPU:
+    """Test MoE module on NPU device."""
 
-    def test_router_cuda(self):
-        """Test router on CUDA."""
-        device = torch.device("cuda")
+    def test_router_npu(self):
+        """Test router on NPU."""
+        device = torch.device("npu")
         num_experts = 8
         hidden_size = 256
         top_k = 2
@@ -168,12 +168,12 @@ class TestMoECUDA:
         hidden_states = torch.randn(batch_size, hidden_size, device=device)
         routing_result = router(hidden_states)
 
-        assert routing_result.selected_experts.device.type == "cuda"
-        assert routing_result.routing_weights.device.type == "cuda"
+        assert routing_result.selected_experts.device.type == "npu"
+        assert routing_result.routing_weights.device.type == "npu"
 
-    def test_experts_cuda(self):
-        """Test experts on CUDA."""
-        device = torch.device("cuda")
+    def test_experts_npu(self):
+        """Test experts on NPU."""
+        device = torch.device("npu")
         num_experts = 4
         hidden_size = 128
         intermediate_size = 512
@@ -192,7 +192,7 @@ class TestMoECUDA:
 
         output = experts(hidden_states, expert_indices)
 
-        assert output.device.type == "cuda"
+        assert output.device.type == "npu"
         assert output.shape == (num_tokens, hidden_size)
 
 
