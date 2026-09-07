@@ -32,6 +32,17 @@ struct ModelOutput {
   torch::Tensor aux_hidden_states;
   // Backend-neutral state emitted for the next MTP draft step.
   MtpTopkStatePtr mtp_topk_state;
+  // Eagle3 GRAPH path only: the per-layer aux hidden states, UN-combined (one
+  // [num_tokens, hidden] tensor per captured layer). Kept separate so the
+  // hidden-dim concat is NOT done inside the ACL Graph capture region: a
+  // combined [num_tokens, 3*hidden] tensor (~2.75MB at bucket 64) crosses the
+  // CANN large-copy/SDMA threshold and dispatches to a side stream that is not
+  // joined to the capture stream, failing capture_end(). Each element here is
+  // ~917KB (same as the working set_hidden_states copy). The executor copies
+  // them per-layer into a persistent [nc, max_tokens, hidden] buffer and the
+  // getter concatenates AFTER capture_end (graph-external). Mirrors vLLM, which
+  // returns aux as a list and cat's outside the graph.
+  std::vector<torch::Tensor> aux_hidden_states_list;
 
   ModelOutput() = default;
 

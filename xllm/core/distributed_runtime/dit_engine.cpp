@@ -122,12 +122,17 @@ DiTForwardOutput DiTEngine::step(std::vector<DiTBatch>& batches) {
   forward_input.input_params.dit_forward_input = dit_forward_input;
   COUNTER_ADD(prepare_input_latency_seconds, timer.elapsed_seconds());
 
+  // Share one input across all workers (refcount bump) instead of deep-copying
+  // per worker on this thread (see LLMEngine::step).
+  auto shared_input =
+      std::make_shared<const ForwardInput>(std::move(forward_input));
+
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
     futures.emplace_back(
-        worker_clients_[worker_rank]->step_remote_async(forward_input));
+        worker_clients_[worker_rank]->step_remote_async(shared_input));
   }
 
   // wait for the all future to complete

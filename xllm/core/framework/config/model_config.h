@@ -103,6 +103,20 @@ class ModelConfig final {
   PROPERTY(bool, use_audio_in_video) = false;
 
   PROPERTY(bool, use_cpp_chat_template) = true;
+
+  // A value of 0 leaves brpc's native maximum body size unchanged.
+  PROPERTY(uint64_t, brpc_max_body_size) = 0;
+
+  // A value of 0 disables the media prefill request cap.
+  PROPERTY(uint64_t, max_media_prefill_requests_per_batch) = 0;
+
+  PROPERTY(bool, enable_fia_decode) = false;
+
+  PROPERTY(bool, enable_moe_gating_topk) = false;
+
+  PROPERTY(bool, enable_moe_mc2) = false;
+
+  PROPERTY(bool, enable_moe_prefill_ep1) = false;
 };
 
 }  // namespace xllm

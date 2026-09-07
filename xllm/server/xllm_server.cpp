@@ -26,8 +26,13 @@ limitations under the License.
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/service_config.h"
 #include "health_reporter.h"
+
+namespace brpc {
+DECLARE_uint64(max_body_size);
+}  // namespace brpc
 
 namespace xllm {
 
@@ -105,6 +110,14 @@ void wait_for_quit_signal() {
   }
 }
 
+void configure_brpc_body_size() {
+  const uint64_t max_body_size =
+      ModelConfig::get_instance().brpc_max_body_size();
+  if (max_body_size > 0) {
+    brpc::FLAGS_max_body_size = max_body_size;
+  }
+}
+
 bool configure_generic_server(brpc::Server* server,
                               google::protobuf::Service* service,
                               const std::string& server_name) {
@@ -127,6 +140,7 @@ XllmServer::~XllmServer() {
 }
 
 bool XllmServer::start(std::unique_ptr<APIService> service) {
+  configure_brpc_body_size();
   server_ = std::make_unique<brpc::Server>();
   if (const char* routes = get_api_service_routes_for_current_mode();
       routes != nullptr) {
@@ -262,6 +276,7 @@ bool XllmServer::create_server(google::protobuf::Service* service,
                                const std::string& addr,
                                int port,
                                const std::string& server_name) {
+  configure_brpc_body_size();
   server_ = std::make_unique<brpc::Server>();
   if (!configure_generic_server(server_.get(), service, server_name)) {
     return false;

@@ -45,7 +45,8 @@ TEST(DpEpPaddingTest, Build) {
                             data,
                             torch::Device(torch::kCPU),
                             torch::Dtype(torch::kInt32),
-                            true);
+                            true,
+                            /*expert_parallel_degree=*/0);
   DpEpPaddingData dp_ep_padding_data = dp_ep_padding.build();
   LOG(INFO) << "attn_padding_idx:" << dp_ep_padding_data.attn_padding_idx();
   LOG(INFO) << "attn_unpadding_idx:" << dp_ep_padding_data.attn_unpadding_idx();
@@ -73,7 +74,8 @@ TEST(DpEpPaddingTest, BuildFfnPaddingWithEmptyDpGroup) {
                             data,
                             torch::Device(torch::kCPU),
                             torch::Dtype(torch::kInt32),
-                            false);
+                            false,
+                            /*expert_parallel_degree=*/0);
   DpEpPaddingData dp_ep_padding_data = dp_ep_padding.build();
 
   EXPECT_LE(dp_ep_padding_data.ffn_padding_idx().max().item<int32_t>(), 1);
@@ -97,7 +99,8 @@ TEST(DpEpPaddingTest, BuildFfnPaddingWithTrailingEmptyDpGroup) {
                             data,
                             torch::Device(torch::kCPU),
                             torch::Dtype(torch::kInt32),
-                            false);
+                            false,
+                            /*expert_parallel_degree=*/0);
   DpEpPaddingData dp_ep_padding_data = dp_ep_padding.build();
 
   EXPECT_LE(dp_ep_padding_data.ffn_padding_idx().max().item<int32_t>(), 0);
@@ -121,7 +124,8 @@ TEST(DpEpPaddingTest, BuildAttnUnpaddingWithTrailingEmptyDpGroup) {
                             data,
                             torch::Device(torch::kCPU),
                             torch::Dtype(torch::kInt32),
-                            false);
+                            false,
+                            /*expert_parallel_degree=*/0);
   DpEpPaddingData dp_ep_padding_data = dp_ep_padding.build();
 
   EXPECT_TRUE(torch::equal(dp_ep_padding_data.attn_unpadding_idx(),
