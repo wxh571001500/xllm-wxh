@@ -266,7 +266,7 @@ NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
                           (quantize_type_ == "w8a8_dynamic" || is_w4a8_dynamic);
   use_kimi_k25_moe_prefill_ep1_ =
       ModelConfig::get_instance().enable_moe_prefill_ep1() &&
-      quantize_type_ == "w8a8_dynamic" &&
+      (quantize_type_ == "w8a8_dynamic" || is_w4a8_dynamic) &&
       ::xllm::EPLBConfig::get_instance().expert_parallel_degree() == 2;
   kimi_k25_moe_mc2_token_capacity_ = kKimiK25MoeMc2TokenCapacity;
 
@@ -304,8 +304,9 @@ NpuDeepseekV2DecoderLayerImpl::NpuDeepseekV2DecoderLayerImpl(
     CHECK(!::xllm::EPLBConfig::get_instance().enable_eplb())
         << "Kimi K2.5 MoE prefill EP1 does not support dynamic expert load "
            "balancing";
-    CHECK_EQ(quantize_type_, "w8a8_dynamic")
-        << "Kimi K2.5 MoE prefill EP1 supports only W8A8 dynamic weights";
+    CHECK(quantize_type_ == "w8a8_dynamic" || is_w4a8_dynamic)
+        << "Kimi K2.5 MoE prefill EP1 supports only W8A8/W4A8 dynamic "
+           "weights";
   }
 
   dp_size_ = parallel_args.dp_size();
