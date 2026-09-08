@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -96,6 +97,7 @@ class _ExpertParallelPrepareAndFinalize(PrepareAndFinalize):
     def __init__(self, config: MoEParallelConfig) -> None:
         self._config = config
         self._num_tokens = 0
+        self._original_num_tokens = 0
 
     def _gather_token_counts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         local_count = torch.tensor(
@@ -109,6 +111,41 @@ class _ExpertParallelPrepareAndFinalize(PrepareAndFinalize):
             world_size=self._config.ep_size,
             group_name=self._config.ep_group_name,
         )
+
+    def _max_tokens_from_metadata(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> int | None:
+        """Return the scheduler's DP max without a device-to-host sync.
+
+        Global EP receives the same local DP token set on every attention-TP
+        rank.  The scheduler already publishes those per-DP counts in host
+        metadata, so repeating an HCCL all-gather for every MoE layer is
+        unnecessary.  The counts are authoritative even when an empty DP
+        shard carries one fake input row: its physical shape is intentionally
+        different from the reported logical count.  Avoid a shape-dependent
+        fallback, which would make only that rank enter the collective.
+        """
+        del hidden_states
+        try:
+            metadata = get_forward_context().metadata
+            token_counts = tuple(int(count) for count in getattr(metadata, "dp_token_counts", ()))
+        except (RuntimeError, TypeError, ValueError):
+            return None
+        if len(token_counts) != self._config.dp_size:
+            return None
+        if not 0 <= self._config.dp_rank < len(token_counts):
+            return None
+        if any(count < 0 for count in token_counts):
+            return None
+        return max(token_counts, default=0)
+
+    def _max_tokens_across_dp(self, hidden_states: torch.Tensor) -> int:
+        max_tokens = self._max_tokens_from_metadata(hidden_states)
+        if max_tokens is not None:
+            return max_tokens
+        token_counts = self._gather_token_counts(hidden_states)
+        return int(token_counts.max().item())
 
     def _reduce_tp(
         self,
@@ -183,18 +220,61 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         router_logits: torch.Tensor,
     ) -> MoEPrepareOutput:
         self._num_tokens = hidden_states.shape[0]
-        if (
-            self._config.ep_size == 1
-            or self._config.partitions_replicated_input
-        ):
+        if self._config.ep_size == 1:
             return MoEPrepareOutput(hidden_states, router_logits)
+
+        if self._config.partitions_replicated_input:
+            # With global EP, each attention-TP rank starts with a replica of
+            # the same DP token set. Partition it first so the subsequent EP
+            # all-gather reconstructs the global token set exactly once.
+            self._original_num_tokens = hidden_states.shape[0]
+            if self._config.dp_size > 1:
+                if _in_acl_graph_capture():
+                    # Graph warmup/capture uses a static bucket on every DP
+                    # rank.  The physical input shape is already equal, and
+                    # querying token counts here would record a host sync in
+                    # the decode graph.
+                    max_tokens = self._num_tokens
+                else:
+                    # Token counts can differ across DP groups. HCCL
+                    # all-gather requires identical input shapes, so pad
+                    # every rank's full DP token set to the global maximum
+                    # before splitting.
+                    max_tokens = self._max_tokens_across_dp(hidden_states)
+                pad_size = max_tokens - hidden_states.shape[0]
+                if pad_size > 0:
+                    hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
+                    router_logits = F.pad(router_logits, (0, 0, 0, pad_size))
+            prepared = self._partition_replicated_input(
+                hidden_states,
+                router_logits,
+            )
+            prepared = replace(
+                prepared,
+                hidden_states=ops.all_gather(
+                    prepared.hidden_states,
+                    dim=0,
+                    world_size=self._config.ep_size,
+                    group_name=self._config.ep_group_name,
+                ),
+                router_logits=ops.all_gather(
+                    prepared.router_logits,
+                    dim=0,
+                    world_size=self._config.ep_size,
+                    group_name=self._config.ep_group_name,
+                ),
+            )
+            prepared = replace(
+                prepared,
+                padded_hidden_states_shape=prepared.hidden_states.shape,
+            )
+            return prepared
 
         if _in_acl_graph_capture():
             # Decode Graph pads every DP rank to the same static bucket.
             max_tokens = self._num_tokens
         else:
-            token_counts = self._gather_token_counts(hidden_states)
-            max_tokens = int(token_counts.max().item())
+            max_tokens = self._max_tokens_across_dp(hidden_states)
         pad_size = max_tokens - self._num_tokens
         if pad_size > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
@@ -226,11 +306,19 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         del padded_hidden_states_shape
         if self._config.partitions_replicated_input:
             if self._config.ep_size > 1:
-                ops.all_reduce_(
+                hidden_states = ops.reduce_scatter(
                     hidden_states,
+                    dim=0,
+                    world_size=self._config.ep_size,
                     group_name=self._config.ep_group_name,
                 )
-            return hidden_states
+            hidden_states = ops.all_gather(
+                hidden_states,
+                dim=0,
+                world_size=self._config.input_tp_size,
+                group_name=self._config.input_tp_group_name,
+            )
+            return hidden_states[: self._original_num_tokens]
         if self._config.ep_size > 1:
             hidden_states = ops.reduce_scatter(
                 hidden_states,
@@ -289,14 +377,14 @@ class MC2PrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
             )
             local_tokens = prepared.hidden_states.shape[0]
             if local_tokens > self._config.mc2_tokens_capacity:
-                raise ValueError(
-                    f"MC2 token count {local_tokens} exceeds capacity "
-                    f"{self._config.mc2_tokens_capacity}"
+                raise ValueError(f"MC2 token count {local_tokens} exceeds capacity {self._config.mc2_tokens_capacity}")
+            active_mask = (
+                torch.arange(
+                    prepared.padded_hidden_states_shape[0],
+                    device=hidden_states.device,
                 )
-            active_mask = torch.arange(
-                prepared.padded_hidden_states_shape[0],
-                device=hidden_states.device,
-            ) < self._num_tokens
+                < self._num_tokens
+            )
             active_mask = torch.tensor_split(
                 active_mask,
                 self._config.input_tp_size,
@@ -305,9 +393,7 @@ class MC2PrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
             return MoEPrepareOutput(
                 hidden_states=prepared.hidden_states,
                 router_logits=prepared.router_logits,
-                padded_hidden_states_shape=(
-                    prepared.padded_hidden_states_shape
-                ),
+                padded_hidden_states_shape=(prepared.padded_hidden_states_shape),
                 active_mask=active_mask,
             )
         if self._config.ep_size == 1:
@@ -325,14 +411,14 @@ class MC2PrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         token_counts = self._gather_token_counts(hidden_states)
         max_tokens = int(token_counts.max().item())
         if max_tokens > self._config.mc2_tokens_capacity:
-            raise ValueError(
-                f"MC2 token count {max_tokens} exceeds capacity "
-                f"{self._config.mc2_tokens_capacity}"
+            raise ValueError(f"MC2 token count {max_tokens} exceeds capacity {self._config.mc2_tokens_capacity}")
+        active_mask = (
+            torch.arange(
+                max_tokens,
+                device=hidden_states.device,
             )
-        active_mask = torch.arange(
-            max_tokens,
-            device=hidden_states.device,
-        ) < self._num_tokens
+            < self._num_tokens
+        )
         pad_size = max_tokens - self._num_tokens
         if pad_size > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))

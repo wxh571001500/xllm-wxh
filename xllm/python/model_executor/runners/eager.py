@@ -33,7 +33,16 @@ class EagerRunner(BaseRunner):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.attention_backend.prepare(metadata)
-        with forward_context(ForwardContext(self.attention_backend, self.device)):
+        # Keep scheduler-owned DP token counts available to global-EP MoE.
+        # The MoE prepare path can then pad from host metadata instead of
+        # launching a token-count all-gather and synchronizing with .item().
+        with forward_context(
+            ForwardContext(
+                self.attention_backend,
+                self.device,
+                metadata,
+            )
+        ):
             if inputs_embeds is None:
                 return self.model(input_ids, positions)
             return self.model(input_ids, positions, inputs_embeds)

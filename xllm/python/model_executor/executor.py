@@ -38,6 +38,21 @@ def _resolve_graph_backend(config: dict, device: torch.device) -> str:
     return graph_backend
 
 
+def _split_prefill_compile_backend(
+    graph_backend: str,
+) -> tuple[str, str | None]:
+    """Split ``aclgraph+inductor`` into decode graph and prefill compile.
+
+    The combined form keeps the existing low-latency decode graph and uses a
+    torch.compile backend only for dynamic prefill shapes.
+    """
+    if not graph_backend.startswith("aclgraph+"):
+        return graph_backend, None
+
+    prefill_backend = graph_backend.split("+", 1)[1]
+    return "aclgraph", prefill_backend or "inductor"
+
+
 def _create_attention_backend(
     first_attention: AttentionLayerSpec,
     device: torch.device,
@@ -150,8 +165,10 @@ class ModelExecutor:
         self.inductor_runner = None
 
         graph_backend = _resolve_graph_backend(config, device)
+        graph_backend, prefill_compile_backend = _split_prefill_compile_backend(graph_backend)
         logger.info(
             f"Python model graph backend: backend={graph_backend}, "
+            f"prefill_compile_backend={prefill_compile_backend}, "
             f"enable_graph={bool(config.get('enable_graph', False))}, "
             f"device={device}"
         )
@@ -188,6 +205,17 @@ class ModelExecutor:
                 int(config["max_position_embeddings"]),
                 int(config.get("block_size", 128)),
             )
+            if prefill_compile_backend is not None:
+                from xllm.python.model_executor.runners.inductor import (
+                    InductorRunner,
+                )
+
+                self.inductor_runner = InductorRunner(
+                    execution_model,
+                    self.attention_backend,
+                    device,
+                    prefill_compile_backend,
+                )
         else:
             from xllm.python.model_executor.runners.inductor import InductorRunner
 
@@ -243,7 +271,18 @@ class ModelExecutor:
         kda_runtime = getattr(self._execution_model, "kda_runtime", None)
         if kda_runtime is None:
             return
-        from xllm.python.layers.kda import PAD_SLOT_ID, KimiK3KDAMetadata
+        from xllm.python.layers.kda import (
+            PAD_SLOT_ID,
+            KimiK3KDAMetadata,
+            build_kda_prefill_host_metadata,
+        )
+
+        prefill_cu_seqlens_host, prefill_chunk_indices_host = (None, None)
+        if view.num_prefill_seqs > 0:
+            prefill_cu_seqlens_host, prefill_chunk_indices_host = build_kda_prefill_host_metadata(
+                view.query_start_loc,
+                view.num_decode_seqs,
+            )
 
         # Empty DP shard: the C++ worker feeds fake token rows with zero real
         # sequences. Preserve the tensor shape, but describe zero-length
@@ -287,6 +326,8 @@ class ModelExecutor:
             has_initial_state=_to_device(view.has_initial_state),
             graph_num_tokens=int(getattr(view, "graph_num_tokens", num_tokens)),
             empty_shard=bool(getattr(view, "empty_shard", False)),
+            prefill_cu_seqlens_host=prefill_cu_seqlens_host,
+            prefill_chunk_indices_host=prefill_chunk_indices_host,
         )
 
     def execute(
@@ -324,7 +365,7 @@ class ModelExecutor:
                 )
         if inputs_embeds is not None:
             return self.eager_runner.execute(input_ids, positions, metadata, inputs_embeds)
-        if self.inductor_runner is not None:
+        if self.inductor_runner is not None and (metadata.is_prefill or metadata.is_chunked_prefill):
             return self.inductor_runner.execute(input_ids, positions, metadata)
         return self.eager_runner.execute(input_ids, positions, metadata)
 

@@ -191,20 +191,14 @@ class AdaptiveMoECommMethod(MoECommMethod):
             quantized,
             device,
         )
-        self._all_to_all = (
-            AllToAllCommMethod(config, num_experts, quantized)
-            if config.ep_size > 1
-            else None
-        )
+        self._all_to_all = AllToAllCommMethod(config, num_experts, quantized) if config.ep_size > 1 else None
         has_mc2 = hasattr(torch_npu, "npu_moe_distribute_dispatch") and hasattr(
             torch_npu,
             "npu_moe_distribute_combine",
         )
         self._mc2 = (
             MC2CommMethod(config, num_experts, quantized, device)
-            if config.ep_size > 1
-            and device.type in ("npu", "privateuseone")
-            and has_mc2
+            if config.ep_size > 1 and device.type in ("npu", "privateuseone") and has_mc2
             else None
         )
         self._active: MoECommMethod | None = None
@@ -214,9 +208,7 @@ class AdaptiveMoECommMethod(MoECommMethod):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> MoEPrepareOutput:
-        if self._mc2 is not None and (
-            hidden_states.shape[0] <= self._config.mc2_tokens_capacity
-        ):
+        if self._mc2 is not None and (hidden_states.shape[0] <= self._config.mc2_tokens_capacity):
             self._active = self._mc2
         elif self._all_to_all is not None:
             self._active = self._all_to_all
@@ -260,6 +252,12 @@ def build_moe_comm_method(
 ) -> MoECommMethod:
     """Build the configured reusable MoE communication method."""
     comm_type = config.comm_type
+    # Keep the explicit communication policy authoritative.  In particular,
+    # global EP on Ascend has replicated attention-TP input, but that does not
+    # imply MC2 or all-to-all: vLLM's compatible path is the explicit
+    # all-gather/reduce-scatter implementation.  The old unconditional NPU
+    # branch silently replaced ``all_gather`` with MC2/A2A and introduced
+    # per-layer host synchronization (or MC2 buffer failures) on EP64.
     if config.ep_size == 1 or comm_type == MoECommType.ALL_GATHER:
         return AllGatherCommMethod(
             config,
