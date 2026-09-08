@@ -52,13 +52,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from xllm.python.ascend_custom_ops import ensure_ascend_custom_ops
 from xllm.python.layers.attention import AttentionRuntimeLayer
 from xllm.python.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
     W8A8DynamicLinearMethod,
 )
-from xllm.python.ascend_custom_ops import ensure_ascend_custom_ops
 
 KDA_CHUNK_SIZE = 64
 # Padding slot convention of the AscendC causal-conv operator.
@@ -95,13 +95,15 @@ class KimiK3KDAMetadata:
     has_initial_state: torch.Tensor | None = None
     graph_num_tokens: int | None = None
     empty_shard: bool = False
+    # Host-side metadata shared by all KDA layers in one prefill step.  The
+    # executor builds it once so each layer does not call ``tolist()`` again.
+    prefill_cu_seqlens_host: tuple[int, ...] | None = None
+    prefill_chunk_indices_host: tuple[int, ...] | None = None
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     x32 = x.float()
-    return (x32 * torch.rsqrt((x32 * x32).sum(-1, keepdim=True) + _L2NORM_EPS)).to(
-        x.dtype
-    )
+    return (x32 * torch.rsqrt((x32 * x32).sum(-1, keepdim=True) + _L2NORM_EPS)).to(x.dtype)
 
 
 def _build_chunk_indices(cu_seqlens: list[int], chunk_size: int) -> list[int]:
@@ -112,6 +114,29 @@ def _build_chunk_indices(cu_seqlens: list[int], chunk_size: int) -> list[int]:
         for chunk in range(-(-seq_len // chunk_size)):
             indices.extend((seq, chunk))
     return indices
+
+
+def build_kda_prefill_host_metadata(
+    query_start_loc: torch.Tensor | None,
+    num_decode_seqs: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]] | tuple[None, None]:
+    """Build host metadata shared by every KDA layer in one prefill step.
+
+    The AscendC prefill kernels accept host-side cumulative lengths and chunk
+    indices.  Building them once per scheduler step avoids a device-to-host
+    sync and Python loop in every KDA layer.
+    """
+    if query_start_loc is None:
+        return None, None
+
+    prefill_cu = query_start_loc[num_decode_seqs:]
+    if prefill_cu.numel() <= 1:
+        return None, None
+
+    cu_values = [int(value) for value in prefill_cu.detach().cpu().reshape(-1).tolist()]
+    cu_list = [value - cu_values[0] for value in cu_values]
+    chunk_indices = tuple(_build_chunk_indices(cu_list, KDA_CHUNK_SIZE))
+    return tuple(cu_list), chunk_indices
 
 
 class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
@@ -156,9 +181,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        assert linear_attn_config.get("use_full_rank_gate", False), (
-            "KimiK3DeltaAttention requires a full-rank gate"
-        )
+        assert linear_attn_config.get("use_full_rank_gate", False), "KimiK3DeltaAttention requires a full-rank gate"
         self.hidden_size = hidden_size
         self.layer_id = layer_id
         self.tp_size = tp_size
@@ -176,13 +199,10 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         self.num_kv_heads = self.local_num_heads
         self.scale = self.head_dim**-0.5
         self.sliding_window = 0
-        self.gate_lower_bound: float | None = linear_attn_config.get(
-            "gate_lower_bound", None
-        )
+        self.gate_lower_bound: float | None = linear_attn_config.get("gate_lower_bound")
         if self.gate_lower_bound is not None:
             assert -5.0 <= self.gate_lower_bound < 0, (
-                "KDA gate lower bound must be in [-5, 0), "
-                f"got {self.gate_lower_bound}."
+                f"KDA gate lower bound must be in [-5, 0), got {self.gate_lower_bound}."
             )
         self.o_norm_eps = rms_norm_eps
 
@@ -220,19 +240,11 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
                 quant_method=W8A8DynamicLinearMethod(),
             )
         else:
-            self.q_proj = ColumnParallelLinear(
-                hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
-            )
-            self.k_proj = ColumnParallelLinear(
-                hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
-            )
-            self.v_proj = ColumnParallelLinear(
-                hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
-            )
+            self.q_proj = ColumnParallelLinear(hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device)
+            self.k_proj = ColumnParallelLinear(hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device)
+            self.v_proj = ColumnParallelLinear(hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device)
         # Full-rank output gate (sigmoid), applied by the gated output norm.
-        self.g_proj = ColumnParallelLinear(
-            hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device
-        )
+        self.g_proj = ColumnParallelLinear(hidden_size, local_proj, tp_size, bias=False, dtype=dtype, device=device)
         self.b_proj = ColumnParallelLinear(
             hidden_size,
             self.local_num_heads,
@@ -250,14 +262,10 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.f_b_proj = ColumnParallelLinear(
-            self.head_dim, local_proj, tp_size, bias=False, dtype=dtype, device=device
-        )
+        self.f_b_proj = ColumnParallelLinear(self.head_dim, local_proj, tp_size, bias=False, dtype=dtype, device=device)
         # Packed [q, k, v] short-conv weights, checkpoint layout, kept fp32.
         self.conv1d_weight = nn.Parameter(
-            torch.empty(
-                3 * local_proj, 1, self.conv_size, dtype=torch.float32, device=device
-            )
+            torch.empty(3 * local_proj, 1, self.conv_size, dtype=torch.float32, device=device)
         )
         # [conv_size, 3 * local_proj] copy in the model dtype consumed by the
         # AscendC conv operator; built by process_weights_after_loading().
@@ -266,15 +274,9 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             torch.zeros(self.conv_size, 3 * local_proj, dtype=dtype, device=device),
             persistent=False,
         )
-        self.A_log = nn.Parameter(
-            torch.empty(self.local_num_heads, dtype=torch.float32, device=device)
-        )
-        self.dt_bias = nn.Parameter(
-            torch.empty(local_proj, dtype=torch.float32, device=device)
-        )
-        self.o_norm_weight = nn.Parameter(
-            torch.empty(self.head_dim, dtype=dtype, device=device)
-        )
+        self.A_log = nn.Parameter(torch.empty(self.local_num_heads, dtype=torch.float32, device=device))
+        self.dt_bias = nn.Parameter(torch.empty(local_proj, dtype=torch.float32, device=device))
+        self.o_norm_weight = nn.Parameter(torch.empty(self.head_dim, dtype=dtype, device=device))
         self.o_proj = RowParallelLinear(
             local_proj,
             hidden_size,
@@ -390,10 +392,10 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         recurrent_state: torch.Tensor,
     ) -> torch.Tensor:
         """Args:
-            hidden_states: ``[num_tokens, hidden_size]`` packed batch.
-            metadata: scheduling info, see :class:`KimiK3KDAMetadata`.
-            conv_state: ``[num_slots, conv_size - 1, 3 * local_proj]``.
-            recurrent_state: ``[num_slots, H, V, K]`` float32.
+        hidden_states: ``[num_tokens, hidden_size]`` packed batch.
+        metadata: scheduling info, see :class:`KimiK3KDAMetadata`.
+        conv_state: ``[num_slots, conv_size - 1, 3 * local_proj]``.
+        recurrent_state: ``[num_slots, H, V, K]`` float32.
         """
         num_tokens = hidden_states.size(0)
         num_decode = metadata.num_decode_seqs
@@ -403,12 +405,8 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         beta = self.b_proj(hidden_states).float().sigmoid().unsqueeze(0)
-        raw_gate = self.f_b_proj(self.f_a_proj(hidden_states)).view(
-            1, num_tokens, self.local_num_heads, self.head_dim
-        )
-        output_gate = self.g_proj(hidden_states).view(
-            num_tokens, self.local_num_heads, self.head_dim
-        )
+        raw_gate = self.f_b_proj(self.f_a_proj(hidden_states)).view(1, num_tokens, self.local_num_heads, self.head_dim)
+        output_gate = self.g_proj(hidden_states).view(num_tokens, self.local_num_heads, self.head_dim)
 
         core_attn_out = torch.zeros(
             (1, num_tokens, self.local_num_heads, self.head_dim),
@@ -438,8 +436,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
                 )
 
             q, k, v = (
-                x.reshape(1, num_tokens, self.local_num_heads, self.head_dim)
-                for x in mixed_qkv.chunk(3, dim=-1)
+                x.reshape(1, num_tokens, self.local_num_heads, self.head_dim) for x in mixed_qkv.chunk(3, dim=-1)
             )
 
             if num_decode > 0:
@@ -454,16 +451,14 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
                     state_indices=metadata.state_indices[:num_decode],
                 )
             if metadata.num_prefill_seqs > 0:
-                core_attn_out[:, num_decode_tokens:] = (
-                    self._prefill(
-                        q[:, num_decode_tokens:],
-                        k[:, num_decode_tokens:],
-                        v[:, num_decode_tokens:],
-                        raw_gate[:, num_decode_tokens:],
-                        beta[:, num_decode_tokens:],
-                        recurrent_state,
-                        metadata,
-                    )
+                core_attn_out[:, num_decode_tokens:] = self._prefill(
+                    q[:, num_decode_tokens:],
+                    k[:, num_decode_tokens:],
+                    v[:, num_decode_tokens:],
+                    raw_gate[:, num_decode_tokens:],
+                    beta[:, num_decode_tokens:],
+                    recurrent_state,
+                    metadata,
                 )
 
         out = self._gated_rms_norm(core_attn_out, output_gate.unsqueeze(0))
@@ -529,9 +524,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             use_beta_sigmoid_in_kernel=False,
             allow_neg_eigval=False,
             safe_gate=self.gate_lower_bound is not None,
-            lower_bound=(
-                self.gate_lower_bound if self.gate_lower_bound is not None else -5.0
-            ),
+            lower_bound=(self.gate_lower_bound if self.gate_lower_bound is not None else -5.0),
         )
 
     def _prefill(
@@ -545,10 +538,15 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         metadata: KimiK3KDAMetadata,
     ) -> torch.Tensor:
         num_decode = metadata.num_decode_seqs
-        prefill_cu = metadata.query_start_loc[num_decode:]
-        # The AscendC prefill operators take host-side cumulative lengths.
-        cu_list = (prefill_cu - prefill_cu[0]).tolist()
-        cu_list = [int(x) for x in cu_list]
+        cu_list = metadata.prefill_cu_seqlens_host
+        chunk_indices = metadata.prefill_chunk_indices_host
+        if cu_list is None or chunk_indices is None:
+            # Fallback for callers that construct metadata without the shared
+            # host metadata (for example unit tests).
+            prefill_cu = metadata.query_start_loc[num_decode:]
+            cu_list = [int(value) for value in prefill_cu.tolist()]
+            cu_list = [value - cu_list[0] for value in cu_list]
+            chunk_indices = tuple(_build_chunk_indices(cu_list, KDA_CHUNK_SIZE))
         slots = metadata.state_indices.long()[num_decode:]
         has_init = metadata.has_initial_state[num_decode:]
 
@@ -591,7 +589,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             initial_state=initial_state_kv,
             output_final_state=True,
             cu_seqlens=cu_list,
-            chunk_indices=_build_chunk_indices(cu_list, KDA_CHUNK_SIZE),
+            chunk_indices=chunk_indices,
             return_intermediate=False,
         )
         final_state = result[1].transpose(-1, -2).contiguous()
@@ -604,13 +602,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         a = self.A_log.exp().view(1, 1, self.local_num_heads, 1)
         return -a * F.softplus(x, beta=1.0, threshold=_SOFTPLUS_THRESHOLD)
 
-    def _gated_rms_norm(
-        self, x: torch.Tensor, gate: torch.Tensor
-    ) -> torch.Tensor:
+    def _gated_rms_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x32 = x.float()
-        y = (
-            x32
-            * torch.rsqrt((x32 * x32).mean(-1, keepdim=True) + self.o_norm_eps)
-            * self.o_norm_weight.float()
-        )
+        y = x32 * torch.rsqrt((x32 * x32).mean(-1, keepdim=True) + self.o_norm_eps) * self.o_norm_weight.float()
         return (y * torch.sigmoid(gate.float())).to(x.dtype)

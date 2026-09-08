@@ -270,8 +270,6 @@ bool send_delta_to_client_brpc(
       if (!call->write(response)) {
         return false;
       }
-      LOG(INFO) << "[KIMI_TTFT_TRACE] phase=first_role_chunk_sent"
-                << " request_id=" << request_id << " sequence_index=" << index;
     }
 
     // Handle reasoning text
@@ -321,12 +319,6 @@ bool send_delta_to_client_brpc(
         if (!call->write(response)) {
           return false;
         }
-        if (seq_output.token_ids.size() == 1) {
-          LOG(INFO) << "[KIMI_TTFT_TRACE] phase=first_content_chunk_sent"
-                    << " request_id=" << request_id
-                    << " sequence_index=" << index
-                    << " delta_tokens=" << seq_output.token_ids.size();
-        }
       }
     }
 
@@ -351,7 +343,6 @@ bool send_delta_to_client_brpc(
         }
       }
 
-      const std::string ttft_finish_reason = seq_output.finish_reason.value();
       response.Clear();
       response.set_object("chat.completion.chunk");
       response.set_id(request_id);
@@ -362,7 +353,7 @@ bool send_delta_to_client_brpc(
       choice->mutable_delta();
 
       if (stream_parser && stream_parser->get_has_tool_call(index) &&
-          ttft_finish_reason == "stop") {
+          seq_output.finish_reason.value() == "stop") {
         choice->set_finish_reason("tool_calls");
       } else {
         choice->set_finish_reason(std::move(seq_output.finish_reason.value()));
@@ -371,10 +362,6 @@ bool send_delta_to_client_brpc(
       if (!call->write(response)) {
         return false;
       }
-      LOG(INFO) << "[KIMI_TTFT_TRACE] phase=finish_chunk_sent"
-                << " request_id=" << request_id << " sequence_index=" << index
-                << " finish_reason=" << ttft_finish_reason
-                << " output_tokens=" << output.usage->num_generated_tokens;
     }
   }
 
@@ -440,8 +427,18 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
     }
 
     // handle tool call output
-    if ((!tools.empty() || tool_call_parser_format == "kimi_k3") &&
-        !tool_call_parser_format.empty() && !cur_text.empty()) {
+    bool should_process_tool_calls = false;
+    if (!tool_call_parser_format.empty() && !cur_text.empty()) {
+      if (!tools.empty()) {
+        should_process_tool_calls = true;
+      } else {
+        // Check if the parser supports reasoning output without tools
+        function_call::FunctionCallParser parser({}, tool_call_parser_format);
+        should_process_tool_calls =
+            parser.get_detector()->supports_reasoning_output();
+      }
+    }
+    if (should_process_tool_calls) {
       auto* arena = response.GetArena();
       auto result =
           api_service::process_tool_calls(cur_text,
@@ -658,8 +655,9 @@ void ChatServiceImpl::process_async_rpc_impl(
   }
 
   RequestParams request_params(rpc_request, "", "");
-  if (tool_call_parser_format_ == "kimi_k3") {
-    request_params.prepare_kimi_k3_chat_params();
+  if (request_params.reasoning_effort.has_value() ||
+      !request_params.tool_choice.empty()) {
+    request_params.prepare_chat_template_params();
   }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
@@ -703,10 +701,17 @@ void ChatServiceImpl::process_async_rpc_impl(
   // Preserve parser-relevant special tokens in decoded output
   // so tool call detectors can match their control markers.
   // Aligns with vLLM parser adjust_request behavior.
-  if ((!tool_call_parser_format_.empty() && !request_params.tools.empty()) ||
-      tool_call_parser_format_ == "kimi_k3" ||
-      reasoning_parser_format_ == "kimi_k3") {
-    request_params.skip_special_tokens = false;
+  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+    function_call::FunctionCallParser parser({}, tool_call_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
+  }
+  if (!reasoning_parser_format_.empty()) {
+    function_call::FunctionCallParser parser({}, reasoning_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
   }
 
   master_->handle_request(std::move(messages),
@@ -720,11 +725,6 @@ void ChatServiceImpl::process_async_rpc_impl(
 void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
-  LOG(INFO) << "[KIMI_TTFT_TRACE] phase=api_request_received"
-            << " request_id=" << call->get_x_request_id() << " model=" << model
-            << " messages_size=" << rpc_request.messages_size()
-            << " streaming=" << rpc_request.stream()
-            << " max_tokens=" << rpc_request.max_tokens();
 
   // Route to RecMaster if configured
   if (rec_master_) {
@@ -758,8 +758,9 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
-  if (tool_call_parser_format_ == "kimi_k3") {
-    request_params.prepare_kimi_k3_chat_params();
+  if (request_params.reasoning_effort.has_value() ||
+      !request_params.tool_choice.empty()) {
+    request_params.prepare_chat_template_params();
   }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
@@ -805,10 +806,17 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     request_params.decode_address = rpc_request.routing().decode_name();
   }
 
-  if ((!tool_call_parser_format_.empty() && !request_params.tools.empty()) ||
-      tool_call_parser_format_ == "kimi_k3" ||
-      reasoning_parser_format_ == "kimi_k3") {
-    request_params.skip_special_tokens = false;
+  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+    function_call::FunctionCallParser parser({}, tool_call_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
+  }
+  if (!reasoning_parser_format_.empty()) {
+    function_call::FunctionCallParser parser({}, reasoning_parser_format_);
+    if (parser.get_detector()->needs_special_tokens_for_parsing()) {
+      request_params.skip_special_tokens = false;
+    }
   }
 
   const bool is_force_reasoning = get_enable_thinking_from_request(
@@ -909,8 +917,9 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
 
-  if (tool_call_parser_format_ == "kimi_k3") {
-    request_params.prepare_kimi_k3_chat_params();
+  if (request_params.reasoning_effort.has_value() ||
+      !request_params.tool_choice.empty()) {
+    request_params.prepare_chat_template_params();
   }
 
   std::vector<Message> messages;

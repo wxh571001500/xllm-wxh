@@ -322,6 +322,16 @@ def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp
     group = _require_group(x, group_name)
     if group.size() != world_size:
         raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    if group.size() == 1:
+        return x.clone()
+    # MoE dispatch gathers along the leading token dimension on every layer.
+    # Use one contiguous output buffer for that hot path; the list-based
+    # all_gather allocates ``world_size`` tensors and a cat result per call.
+    # Keep the generic path for other dimensions (for example lm_head output).
+    if dim == 0:
+        output = x.new_empty((x.shape[0] * world_size, *x.shape[1:]))
+        dist.all_gather_into_tensor(output, x.contiguous(), group=group)
+        return output
     chunks = [torch.empty_like(x) for _ in range(world_size)]
     dist.all_gather(chunks, x, group=group)
     return torch.cat(chunks, dim=dim)
