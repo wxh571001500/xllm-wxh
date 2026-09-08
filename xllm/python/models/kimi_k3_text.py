@@ -387,7 +387,7 @@ class KimiK3TextConfig:
             dp_size=int(config.get("dp_size", raw.get("dp_size", 1))),
             dp_rank=_resolve_dp_rank(config),
             moe_comm_type=str(pick("moe_comm_type", "moe_communication", default="all_gather")),
-            mc2_tokens_capacity=int(pick("mc2_tokens_capacity", default=16)),
+            mc2_tokens_capacity=int(pick("mc2_tokens_capacity", default=512)),
             enable_flashcomm1=bool(pick("enable_flashcomm1", default=False)),
             enable_prefix_cache=bool(pick("enable_prefix_cache", default=True)),
         )

@@ -358,6 +358,17 @@ def _(x: torch.Tensor, group_name: str = "tp") -> None:
     return None
 
 
+def _use_prefill_all_gather() -> bool:
+    """Gate the leading-dim all-gather optimization to prefill steps."""
+    try:
+        from xllm.python.model_executor.forward_context import get_forward_context
+
+        metadata = get_forward_context().metadata
+    except (RuntimeError, ImportError, AttributeError):
+        return False
+    return bool(metadata is not None and (metadata.is_prefill or metadata.is_chunked_prefill))
+
+
 @torch.library.custom_op("xllm_ops::all_gather", mutates_args=())
 def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> torch.Tensor:
     group = _require_group(x, group_name)
@@ -368,8 +379,9 @@ def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp
     # MoE dispatch gathers along the leading token dimension on every layer.
     # Use one contiguous output buffer for that hot path; the list-based
     # all_gather allocates ``world_size`` tensors and a cat result per call.
-    # Keep the generic path for other dimensions (for example lm_head output).
-    if dim == 0:
+    # Keep the generic path for other dimensions (for example lm_head output)
+    # and for decode, whose legacy graph-safe collective layout must not change.
+    if dim == 0 and _use_prefill_all_gather():
         output = x.new_empty((x.shape[0] * world_size, *x.shape[1:]))
         dist.all_gather_into_tensor(output, x.contiguous(), group=group)
         return output

@@ -215,6 +215,21 @@ class _ExpertParallelPrepareAndFinalize(PrepareAndFinalize):
 class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
     """Gather EP tokens before experts and reduce-scatter their outputs."""
 
+    def _use_prefill_fast_path(self) -> bool:
+        """Whether this step may use the prefill-only global-EP fast path.
+
+        Decode must keep the commit-c26 graph-safe behavior. The optimized
+        path is enabled only for explicit prefill/chunked-prefill steps and
+        falls back to the legacy path whenever phase metadata is unavailable.
+        """
+        if _in_acl_graph_capture():
+            return False
+        try:
+            metadata = get_forward_context().metadata
+        except (RuntimeError, AttributeError):
+            return False
+        return bool(metadata is not None and (metadata.is_prefill or metadata.is_chunked_prefill))
+
     def prepare(
         self,
         hidden_states: torch.Tensor,
@@ -225,6 +240,10 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
             return MoEPrepareOutput(hidden_states, router_logits)
 
         if self._config.partitions_replicated_input:
+            if not self._use_prefill_fast_path():
+                # Legacy decode path: each EP rank executes its local experts
+                # on replicated tokens and sums with an EP all-reduce.
+                return MoEPrepareOutput(hidden_states, router_logits)
             # With global EP, each attention-TP rank starts with a replica of
             # the same DP token set. Partition it first so the subsequent EP
             # all-gather reconstructs the global token set exactly once.
@@ -315,6 +334,15 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
     ) -> torch.Tensor:
         del padded_hidden_states_shape
         if self._config.partitions_replicated_input:
+            if not self._use_prefill_fast_path():
+                # Legacy decode path: sum partial expert outputs across EP and
+                # keep the replicated token layout expected by the graph.
+                if self._config.ep_size > 1:
+                    ops.all_reduce_(
+                        hidden_states,
+                        group_name=self._config.ep_group_name,
+                    )
+                return hidden_states
             if self._config.ep_size > 1:
                 hidden_states = ops.reduce_scatter(
                     hidden_states,
