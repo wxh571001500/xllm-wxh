@@ -93,6 +93,7 @@ DEFINE_string(
     "Defaults to aclgraph on NPU when --enable_graph is enabled. "
     "Values: off (eager), cudagraphs (CUDA decode graph with eager prefill), "
     "aclgraph (NPU decode graph with eager prefill), "
+    "aclgraph+<backend> (NPU decode graph with a torch.compile prefill), "
     "or any torch.compile backend name.");
 
 DEFINE_bool(

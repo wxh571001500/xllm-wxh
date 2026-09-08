@@ -252,6 +252,12 @@ def build_moe_comm_method(
 ) -> MoECommMethod:
     """Build the configured reusable MoE communication method."""
     comm_type = config.comm_type
+    # Keep the explicit communication policy authoritative.  In particular,
+    # global EP on Ascend has replicated attention-TP input, but that does not
+    # imply MC2 or all-to-all: vLLM's compatible path is the explicit
+    # all-gather/reduce-scatter implementation.  The old unconditional NPU
+    # branch silently replaced ``all_gather`` with MC2/A2A and introduced
+    # per-layer host synchronization (or MC2 buffer failures) on EP64.
     if config.ep_size == 1 or comm_type == MoECommType.ALL_GATHER:
         return AllGatherCommMethod(
             config,

@@ -387,7 +387,7 @@ class KimiK3TextConfig:
             dp_size=int(config.get("dp_size", raw.get("dp_size", 1))),
             dp_rank=_resolve_dp_rank(config),
             moe_comm_type=str(pick("moe_comm_type", "moe_communication", default="all_gather")),
-            mc2_tokens_capacity=int(pick("mc2_tokens_capacity", default=512)),
+            mc2_tokens_capacity=int(pick("mc2_tokens_capacity", default=16)),
             enable_flashcomm1=bool(pick("enable_flashcomm1", default=False)),
             enable_prefix_cache=bool(pick("enable_prefix_cache", default=True)),
         )
@@ -419,6 +419,9 @@ class KimiK3TextConfig:
             raise ValueError("Kimi K3 DP rank and size are invalid")
         if self.ep_size > 1 and self.dp_size != self.ep_size:
             supported = self.dp_size == 1 and self.tp_size == self.ep_size and self.world_size == self.ep_size
+            supported = supported or (
+                self.ep_size == self.world_size and self.world_size == self.dp_size * self.tp_size
+            )
             if not supported:
                 raise ValueError("Kimi K3 supports EP with either dp=ep or dp=1, attention_tp=ep")
         MoECommType.from_value(self.moe_comm_type)

@@ -80,8 +80,11 @@ class MoEParallelConfig:
             raise ValueError("MoE input TP rank and size are invalid")
         if input_tp_size != self.tp_size:
             supported = self.dp_size == 1 and self.tp_size == 1 and input_tp_size == self.ep_size
+            supported = supported or (self.tp_size == 1 and self.ep_size == self.dp_size * input_tp_size)
             if not supported:
-                raise ValueError("MoE currently supports distinct input TP only for dp=1, moe_tp=1, and input_tp=ep")
+                raise ValueError(
+                    "MoE supports distinct input TP only for dp=1 with input_tp=ep, or global EP with ep=dp*input_tp"
+                )
 
     @property
     def partitions_replicated_input(self) -> bool:

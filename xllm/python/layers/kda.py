@@ -95,6 +95,10 @@ class KimiK3KDAMetadata:
     has_initial_state: torch.Tensor | None = None
     graph_num_tokens: int | None = None
     empty_shard: bool = False
+    # Host-side metadata shared by all KDA layers in one prefill step.  The
+    # executor builds it once so each layer does not call ``tolist()`` again.
+    prefill_cu_seqlens_host: tuple[int, ...] | None = None
+    prefill_chunk_indices_host: tuple[int, ...] | None = None
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
@@ -110,6 +114,29 @@ def _build_chunk_indices(cu_seqlens: list[int], chunk_size: int) -> list[int]:
         for chunk in range(-(-seq_len // chunk_size)):
             indices.extend((seq, chunk))
     return indices
+
+
+def build_kda_prefill_host_metadata(
+    query_start_loc: torch.Tensor | None,
+    num_decode_seqs: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]] | tuple[None, None]:
+    """Build host metadata shared by every KDA layer in one prefill step.
+
+    The AscendC prefill kernels accept host-side cumulative lengths and chunk
+    indices.  Building them once per scheduler step avoids a device-to-host
+    sync and Python loop in every KDA layer.
+    """
+    if query_start_loc is None:
+        return None, None
+
+    prefill_cu = query_start_loc[num_decode_seqs:]
+    if prefill_cu.numel() <= 1:
+        return None, None
+
+    cu_values = [int(value) for value in prefill_cu.detach().cpu().reshape(-1).tolist()]
+    cu_list = [value - cu_values[0] for value in cu_values]
+    chunk_indices = tuple(_build_chunk_indices(cu_list, KDA_CHUNK_SIZE))
+    return tuple(cu_list), chunk_indices
 
 
 class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
@@ -515,10 +542,15 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         metadata: KimiK3KDAMetadata,
     ) -> torch.Tensor:
         num_decode = metadata.num_decode_seqs
-        prefill_cu = metadata.query_start_loc[num_decode:]
-        # The AscendC prefill operators take host-side cumulative lengths.
-        cu_list = (prefill_cu - prefill_cu[0]).tolist()
-        cu_list = [int(x) for x in cu_list]
+        cu_list = metadata.prefill_cu_seqlens_host
+        chunk_indices = metadata.prefill_chunk_indices_host
+        if cu_list is None or chunk_indices is None:
+            # Fallback for callers that construct metadata without the shared
+            # host metadata (for example unit tests).
+            prefill_cu = metadata.query_start_loc[num_decode:]
+            cu_list = [int(value) for value in prefill_cu.tolist()]
+            cu_list = [value - cu_list[0] for value in cu_list]
+            chunk_indices = tuple(_build_chunk_indices(cu_list, KDA_CHUNK_SIZE))
         slots = metadata.state_indices.long()[num_decode:]
         has_init = metadata.has_initial_state[num_decode:]
 
@@ -561,7 +593,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
             initial_state=initial_state_kv,
             output_final_state=True,
             cu_seqlens=cu_list,
-            chunk_indices=_build_chunk_indices(cu_list, KDA_CHUNK_SIZE),
+            chunk_indices=chunk_indices,
             return_intermediate=False,
         )
         final_state = result[1].transpose(-1, -2).contiguous()

@@ -28,7 +28,7 @@ from xllm.python.model_executor.runners.base import BaseRunner
 class InductorRunner(BaseRunner):
     def __init__(self, model, attention_backend, device, backend: str) -> None:
         super().__init__(model, attention_backend, device)
-        self.compiled_model = torch.compile(model, backend=backend)
+        self.compiled_model = torch.compile(model, backend=backend, dynamic=True)
 
     def execute(
         self,
