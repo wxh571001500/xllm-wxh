@@ -24,8 +24,11 @@ namespace py = pybind11;
 #include <acl/acl.h>
 #endif
 
+#include <cctype>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <random>
 
@@ -72,6 +75,44 @@ using namespace xllm;
 static std::atomic<uint32_t> signal_received{0};
 
 namespace {
+
+bool env_bool_or(const char* name, bool fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+  std::string normalized(value);
+  for (char& c : normalized) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (normalized == "1" || normalized == "true" || normalized == "yes" ||
+      normalized == "on") {
+    return true;
+  }
+  if (normalized == "0" || normalized == "false" || normalized == "no" ||
+      normalized == "off") {
+    return false;
+  }
+  LOG(WARNING) << "Ignoring invalid boolean environment variable " << name
+               << "=" << value;
+  return fallback;
+}
+
+int32_t env_int_or(const char* name, int32_t fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int32_t>::max()) {
+    LOG(WARNING) << "Ignoring invalid integer environment variable " << name
+                 << "=" << value;
+    return fallback;
+  }
+  return static_cast<int32_t>(parsed);
+}
 
 void initialize_configs() {
   BeamSearchConfig::get_instance().initialize();
@@ -129,10 +170,19 @@ Options create_options(const std::string& instance_name, bool is_local) {
 
   Options options;
 #if defined(USE_NPU)
+  // Keep FlashComm1 deployment-controlled, matching vLLM's environment-based
+  // switch. The CLI values remain as compatibility fallbacks.
+  const bool flashcomm1_enabled =
+      env_bool_or("XLLM_ENABLE_FLASHCOMM1", kernel_config.enable_flashcomm1());
+  // vLLM enables FC1 for every non-empty MoE prefill. When deployment turns
+  // the xLLM switch on via the environment, use the same one-token floor
+  // unless an explicit environment threshold is supplied.
+  const int32_t flashcomm1_default_min_tokens =
+      flashcomm1_enabled ? 1 : kernel_config.flashcomm1_min_prefill_tokens();
   options.npu_kernel_backend(kernel_config.npu_kernel_backend());
-  options.enable_flashcomm1(kernel_config.enable_flashcomm1())
-      .flashcomm1_min_prefill_tokens(
-          kernel_config.flashcomm1_min_prefill_tokens())
+  options.enable_flashcomm1(flashcomm1_enabled)
+      .flashcomm1_min_prefill_tokens(env_int_or(
+          "XLLM_FLASHCOMM1_MIN_PREFILL_TOKENS", flashcomm1_default_min_tokens))
       .enable_mmrs_fusion(kernel_config.enable_mmrs_fusion())
       .mmrs_comm_mode(kernel_config.mmrs_comm_mode());
 #endif

@@ -33,6 +33,7 @@ from xllm.python.layers.moe.token_dispatcher import (
     MC2TokenDispatcher,
     MoETokenDispatcher,
     NativeTokenDispatcher,
+    VllmAllToAllTokenDispatcher,
 )
 from xllm.python.layers.moe.types import (
     MoECommType,
@@ -42,6 +43,17 @@ from xllm.python.layers.moe.types import (
     MoERoutingResult,
     MoETokenDispatchInput,
 )
+
+
+def _in_acl_graph_capture() -> bool:
+    """Return whether dynamic host-side MoE metadata is graph-unsafe."""
+    try:
+        from xllm.python.model_executor.forward_context import get_forward_context
+
+        context = get_forward_context()
+        return context.acl_graph is not None or context.graph_warmup
+    except (ImportError, RuntimeError, AttributeError):
+        return False
 
 
 class MoECommMethod:
@@ -149,9 +161,14 @@ class AllToAllCommMethod(MoECommMethod):
         config: MoEParallelConfig,
         num_experts: int,
         quantized: bool,
+        vllm_prefill: bool = False,
     ) -> None:
         super().__init__(
-            AllToAllTokenDispatcher(config, num_experts, quantized),
+            (
+                VllmAllToAllTokenDispatcher(config, num_experts, quantized)
+                if vllm_prefill
+                else AllToAllTokenDispatcher(config, num_experts, quantized)
+            ),
             AllToAllPrepareAndFinalize(config),
         )
 
@@ -182,23 +199,30 @@ class AdaptiveMoECommMethod(MoECommMethod):
         top_k: int,
         quantized: bool,
         device: torch.device,
+        enable_mc2: bool = True,
+        all_gather_config: MoEParallelConfig | None = None,
+        vllm_prefill: bool = False,
     ) -> None:
         self._config = config
         self._all_gather = AllGatherCommMethod(
-            config,
+            all_gather_config or config,
             num_experts,
             top_k,
             quantized,
             device,
         )
-        self._all_to_all = AllToAllCommMethod(config, num_experts, quantized) if config.ep_size > 1 else None
+        self._all_to_all = (
+            AllToAllCommMethod(config, num_experts, quantized, vllm_prefill=vllm_prefill)
+            if config.ep_size > 1
+            else None
+        )
         has_mc2 = hasattr(torch_npu, "npu_moe_distribute_dispatch") and hasattr(
             torch_npu,
             "npu_moe_distribute_combine",
         )
         self._mc2 = (
             MC2CommMethod(config, num_experts, quantized, device)
-            if config.ep_size > 1 and device.type in ("npu", "privateuseone") and has_mc2
+            if enable_mc2 and config.ep_size > 1 and device.type in ("npu", "privateuseone") and has_mc2
             else None
         )
         self._active: MoECommMethod | None = None
@@ -208,7 +232,12 @@ class AdaptiveMoECommMethod(MoECommMethod):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> MoEPrepareOutput:
-        if self._mc2 is not None and (hidden_states.shape[0] <= self._config.mc2_tokens_capacity):
+        # All-to-all needs host-side split lists, which cannot be materialized
+        # during ACL graph capture.  Keep graph warmup/capture on the existing
+        # static all-gather path and use routed all-to-all for eager prefill.
+        if _in_acl_graph_capture():
+            self._active = self._all_gather
+        elif self._mc2 is not None and (hidden_states.shape[0] <= self._config.mc2_tokens_capacity):
             self._active = self._mc2
         elif self._all_to_all is not None:
             self._active = self._all_to_all
@@ -249,6 +278,8 @@ def build_moe_comm_method(
     top_k: int,
     quantized: bool,
     device: torch.device,
+    all_gather_config: MoEParallelConfig | None = None,
+    vllm_prefill: bool = False,
 ) -> MoECommMethod:
     """Build the configured reusable MoE communication method."""
     comm_type = config.comm_type
@@ -267,7 +298,19 @@ def build_moe_comm_method(
             device,
         )
     if comm_type == MoECommType.ALL_TO_ALL:
-        return AllToAllCommMethod(config, num_experts, quantized)
+        # Explicit all-to-all is used for eager prefill.  During ACL graph
+        # capture AdaptiveMoECommMethod falls back to static all-gather because
+        # all-to-all split metadata is materialized on the host.
+        return AdaptiveMoECommMethod(
+            config,
+            num_experts,
+            top_k,
+            quantized,
+            device,
+            enable_mc2=False,
+            all_gather_config=all_gather_config,
+            vllm_prefill=vllm_prefill,
+        )
     if comm_type == MoECommType.MC2:
         return MC2CommMethod(config, num_experts, quantized, device)
     if comm_type == MoECommType.AUTO:

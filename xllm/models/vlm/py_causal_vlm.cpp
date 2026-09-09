@@ -63,6 +63,13 @@ PyCausalVLM::PyCausalVLM(const ModelContext& context)
       py::str(context.get_model_args().model_type()));
   LOG(INFO) << "Building config dict";
   config_dict_ = build_config_dict(parallel_args, context.get_quant_args());
+  // The Python model must use the same runtime switch as the C++ FlashComm1
+  // eligibility gate. This is intentionally injected after checkpoint JSON
+  // loading so deployment environment settings take effect without editing it.
+  config_dict_["enable_flashcomm1"] =
+      context.get_flash_comm1_options().enable_flashcomm1;
+  config_dict_["flashcomm1_min_prefill_tokens"] =
+      context.get_flash_comm1_options().min_prefill_tokens;
   LOG(INFO) << "Creating Python model instance";
   py_model_ = model_cls(config_dict_);
   LOG(INFO) << "Setting model to eval mode";
