@@ -329,12 +329,13 @@ class RowParallelLinear(_LinearBase):
         self.weight.data = torch_npu.npu_format_cast(transposed, 29)
         self._weight_is_transposed = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reduce_results: bool | None = None) -> torch.Tensor:
         if self._weight_is_transposed:
             out = torch.matmul(x, self.weight)
         else:
             out = self._apply_linear_with_bias(x, None)
-        if self.reduce_results and self.tp_size > 1:
+        should_reduce = self.reduce_results if reduce_results is None else reduce_results
+        if should_reduce and self.tp_size > 1:
             ops.all_reduce_(out)
         if self.bias is not None:
             out = out + self.bias
