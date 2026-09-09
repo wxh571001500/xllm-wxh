@@ -221,15 +221,17 @@ class KimiK3GatedMLA(nn.Module):
         self,
         attention_output: torch.Tensor,
         hidden_states: torch.Tensor,
+        reduce_results: bool | None = None,
     ) -> torch.Tensor:
         """Apply Kimi K3's output gate before the output projection."""
         gate = torch.sigmoid(self.g_proj(hidden_states))
-        return self.o_proj(attention_output * gate)
+        return self.o_proj(attention_output * gate, reduce_results=reduce_results)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         sequence_lengths: Sequence[int] | None = None,
+        reduce_results: bool | None = None,
     ) -> torch.Tensor:
         if hidden_states.ndim != 2 or hidden_states.shape[-1] != self.config.hidden_size:
             raise ValueError(f"Kimi K3 Gated-MLA hidden states must have shape [tokens, {self.config.hidden_size}]")
@@ -243,4 +245,4 @@ class KimiK3GatedMLA(nn.Module):
         query, key, value = self._project_qkv(hidden_states)
         attended = self._causal_attention(query, key, value, lengths)
         attended = attended.reshape(num_tokens, -1)
-        return self.apply_output_gate(attended, hidden_states)
+        return self.apply_output_gate(attended, hidden_states, reduce_results=reduce_results)

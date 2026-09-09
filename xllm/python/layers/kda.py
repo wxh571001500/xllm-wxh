@@ -394,6 +394,7 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
         metadata: KimiK3KDAMetadata,
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
+        reduce_o_proj: bool | None = None,
     ) -> torch.Tensor:
         """Args:
         hidden_states: ``[num_tokens, hidden_size]`` packed batch.
@@ -466,7 +467,10 @@ class KimiK3DeltaAttention(AttentionRuntimeLayer, nn.Module):
                 )
 
         out = self._gated_rms_norm(core_attn_out, output_gate.unsqueeze(0))
-        return self.o_proj(out.reshape(num_tokens, self.local_projection_size))
+        return self.o_proj(
+            out.reshape(num_tokens, self.local_projection_size),
+            reduce_results=reduce_o_proj,
+        )
 
     # -- internals ---------------------------------------------------------------
 
