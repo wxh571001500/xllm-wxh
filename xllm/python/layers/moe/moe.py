@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from xllm.python import ops
 from xllm.python.distributed import (
@@ -79,9 +81,7 @@ class MoE(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.zeros(num_experts, dtype=dtype, device=device)
-        )
+        self.gate.e_score_correction_bias = nn.Parameter(torch.zeros(num_experts, dtype=dtype, device=device))
         self.experts = experts
         self.shared_experts = shared_experts
         self._router = GroupedTopKRouter(router_config)
@@ -134,19 +134,14 @@ class MoE(nn.Module):
         if name == "gate.weight":
             target = self.gate.weight
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"MoE gate expects {target.shape}, got {tensor.shape}"
-                )
+                raise ValueError(f"MoE gate expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add(name)
             return True
         if name in ("e_score_correction_bias", "gate.e_score_correction_bias"):
             target = self.gate.e_score_correction_bias
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"MoE correction bias expects {target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"MoE correction bias expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add("gate.e_score_correction_bias")
             return True
@@ -154,7 +149,7 @@ class MoE(nn.Module):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -197,9 +192,7 @@ class MoE(nn.Module):
         return self.shared_experts, self.experts
 
     def finish_weight_loading(self) -> None:
-        missing = self._required_weight_names().difference(
-            self._loaded_components
-        )
+        missing = self._required_weight_names().difference(self._loaded_components)
         if missing:
             raise KeyError(f"MoE weights are missing: {sorted(missing)}")
         for module in self._weight_modules_to_finalize():
@@ -280,14 +273,10 @@ class KimiK3MoE(MoE):
                 dp_rank = int(getattr(config, "rank", tp_rank)) // tp_size
                 tp_group_name = "tp"
             else:
-                world_size = int(
-                    getattr(config, "world_size", tp_size * ep_size)
-                )
+                world_size = int(getattr(config, "world_size", tp_size * ep_size))
                 global_rank = int(getattr(config, "rank", tp_rank))
                 if world_size % ep_size != 0:
-                    raise ValueError(
-                        "Kimi K3 world size must divide MoE EP size"
-                    )
+                    raise ValueError("Kimi K3 world size must divide MoE EP size")
                 moe_tp_size = world_size // ep_size
                 moe_tp_rank = global_rank % moe_tp_size
                 ep_rank = global_rank // moe_tp_size
@@ -299,15 +288,28 @@ class KimiK3MoE(MoE):
             ep_rank=ep_rank,
             dp_size=dp_size,
             dp_rank=dp_rank,
-            comm_type=MoECommType.from_value(
-                getattr(config, "moe_comm_type", "all_gather")
-            ),
-            mc2_tokens_capacity=int(
-                getattr(config, "mc2_tokens_capacity", 512)
-            ),
+            comm_type=MoECommType.from_value(getattr(config, "moe_comm_type", "all_gather")),
+            mc2_tokens_capacity=int(getattr(config, "mc2_tokens_capacity", 512)),
             tp_group_name=tp_group_name,
             input_tp_size=input_tp_size,
             input_tp_rank=input_tp_rank,
+        )
+        # FlashComm1 gives each attention-TP rank a distinct token shard.  In
+        # the explicit all-to-all path those rows are already the dispatch
+        # input; partitioning them once more would reduce 508 rows to 32.
+        # Use a local-token MoE topology for routed experts and let the
+        # sequence-parallel wrapper handle the shared expert branch below.
+        self.sequence_parallel_routed = parallel_config.comm_type == MoECommType.ALL_TO_ALL and input_tp_size > 1
+        comm_parallel_config = (
+            replace(
+                parallel_config,
+                tp_size=1,
+                tp_rank=0,
+                input_tp_size=1,
+                input_tp_rank=0,
+            )
+            if self.sequence_parallel_routed
+            else parallel_config
         )
         experts_config = MoEExpertsConfig(
             num_experts=num_experts,
@@ -351,19 +353,35 @@ class KimiK3MoE(MoE):
             num_expert_group=int(getattr(config, "num_expert_group", 1)),
             topk_group=int(getattr(config, "topk_group", 1)),
         )
-        comm_method = build_moe_comm_method(
+        # Keep the decode runner on the original model topology.  The
+        # sequence-parallel all-to-all implementation below is intentionally
+        # used only by the prefill path.
+        decode_comm_method = build_moe_comm_method(
             config=parallel_config,
             num_experts=num_experts,
             top_k=top_k,
             quantized=quantized,
             device=device,
         )
+        prefill_comm_method = (
+            build_moe_comm_method(
+                config=comm_parallel_config,
+                num_experts=num_experts,
+                top_k=top_k,
+                quantized=quantized,
+                device=device,
+                all_gather_config=parallel_config,
+                vllm_prefill=True,
+            )
+            if self.sequence_parallel_routed
+            else decode_comm_method
+        )
         super().__init__(
             hidden_size=hidden_size,
             num_experts=num_experts,
             router_config=router_config,
             experts=experts,
-            comm_method=comm_method,
+            comm_method=decode_comm_method,
             dtype=dtype,
             device=device,
             shared_experts=shared_experts,
@@ -390,10 +408,67 @@ class KimiK3MoE(MoE):
         )
         self._runner = KimiK3MoERunner(
             self._router,
-            comm_method,
+            decode_comm_method,
             input_tp_size,
             parallel_config.input_tp_group_name,
         )
+        self._prefill_runner = (
+            KimiK3MoERunner(
+                self._router,
+                prefill_comm_method,
+                1,
+                parallel_config.input_tp_group_name,
+            )
+            if self.sequence_parallel_routed
+            else self._runner
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        sequence_parallel_tokens: int | None = None,
+    ) -> torch.Tensor:
+        if not self.sequence_parallel_routed or sequence_parallel_tokens is None:
+            return super().forward(hidden_states)
+
+        original_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        router_logits = self.gate(hidden_states)
+        routed_input = hidden_states
+        routed_transform = self._routed_input_transform()
+        if routed_transform is not None:
+            routed_input = self._runner._unwrap_tensor(routed_transform(routed_input))
+        routed_output = self._prefill_runner.forward(
+            hidden_states=routed_input,
+            router_logits=router_logits,
+            correction_bias=self.gate.e_score_correction_bias,
+            experts=self.experts,
+            shared_experts=None,
+            routed_input_transform=None,
+            routed_output_transform=self._routed_output_transform(),
+        )
+
+        # The shared MLP is TP-sharded.  It still needs a full token view so
+        # its row-parallel output can be reduced across TP, then returned to
+        # the local sequence shard alongside the routed result.
+        if self.shared_experts is not None:
+            full_input = ops.all_gather(
+                hidden_states,
+                dim=0,
+                world_size=self.tp_size,
+                group_name="tp",
+            )[:sequence_parallel_tokens]
+            shared_output = self._runner._unwrap_tensor(self.shared_experts(full_input))
+            if self.tp_size > 1:
+                ops.all_reduce_(shared_output, group_name="tp")
+            pad_size = (-sequence_parallel_tokens) % self.tp_size
+            if pad_size > 0:
+                shared_output = F.pad(shared_output, (0, 0, 0, pad_size))
+            shard_size = shared_output.shape[0] // self.tp_size
+            start = self.tp_rank * shard_size
+            shared_output = shared_output[start : start + hidden_states.shape[0]]
+            routed_output = routed_output + shared_output
+        return routed_output.reshape(original_shape)
 
     def _routed_input_transform(self) -> TensorTransform:
         return self.routed_expert_down_proj
@@ -431,20 +506,14 @@ class KimiK3MoE(MoE):
                 return False
             target = module.weight
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"Kimi K3 weight {name} expects {target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"Kimi K3 weight {name} expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add(name)
             return True
         if name == "routed_expert_norm.weight" and self.routed_expert_norm is not None:
             target = self.routed_expert_norm.weight
             if tensor.shape != target.shape:
-                raise ValueError(
-                    f"Kimi K3 weight {name} expects {target.shape}, "
-                    f"got {tensor.shape}"
-                )
+                raise ValueError(f"Kimi K3 weight {name} expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
             self._loaded_components.add(name)
             return True
@@ -452,7 +521,7 @@ class KimiK3MoE(MoE):
 
     def load_weights(
         self,
-        state_dict: "StateDict",
+        state_dict: StateDict,
         tp_rank: int,
         tp_size: int,
     ) -> set[str]:
@@ -472,9 +541,7 @@ class KimiK3MoE(MoE):
                 self.tp_rank,
                 self.tp_size,
             )
-            loaded.update(
-                f"shared_experts.{name}" for name in child_loaded
-            )
+            loaded.update(f"shared_experts.{name}" for name in child_loaded)
 
         experts_state_dict = state_dict.get_dict_with_prefix("experts.")
         if experts_state_dict.size() > 0:
@@ -494,10 +561,7 @@ class KimiK3MoE(MoE):
                 "routed_expert_down_proj",
                 "routed_expert_up_proj",
             ):
-                direct_names.extend(
-                    f"{projection}.{suffix}"
-                    for suffix in ("weight_scale", "weight_offset")
-                )
+                direct_names.extend(f"{projection}.{suffix}" for suffix in ("weight_scale", "weight_offset"))
         if self.routed_expert_norm is not None:
             direct_names.append("routed_expert_norm.weight")
         for name in direct_names:
@@ -521,10 +585,7 @@ class KimiK3MoE(MoE):
                 "routed_expert_down_proj",
                 "routed_expert_up_proj",
             ):
-                required.update(
-                    f"{projection}.{suffix}"
-                    for suffix in ("weight_scale", "weight_offset")
-                )
+                required.update(f"{projection}.{suffix}" for suffix in ("weight_scale", "weight_offset"))
         if self.routed_expert_norm is not None:
             required.add("routed_expert_norm.weight")
         return required

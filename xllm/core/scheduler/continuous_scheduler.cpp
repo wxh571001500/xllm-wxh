@@ -580,19 +580,6 @@ void ContinuousScheduler::process_batch_output(bool enable_schedule_overlap) {
   std::vector<std::shared_ptr<Request>> stream_requests;
   // process request output in batch
   for (auto request : to_be_processed_requests) {
-    if (!request->sequences().empty() &&
-        request->sequences()[0]->num_generated_tokens() == 1) {
-      const auto& ttft_sequence = request->sequences()[0];
-      LOG(INFO) << "[KIMI_TTFT_TRACE] phase=first_token_generated"
-                << " request_id=" << request->x_request_id()
-                << " prompt_tokens=" << ttft_sequence->num_prompt_tokens()
-                << " generated_tokens=" << ttft_sequence->num_generated_tokens()
-                << " kv_cache_tokens="
-                << ttft_sequence->kv_state().kv_cache_tokens_num()
-                << " elapsed_since_request_created_ms="
-                << request->elapsed_seconds() * 1000.0;
-    }
-
     // ignore cancelled/finished requests when enable_schedule_overlap.
     if (options_.enable_schedule_overlap()) {
       if (request->state().stream) {

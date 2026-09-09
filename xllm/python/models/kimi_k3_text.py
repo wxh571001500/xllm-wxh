@@ -21,6 +21,7 @@ a placeholder remains only as a defensive fallback for incomplete layer maps.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -62,6 +63,19 @@ def _tp_rank_from_device(device: object) -> int:
         return int(value.rsplit(":", 1)[-1])
     except ValueError:
         return 0
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a deployment boolean without treating ``"false"`` as true."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _resolve_dp_rank(config: dict[str, Any]) -> int:
@@ -385,9 +399,22 @@ class KimiK3TextConfig:
             ep_size=int(config.get("ep_size", raw.get("ep_size", 1))),
             dp_size=int(config.get("dp_size", raw.get("dp_size", 1))),
             dp_rank=_resolve_dp_rank(config),
-            moe_comm_type=str(pick("moe_comm_type", "moe_communication", default="all_gather")),
+            # Keep the model config as the default, but allow deployment
+            # scripts to select the EP transport without rewriting the
+            # checkpoint config.  vLLM's K3 path uses routed all-to-all.
+            moe_comm_type=str(
+                os.environ.get(
+                    "XLLM_MOE_COMM_TYPE",
+                    pick("moe_comm_type", "moe_communication", default="all_gather"),
+                )
+            ),
             mc2_tokens_capacity=int(pick("mc2_tokens_capacity", default=512)),
-            enable_flashcomm1=bool(pick("enable_flashcomm1", default=False)),
+            enable_flashcomm1=bool(
+                pick(
+                    "enable_flashcomm1",
+                    default=_env_bool("XLLM_ENABLE_FLASHCOMM1", False),
+                )
+            ),
             enable_prefix_cache=bool(pick("enable_prefix_cache", default=True)),
         )
 
@@ -1261,6 +1288,23 @@ def _flashcomm1_shard(full: torch.Tensor, num_tokens: int, tp_size: int, tp_rank
     return full[tp_rank * shard : (tp_rank + 1) * shard].contiguous()
 
 
+def _sp_active(sp_flag: bool) -> bool:
+    """FlashComm1 sequence-parallel is prefill-only (matching the C++ gate).
+    During ACL graph capture/warmup (decode) it must be disabled so that
+    graph-incompatible collective ops (TP all-gather/reduce-scatter) are
+    not recorded into the static graph."""
+    if not sp_flag:
+        return False
+    try:
+        ctx = get_forward_context()
+        if ctx.acl_graph is not None or ctx.graph_warmup:
+            return False
+        metadata = ctx.metadata
+        return bool(metadata is not None and (metadata.is_prefill or metadata.is_chunked_prefill))
+    except RuntimeError:
+        return False
+
+
 class KimiK3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1439,9 +1483,15 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         if hasattr(self, "block_sparse_moe"):
-            # The MoE keeps its own replicated TP/EP reductions, so gather to
-            # full tokens and shard the result back.
-            if self._sp:
+            # Routed all-to-all can consume the sequence-parallel shard
+            # directly.  The legacy all-gather path still gathers full tokens
+            # and shards the result back after MoE execution.
+            if sp and getattr(self.block_sparse_moe, "sequence_parallel_routed", False):
+                hidden_states = self.block_sparse_moe(
+                    hidden_states,
+                    sequence_parallel_tokens=num_tokens,
+                )
+            elif sp:
                 moe_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_shard(
                     self.block_sparse_moe(moe_input),

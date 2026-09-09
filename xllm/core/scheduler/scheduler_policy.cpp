@@ -268,12 +268,6 @@ void SchedulerPolicy::schedule_prefill_from_queue(
         }
       }
 
-      const size_t ttft_cached_tokens_before =
-          prefill_sequence->kv_state().kv_cache_tokens_num();
-      const size_t ttft_chunk_limit =
-          options_.max_tokens_per_chunk_for_prefill() == 0
-              ? 1
-              : options_.max_tokens_per_chunk_for_prefill();
       size_t actual_tokens = 0;
       // allocate_for_prefill internally handles cleanup on failure:
       // - Fresh requests (no prior blocks): prefix cache blocks are released
@@ -286,16 +280,6 @@ void SchedulerPolicy::schedule_prefill_from_queue(
         blocks_exhausted = true;
         break;
       }
-
-      LOG(INFO) << "[KIMI_TTFT_TRACE] phase=prefill_chunk_scheduled"
-                << " request_id=" << request->x_request_id()
-                << " dp_rank=" << prefill_sequence->dp_rank()
-                << " prompt_tokens=" << prefill_sequence->num_prompt_tokens()
-                << " sequence_tokens=" << prefill_sequence->num_tokens()
-                << " cached_tokens_before=" << ttft_cached_tokens_before
-                << " chunk_tokens=" << actual_tokens << " chunk_index="
-                << (ttft_cached_tokens_before / ttft_chunk_limit + 1)
-                << " chunk_limit=" << ttft_chunk_limit;
 
       prefill_sequences_budget.emplace_back(actual_tokens);
       prefill_sequences.emplace_back(prefill_sequence.get());
