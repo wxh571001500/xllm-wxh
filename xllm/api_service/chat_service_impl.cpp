@@ -270,8 +270,6 @@ bool send_delta_to_client_brpc(
       if (!call->write(response)) {
         return false;
       }
-      LOG(INFO) << "[KIMI_TTFT_TRACE] phase=first_role_chunk_sent"
-                << " request_id=" << request_id << " sequence_index=" << index;
     }
 
     // Handle reasoning text
@@ -321,12 +319,6 @@ bool send_delta_to_client_brpc(
         if (!call->write(response)) {
           return false;
         }
-        if (seq_output.token_ids.size() == 1) {
-          LOG(INFO) << "[KIMI_TTFT_TRACE] phase=first_content_chunk_sent"
-                    << " request_id=" << request_id
-                    << " sequence_index=" << index
-                    << " delta_tokens=" << seq_output.token_ids.size();
-        }
       }
     }
 
@@ -351,7 +343,6 @@ bool send_delta_to_client_brpc(
         }
       }
 
-      const std::string ttft_finish_reason = seq_output.finish_reason.value();
       response.Clear();
       response.set_object("chat.completion.chunk");
       response.set_id(request_id);
@@ -362,7 +353,7 @@ bool send_delta_to_client_brpc(
       choice->mutable_delta();
 
       if (stream_parser && stream_parser->get_has_tool_call(index) &&
-          ttft_finish_reason == "stop") {
+          seq_output.finish_reason.value() == "stop") {
         choice->set_finish_reason("tool_calls");
       } else {
         choice->set_finish_reason(std::move(seq_output.finish_reason.value()));
@@ -371,10 +362,6 @@ bool send_delta_to_client_brpc(
       if (!call->write(response)) {
         return false;
       }
-      LOG(INFO) << "[KIMI_TTFT_TRACE] phase=finish_chunk_sent"
-                << " request_id=" << request_id << " sequence_index=" << index
-                << " finish_reason=" << ttft_finish_reason
-                << " output_tokens=" << output.usage->num_generated_tokens;
     }
   }
 
@@ -720,12 +707,6 @@ void ChatServiceImpl::process_async_rpc_impl(
 void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
-  LOG(INFO) << "[KIMI_TTFT_TRACE] phase=api_request_received"
-            << " request_id=" << call->get_x_request_id() << " model=" << model
-            << " messages_size=" << rpc_request.messages_size()
-            << " streaming=" << rpc_request.stream()
-            << " max_tokens=" << rpc_request.max_tokens();
-
   // Route to RecMaster if configured
   if (rec_master_) {
     if (unlikely(!models_.contains(model))) {

@@ -274,13 +274,6 @@ void LLMMaster::handle_request(std::vector<Message> messages,
                          callback = std::move(callback),
                          call]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_chat);
-    const auto ttft_trace_start = std::chrono::steady_clock::now();
-    LOG(INFO) << "[KIMI_TTFT_TRACE] phase=master_request_received"
-              << " request_id=" << sp.x_request_id
-              << " messages_size=" << messages.size()
-              << " streaming=" << sp.streaming
-              << " max_tokens=" << sp.max_tokens;
-
     // remove the pending request after scheduling
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
 
@@ -293,38 +286,18 @@ void LLMMaster::handle_request(std::vector<Message> messages,
       return;
     }
 
-    LOG(INFO) << "[KIMI_TTFT_TRACE] phase=master_params_verified"
-              << " request_id=" << sp.x_request_id << " master_handle_ms="
-              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - ttft_trace_start)
-                     .count();
-
     rate_limit_guard.dismiss();
     auto request =
         generate_request(messages, std::move(prompt_token), sp, call, callback);
-    LOG(INFO) << "[KIMI_TTFT_TRACE] phase=master_request_created"
-              << " request_id=" << sp.x_request_id << " master_handle_ms="
-              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - ttft_trace_start)
-                     .count();
     if (!request) {
       return;
     }
 
-    LOG(INFO) << "[KIMI_TTFT_TRACE] phase=scheduler_request_adding"
-              << " request_id=" << request->x_request_id();
     if (!scheduler_->add_request(request)) {
       CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
                           "No available resources to schedule request",
                           sp.service_request_id,
                           sp.source_xservice_addr);
-    } else {
-      LOG(INFO) << "[KIMI_TTFT_TRACE] phase=scheduler_request_added"
-                << " request_id=" << request->x_request_id()
-                << " master_handle_ms="
-                << std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::steady_clock::now() - ttft_trace_start)
-                       .count();
     }
   });
 }
@@ -385,11 +358,6 @@ std::shared_ptr<Request> LLMMaster::generate_request(
   }
 
   // encode the prompt
-  const auto ttft_tokenize_start = std::chrono::steady_clock::now();
-  LOG(INFO) << "[KIMI_TTFT_TRACE] phase=tokenize_start"
-            << " request_id=" << sp.x_request_id
-            << " has_precomputed_tokens=" << has_prompt_tokens
-            << " add_special_tokens=" << sp.add_special_tokens;
   Timer timer;
   std::vector<int> local_prompt_tokens;
 
@@ -408,14 +376,6 @@ std::shared_ptr<Request> LLMMaster::generate_request(
   }
 
   COUNTER_ADD(tokenization_latency_seconds, timer.elapsed_seconds());
-  LOG(INFO) << "[KIMI_TTFT_TRACE] phase=tokenize_end"
-            << " request_id=" << sp.x_request_id
-            << " prompt_tokens=" << local_prompt_tokens.size()
-            << " tokenize_ms="
-            << std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::steady_clock::now() - ttft_tokenize_start)
-                   .count();
-
   // Validate directly-supplied prompt tokens against the vocabulary range to
   // avoid out-of-bounds embedding lookups. Encoded tokens are trusted, so only
   // scan when tokens were provided and the vocab range is known.
@@ -634,14 +594,6 @@ std::shared_ptr<Request> LLMMaster::generate_request(
                                            sp.service_request_id,
                                            sp.source_xservice_addr,
                                            get_rate_limiter());
-  LOG(INFO) << "[KIMI_TTFT_TRACE] phase=request_object_created"
-            << " request_id=" << request->x_request_id()
-            << " prompt_tokens=" << local_prompt_tokens.size()
-            << " max_context_len=" << max_context_len
-            << " chunked_prefill=" << options_.enable_chunked_prefill()
-            << " max_chunk_tokens="
-            << options_.max_tokens_per_chunk_for_prefill();
-
   // add one sequence, rest will be added by scheduler
   return request;
 }
@@ -659,10 +611,6 @@ std::shared_ptr<Request> LLMMaster::generate_request(
   xllm::ScopeGuard rate_limit_guard(
       [this] { get_rate_limiter()->decrease_one_request(); });
 
-  const auto ttft_render_start = std::chrono::steady_clock::now();
-  LOG(INFO) << "[KIMI_TTFT_TRACE] phase=chat_template_start"
-            << " request_id=" << sp.x_request_id
-            << " messages_size=" << messages.size();
   Timer timer;
 
   const std::optional<ChatTemplateRenderResult> render_result =
@@ -678,14 +626,6 @@ std::shared_ptr<Request> LLMMaster::generate_request(
   }
 
   COUNTER_ADD(chat_template_latency_seconds, timer.elapsed_seconds());
-  LOG(INFO) << "[KIMI_TTFT_TRACE] phase=chat_template_end"
-            << " request_id=" << sp.x_request_id << " rendered_prompt_chars="
-            << (render_result.has_value() ? render_result->prompt.size() : 0)
-            << " chat_template_ms="
-            << std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::steady_clock::now() - ttft_render_start)
-                   .count();
-
   rate_limit_guard.dismiss();
   return generate_request(std::move(render_result->prompt),
                           std::move(prompt_tokens),
