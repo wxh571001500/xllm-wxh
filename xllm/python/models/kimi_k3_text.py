@@ -620,9 +620,9 @@ class KimiK3MLP(nn.Module):
             return ops.silu_and_mul(tensor)
         raise ValueError(f"Unsupported Kimi K3 activation: {self.hidden_act}")
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, reduce_results: bool | None = None) -> torch.Tensor:
         activated = self._activation(self.gate_up_proj(hidden_states))
-        return self.down_proj(activated)
+        return self.down_proj(activated, reduce_results=reduce_results)
 
     def load_weight(
         self,
@@ -940,7 +940,9 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
             config.tp_size,
             dtype=dtype,
             device=device,
-            reduce_results=not config.use_sequence_parallel,
+            # Reduction is selected per forward: FlashComm1 is prefill-only,
+            # while decode must retain the original TP all-reduce.
+            reduce_results=True,
         )
         self.register_buffer(
             "W_UK",
@@ -966,7 +968,12 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
         )
         self._loaded_components: set[str] = set()
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        reduce_results: bool | None = None,
+    ) -> torch.Tensor:
         del positions  # Kimi K3 retains the positional slice but does not rotate it.
         num_tokens = hidden_states.shape[0]
         qkv_lora = self.fused_qkv_a_proj(hidden_states)
@@ -1024,7 +1031,7 @@ class KimiK3MLAAttention(KimiK3GatedMLA, AttentionRuntimeLayer):
                 self.W_UV,
             ).transpose(0, 1)
         values = values.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
-        return self.apply_output_gate(values, hidden_states)
+        return self.apply_output_gate(values, hidden_states, reduce_results=reduce_results)
 
     def _load_projection_weight(
         self,
@@ -1238,8 +1245,13 @@ class KimiK3AttentionPlaceholder(Attention):
             layer_id=layer_id,
         )
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        del positions
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        reduce_results: bool | None = None,
+    ) -> torch.Tensor:
+        del positions, reduce_results
         return torch.zeros_like(hidden_states)
 
 
@@ -1337,7 +1349,9 @@ class KimiK3DecoderLayer(nn.Module):
                 tp_rank=config.tp_rank,
                 rms_norm_eps=config.rms_norm_eps,
                 quantized=config.uses_quantized_weights,
-                reduce_o_proj=not config.use_sequence_parallel,
+                # Reduction is selected per forward; decode must retain the
+                # original TP all-reduce even when prefill SP is enabled.
+                reduce_o_proj=True,
                 dtype=dtype,
                 device=device,
             )
@@ -1390,6 +1404,8 @@ class KimiK3DecoderLayer(nn.Module):
                     dtype,
                     device,
                     intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
+                    # KimiK3MoERunner explicitly reduces the shared branch in
+                    # both decode and prefill, so keep this projection partial.
                     reduce_results=False,
                 )
                 if config.num_shared_experts
@@ -1411,7 +1427,7 @@ class KimiK3DecoderLayer(nn.Module):
                 config,
                 dtype,
                 device,
-                reduce_results=not config.use_sequence_parallel,
+                reduce_results=True,
             )
         self.attn_res_block_size = config.attn_res_block_size
         self.self_attention_res_norm = RMSNorm(
@@ -1469,10 +1485,20 @@ class KimiK3DecoderLayer(nn.Module):
         attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if self._sp else hidden_states
         if self.is_kda:
             metadata, conv_state, recurrent_state = self.kda_runtime.require(self.layer_id)
-            attention_output = self.self_attn(attention_input, metadata, conv_state, recurrent_state)
+            attention_output = self.self_attn(
+                attention_input,
+                metadata,
+                conv_state,
+                recurrent_state,
+                reduce_o_proj=not sp,
+            )
         else:
-            attention_output = self.self_attn(attention_input, positions)
-        if self._sp:
+            attention_output = self.self_attn(
+                attention_input,
+                positions,
+                reduce_results=not sp,
+            )
+        if sp:
             attention_output = _flashcomm1_reduce_scatter(attention_output, self.tp_size)
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         hidden_states = _apply_attention_residual(
@@ -1504,9 +1530,12 @@ class KimiK3DecoderLayer(nn.Module):
         else:
             if self._sp:
                 mlp_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
-                hidden_states = _flashcomm1_reduce_scatter(self.mlp(mlp_input), self.tp_size)
+                hidden_states = _flashcomm1_reduce_scatter(
+                    self.mlp(mlp_input, reduce_results=False),
+                    self.tp_size,
+                )
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.mlp(hidden_states, reduce_results=not sp)
         return prefix_sum + hidden_states, block_residual
 
     def load_weights(
