@@ -1470,6 +1470,7 @@ class KimiK3DecoderLayer(nn.Module):
         # attention and the FFN need the full token set, so we gather before
         # them and shard their outputs back.
         num_tokens = positions.shape[0]
+        sp = _sp_active(self._sp)
         prefix_sum: torch.Tensor | None = hidden_states
         if block_residual.shape[1] > 0:
             hidden_states = _apply_attention_residual(
@@ -1482,7 +1483,7 @@ class KimiK3DecoderLayer(nn.Module):
             block_residual = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
             prefix_sum = None
         hidden_states = self.input_layernorm(hidden_states)
-        attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if self._sp else hidden_states
+        attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if sp else hidden_states
         if self.is_kda:
             metadata, conv_state, recurrent_state = self.kda_runtime.require(self.layer_id)
             attention_output = self.self_attn(
@@ -1528,7 +1529,7 @@ class KimiK3DecoderLayer(nn.Module):
             else:
                 hidden_states = self.block_sparse_moe(hidden_states)
         else:
-            if self._sp:
+            if sp:
                 mlp_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_reduce_scatter(
                     self.mlp(mlp_input, reduce_results=False),
@@ -1673,7 +1674,8 @@ class KimiK3TextModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         num_tokens = hidden_states.shape[0]
-        if self._sp:
+        sp = _sp_active(self._sp)
+        if sp:
             # FlashComm1: shard the token dimension so the residual trunk runs
             # sequence-parallel; the embedding output is replicated, so this is
             # a local slice.
@@ -1687,7 +1689,7 @@ class KimiK3TextModel(nn.Module):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
         )
-        if self._sp:
+        if sp:
             hidden_states = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
         return self.norm(hidden_states)
 
