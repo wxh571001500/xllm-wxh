@@ -30,7 +30,7 @@ from xllm.python.distributed import (
 )
 from xllm.python.layers.moe.activation import SituAndMul
 from xllm.python.layers.moe.communication import (
-    AllToAllCommMethod,
+    AllGatherCommMethod,
     MoECommMethod,
     build_moe_comm_method,
 )
@@ -354,26 +354,19 @@ class KimiK3MoE(MoE):
             num_expert_group=int(getattr(config, "num_expert_group", 1)),
             topk_group=int(getattr(config, "topk_group", 1)),
         )
-        # Keep the decode runner on the original model topology.  The
-        # sequence-parallel all-to-all implementation below is intentionally
-        # used only by the prefill path.  Decode uses the plain all-to-all
-        # method (legacy token dispatcher), matching the verified e39ca1d7
-        # behavior, instead of the adaptive method whose small-batch MC2
-        # fallback regresses decode accuracy.
-        if parallel_config.comm_type == MoECommType.ALL_TO_ALL:
-            decode_comm_method = AllToAllCommMethod(
-                parallel_config,
-                num_experts,
-                quantized,
-            )
-        else:
-            decode_comm_method = build_moe_comm_method(
-                config=parallel_config,
-                num_experts=num_experts,
-                top_k=top_k,
-                quantized=quantized,
-                device=device,
-            )
+        # Decode always uses all-gather (graph-safe, no host-side splits),
+        # matching the verified e39ca1d7 all_gather behavior.  The
+        # all-to-all / MC2 optimizations are prefill-only: their
+        # host-materialized split metadata (`.to("cpu").tolist()`) cannot run
+        # inside the decode ACL graph and regresses decode accuracy or trips
+        # aclrtMemcpy.
+        decode_comm_method = AllGatherCommMethod(
+            parallel_config,
+            num_experts,
+            top_k,
+            quantized,
+            device,
+        )
         prefill_comm_method = (
             build_moe_comm_method(
                 config=comm_parallel_config,
