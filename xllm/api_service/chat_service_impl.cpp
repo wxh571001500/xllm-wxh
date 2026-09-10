@@ -412,6 +412,7 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
 
     // handle reasoning output
     std::string cur_text = output.text;
+    LOG(INFO) << "[KIMI_K3_DEBUG] raw output.text=[" << output.text << "]";
     if (!reasoning_parser_format.empty()) {
       auto reasoning_parser = std::make_unique<ReasoningParser>(
           reasoning_parser_format, false, is_force_reasoning);
@@ -424,6 +425,8 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
       if (result.reasoning_text.has_value()) {
         message->set_reasoning_content(result.reasoning_text.value());
       }
+      LOG(INFO) << "[KIMI_K3_DEBUG] after reasoning: cur_text=[" << cur_text
+                << "] reasoning=[" << result.reasoning_text.value_or("") << "]";
     }
 
     // handle tool call output
@@ -448,6 +451,8 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
                                           arena);
 
       message->mutable_content()->swap(result.text);
+      LOG(INFO) << "[KIMI_K3_DEBUG] after tool_calls: content=[" << result.text
+                << "] finish_reason=[" << result.finish_reason << "]";
 
       if (result.tool_calls) {
         auto& source_tool_calls = *result.tool_calls;
@@ -701,13 +706,20 @@ void ChatServiceImpl::process_async_rpc_impl(
   // Preserve parser-relevant special tokens in decoded output
   // so tool call detectors can match their control markers.
   // Aligns with vLLM parser adjust_request behavior.
+  // Kimi K3 XTML control markers (<|open|>/<|close|>/<|sep|>/<|end_of_msg|>)
+  // must always be preserved during detokenization, regardless of whether the
+  // request carries tools/reasoning_effort; otherwise its state machine
+  // receives malformed boundaries and emits out-of-order control tokens.
   if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
     function_call::FunctionCallParser parser({}, tool_call_parser_format_);
     if (parser.get_detector()->needs_special_tokens_for_parsing()) {
       request_params.skip_special_tokens = false;
     }
   }
-  if (!reasoning_parser_format_.empty()) {
+  if (tool_call_parser_format_ == "kimi_k3" ||
+      reasoning_parser_format_ == "kimi_k3") {
+    request_params.skip_special_tokens = false;
+  } else if (!reasoning_parser_format_.empty()) {
     function_call::FunctionCallParser parser({}, reasoning_parser_format_);
     if (parser.get_detector()->needs_special_tokens_for_parsing()) {
       request_params.skip_special_tokens = false;
@@ -812,7 +824,10 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
       request_params.skip_special_tokens = false;
     }
   }
-  if (!reasoning_parser_format_.empty()) {
+  if (tool_call_parser_format_ == "kimi_k3" ||
+      reasoning_parser_format_ == "kimi_k3") {
+    request_params.skip_special_tokens = false;
+  } else if (!reasoning_parser_format_.empty()) {
     function_call::FunctionCallParser parser({}, reasoning_parser_format_);
     if (parser.get_detector()->needs_special_tokens_for_parsing()) {
       request_params.skip_special_tokens = false;
@@ -920,6 +935,13 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   if (request_params.reasoning_effort.has_value() ||
       !request_params.tool_choice.empty()) {
     request_params.prepare_chat_template_params();
+  }
+
+  // Kimi K3 XTML control markers must always be preserved during
+  // detokenization (see process_async_rpc_impl above).
+  if (tool_call_parser_format_ == "kimi_k3" ||
+      reasoning_parser_format_ == "kimi_k3") {
+    request_params.skip_special_tokens = false;
   }
 
   std::vector<Message> messages;

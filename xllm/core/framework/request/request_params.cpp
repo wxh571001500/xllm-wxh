@@ -703,23 +703,32 @@ bool RequestParams::verify_params(OutputCallback callback) const {
 
 void RequestParams::prepare_chat_template_params() {
   if (!chat_template_kwargs.contains("tool_choice")) {
-    std::string prompt_tool_choice = tools.empty() ? "none" : tool_choice;
-    if (!tool_choice.empty() && tool_choice.front() == '{') {
-      const nlohmann::json named_choice =
-          nlohmann::json::parse(tool_choice, nullptr, false);
-      if (named_choice.is_object() && named_choice.contains("function") &&
-          named_choice["function"].is_object() &&
-          named_choice["function"].contains("name") &&
-          named_choice["function"]["name"].is_string()) {
-        const std::string name =
-            named_choice["function"]["name"].get<std::string>();
-        std::erase_if(tools, [&name](const JsonTool& tool) {
-          return tool.function.name != name;
-        });
-        prompt_tool_choice = "required";
+    // Without any declared tools there is no tool_choice to make: keep it
+    // unset ("auto") so the chat template does not inject a spurious
+    // `tool_choice=none` system message ("You MUST NOT call any tools").
+    // This matches vLLM's K3 tokenizer, which only emits a tool-choice
+    // instruction when tool_choice is explicitly required/none.
+    if (tools.empty()) {
+      chat_template_kwargs["tool_choice"] = "auto";
+    } else {
+      std::string prompt_tool_choice = tool_choice;
+      if (!tool_choice.empty() && tool_choice.front() == '{') {
+        const nlohmann::json named_choice =
+            nlohmann::json::parse(tool_choice, nullptr, false);
+        if (named_choice.is_object() && named_choice.contains("function") &&
+            named_choice["function"].is_object() &&
+            named_choice["function"].contains("name") &&
+            named_choice["function"]["name"].is_string()) {
+          const std::string name =
+              named_choice["function"]["name"].get<std::string>();
+          std::erase_if(tools, [&name](const JsonTool& tool) {
+            return tool.function.name != name;
+          });
+          prompt_tool_choice = "required";
+        }
       }
+      chat_template_kwargs["tool_choice"] = prompt_tool_choice;
     }
-    chat_template_kwargs["tool_choice"] = prompt_tool_choice;
   }
   if (!reasoning_effort.has_value()) {
     return;
