@@ -32,6 +32,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -187,10 +188,9 @@ torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
 }
 
 // Whether the current prefill step end should hold a linear-state checkpoint.
-// Checkpoints are saved at prefill step ends that land on a chunk-end boundary
-// (stride = max_tokens_per_chunk_for_prefill). The linear-state cache is a
-// sparse per-chunk overlay: KV may cache every block boundary while
-// linear-state saves only at chunk ends.
+// Checkpoints are saved at prefill step ends that land on a KV block boundary
+// (stride = block_size), matching vLLM's mamba_cache_mode="all" which caches
+// the mamba state at every i * block_size position.
 bool should_save_linear_checkpoint(Sequence* sequence,
                                    uint32_t boundary_tokens,
                                    uint32_t chunk_stride) {
@@ -903,18 +903,19 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
   LinearStateCacheOp linear_state_cache_op;
   linear_state_cache_op.linear_state_id = state.linear_state_ids.back();
   linear_state_cache_op.reset_requested = n_kv_cache_tokens == 0;
-  // Linear-state checkpoints live on chunk-end boundaries, so the prefix hash
-  // is chained per chunk (stride = max_tokens_per_chunk_for_prefill), not per
-  // KV block. The engine enforces this stride is a positive multiple of
-  // block_size when linear prefix cache is on (llm_engine.cpp); guard against
-  // an unset (<= 0) stride so a misconfigured run simply skips cache ops.
-  const int32_t chunk_stride = ::xllm::SchedulerConfig::get_instance()
-                                   .max_tokens_per_chunk_for_prefill();
+  // Linear-state checkpoints live on KV block boundaries (stride =
+  // block_size = 128), matching vLLM's mamba_cache_mode="all" which caches the
+  // mamba state at every i * block_size position. The engine enforces this
+  // stride is a positive multiple of block_size when linear prefix cache is on
+  // (llm_engine.cpp); guard against an unset (<= 0) stride so a misconfigured
+  // run simply skips cache ops.
+  const int32_t chunk_stride =
+      ::xllm::KVCacheConfig::get_instance().block_size();
   // Cold-start restore: emit a restore hash only when a restore source
   // checkpoint is mounted on this sequence -- class A at admission
   // (allocate_shared_for_sequence) or class B at the previous step's
   // save-rotation (allocate_for_sequence) -- AND the reused prefix lands
-  // on a chunk-end boundary, where the recurrent state lives in a checkpoint.
+  // on a KV block boundary, where the recurrent state lives in a checkpoint.
   // A mounted source is present exactly on a slot that is cold and needs
   // copy-in; continued forwards keep their live slot warm with no source
   // mounted, so they emit no restore and are not reset to cold by the worker.
@@ -923,14 +924,15 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
                                   n_kv_cache_tokens > 0 && chunk_stride > 0 &&
                                   n_kv_cache_tokens % chunk_stride == 0;
   // Exit-boundary save: persist the live state only when this prefill step
-  // lands on a chunk-end boundary, so the linear-state cache stays a sparse
-  // per-chunk overlay on top of the per-block KV cache.
+  // lands on a KV block boundary, so the linear-state cache stays a sparse
+  // per-block overlay on top of the per-block KV cache.
   const bool needs_save_hash =
       should_save_linear_checkpoint(sequence, seq_len, chunk_stride);
-  // Refresh the sequence's cached chunk hashes to cover this step's deepest
-  // boundary, then read them back. The cache is chained and incremental, so
-  // this only hashes chunks not seen on a previous step; the match probe and
-  // this builder now share the one hash source instead of each recomputing.
+  // Refresh the sequence's cached block-boundary hashes to cover this step's
+  // deepest boundary, then read them back. The cache is chained and
+  // incremental, so this only hashes boundaries not seen on a previous step;
+  // the match probe and this builder now share the one hash source instead of
+  // each recomputing.
   Slice<XXH3Key> linear_state_hashes;
   if (needs_restore_hash || needs_save_hash) {
     sequence->update_linear_state_hashes(static_cast<uint32_t>(chunk_stride));

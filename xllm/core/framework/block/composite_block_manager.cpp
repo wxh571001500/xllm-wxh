@@ -141,8 +141,13 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     CHECK_GT(options.linear_state_num_slots(), 0)
         << "linear_state_num_slots must be set when linear state is enabled";
     const bool linear_prefix_cache = prefix_cache_on && linear_participates;
-    int32_t chunk_stride =
-        SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+    // The linear-state checkpoint stride is the KV block_size (128 tokens),
+    // matching vLLM's mamba_cache_mode="all" which caches the mamba state at
+    // every i * block_size position. This keeps the recurrent-state cache
+    // granularity aligned with the KV block granularity so a prefix hit can
+    // resume at any block boundary instead of being forced back to the much
+    // coarser prefill chunk boundary (max_tokens_per_chunk_for_prefill).
+    int32_t chunk_stride = ::xllm::KVCacheConfig::get_instance().block_size();
     // The chunk stride is the checkpoint boundary for the LINEAR prefix cache.
     // It only matters when that cache is on (PREFILL role); the LINEAR leaf
     // holds no token cache otherwise (see set_kv_cache_info's LINEAR skip) and
@@ -152,7 +157,7 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     // when the LINEAR prefix cache is actually enabled, and fall back to a
     // valid positive block_size otherwise so the pool sizing stays well-formed.
     if (linear_prefix_cache) {
-      CHECK_GT(chunk_stride, 0) << "max_tokens_per_chunk_for_prefill must be "
+      CHECK_GT(chunk_stride, 0) << "block_size must be "
                                    "positive for linear state prefix cache";
     } else if (chunk_stride <= 0) {
       chunk_stride = 1;

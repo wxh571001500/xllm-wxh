@@ -615,9 +615,13 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
         << "Linear-attention prefix cache requires block-aligned chunked "
            "prefill to save matching linear states. Please set "
            "--enable_chunked_prefill=true in your config.";
+    // Linear-state checkpoints are saved at KV block boundaries (stride =
+    // block_size), matching vLLM's mamba_cache_mode="all". The chunk size only
+    // needs to be a multiple of block_size so every chunk-end lands on a block
+    // boundary; the checkpoint stride itself is block_size.
     CHECK(scheduler_config.max_tokens_per_chunk_for_prefill() % block_size == 0)
         << "linear-attention prefix cache saves linear-state checkpoints at "
-           "chunk-end boundaries, so max_tokens_per_chunk_for_prefill ("
+           "block boundaries, so max_tokens_per_chunk_for_prefill ("
         << scheduler_config.max_tokens_per_chunk_for_prefill()
         << ") must be a multiple of block_size (" << block_size << ").";
   }
