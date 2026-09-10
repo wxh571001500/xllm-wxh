@@ -30,6 +30,7 @@ from xllm.python.distributed import (
 )
 from xllm.python.layers.moe.activation import SituAndMul
 from xllm.python.layers.moe.communication import (
+    AllToAllCommMethod,
     MoECommMethod,
     build_moe_comm_method,
 )
@@ -355,14 +356,24 @@ class KimiK3MoE(MoE):
         )
         # Keep the decode runner on the original model topology.  The
         # sequence-parallel all-to-all implementation below is intentionally
-        # used only by the prefill path.
-        decode_comm_method = build_moe_comm_method(
-            config=parallel_config,
-            num_experts=num_experts,
-            top_k=top_k,
-            quantized=quantized,
-            device=device,
-        )
+        # used only by the prefill path.  Decode uses the plain all-to-all
+        # method (legacy token dispatcher), matching the verified e39ca1d7
+        # behavior, instead of the adaptive method whose small-batch MC2
+        # fallback regresses decode accuracy.
+        if parallel_config.comm_type == MoECommType.ALL_TO_ALL:
+            decode_comm_method = AllToAllCommMethod(
+                parallel_config,
+                num_experts,
+                quantized,
+            )
+        else:
+            decode_comm_method = build_moe_comm_method(
+                config=parallel_config,
+                num_experts=num_experts,
+                top_k=top_k,
+                quantized=quantized,
+                device=device,
+            )
         prefill_comm_method = (
             build_moe_comm_method(
                 config=comm_parallel_config,
