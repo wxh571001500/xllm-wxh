@@ -472,13 +472,13 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
       std::min(kv_cache_tokens_num + token_budget, seq->num_tokens());
 
   // Linear-state block alignment: for models with linear attention layers +
-  // prefix cache, chunk boundaries must align to chunk_stride so linear-state
-  // checkpoints land at recoverable positions.
+  // prefix cache, boundaries must align to the KV block_size so linear-state
+  // checkpoints land at recoverable positions (matching vLLM
+  // mamba_cache_mode="all", which caches state at every i * block_size).
   if (state.has_linear_attention_layers && state.enable_prefix_cache &&
       seq->is_prefill_stage()) {
     const size_t chunk_stride =
-        static_cast<size_t>(::xllm::SchedulerConfig::get_instance()
-                                .max_tokens_per_chunk_for_prefill());
+        static_cast<size_t>(::xllm::KVCacheConfig::get_instance().block_size());
     const size_t aligned =
         (max_handle_num_tokens / chunk_stride) * chunk_stride;
     if (aligned <= kv_cache_tokens_num) {
