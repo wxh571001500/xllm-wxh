@@ -220,7 +220,14 @@ class AllGatherPrepareAndFinalize(_ExpertParallelPrepareAndFinalize):
         Decode must keep the commit-c26 graph-safe behavior. The optimized
         path is enabled only for explicit prefill/chunked-prefill steps and
         falls back to the legacy path whenever phase metadata is unavailable.
+
+        IMPORTANT: For EP=64 global EP, always disable fast path to use
+        the simpler all-reduce logic, avoiding reduce-scatter+all-gather
+        complexity that can cause token repetition issues.
         """
+        # Disable fast path for large EP configurations (global EP)
+        if self._config.partitions_replicated_input and self._config.ep_size > 16:
+            return False
         if _in_acl_graph_capture():
             return False
         try:
