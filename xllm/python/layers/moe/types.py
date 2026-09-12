@@ -73,23 +73,20 @@ class MoEParallelConfig:
         if self.mc2_tokens_capacity <= 0:
             raise ValueError("MoE MC2 token capacity must be positive")
         input_tp_size = self.input_tp_size or self.tp_size
-        input_tp_rank = (
-            self.tp_rank if self.input_tp_rank < 0 else self.input_tp_rank
-        )
+        input_tp_rank = self.tp_rank if self.input_tp_rank < 0 else self.input_tp_rank
         object.__setattr__(self, "input_tp_size", input_tp_size)
         object.__setattr__(self, "input_tp_rank", input_tp_rank)
         if input_tp_size <= 0 or not 0 <= input_tp_rank < input_tp_size:
             raise ValueError("MoE input TP rank and size are invalid")
         if input_tp_size != self.tp_size:
-            supported = (
-                self.dp_size == 1
-                and self.tp_size == 1
-                and input_tp_size == self.ep_size
-            )
+            # Support two topologies:
+            # 1. dp=1, moe_tp=1, input_tp=ep (original)
+            # 2. moe_tp=1, ep=dp*input_tp (global EP for vLLM compatibility)
+            supported = self.dp_size == 1 and self.tp_size == 1 and input_tp_size == self.ep_size
+            supported = supported or (self.tp_size == 1 and self.ep_size == self.dp_size * input_tp_size)
             if not supported:
                 raise ValueError(
-                    "MoE currently supports distinct input TP only for "
-                    "dp=1, moe_tp=1, and input_tp=ep"
+                    "MoE supports distinct input TP only for dp=1 with input_tp=ep, or global EP with ep=dp*input_tp"
                 )
 
     @property
