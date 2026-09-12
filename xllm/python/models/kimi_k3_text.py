@@ -1490,15 +1490,15 @@ class KimiK3DecoderLayer(nn.Module):
                 metadata,
                 conv_state,
                 recurrent_state,
-                reduce_o_proj=not sp,
+                reduce_o_proj=not self._sp,
             )
         else:
             attention_output = self.self_attn(
                 attention_input,
                 positions,
-                reduce_results=not sp,
+                reduce_results=not self._sp,
             )
-        if sp:
+        if self._sp:
             attention_output = _flashcomm1_reduce_scatter(attention_output, self.tp_size)
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         hidden_states = _apply_attention_residual(
@@ -1512,12 +1512,12 @@ class KimiK3DecoderLayer(nn.Module):
             # Routed all-to-all can consume the sequence-parallel shard
             # directly.  The legacy all-gather path still gathers full tokens
             # and shards the result back after MoE execution.
-            if sp and getattr(self.block_sparse_moe, "sequence_parallel_routed", False):
+            if self._sp and getattr(self.block_sparse_moe, "sequence_parallel_routed", False):
                 hidden_states = self.block_sparse_moe(
                     hidden_states,
                     sequence_parallel_tokens=num_tokens,
                 )
-            elif sp:
+            elif self._sp:
                 moe_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_shard(
                     self.block_sparse_moe(moe_input),
@@ -1535,7 +1535,7 @@ class KimiK3DecoderLayer(nn.Module):
                     self.tp_size,
                 )
             else:
-                hidden_states = self.mlp(hidden_states, reduce_results=not sp)
+                hidden_states = self.mlp(hidden_states, reduce_results=not self._sp)
         return prefix_sum + hidden_states, block_residual
 
     def load_weights(
