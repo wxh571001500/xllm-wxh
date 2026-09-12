@@ -30,6 +30,7 @@ from xllm.python.distributed import (
 )
 from xllm.python.layers.moe.activation import SituAndMul
 from xllm.python.layers.moe.communication import (
+    AllGatherCommMethod,
     MoECommMethod,
     build_moe_comm_method,
 )
@@ -353,15 +354,15 @@ class KimiK3MoE(MoE):
             num_expert_group=int(getattr(config, "num_expert_group", 1)),
             topk_group=int(getattr(config, "topk_group", 1)),
         )
-        # Keep the decode runner on the original model topology.  The
-        # sequence-parallel all-to-all implementation below is intentionally
-        # used only by the prefill path.
-        decode_comm_method = build_moe_comm_method(
-            config=parallel_config,
-            num_experts=num_experts,
-            top_k=top_k,
-            quantized=quantized,
-            device=device,
+        # Keep the decode runner on the original model topology.  Decode always
+        # uses all-gather (graph-safe, matching the verified e39ca1d7 path);
+        # the all-to-all / MC2 optimizations are prefill-only.
+        decode_comm_method = AllGatherCommMethod(
+            parallel_config,
+            num_experts,
+            top_k,
+            quantized,
+            device,
         )
         prefill_comm_method = (
             build_moe_comm_method(
@@ -428,7 +429,13 @@ class KimiK3MoE(MoE):
         hidden_states: torch.Tensor,
         sequence_parallel_tokens: int | None = None,
     ) -> torch.Tensor:
-        if not self.sequence_parallel_routed or sequence_parallel_tokens is None:
+        # Import the prefill detection helper
+        from xllm.python.layers.moe.token_dispatcher import _in_prefill
+
+        # Only use prefill_runner during actual prefill stage
+        use_prefill_path = self.sequence_parallel_routed and sequence_parallel_tokens is not None and _in_prefill()
+
+        if not use_prefill_path:
             return super().forward(hidden_states)
 
         original_shape = hidden_states.shape
