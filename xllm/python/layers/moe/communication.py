@@ -44,6 +44,22 @@ from xllm.python.layers.moe.types import (
 )
 
 
+def _in_acl_graph_capture() -> bool:
+    """Return whether we are in ACL graph capture/warmup mode.
+
+    During graph capture, dynamic operations (like all-to-all with dynamic
+    split sizes) cannot be recorded into the static graph. We must use
+    all-gather instead.
+    """
+    try:
+        from xllm.python.model_executor.forward_context import get_forward_context
+
+        context = get_forward_context()
+        return context.acl_graph is not None or context.graph_warmup
+    except (ImportError, RuntimeError, AttributeError):
+        return False
+
+
 class MoECommMethod:
     """Compose prepare/finalize and token dispatch into one MoE pipeline."""
 
@@ -191,20 +207,14 @@ class AdaptiveMoECommMethod(MoECommMethod):
             quantized,
             device,
         )
-        self._all_to_all = (
-            AllToAllCommMethod(config, num_experts, quantized)
-            if config.ep_size > 1
-            else None
-        )
+        self._all_to_all = AllToAllCommMethod(config, num_experts, quantized) if config.ep_size > 1 else None
         has_mc2 = hasattr(torch_npu, "npu_moe_distribute_dispatch") and hasattr(
             torch_npu,
             "npu_moe_distribute_combine",
         )
         self._mc2 = (
             MC2CommMethod(config, num_experts, quantized, device)
-            if config.ep_size > 1
-            and device.type in ("npu", "privateuseone")
-            and has_mc2
+            if config.ep_size > 1 and device.type in ("npu", "privateuseone") and has_mc2
             else None
         )
         self._active: MoECommMethod | None = None
@@ -214,9 +224,12 @@ class AdaptiveMoECommMethod(MoECommMethod):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> MoEPrepareOutput:
-        if self._mc2 is not None and (
-            hidden_states.shape[0] <= self._config.mc2_tokens_capacity
-        ):
+        # During ACL graph capture, all-to-all cannot be used because it needs
+        # dynamic split metadata that cannot be materialized in a static graph.
+        # Force all-gather path during graph warmup/capture.
+        if _in_acl_graph_capture():
+            self._active = self._all_gather
+        elif self._mc2 is not None and (hidden_states.shape[0] <= self._config.mc2_tokens_capacity):
             self._active = self._mc2
         elif self._all_to_all is not None:
             self._active = self._all_to_all
@@ -269,7 +282,16 @@ def build_moe_comm_method(
             device,
         )
     if comm_type == MoECommType.ALL_TO_ALL:
-        return AllToAllCommMethod(config, num_experts, quantized)
+        # Use AdaptiveMoECommMethod to automatically fall back to all-gather
+        # during ACL graph capture (all-to-all needs dynamic split sizes which
+        # cannot be captured in a static graph).
+        return AdaptiveMoECommMethod(
+            config,
+            num_experts,
+            top_k,
+            quantized,
+            device,
+        )
     if comm_type == MoECommType.MC2:
         return MC2CommMethod(config, num_experts, quantized, device)
     if comm_type == MoECommType.AUTO:
