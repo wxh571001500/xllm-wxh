@@ -189,7 +189,11 @@ class MC2CommMethod(MoECommMethod):
 
 
 class AdaptiveMoECommMethod(MoECommMethod):
-    """Select MC2 for small batches and All2All for larger EP batches."""
+    """Select MC2 for small batches and All2All for larger EP batches.
+
+    For global EP (partitions_replicated_input), uses a graph-safe all-gather
+    fallback that properly handles the replicated input topology.
+    """
 
     def __init__(
         self,
@@ -200,13 +204,33 @@ class AdaptiveMoECommMethod(MoECommMethod):
         device: torch.device,
     ) -> None:
         self._config = config
-        self._all_gather = AllGatherCommMethod(
-            config,
-            num_experts,
-            top_k,
-            quantized,
-            device,
-        )
+        # For global EP, create a separate all-gather config without replicated input
+        # to use during graph capture as a fallback
+        if config.partitions_replicated_input:
+            # Create a non-replicated config for graph capture fallback
+            # This treats each EP rank independently during graph mode
+            from dataclasses import replace
+
+            graph_config = replace(
+                config,
+                input_tp_size=config.tp_size,
+                input_tp_rank=config.tp_rank,
+            )
+            self._all_gather = AllGatherCommMethod(
+                graph_config,
+                num_experts,
+                top_k,
+                quantized,
+                device,
+            )
+        else:
+            self._all_gather = AllGatherCommMethod(
+                config,
+                num_experts,
+                top_k,
+                quantized,
+                device,
+            )
         self._all_to_all = AllToAllCommMethod(config, num_experts, quantized) if config.ep_size > 1 else None
         has_mc2 = hasattr(torch_npu, "npu_moe_distribute_dispatch") and hasattr(
             torch_npu,
