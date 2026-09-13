@@ -134,6 +134,9 @@ class MoE(nn.Module):
     def load_weight(self, name: str, tensor: torch.Tensor) -> bool:
         if name == "gate.weight":
             target = self.gate.weight
+            # 减专家验证：权重含 num_experts 个专家，config 减到更少时截断前 N 行。
+            if tensor.shape[0] > target.shape[0]:
+                tensor = tensor[: target.shape[0]]
             if tensor.shape != target.shape:
                 raise ValueError(f"MoE gate expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))
@@ -141,6 +144,8 @@ class MoE(nn.Module):
             return True
         if name in ("e_score_correction_bias", "gate.e_score_correction_bias"):
             target = self.gate.e_score_correction_bias
+            if tensor.shape[0] > target.shape[0]:
+                tensor = tensor[: target.shape[0]]
             if tensor.shape != target.shape:
                 raise ValueError(f"MoE correction bias expects {target.shape}, got {tensor.shape}")
             target.data.copy_(tensor.to(target))

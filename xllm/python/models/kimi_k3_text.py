@@ -22,6 +22,7 @@ a placeholder remains only as a defensive fallback for incomplete layer maps.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -1309,11 +1310,11 @@ def _sp_active(sp_flag: bool) -> bool:
         return False
     try:
         ctx = get_forward_context()
-        if ctx.acl_graph is not None or ctx.graph_warmup:
+        if ctx.acl_graph is not None:
             return False
         metadata = ctx.metadata
         return bool(metadata is not None and (metadata.is_prefill or metadata.is_chunked_prefill))
-    except RuntimeError:
+    except (RuntimeError, AttributeError):
         return False
 
 
@@ -1470,6 +1471,12 @@ class KimiK3DecoderLayer(nn.Module):
         # attention and the FFN need the full token set, so we gather before
         # them and shard their outputs back.
         num_tokens = positions.shape[0]
+        sp_active = _sp_active(self._sp)
+        from xllm.python.layers.moe.dump_debug import dump_intermediate
+
+        _dbg_L = self.layer_id
+        if _dbg_L == 0:
+            dump_intermediate("in", hidden_states, _dbg_L)
         prefix_sum: torch.Tensor | None = hidden_states
         if block_residual.shape[1] > 0:
             hidden_states = _apply_attention_residual(
@@ -1482,7 +1489,11 @@ class KimiK3DecoderLayer(nn.Module):
             block_residual = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
             prefix_sum = None
         hidden_states = self.input_layernorm(hidden_states)
-        attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if self._sp else hidden_states
+        if _dbg_L == 0:
+            dump_intermediate("input_ln_out", hidden_states, _dbg_L)
+        attention_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size) if sp_active else hidden_states
+        if _dbg_L == 0:
+            dump_intermediate("attn_input", attention_input, _dbg_L)
         if self.is_kda:
             metadata, conv_state, recurrent_state = self.kda_runtime.require(self.layer_id)
             attention_output = self.self_attn(
@@ -1490,16 +1501,18 @@ class KimiK3DecoderLayer(nn.Module):
                 metadata,
                 conv_state,
                 recurrent_state,
-                reduce_o_proj=not self._sp,
+                reduce_o_proj=not sp_active,
             )
         else:
             attention_output = self.self_attn(
                 attention_input,
                 positions,
-                reduce_results=not self._sp,
+                reduce_results=not sp_active,
             )
-        if self._sp:
+        if sp_active:
             attention_output = _flashcomm1_reduce_scatter(attention_output, self.tp_size)
+        if _dbg_L == 0:
+            dump_intermediate("attn_out", attention_output, _dbg_L)
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         hidden_states = _apply_attention_residual(
             prefix_sum,
@@ -1507,17 +1520,21 @@ class KimiK3DecoderLayer(nn.Module):
             self.mlp_res_proj,
             self.mlp_res_norm,
         )
+        if _dbg_L == 0:
+            dump_intermediate("mlp_res_out", hidden_states, _dbg_L)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if _dbg_L == 0:
+            dump_intermediate("post_ln_out", hidden_states, _dbg_L)
         if hasattr(self, "block_sparse_moe"):
             # Routed all-to-all can consume the sequence-parallel shard
             # directly.  The legacy all-gather path still gathers full tokens
             # and shards the result back after MoE execution.
-            if self._sp and getattr(self.block_sparse_moe, "sequence_parallel_routed", False):
+            if sp_active and getattr(self.block_sparse_moe, "sequence_parallel_routed", False):
                 hidden_states = self.block_sparse_moe(
                     hidden_states,
                     sequence_parallel_tokens=num_tokens,
                 )
-            elif self._sp:
+            elif sp_active:
                 moe_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_shard(
                     self.block_sparse_moe(moe_input),
@@ -1528,14 +1545,14 @@ class KimiK3DecoderLayer(nn.Module):
             else:
                 hidden_states = self.block_sparse_moe(hidden_states)
         else:
-            if self._sp:
+            if sp_active:
                 mlp_input = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
                 hidden_states = _flashcomm1_reduce_scatter(
                     self.mlp(mlp_input, reduce_results=False),
                     self.tp_size,
                 )
             else:
-                hidden_states = self.mlp(hidden_states, reduce_results=not self._sp)
+                hidden_states = self.mlp(hidden_states, reduce_results=not sp_active)
         return prefix_sum + hidden_states, block_residual
 
     def load_weights(
@@ -1632,6 +1649,9 @@ class KimiK3TextModel(nn.Module):
     def __init__(self, config: KimiK3TextConfig, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.config = config
+        from xllm.python.layers.moe.dump_debug import set_dump_rank
+
+        set_dump_rank(config.rank)
         self.embed_tokens = HiddenParallelEmbedding(
             config.vocab_size,
             config.hidden_size // config.tp_size,
@@ -1660,6 +1680,26 @@ class KimiK3TextModel(nn.Module):
         self._sp = config.use_sequence_parallel
         self.tp_size = config.tp_size
         self.tp_rank = config.tp_rank
+        try:
+            import torch.distributed as _dist
+
+            _init = _dist.is_available() and _dist.is_initialized()
+            _dr = "n/a"
+            if _init:
+                try:
+                    _dr = str(_dist.get_rank())
+                except Exception as _e:
+                    _dr = f"err:{_e}"
+            else:
+                _dr = "not_initialized"
+            line = f"config.rank={config.rank} config.tp_rank={config.tp_rank} tp_size={config.tp_size} dist_rank={_dr} pid={os.getpid()}\n"
+            if config.rank == 0:
+                with open("/tmp/xllm_rank0_cfg.txt", "w") as _f:
+                    _f.write(line)
+            with open(f"/tmp/xllm_rank_cfg_{config.rank}.txt", "w") as _f:
+                _f.write(line)
+        except Exception:
+            pass
         self._loaded_weights: set[str] = set()
 
     def initial_block_count(self) -> int:
@@ -1673,11 +1713,17 @@ class KimiK3TextModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         num_tokens = hidden_states.shape[0]
-        if self._sp:
+        from xllm.python.layers.moe.dump_debug import dump_input_ids, dump_intermediate
+
+        dump_input_ids(input_ids)
+        dump_intermediate("embed", hidden_states)
+        sp_active = _sp_active(self._sp)
+        if sp_active:
             # FlashComm1: shard the token dimension so the residual trunk runs
             # sequence-parallel; the embedding output is replicated, so this is
             # a local slice.
             hidden_states = _flashcomm1_shard(hidden_states, num_tokens, self.tp_size, self.tp_rank)
+            dump_intermediate("embed_shard", hidden_states)
         block_residual = hidden_states.new_zeros((hidden_states.shape[0], 0, hidden_states.shape[-1]))
         for layer in self.layers:
             hidden_states, block_residual = layer(hidden_states, positions, block_residual)
@@ -1687,7 +1733,7 @@ class KimiK3TextModel(nn.Module):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
         )
-        if self._sp:
+        if sp_active:
             hidden_states = _flashcomm1_gather(hidden_states, num_tokens, self.tp_size)
         return self.norm(hidden_states)
 

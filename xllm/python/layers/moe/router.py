@@ -78,29 +78,19 @@ class GroupedTopKRouter(MoERouter):
         elif self.config.scoring_func == "sigmoid":
             norm_type = 1
         else:
-            raise ValueError(
-                f"Unsupported MoE router activation: {self.config.scoring_func}"
-            )
+            raise ValueError(f"Unsupported MoE router activation: {self.config.scoring_func}")
         topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
             router_logits,
             k=self.config.top_k,
             k_group=self.config.topk_group if self.config.use_grouped_topk else 1,
-            group_count=(
-                self.config.num_expert_group
-                if self.config.use_grouped_topk
-                else 1
-            ),
+            group_count=(self.config.num_expert_group if self.config.use_grouped_topk else 1),
             group_select_mode=1,
             renorm=int(self.config.renormalize),
             norm_type=norm_type,
             out_flag=False,
             routed_scaling_factor=self.config.routed_scaling_factor,
             eps=1e-20,
-            bias_opt=(
-                correction_bias.to(router_logits)
-                if correction_bias is not None
-                else None
-            ),
+            bias_opt=(correction_bias.to(router_logits) if correction_bias is not None else None),
         )
         return MoERoutingResult(
             topk_ids=topk_ids.to(torch.int32),
@@ -117,9 +107,7 @@ class GroupedTopKRouter(MoERouter):
         elif self.config.scoring_func == "sigmoid":
             scores = torch.sigmoid(router_logits)
         else:
-            raise ValueError(
-                f"Unsupported MoE router activation: {self.config.scoring_func}"
-            )
+            raise ValueError(f"Unsupported MoE router activation: {self.config.scoring_func}")
 
         selection = scores
         if correction_bias is not None:
@@ -128,7 +116,7 @@ class GroupedTopKRouter(MoERouter):
             selection = self._mask_unselected_groups(selection)
 
         topk_ids = torch.topk(
-            selection,
+            selection.to(torch.float32),
             self.config.top_k,
             dim=-1,
         ).indices
@@ -137,10 +125,10 @@ class GroupedTopKRouter(MoERouter):
             topk_weights = topk_weights / topk_weights.sum(
                 dim=-1,
                 keepdim=True,
-            ).clamp_min(1e-20)
+            )
         topk_weights = topk_weights * self.config.routed_scaling_factor
         return MoERoutingResult(
-            topk_ids=topk_ids,
+            topk_ids=topk_ids.to(torch.int32),
             topk_weights=topk_weights,
         )
 
