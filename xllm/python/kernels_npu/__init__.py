@@ -46,6 +46,7 @@ _EXPORTS = {
         "mega_gdn_decode",
         "mega_gdn_mtp_decode",
         "mega_gdn_prefill",
+        "recurrent_gated_delta_rule",
     ),
     "linear": ("prepare_quant_weight", "prepare_row_parallel_weight"),
     "mla": (

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,6 +29,12 @@ limitations under the License.
 #include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model_context.h"
+#include "models/py_model_bridge.h"
+
+namespace xllm::detail {
+void share_python_model_weights(pybind11::object& draft_model,
+                                const pybind11::object& target_model);
+}  // namespace xllm::detail
 
 namespace xllm {
 
@@ -38,9 +44,6 @@ class MegaMoeCommResource;
 #endif
 
 namespace detail {
-void share_python_model_weights(pybind11::object& draft_model,
-                                const pybind11::object& target_model);
-
 int64_t python_mega_moe_max_num_tokens_per_rank(int64_t max_seqs_per_batch,
                                                 int64_t num_speculative_tokens,
                                                 int64_t dp_size);
@@ -56,8 +59,10 @@ int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
 // PyExecutorImpl drives it. The CausalVLM ``encode`` / ``get_input_embeddings``
 // virtuals are stubbed: in the Python path, PyExecutorImpl::run calls the
 // Python model's own encode/get_input_embeddings via pybind (they are never
-// reached here).
-class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
+// reached here). PyModelBridge mixes in the accessors PyExecutorImpl uses for
+// both this class and Kimi's PyCausalVLM.
+class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM,
+                                                         public PyModelBridge {
  public:
   explicit PyCausalLM(const ModelContext& context, bool is_vlm);
   ~PyCausalLM() override;
@@ -67,6 +72,8 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& parameters) override;
 
+  // CausalVLM virtuals are stubbed on the Python path: PyExecutorImpl drives
+  // the Python model's own encode/get_input_embeddings via pybind.
   MMDict encode(const ModelInputParams& parameters) override {
     LOG(FATAL) << "PyCausalLM::encode must not be called directly; "
                << "PyExecutorImpl drives the Python model's encode via pybind.";
@@ -122,8 +129,12 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   void update_expert_weight(int32_t layer_id) override;
   bool last_prepare_expert_weight_ok(int32_t layer_id) const override;
 
+  pybind11::object& python_model() override { return py_model_; }
+  const pybind11::object& config_dict() const override { return config_dict_; }
+
   bool share_weights_from(CausalLM& source) override;
 
+  // Native collective forwarding entry points (jd-main).
   void tp_all_reduce(torch::Tensor& tensor);
   torch::Tensor tp_all_gather(const torch::Tensor& tensor, int64_t dim);
   torch::Tensor dp_all_gather(
@@ -139,8 +150,6 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   static PyCausalLM* active_instance();
   static void set_active_instance(PyCausalLM* py_causal_lm);
 
-  pybind11::object& python_model() { return py_model_; }
-  const pybind11::object& config_dict() const { return config_dict_; }
   int64_t cp_size() const { return cp_size_; }
   int64_t kv_split_size() const { return kv_split_size_; }
   int64_t kv_split_rank() const { return kv_split_rank_; }
@@ -148,6 +157,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
  private:
   pybind11::dict build_config_dict(
       const ParallelArgs& parallel_args,
+      const QuantArgs& quant_args,
       const SpeculativeRuntimeConfig& speculative_runtime_config) const;
   const pybind11::object& get_or_build_python_kv_caches(
       std::vector<KVCache>& kv_caches);
@@ -159,6 +169,8 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
 
   int64_t tp_size_ = 1;
   int64_t tp_rank_ = 0;
+  // Parallel dimensions carried for the native collective forwarding path.
+  // jd-main reads them from the orthogonally-split process groups.
   int64_t dp_size_ = 1;
   int64_t dp_rank_ = 0;
   int64_t moe_tp_size_ = 1;

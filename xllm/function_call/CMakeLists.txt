@@ -11,6 +11,7 @@ cc_library (
         qwen25_detector.h
         qwen3_coder_detector.h
         kimik2_detector.h
+        kimi_k3_detector.h
         deepseekv3_detector.h
         deepseekv32_detector.h
         glm45_detector.h
@@ -23,6 +24,7 @@ cc_library (
         qwen25_detector.cpp
         qwen3_coder_detector.cpp
         kimik2_detector.cpp
+        kimi_k3_detector.cpp
         deepseekv3_detector.cpp
         deepseekv32_detector.cpp
         glm45_detector.cpp

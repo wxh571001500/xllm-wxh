@@ -18,6 +18,8 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
+#include <cstdint>
+
 #include "executor.h"
 #include "forward_params.h"
 #include "framework/model/causal_vlm.h"

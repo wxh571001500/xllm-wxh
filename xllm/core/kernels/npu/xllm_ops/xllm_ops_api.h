@@ -170,6 +170,19 @@ std::tuple<at::Tensor, at::Tensor> dequant_swiglu_quant(
     double glu_alpha,
     double glu_bias);
 
+std::tuple<torch::Tensor, torch::Tensor> dequant_situ_quant(
+    const torch::Tensor& x,
+    const std::optional<torch::Tensor>& weight_scale,
+    const std::optional<torch::Tensor>& activation_scale,
+    const std::optional<torch::Tensor>& bias,
+    const std::optional<torch::Tensor>& quant_scale,
+    const std::optional<torch::Tensor>& quant_offset,
+    const std::optional<torch::Tensor>& group_index,
+    double beta,
+    double linear_beta,
+    bool activate_left,
+    const std::string& quant_mode);
+
 at::Tensor hc_post(const at::Tensor& x,
                    const at::Tensor& residual,
                    const at::Tensor& post,

@@ -668,6 +668,29 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     LOG(FATAL) << *host_cache_error;
   }
 
+  // DECODE-side skips LINEAR prefix cache by role (see
+  // composite_block_manager.cpp::leaf_participates_in_prefix_cache), so the
+  // chunked-prefill + chunk-stride guards below are only meaningful for
+  // PREFILL / MIX. On DECODE the linear-state cache is disabled anyway and
+  // pd_launch.sh legitimately sets --enable_chunked_prefill=false.
+  const bool is_decode = options_.instance_role() == InstanceRole::DECODE;
+  if (options_.enable_prefix_cache() && has_gdn_state && !is_decode) {
+    const auto& scheduler_config = ::xllm::SchedulerConfig::get_instance();
+    CHECK(scheduler_config.enable_chunked_prefill())
+        << "Linear-attention prefix cache requires block-aligned chunked "
+           "prefill to save matching linear states. Please set "
+           "--enable_chunked_prefill=true in your config.";
+    // Linear-state checkpoints are saved at KV block boundaries (stride =
+    // block_size), matching vLLM's mamba_cache_mode="all". The chunk size only
+    // needs to be a multiple of block_size so every chunk-end lands on a block
+    // boundary; the checkpoint stride itself is block_size.
+    CHECK(scheduler_config.max_tokens_per_chunk_for_prefill() % block_size == 0)
+        << "linear-attention prefix cache saves linear-state checkpoints at "
+           "block boundaries, so max_tokens_per_chunk_for_prefill ("
+        << scheduler_config.max_tokens_per_chunk_for_prefill()
+        << ") must be a multiple of block_size (" << block_size << ").";
+  }
+
   // init kv cache for each worker
   kv_cache_shape.print_shapes();
 

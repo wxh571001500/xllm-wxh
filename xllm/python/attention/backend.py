@@ -96,6 +96,18 @@ def normalize_layer_caches(caches: Sequence[LayerCacheInput]) -> list[LayerCache
     return normalized
 
 
+KVCache = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class MlaUnabsorbedPrefill:
+    """Unabsorbed MLA tensors used by model-specific prefill paths."""
+
+    query_nope: torch.Tensor
+    key_nope: torch.Tensor
+    value: torch.Tensor
+
+
 class AttentionMetadata(Protocol):
     slot_mapping: torch.Tensor
     paged_kv_indptr: torch.Tensor
@@ -369,6 +381,7 @@ class AttentionBackend(ABC):
         layer: Attention,
         topk: torch.Tensor | None = None,
         cache_is_preprocessed: bool = False,
+        unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
     ) -> torch.Tensor:
         """Absorbed-MLA attention over paged latent (nope) + rope caches.
 
@@ -378,6 +391,9 @@ class AttentionBackend(ABC):
         that do not implement MLA raise.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support MLA")
+
+    def use_unabsorbed_mla_prefill(self) -> bool:
+        return False
 
     def mla_preprocess_context(
         self,

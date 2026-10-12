@@ -404,8 +404,8 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
     }
 
     // handle tool call output
-    if (!tools.empty() && !tool_call_parser_format.empty() &&
-        !cur_text.empty()) {
+    if ((!tools.empty() || tool_call_parser_format == "kimi_k3") &&
+        !tool_call_parser_format.empty() && !cur_text.empty()) {
       auto* arena = response.GetArena();
       auto result =
           api_service::process_tool_calls(cur_text,
@@ -612,6 +612,9 @@ void ChatServiceImpl::process_async_rpc_impl(
   }
 
   RequestParams request_params(rpc_request, "", "");
+  if (tool_call_parser_format_ == "kimi_k3") {
+    request_params.prepare_kimi_k3_chat_params();
+  }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
@@ -654,7 +657,9 @@ void ChatServiceImpl::process_async_rpc_impl(
   // Preserve parser-relevant special tokens in decoded output
   // so tool call detectors can match their control markers.
   // Aligns with vLLM parser adjust_request behavior.
-  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+  if ((!tool_call_parser_format_.empty() && !request_params.tools.empty()) ||
+      tool_call_parser_format_ == "kimi_k3" ||
+      reasoning_parser_format_ == "kimi_k3") {
     request_params.skip_special_tokens = false;
   }
 
@@ -669,7 +674,6 @@ void ChatServiceImpl::process_async_rpc_impl(
 void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
-
   // Route to RecMaster if configured
   if (rec_master_) {
     if (unlikely(!models_.contains(model))) {
@@ -702,6 +706,9 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+  if (tool_call_parser_format_ == "kimi_k3") {
+    request_params.prepare_kimi_k3_chat_params();
+  }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
@@ -746,7 +753,9 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     request_params.decode_address = rpc_request.routing().decode_name();
   }
 
-  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+  if ((!tool_call_parser_format_.empty() && !request_params.tools.empty()) ||
+      tool_call_parser_format_ == "kimi_k3" ||
+      reasoning_parser_format_ == "kimi_k3") {
     request_params.skip_special_tokens = false;
   }
 
@@ -853,6 +862,10 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+
+  if (tool_call_parser_format_ == "kimi_k3") {
+    request_params.prepare_kimi_k3_chat_params();
+  }
 
   bool include_usage = false;
   if (rpc_request.has_stream_options()) {

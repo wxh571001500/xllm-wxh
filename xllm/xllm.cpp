@@ -33,6 +33,7 @@ namespace py = pybind11;
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -40,6 +41,7 @@ namespace py = pybind11;
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
@@ -87,6 +89,44 @@ using namespace xllm;
 static std::atomic<uint32_t> signal_received{0};
 
 namespace {
+
+bool env_bool_or(const char* name, bool fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+  std::string normalized(value);
+  for (char& c : normalized) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (normalized == "1" || normalized == "true" || normalized == "yes" ||
+      normalized == "on") {
+    return true;
+  }
+  if (normalized == "0" || normalized == "false" || normalized == "no" ||
+      normalized == "off") {
+    return false;
+  }
+  LOG(WARNING) << "Ignoring invalid boolean environment variable " << name
+               << "=" << value;
+  return fallback;
+}
+
+int32_t env_int_or(const char* name, int32_t fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int32_t>::max()) {
+    LOG(WARNING) << "Ignoring invalid integer environment variable " << name
+                 << "=" << value;
+    return fallback;
+  }
+  return static_cast<int32_t>(parsed);
+}
 
 void initialize_configs() {
   BeamSearchConfig::get_instance().initialize();
@@ -136,10 +176,19 @@ Options create_options(const std::string& instance_name, bool is_local) {
 
   Options options;
 #if defined(USE_NPU)
+  // Keep FlashComm1 deployment-controlled, matching vLLM's environment-based
+  // switch. The CLI values remain as compatibility fallbacks.
+  const bool flashcomm1_enabled =
+      env_bool_or("XLLM_ENABLE_FLASHCOMM1", kernel_config.enable_flashcomm1());
+  // vLLM enables FC1 for every non-empty MoE prefill. When deployment turns
+  // the xLLM switch on via the environment, use the same one-token floor
+  // unless an explicit environment threshold is supplied.
+  const int32_t flashcomm1_default_min_tokens =
+      flashcomm1_enabled ? 1 : kernel_config.flashcomm1_min_prefill_tokens();
   options.npu_kernel_backend(kernel_config.npu_kernel_backend());
-  options.enable_flashcomm1(kernel_config.enable_flashcomm1())
-      .flashcomm1_min_prefill_tokens(
-          kernel_config.flashcomm1_min_prefill_tokens())
+  options.enable_flashcomm1(flashcomm1_enabled)
+      .flashcomm1_min_prefill_tokens(env_int_or(
+          "XLLM_FLASHCOMM1_MIN_PREFILL_TOKENS", flashcomm1_default_min_tokens))
       .enable_mmrs_fusion(kernel_config.enable_mmrs_fusion())
       .mmrs_comm_mode(kernel_config.mmrs_comm_mode());
 #endif
@@ -273,6 +322,15 @@ namespace {
 // All NPU processes go through this path for consistency — the build system
 // links against the pip-installed torch_npu .so directly.
 void init_npu_python_runtime() {
+  // aclInit must run before the embedded Python runtime is imported. CANN
+  // scans ASCEND_CUSTOM_OPP_PATH at aclInit time, so keep the path limited to
+  // the xLLM custom operators needed by this process. Registering competing
+  // CausalConv1d schemas from multiple vendors can make graph compilation
+  // select an incompatible backward input contract.
+  auto acl_ret = aclInit(nullptr);
+  CHECK(acl_ret == ACL_SUCCESS || acl_ret == 500000)
+      << "aclInit failed with error " << acl_ret;
+
   bool we_initialized_python = false;
   if (!Py_IsInitialized()) {
     py::initialize_interpreter(/*init_signal_handlers=*/false);
@@ -291,26 +349,6 @@ void init_npu_python_runtime() {
       DeviceNameUtils::get_device_idx(distributed_config.node_rank(),
                                       distributed_config.nnodes(),
                                       visible_device_count);
-
-  // Register fla_npu's embedded AscendC opapi (libcust_opapi) + OPP vendor
-  // dir before aclInit. The KDA forward op (aclnnChunkKdaFwd) and its kernels
-  // live in fla_npu's embedded OPP; without this registration the opapi cannot
-  // locate the kernel binary and aclnnChunkKdaFwdGetWorkspaceSize returns
-  // ACLNN_ERR_INNER_NULLPTR (561103), breaking GLM-5.3-Flash's KDA layers.
-  // Guarded so non-KDA builds without fla_npu stay unaffected.
-  {
-    py::gil_scoped_acquire gil;
-    py::exec(
-        "try:\n"
-        "    import fla_npu\n"
-        "    fla_npu.load_ascendc_opapi_libraries()\n"
-        "except (ImportError, RuntimeError):\n"
-        "    pass\n");
-  }
-
-  auto acl_ret = aclInit(nullptr);
-  CHECK(acl_ret == ACL_SUCCESS || acl_ret == 500000)
-      << "aclInit failed with error " << acl_ret;
 
   {
     py::gil_scoped_acquire gil;

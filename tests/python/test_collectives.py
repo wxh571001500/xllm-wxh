@@ -896,3 +896,23 @@ def test_reduce_scatter_one_rank_does_not_alias_input() -> None:
     actual = collectives.reduce_scatter(value, 1)
     torch.testing.assert_close(actual, value)
     assert actual.data_ptr() != value.data_ptr()
+
+
+def test_vlm_runtime_uses_initialized_python_collectives(monkeypatch) -> None:
+    native_gather = MagicMock(side_effect=AssertionError("inactive native bridge used"))
+    monkeypatch.setitem(
+        sys.modules,
+        "xllm_runtime",
+        SimpleNamespace(
+            native_collectives_available=lambda: False,
+            tp_all_gather=native_gather,
+        ),
+    )
+    value = torch.ones(1, 2)
+    expected = torch.ones(1, 8)
+    python_gather = MagicMock(return_value=expected)
+    monkeypatch.setattr(collectives, "all_gather", python_gather)
+
+    assert collectives.tp_all_gather(value, 1, 4) is expected
+    python_gather.assert_called_once_with(value, 1, 4, "tp")
+    native_gather.assert_not_called()

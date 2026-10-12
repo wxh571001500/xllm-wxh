@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,10 +46,7 @@ limitations under the License.
 
 namespace py = pybind11;
 
-namespace xllm {
-
-namespace detail {
-
+namespace xllm::detail {
 void share_python_model_weights(py::object& draft_model,
                                 const py::object& target_model) {
   // Keep the draft's own head/embedding when the checkpoint ships them (DSpark
@@ -104,8 +101,9 @@ int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
   // gather DP tokens before dispatch, so no empty-rank dummy rows are added.
   return std::max(max_tokens_per_batch, max_decode_tokens);
 }
+}  // namespace xllm::detail
 
-}  // namespace detail
+namespace xllm {
 
 namespace {
 
@@ -360,6 +358,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(py::str(module_name));
   config_dict_ = build_config_dict(parallel_args,
+                                   context.get_quant_args(),
                                    context.get_speculative_runtime_config());
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();
@@ -384,8 +383,22 @@ const py::object& PyCausalLM::get_or_build_python_kv_caches(
 
 py::dict PyCausalLM::build_config_dict(
     const ParallelArgs& parallel_args,
+    const QuantArgs& quant_args,
     const SpeculativeRuntimeConfig& speculative_runtime_config) const {
   py::dict d;
+  if (model_args_.model_type() == "kimi_k3") {
+    py::module_ json = py::module_::import("json");
+    py::module_ builtins = py::module_::import("builtins");
+    const std::string config_path =
+        ModelConfig::get_instance().model() + "/config.json";
+    py::object config_file = builtins.attr("open")(config_path, "r");
+    d = json.attr("load")(config_file).cast<py::dict>();
+    config_file.attr("close")();
+    d["quantize_type"] = quant_args.quantize_type();
+    d["quant_method"] = quant_args.quant_method();
+    d["quant_group_size"] = quant_args.group_size();
+    d["quant_version"] = quant_args.quant_version();
+  }
   PyDictVisitor visitor(d);
   visit_properties(model_args_, visitor);
   visit_properties(parallel_args, visitor);

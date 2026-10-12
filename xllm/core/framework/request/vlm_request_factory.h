@@ -51,7 +51,7 @@ class Tokenizer;
 class VLMRequestFactory final {
  public:
   VLMRequestFactory(MultimodalProcessorBase* processor,
-                    JinjaChatTemplate* chat_template,
+                    ChatTemplate* chat_template,
                     const Tokenizer* tokenizer,
                     const ModelArgs* model_args,
                     const Options* options,
@@ -88,7 +88,7 @@ class VLMRequestFactory final {
       const OutputCallback& callback);
 
   MultimodalProcessorBase* processor_ = nullptr;
-  JinjaChatTemplate* chat_template_ = nullptr;
+  ChatTemplate* chat_template_ = nullptr;
   const Tokenizer* tokenizer_ = nullptr;
   const ModelArgs* model_args_ = nullptr;
   const Options* options_ = nullptr;

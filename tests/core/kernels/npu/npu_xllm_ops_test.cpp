@@ -289,6 +289,218 @@ class NpuXllmOpsTest : public ::testing::Test {
   }
 };
 
+TEST_F(NpuXllmOpsTest, KimiRecurrentLayerMatchesReference) {
+  py::gil_scoped_acquire gil;
+  py::exec(R"PY(
+import sys
+import torch
+from xllm.python.layers.kda import KimiK3DeltaAttention
+
+torch.npu.set_device(0)
+for lower_bound in (-5.0, -1.0, None):
+    for batch in (1, 2, 4, 8, 16):
+        torch.manual_seed(20261008)
+        heads, dim = 2, 128
+        layer = KimiK3DeltaAttention.__new__(KimiK3DeltaAttention)
+        torch.nn.Module.__init__(layer)
+        layer.local_num_heads = heads
+        layer.scale = dim ** -0.5
+        layer.gate_lower_bound = lower_bound
+        layer.A_log = torch.randn(heads, device="npu:0") * 0.1
+        layer.dt_bias = torch.randn(heads * dim, device="npu:0") * 0.1
+        q, k, v, raw_gate = [
+            torch.randn(1, batch, heads, dim, device="npu:0", dtype=torch.bfloat16)
+            for _ in range(4)
+        ]
+        beta = torch.randn(1, batch, heads, device="npu:0").sigmoid()
+        state = torch.randn(batch + 2, heads, dim, dim, device="npu:0") * 0.03
+        original_state = state.cpu()
+        slots = torch.arange(batch, 0, -1, dtype=torch.int32, device="npu:0")
+        if batch > 1:
+            slots[-1] = -1
+        starts = torch.arange(batch + 1, dtype=torch.int32, device="npu:0")
+        actual = layer._recurrent(
+            q, k, v, raw_gate, beta, state,
+            cu_seqlens=starts, state_indices=slots,
+        )
+        expected = torch.zeros_like(v.cpu())
+        expected_state = original_state.clone()
+        q_cpu, k_cpu = q.cpu().float(), k.cpu().float()
+        q_cpu = q_cpu * torch.rsqrt(q_cpu.square().sum(-1, keepdim=True) + 1e-6)
+        k_cpu = k_cpu * torch.rsqrt(k_cpu.square().sum(-1, keepdim=True) + 1e-6)
+        x = raw_gate.cpu().float() + layer.dt_bias.cpu().view(1, 1, heads, dim)
+        a = layer.A_log.cpu().exp().view(1, 1, heads, 1)
+        if lower_bound is None:
+            gate = -a * torch.nn.functional.softplus(x)
+        else:
+            gate = lower_bound * torch.sigmoid(a * x)
+        for token, slot in enumerate(slots.cpu().tolist()):
+            if slot < 0:
+                continue
+            h = original_state[slot] * gate[0, token].exp().unsqueeze(-2)
+            delta = v.cpu()[0, token].float() - (h * k_cpu[0, token].unsqueeze(-2)).sum(-1)
+            delta = delta * beta.cpu()[0, token].unsqueeze(-1)
+            h = h + delta.unsqueeze(-1) * k_cpu[0, token].unsqueeze(-2)
+            expected[0, token] = (h * (q_cpu[0, token] * layer.scale).unsqueeze(-2)).sum(-1)
+            expected_state[slot] = h
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0.01, atol=0.0002)
+        torch.testing.assert_close(state.cpu(), expected_state, rtol=0.01, atol=0.000002)
+        assert torch.equal(state[0].cpu(), original_state[0])
+        if batch > 1:
+            assert torch.count_nonzero(actual[0, -1]).item() == 0
+        print(
+            f"native KDA batch={batch} gate={lower_bound} "
+            f"output_max_abs={(actual.cpu().float() - expected.float()).abs().max().item():.8g} "
+            f"state_max_abs={(state.cpu() - expected_state).abs().max().item():.8g}",
+            flush=True,
+        )
+assert "vllm_ascend" not in sys.modules
+import os
+comparison_path = os.environ.get("XLLM_KDA_RECURRENT_COMPARISON_PATH")
+if comparison_path:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("recurrent_comparison", comparison_path)
+    comparison = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(comparison)
+    comparison.run()
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, KimiConvolutionAndPrefillMatchesReference) {
+  py::gil_scoped_acquire gil;
+  py::exec(R"PY(
+import torch
+import torch.nn.functional as functional
+from xllm.python.layers.kda import KimiK3DeltaAttention, KimiK3KDAMetadata
+
+torch.npu.set_device(0)
+torch.manual_seed(20261008)
+layer = KimiK3DeltaAttention.__new__(KimiK3DeltaAttention)
+torch.nn.Module.__init__(layer)
+channels, heads, dim = 768, 2, 128
+layer.local_num_heads, layer.scale = heads, dim ** -0.5
+layer.gate_lower_bound = -5.0
+layer.A_log = (torch.randn(heads) * 0.1).to("npu:0")
+layer.dt_bias = (torch.randn(heads * dim) * 0.1).to("npu:0")
+layer.conv_weight_t = (torch.randn(4, channels) * 0.1).bfloat16().to("npu:0")
+state = (torch.randn(6, 3, channels) * 0.1).bfloat16().to("npu:0")
+slots = torch.tensor([1, 3, 0, 4], dtype=torch.int64, device="npu:0")
+for lengths, initial, mode in (
+    ((1, 1, 3, 5), [True, True, False, True], 0),
+    ((1, 1, 1, 1), [True] * 4, 1),
+):
+    starts = [0]
+    for length in lengths:
+        starts.append(starts[-1] + length)
+    data = (torch.randn(sum(lengths), channels) * 0.1).bfloat16().to("npu:0")
+    original_state = state.cpu()
+    expected_state = original_state.clone()
+    expected_output = []
+    for row, slot in enumerate(slots.cpu().tolist()):
+        history = original_state[slot] if initial[row] else torch.zeros_like(original_state[slot])
+        window = torch.cat((history, data.cpu()[starts[row]:starts[row + 1]]))
+        output = functional.conv1d(
+            window.t().unsqueeze(0).float(),
+            layer.conv_weight_t.cpu().t().unsqueeze(1).float(),
+            groups=channels,
+        ).squeeze(0).t()
+        expected_output.append(functional.silu(output).bfloat16())
+        expected_state[slot] = window[-3:]
+    actual = layer._causal_conv1d(
+        data, state,
+        query_start_loc=torch.tensor(starts, dtype=torch.int32, device="npu:0"),
+        cache_indices=slots,
+        initial_state_mode=torch.tensor(initial, device="npu:0") if mode == 0 else None,
+        run_mode=mode,
+    )
+    torch.testing.assert_close(actual.cpu(), torch.cat(expected_output), rtol=0.02, atol=0.0002)
+    torch.testing.assert_close(state.cpu(), expected_state, rtol=0, atol=0)
+
+for tokens in (17, 64, 65, 129):
+    q, k, v, raw_gate = [torch.randn(1, tokens, heads, dim).bfloat16().to("npu:0") for _ in range(4)]
+    beta = torch.randn(1, tokens, heads).sigmoid().to("npu:0")
+    recurrent_state = torch.randn(3, heads, dim, dim, device="npu:0") * 0.01
+    original_state = recurrent_state.cpu()
+    metadata = KimiK3KDAMetadata(
+        query_start_loc=torch.tensor([0, tokens], dtype=torch.int32, device="npu:0"),
+        state_indices=torch.tensor([1], dtype=torch.int64, device="npu:0"),
+        num_decode_seqs=0, num_prefill_seqs=1,
+        has_initial_state=torch.tensor([True], device="npu:0"),
+        prefill_cu_seqlens_host=(0, tokens),
+        prefill_chunk_indices_host=tuple(value for chunk in range((tokens + 63) // 64) for value in (0, chunk)),
+    )
+    actual = layer._prefill(q, k, v, raw_gate, beta, recurrent_state, metadata)
+    q_cpu, k_cpu = q.cpu().float(), k.cpu().float()
+    q_cpu = (q_cpu * torch.rsqrt(q_cpu.square().sum(-1, keepdim=True) + 1e-6)).bfloat16().float()
+    k_cpu = (k_cpu * torch.rsqrt(k_cpu.square().sum(-1, keepdim=True) + 1e-6)).bfloat16().float()
+    x = raw_gate.cpu().float() + layer.dt_bias.cpu().view(1, 1, heads, dim)
+    gate = -5.0 * torch.sigmoid(layer.A_log.cpu().exp().view(1, 1, heads, 1) * x)
+    current = original_state[1].clone()
+    expected = torch.empty_like(v.cpu())
+    for token in range(tokens):
+        current = current * gate[0, token].exp().unsqueeze(-2)
+        delta = (v.cpu()[0, token].float() - (current * k_cpu[0, token].unsqueeze(-2)).sum(-1)) * beta.cpu()[0, token].unsqueeze(-1)
+        current = current + delta.unsqueeze(-1) * k_cpu[0, token].unsqueeze(-2)
+        expected[0, token] = (current * (q_cpu[0, token] * layer.scale).unsqueeze(-2)).sum(-1)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.03, atol=0.003)
+    torch.testing.assert_close(recurrent_state[1].cpu(), current, rtol=0.03, atol=0.003)
+    torch.testing.assert_close(recurrent_state[0].cpu(), original_state[0], rtol=0, atol=0)
+    torch.testing.assert_close(recurrent_state[2].cpu(), original_state[2], rtol=0, atol=0)
+
+import os
+comparison_path = os.environ.get("XLLM_KDA_PREFILL_COMPARISON_PATH")
+if comparison_path:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("prefill_comparison", comparison_path)
+    comparison = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(comparison)
+    comparison.run()
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, KimiRecurrentGraphReplayUsesCurrentStateSlots) {
+  py::gil_scoped_acquire gil;
+  py::exec(R"PY(
+import torch
+from xllm.python.layers.kda import KimiK3DeltaAttention
+
+torch.npu.set_device(0)
+for batch in (1, 4, 16):
+    heads, dim = 2, 128
+    torch.manual_seed(20261008)
+    layer = KimiK3DeltaAttention.__new__(KimiK3DeltaAttention)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_heads, layer.scale = heads, dim ** -0.5
+    layer.gate_lower_bound = -5.0
+    layer.A_log = torch.zeros(heads, device="npu:0")
+    layer.dt_bias = torch.zeros(heads * dim, device="npu:0")
+    q, k, v, gate = [torch.randn(1, batch, heads, dim, device="npu:0").bfloat16() for _ in range(4)]
+    beta = torch.rand(1, batch, heads, device="npu:0")
+    initial_state = torch.randn(batch + 2, heads, dim, dim, device="npu:0") * 0.01
+    state = initial_state.clone()
+    indices = torch.arange(batch, dtype=torch.int32, device="npu:0")
+    starts = torch.arange(batch + 1, dtype=torch.int32, device="npu:0")
+    for _ in range(3):
+        layer._recurrent(q, k, v, gate, beta, state, cu_seqlens=starts, state_indices=indices)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = layer._recurrent(q, k, v, gate, beta, state, cu_seqlens=starts, state_indices=indices)
+    for padding in (False, True, False):
+        current_indices = torch.arange(batch, 0, -1, dtype=torch.int32, device="npu:0")
+        if padding:
+            current_indices[::2] = -1
+        reference_state = initial_state.clone()
+        expected = layer._recurrent(q, k, v, gate, beta, reference_state, cu_seqlens=starts, state_indices=current_indices)
+        state.copy_(initial_state)
+        indices.copy_(current_indices)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
+        torch.testing.assert_close(state.cpu(), reference_state.cpu(), rtol=0, atol=0)
+)PY");
+}
+
 TEST_F(NpuXllmOpsTest, DispatcherRmsNormMatchesReference) {
   py::gil_scoped_acquire gil;
   auto opts =

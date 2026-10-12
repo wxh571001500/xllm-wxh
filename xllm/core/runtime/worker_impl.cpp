@@ -325,6 +325,37 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
   }
   input_params.linear_state_validity_mask =
       build_linear_state_mask(rows.cached_tokens, rows.active_rows);
+#if defined(USE_NPU)
+  // Kimi K3's KDA causal-conv1d prefill reads a per-sequence has_initial_state
+  // flag (1 when a sequence resumes a cached state, else 0) from the
+  // KimiK3KDAMetadata view. coding-main folded query_start_loc into
+  // get_host_linear_state_rows but did not carry this population over, so
+  // restore it here from the same host kv-cache token counts.
+  {
+    std::vector<int64_t> has_initial_state;
+    has_initial_state.reserve(rows.cached_tokens.size());
+    for (int32_t num_tokens : rows.cached_tokens) {
+      has_initial_state.emplace_back(num_tokens > 0 ? 1 : 0);
+    }
+    const int64_t batch_size = rows.active_rows;
+    const int64_t his_size = static_cast<int64_t>(has_initial_state.size());
+    if (his_size > 0) {
+      if (batch_size == his_size) {
+        input_params.parallel.has_initial_state = std::move(has_initial_state);
+      } else if (batch_size % his_size == 0) {
+        const int64_t repeat_count = batch_size / his_size;
+        input_params.parallel.has_initial_state.clear();
+        input_params.parallel.has_initial_state.reserve(batch_size);
+        for (int64_t i = 0; i < his_size; ++i) {
+          for (int64_t r = 0; r < repeat_count; ++r) {
+            input_params.parallel.has_initial_state.push_back(
+                has_initial_state[i]);
+          }
+        }
+      }
+    }
+  }
+#endif
 }
 #endif
 
@@ -540,6 +571,20 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .window_size(std::max(args.window_size(), 1))
       .compress_ratios(args.compress_ratios())
       .kv_source_layer_ids(args.kv_source_layer_ids());
+  // Build a per-layer linear-attention mask from explicit layer_types so models
+  // whose linear layers form an arbitrary set (e.g. Kimi-K3's kda_layers)
+  // dispatch correctly and stay consistent with the layer_types-based capacity
+  // estimation. Left empty for interval-only models, which preserves the legacy
+  // interval-based dispatch path byte-for-byte.
+  if (enable_linear_attention && !args.layer_types().empty()) {
+    std::vector<bool> linear_attention_layers;
+    linear_attention_layers.reserve(num_layers);
+    for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      linear_attention_layers.emplace_back(
+          !is_full_attention_layer(args, layer_id));
+    }
+    create_options.linear_attention_layers(std::move(linear_attention_layers));
+  }
 #if defined(USE_NPU)
   create_options.enable_kv_cache_huge_page_allocator(use_huge_page_allocator);
 #endif

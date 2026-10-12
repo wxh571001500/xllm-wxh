@@ -29,9 +29,11 @@ Executor::Executor(CausalLM* model,
                    const runtime::Options& options) {
   const auto& model_config = ModelConfig::get_instance();
   std::string backend;
-  if (ModelConfig::is_python_model_impl(model_config.model_impl())) {
+  if (options.backend() == "vlm") {
+    backend = "vlm";
+  } else if (ModelConfig::is_python_model_impl(model_config.model_impl())) {
     backend = "python";
-  } else if (options.backend() != "vlm" && options.enable_graph()) {
+  } else if (options.enable_graph()) {
     backend = Platform::type_str();
   } else {
     backend = options.backend();

@@ -347,6 +347,9 @@ def _native_runtime_op(name: str) -> object | None:
         import xllm_runtime
     except ImportError:
         return None
+    available = getattr(xllm_runtime, "native_collectives_available", None)
+    if available is not None and not available():
+        return None
     return getattr(xllm_runtime, name, None)
 
 

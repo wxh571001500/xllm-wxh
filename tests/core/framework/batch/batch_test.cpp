@@ -30,6 +30,7 @@ limitations under the License.
 #include <vector>
 
 #include "batch_input_builder.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/block/block.h"
@@ -267,19 +268,25 @@ class ScopedModelImpl final {
 
 class ScopedPrefillChunkStride final {
  public:
-  explicit ScopedPrefillChunkStride(int32_t chunk_stride)
-      : previous_(SchedulerConfig::get_instance()
-                      .max_tokens_per_chunk_for_prefill()) {
+  explicit ScopedPrefillChunkStride(int32_t chunk_stride,
+                                    int32_t checkpoint_stride = 0)
+      : previous_(
+            SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill()),
+        previous_block_size_(KVCacheConfig::get_instance().block_size()) {
     SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(
         chunk_stride);
+    KVCacheConfig::get_instance().block_size(
+        checkpoint_stride > 0 ? checkpoint_stride : chunk_stride);
   }
 
   ~ScopedPrefillChunkStride() {
     SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(previous_);
+    KVCacheConfig::get_instance().block_size(previous_block_size_);
   }
 
  private:
   int32_t previous_;
+  int32_t previous_block_size_;
 };
 
 class ScopedJsonObjectOutput final {
@@ -2695,6 +2702,37 @@ TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
   ASSERT_EQ(reclaimed.size(), 1u);
   EXPECT_EQ(reclaimed.front().id(), source_id);
   EXPECT_EQ(reclaimed.front().ref_count(), 1u);
+}
+
+TEST(BatchTest, KimiPrefixRestoreUsesKvBlockStrideWithLargerPrefillChunk) {
+  ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/8192);
+  const int32_t block_size = KVCacheConfig::get_instance().block_size();
+  ASSERT_GT(block_size, 0);
+  BlockManager::Options options;
+  options.num_blocks(/*num_blocks=*/6).block_size(block_size);
+  BlockManagerImpl manager(options);
+  std::vector<int32_t> tokens(static_cast<size_t>(block_size) * 2, 42);
+  Sequence sequence = make_basic_sequence(tokens);
+  sequence.add_blocks(BlockType::KV, manager.allocate(2));
+  sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
+  sequence.kv_state().incr_kv_cache_tokens_num(block_size);
+  std::vector<Block> restore_sources = manager.allocate(1);
+  ASSERT_EQ(restore_sources.size(), 1u);
+  const int32_t source_id = restore_sources[0].id();
+  mount_linear_source_for_test(
+      sequence, std::move(restore_sources[0]), manager);
+
+  Batch batch;
+  batch.add(&sequence, /*allowed_max_token=*/block_size);
+  ModelArgs args;
+  args.model_type("kimi_k3");
+  args.layer_types({"linear_attention"});
+  ForwardInput input = batch.prepare_forward_input(
+      /*num_decoding_tokens=*/0, /*min_decoding_bach_size=*/0, args);
+
+  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
+  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids[0], source_id);
+  EXPECT_NE(input.input_params.embedding.linear_state_ids[0], source_id);
 }
 
 TEST(BatchTest, Glm53PrefillPreservesCheckpointReadIds) {
