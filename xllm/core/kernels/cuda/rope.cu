@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,7 @@ limitations under the License.
 #include <torch/all.h>
 
 #include "cuda_ops_api.h"
+#include "device_utils.cuh"
 
 // ref to:
 // https://github.com/vllm-project/vllm/blob/main/csrc/pos_encoding_kernels.cu
@@ -98,7 +99,7 @@ inline __device__ void apply_rotary_embedding(
 }
 
 template <typename scalar_t, bool IS_NEOX>
-__global__ void rotary_embedding_kernel(
+__global__ void XLLM_KERNEL_ATTR(512) rotary_embedding_kernel(
     const int64_t* __restrict__ positions,  // [batch_size, seq_len] or
                                             // [num_tokens]
     scalar_t* __restrict__ query,           // [batch_size, seq_len, num_heads,
@@ -106,10 +107,10 @@ __global__ void rotary_embedding_kernel(
                                    // head_size]
     scalar_t* __restrict__ key,  // nullptr or
                                  // [batch_size, seq_len, num_kv_heads,
-                                 // head_size] or [num_tokens, num_kv_heads,
-                                 // head_size]
-    const scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2, rot_dim //
-                                                 // 2]
+    // head_size] or [num_tokens, num_kv_heads,
+    // head_size]
+    const scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2,
+                                                 // rot_dim // 2]
     const int rot_dim,
     const int64_t query_stride,
     const int64_t key_stride,
@@ -168,9 +169,16 @@ void rotary_embedding(
     torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
     bool is_neox) {
   // num_tokens = batch_size * seq_len
-  int64_t head_size = cos_sin_cache.size(-1);
+  const int positions_ndim = positions.dim();
+  const int query_ndim = query.dim();
+  // For partial rotary models, e.g. MiniMax-M2 with head_dim=128 and
+  // rotary_dim=64, the cache width is the rotary dimension rather than the
+  // physical per-head stride. When query is already shaped as
+  // [*, num_heads, head_size], infer the real head_size from query itself.
+  int64_t head_size = (query_ndim == positions_ndim + 2)
+                          ? query.size(-1)
+                          : cos_sin_cache.size(-1);
   int64_t num_tokens = positions.numel();
-  int positions_ndim = positions.dim();
 
   // Make sure num_tokens dim is consistent across positions, query, and key
   CHECK(positions_ndim == 1 || positions_ndim == 2)
@@ -208,7 +216,6 @@ void rotary_embedding(
   // Determine head stride: for [*, heads, head_size] use stride of last dim;
   // for flat [*, heads*head_size], heads blocks are contiguous of size
   // head_size
-  int query_ndim = query.dim();
   int64_t head_stride =
       (query_ndim == positions_ndim + 2) ? query.stride(-2) : head_size;
 

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -26,8 +26,8 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& /*model_args*/,
                            const ParallelArgs& /*parallel_args*/,
                            const torch::TensorOptions& /*options*/) {
   NOT_IMPLEMENTED_WITH_MSG(
-      "FusedMoE is not supported for this backend. Please use MLU or ILU "
-      "backend for MoE models.");
+      "FusedMoE is not supported for this backend. Please use CUDA, MLU or "
+      "ILU backend for MoE models.");
 }
 
 torch::Tensor FusedMoEImpl::forward_experts(
@@ -35,23 +35,23 @@ torch::Tensor FusedMoEImpl::forward_experts(
     const torch::Tensor& /*router_logits*/,
     bool /*enable_all2all_communication*/) {
   NOT_IMPLEMENTED_WITH_MSG(
-      "FusedMoE is not supported for this backend. Please use MLU or ILU "
-      "backend for MoE models.");
+      "FusedMoE is not supported for this backend. Please use CUDA, MLU or "
+      "ILU backend for MoE models.");
   return torch::Tensor();
 }
 
 torch::Tensor FusedMoEImpl::forward(const torch::Tensor& /*hidden_states*/,
                                     const ModelInputParams& /*input_params*/) {
   NOT_IMPLEMENTED_WITH_MSG(
-      "FusedMoE is not supported for this backend. Please use MLU or ILU "
-      "backend for MoE models.");
+      "FusedMoE is not supported for this backend. Please use CUDA, MLU or "
+      "ILU backend for MoE models.");
   return torch::Tensor();
 }
 
 void FusedMoEImpl::load_state_dict(const StateDict& /*state_dict*/) {
   NOT_IMPLEMENTED_WITH_MSG(
-      "FusedMoE is not supported for this backend. Please use MLU or ILU "
-      "backend for MoE models.");
+      "FusedMoE is not supported for this backend. Please use CUDA, MLU or "
+      "ILU backend for MoE models.");
 }
 
 }  // namespace layer

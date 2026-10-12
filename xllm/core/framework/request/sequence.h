@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,29 +20,39 @@ limitations under the License.
 #include <absl/time/time.h>
 #include <folly/futures/Future.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "core/common/types.h"
+#include "core/framework/multimodal/mm_data.h"
+#include "core/framework/prefix_cache/block_hasher.h"
+#include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/util/slice.h"
 #include "finish_reason.h"
 #include "framework/block/block.h"
 #include "incremental_decoder.h"
-#include "mm_data.h"
 #include "rec_type.h"
 #include "request_output.h"
 #include "sample_slot.h"
 #include "sequence_kv_state.h"
 #include "sequence_logprob_state.h"
 #include "stopping_checker.h"
-#include "util/timer.h"
 
 namespace xllm {
+
+struct ModelArgs;
+
+using OptionalModelArgsRef =
+    std::optional<std::reference_wrapper<const ModelArgs>>;
 
 enum class SequenceOutputType : int8_t {
   TOKENS = 0,
@@ -59,12 +69,20 @@ enum class SequenceStage : int8_t {
   DECODE = 2
 };
 
+struct RequestFailureState final {
+  std::optional<Status> status;
+};
+
 struct SequenceParams {
   // max tokens count in the sequence.
   size_t seq_capacity = 0;
 
   // whether to skip special tokens in the output text. default = true.
   bool skip_special_tokens = true;
+
+  // whether to include stop strings or stop tokens in the output text.
+  // default = false.
+  bool include_stop_str_in_output = false;
 
   // whether to echo the prompt in the output text. default = false.
   bool echo = false;
@@ -85,6 +103,8 @@ struct SequenceParams {
   // enable_schedule_overlap or not. default = false.
   bool enable_schedule_overlap = false;
 
+  bool is_graph_warmup = false;
+
   RecType rec_type = RecType::kNone;
 
   int32_t bos_token_id = 0;
@@ -101,6 +121,11 @@ struct SequenceParams {
   // stopping checker
   // reference from request
   StoppingChecker* stopping_checker;  // not owned
+
+  std::shared_ptr<const JsonObjectGrammar> json_object_grammar;
+  bool json_reasoning_enabled = false;
+  std::shared_ptr<RequestFailureState> request_failure_state;
+  std::shared_ptr<SpeculativeTokenStats> speculative_token_stats;
 };
 
 class Sequence final {
@@ -113,11 +138,26 @@ class Sequence final {
            const SequenceParams& seq_params);
 
   Sequence(const Sequence& other);
+  Sequence(const Sequence& other, size_t index);
 
   // get mm data
-  const MMData& get_mm_data() const { return mm_data_; }
+  const MMData& mm_data() const { return mm_data_; }
+  MMData& mutable_mm_data() { return mm_data_; }
   void set_mrope_position_delta(int val) { mrope_position_delta_ = val; }
   int get_mrope_position_delta() { return mrope_position_delta_; }
+
+  // Full-prompt mRoPE positions cache, see `mrope_positions_`.
+  void set_mrope_positions(const torch::Tensor& positions) {
+    CHECK(!positions.defined() || positions.dim() == 2)
+        << "mrope_positions must be 2-D [3, num_tokens], got dim="
+        << (positions.defined() ? positions.dim() : -1);
+    mrope_positions_ = positions;
+  }
+  const torch::Tensor& mrope_positions() const { return mrope_positions_; }
+  bool has_mrope_positions() const {
+    return mrope_positions_.defined() && mrope_positions_.dim() == 2 &&
+           mrope_positions_.size(1) == static_cast<int64_t>(num_tokens_);
+  }
 
   // get token ids to count map
   const std::unordered_map<int32_t, int32_t>& token_to_count_map() const {
@@ -131,9 +171,10 @@ class Sequence final {
   bool is_prefill_stage() const { return stage() != SequenceStage::DECODE; }
   // get the sequence stage
   SequenceStage stage() const {
-    if (kv_state_.kv_cache_tokens_num() <
+    const size_t cached_tokens = kv_cache_tokens_num();
+    if (cached_tokens <
         std::max(volatile_num_prompt_tokens_, num_prompt_tokens())) {
-      if (kv_state_.kv_cache_tokens_num() > 0) {
+      if (cached_tokens > 0) {
         return SequenceStage::CHUNKED_PREFILL;
       }
       return SequenceStage::PREFILL;
@@ -144,6 +185,7 @@ class Sequence final {
   // whether the new added token is the first token
   bool is_first_token() const { return is_first_token_; }
   std::optional<RemoteToken>& first_token() { return first_token_; }
+
   // get the total number of tokens
   size_t num_tokens() const { return num_tokens_; }
   // get the number of prompt tokens
@@ -166,43 +208,115 @@ class Sequence final {
 
   // get the number of tokens need compute
   size_t num_need_compute_tokens() const {
-    return num_tokens_ - std::max(kv_state_.kv_cache_tokens_num(),
-                                  host_kv_state_.kv_cache_tokens_num());
+    return num_tokens_ - kv_cache_tokens_num();
   }
 
   size_t kv_cache_tokens_num() const {
-    return std::max(kv_state_.kv_cache_tokens_num(),
-                    host_kv_state_.kv_cache_tokens_num());
+    return std::max({kv_state_.kv_cache_tokens_num(),
+                     host_kv_state_.kv_cache_tokens_num(),
+                     effective_restore_tokens_.value_or(0)});
   }
+
+  size_t last_confirmed_cached_tokens_num() const {
+    return last_confirmed_cached_tokens_num_;
+  }
+  void set_last_confirmed_cached_tokens_num(size_t num_tokens) {
+    last_confirmed_cached_tokens_num_ = num_tokens;
+  }
+
+  size_t accepted_length() const { return accepted_length_; }
+  void set_accepted_length(size_t length) { accepted_length_ = length; }
+
+  size_t num_prefix_cache_tokens() const;
 
   // add a new token id to the sequence and update the count
   // the token would be discarded if the sequence is still in prefill stage
   void append_token(const Token& token);
   void append_token(int64_t token_id) { append_token(Token(token_id)); }
   void update_token(size_t index, const Token& token);
+  bool restore_json_object_state(const JsonObjectGrammarSnapshot& snapshot);
   void update_last_step_token(const Token& token, size_t token_offset = 0);
   bool has_new_tokens_generated() const {
-    return num_tokens_ > decoder_.output_offset();
+    return num_tokens_ > stream_output_token_offset_;
   }
 
   // update mm embeddings to the sequence
-  void update_mm_embeddings(const std::vector<torch::Tensor>& mm_embeddings);
+  void update_mm_embeddings(const std::vector<torch::Tensor>& mm_embeddings,
+                            OptionalModelArgsRef model_args = std::nullopt);
   // update embeddings to the sequence
   void update_embeddings(const torch::Tensor& embedding);
-  bool has_embedding_id() const { return embedding_block_.is_valid(); }
-  int32_t get_embedding_id() const { return embedding_block_.id(); }
-  void set_embedding_block(Block embedding_block) {
-    embedding_block_ = std::move(embedding_block);
+  void update_mtp_bootstrap_embedding(const torch::Tensor& embedding);
+  void record_speculative_token_stats(const SpeculativeTokenStats& stats);
+  torch::Tensor get_mtp_bootstrap_embedding() const {
+    return mtp_bootstrap_embedding_;
   }
-  Block reset_embedding_block() { return std::move(embedding_block_); }
-  const std::string& request_id() const { return request_id_; }
+  void clear_mtp_bootstrap_embedding() {
+    mtp_bootstrap_embedding_ = torch::Tensor();
+  }
+
+  int32_t get_embedding_block_id() const {
+    return kv_state_.get_embedding_block_id();
+  }
+
+  // Linear-state (Qwen3.5 GDN) live slot, stored in composite_blocks_ under
+  // BlockType::LINEAR. Drawn from the dedicated LinearStateBlockManager id
+  // space.
+  bool has_linear_state_slot() const {
+    return kv_state_.get_linear_block_id() >= 0;
+  }
+  int32_t get_linear_state_slot_id() const {
+    return kv_state_.get_linear_block_id();
+  }
+
+  int32_t get_recurrent_state_slot_id() const {
+    return get_linear_state_slot_id();
+  }
+
+  // The request id already lives in sequence_params_; don't keep a second
+  // copy per sequence (a heap allocation each for UUID-length ids).
+  const std::string& request_id() const { return sequence_params_.request_id; }
+  std::string sample_sequence_id() const {
+    return sequence_params_.request_id + "#" + std::to_string(index_);
+  }
+
+  bool is_graph_warmup() const { return sequence_params_.is_graph_warmup; }
   // get input embedding
   torch::Tensor get_input_embedding() const { return input_embedding_; }
 
-  void add_kv_blocks(const std::vector<Block>& blocks);
-  void add_host_kv_blocks(const std::vector<Block>& blocks);
-  void add_shared_kv_blocks(std::vector<Block>&& blocks);
-  void add_shared_host_kv_blocks(std::vector<Block>&& blocks);
+  void add_blocks(BlockType type, const std::vector<Block>& blocks);
+  void add_host_blocks(BlockType type, const std::vector<Block>& blocks);
+  void add_shared_host_blocks(BlockType type, std::vector<Block>&& blocks);
+
+  // Precomputed chained block hashes used by the prefix cache. Covers all full
+  // blocks with available token dependencies; reused by match()/insert() so the
+  // hash is computed once per sequence instead of recomputed on every call.
+  // Returns the chain for the stride set by the most recent
+  // update_block_hashes() call.
+  Slice<XXH3Key> block_hashes() const;
+
+  // MTP identity must never include overlap placeholders or unverified tokens.
+  Slice<int32_t> hash_tokens(BlockHasherType hasher_type) const;
+
+  // Extend the per-stride chain for `block_size` to cover any newly completed
+  // full blocks, and select it as the one block_hashes() returns. Cheap (no-op)
+  // when no new full block is available, so it is safe to call before every
+  // match()/cache(). DSV4 admission probes SWA / C4 / C128 back-to-back with
+  // different strides (base / 4*base / 128*base); each stride keeps its own
+  // chain so switching strides no longer discards and rebuilds the whole chain.
+  void update_block_hashes(uint32_t block_size, BlockHasherType hasher_type);
+
+  // Precomputed chained per-chunk hashes for the linear-state checkpoint index.
+  // Separate hash domain from the KV block-hash chains: the stride is one
+  // prefill chunk (a multiple of the KV block size), not a KV block, so a
+  // linear checkpoint is a sparse overlay on the per-block KV cache. Consumed
+  // by the batch builder (save/restore boundaries) and the LINEAR leaf's match
+  // probe.
+  Slice<XXH3Key> linear_state_hashes() const { return linear_state_hashes_; }
+
+  // Extend `linear_state_hashes_` to cover any newly completed full chunks at
+  // the given stride. Cheap (no-op) when no new full chunk is available, so it
+  // is safe to call before every match()/save-boundary check.
+  void update_linear_state_hashes(uint32_t chunk_stride);
 
   // whether the prefill stage has been cached.
   bool if_cache_block_for_prefill() {
@@ -213,10 +327,14 @@ class Sequence final {
   }
 
   FinishReason finish_reason() const { return finish_reason_; }
+  const std::optional<Status>& error_status() const {
+    return sequence_params_.request_failure_state->status;
+  }
   // check finish status, use cached value if not invalidated
   bool finished() const;
   // mark sequence as finished (used by rec model multi-round decoding)
   void finish();
+  void fail(Status status);
 
   // get the output of the sequence until the specified number of tokens,
   // returns nullopt if no delta text and not finished
@@ -234,6 +352,11 @@ class Sequence final {
     return sequence_params_.sampling_param;
   }
 
+  const JsonObjectGrammarState* json_object_state() const {
+    return json_object_state_.has_value() ? &json_object_state_.value()
+                                          : nullptr;
+  }
+
   // get the stopping criteria
   const StoppingChecker* stopping_checker() const {
     return sequence_params_.stopping_checker;
@@ -245,6 +368,14 @@ class Sequence final {
 
   // time between two tokens
   int64_t tbt(const absl::Time& now);
+  int64_t tbt_microseconds(const absl::Time& now);
+
+  // Number of real tokens committed to this sequence since the last tbt/tbt_us
+  // reset. Speculative/MTP steps commit multiple tokens per step, so this is
+  // used to amortize the per-step inter-token latency into a per-token value.
+  size_t generated_tokens_since_latency() const {
+    return generated_tokens_since_latency_;
+  }
 
   void set_wait_time_ms() {
     wait_time_ms_ = static_cast<int32_t>(
@@ -278,7 +409,20 @@ class Sequence final {
 
   KVCacheState& kv_state() { return kv_state_; }
 
+  bool has_any_blocks() const {
+    return kv_state_.has_any_blocks() || host_kv_state_.has_any_blocks();
+  }
+
   KVCacheState& host_kv_state() { return host_kv_state_; }
+  const KVCacheState& host_kv_state() const { return host_kv_state_; }
+
+  void set_host_cache_match(size_t restore_tokens, size_t copy_units);
+  void set_host_cache_restore(size_t restore_tokens, size_t copy_units);
+  void clear_host_cache_match();
+  bool has_host_cache_match() const {
+    return effective_restore_tokens_.has_value();
+  }
+  size_t host_cache_copy_units() const { return host_cache_copy_units_; }
 
   // for generated tokens
   float get_acc_logprob();
@@ -289,15 +433,6 @@ class Sequence final {
       size_t end_idx,
       const Tokenizer& tokenizer,
       std::optional<std::vector<LogProb>>& out_logprobs);
-
-  std::shared_ptr<std::atomic<int32_t>> get_termination_flag() {
-    return termination_flag_;
-  }
-  std::vector<std::shared_ptr<std::atomic<uint32_t>>>* get_prefetch_results() {
-    return &prefetch_results_;
-  }
-
-  bool update_prefetch_result(uint32_t timeout, uint32_t& success_cnt);
 
   void reset();
 
@@ -352,7 +487,7 @@ class Sequence final {
   int32_t beam_width_cached() const { return beam_width_cached_; }
   int32_t total_rounds_cached() const { return total_rounds_cached_; }
 
-  LogprobState* logprob_state() { return logprob_state_.get(); }
+  LogprobState* logprob_state() { return &logprob_state_; }
   void set_estimated_latency(double estimated_latency) {
     estimated_latency_ = estimated_latency;
   }
@@ -404,10 +539,25 @@ class Sequence final {
 
  private:
   void record_first_token(const Token& token);
+  bool try_commit_json_object_token(int32_t token_id, int64_t token_offset);
+
+  // Drop cached block hashes that may be stale after the token at
+  // `token_index` was rewritten (beam search / speculative / disagg PD).
+  void invalidate_block_hashes_from(size_t token_index);
+
+  // Same as above for the linear-state hash domain: drop cached chunk hashes
+  // from the chunk containing `token_index` onward.
+  void invalidate_linear_state_hashes_from(size_t token_index);
+
+  // Number of tokens available to the decoder after applying stop-output
+  // suppression and streaming buffering. The underlying sequence retains all
+  // generated tokens for usage and scheduling accounting.
+  size_t get_decodable_token_count(size_t size) const;
 
   SequenceOutputType output_type();
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
+  torch::Tensor generate_mm_embeddings_tags(const ModelArgs& model_args) const;
 
   void init_onerec_sequence(const std::vector<int32_t>& prompt_token_ids,
                             torch::Tensor input_embedding);
@@ -418,6 +568,7 @@ class Sequence final {
 
   void generate_onerec_output(const Slice<int32_t>& ids,
                               size_t size,
+                              const Tokenizer& tokenizer,
                               SequenceOutput& output) const;
 
   struct OneRecState {
@@ -435,10 +586,27 @@ class Sequence final {
 
   KVCacheState host_kv_state_;
 
-  std::unique_ptr<LogprobState> logprob_state_;
+  std::optional<size_t> effective_restore_tokens_;
+  size_t host_cache_copy_units_ = 0;
+
+  // Real-result cursor used by LINEAR decode rolling. Sequence result commits
+  // update it; builder pre-advancement and overlap placeholders do not.
+  size_t last_confirmed_cached_tokens_num_ = 0;
+
+  // Maximum accepted draft offset in the most recent sample. A regular decode
+  // target occupies offset zero, so it records zero here.
+  size_t accepted_length_ = 0;
+
+  // Held by value: it is always present after construction, so a unique_ptr
+  // only added a heap allocation per sequence and an indirection on the
+  // per-token update_logprob() path.
+  LogprobState logprob_state_;
 
   // latest token generate time
   absl::Time latest_generate_time_;
+
+  // number of real tokens committed since the last tbt() reset
+  size_t generated_tokens_since_latency_ = 0;
 
   // sequence ttft latency
   double time_to_first_token_latency_seconds_ = 0.0;
@@ -454,6 +622,11 @@ class Sequence final {
   // incremental decoder to decode the tokens
   IncrementalDecoder decoder_;
 
+  // All tokens before this offset have been returned in streaming output.
+  // This is independent from the decoder offset because hidden stop tokens
+  // remain present in token_ids and logprobs.
+  size_t stream_output_token_offset_ = 0;
+
   // token ids generated for the sequence
   std::vector<int32_t> tokens_;
 
@@ -462,11 +635,22 @@ class Sequence final {
   MMData mm_data_;
   int mrope_position_delta_ = 0;
 
+  // Full-prompt mRoPE positions [3, num_tokens], generated once on the first
+  // prefill chunk and sliced per chunk afterwards. Cached here so chunked
+  // prefill and prefix-cache hits do not regenerate the whole sequence's
+  // positions on every step. Only valid during the prefill stage; the decode
+  // stage derives positions from mrope_position_delta_ instead.
+  torch::Tensor mrope_positions_;
+
   // mm embedding of the sequence
   std::vector<torch::Tensor> output_mm_embeddings_;
+  torch::Tensor output_mm_embeddings_tags_;
 
   // embeddings of the sequence
   torch::Tensor output_embedding_;
+
+  // temporary PD handoff bootstrap hidden state for first MTP decode.
+  torch::Tensor mtp_bootstrap_embedding_;
 
   // number of tokens in the sequence
   size_t num_tokens_ = 0;
@@ -478,7 +662,32 @@ class Sequence final {
   // the length of the prompt tokens
   size_t num_prompt_tokens_ = 0;
 
+  // Precomputed chained block hashes covering dependency-complete blocks,
+  // keyed by block-size stride. DSV4 admission probes multiple strides (base /
+  // 4*base / 128*base) per tick; each keeps its own chain so a stride switch
+  // extends incrementally instead of discarding and rebuilding. Extended
+  // incrementally; consumed by the prefix cache. std::map node storage is
+  // pointer-stable, so a Slice handed out by block_hashes() survives inserts of
+  // other strides.
+  std::map<uint32_t, std::vector<XXH3Key>> block_hashes_by_stride_;
+
+  // Stride selected by the most recent update_block_hashes() call; keys
+  // block_hashes() into `block_hashes_by_stride_` (0 until first computed).
+  uint32_t hash_block_size_ = 0;
+  BlockHasherType hash_type_ = BlockHasherType::TEXT;
+
+  // Precomputed chained per-chunk hashes for the linear-state checkpoint index
+  // (own hash domain, chunk-strided). Extended incrementally, invalidated on
+  // token rewrite; see linear_state_hashes()/update_linear_state_hashes().
+  std::vector<XXH3Key> linear_state_hashes_;
+
+  // Chunk stride used to compute `linear_state_hashes_` (0 until first
+  // computed).
+  uint32_t linear_hash_stride_ = 0;
+
   std::optional<OneRecState> onerec_state_;
+
+  std::optional<JsonObjectGrammarState> json_object_state_;
 
   // NOTE: MUST FIXME Later
   // record all tokens num in last turn when the request is
@@ -488,9 +697,6 @@ class Sequence final {
   // In the next execution, we should treat these generated tokens as prompts.
   size_t volatile_num_prompt_tokens_ = 0;
 
-  // embedding block that holds the embedding id.
-  Block embedding_block_;
-
   // is the sequence finished
   mutable bool finished_ = false;
 
@@ -499,6 +705,11 @@ class Sequence final {
 
   // the reason why the sequence is finished
   mutable FinishReason finish_reason_ = FinishReason::NONE;
+
+  // Number of trailing tokens that matched the stopping criterion. These
+  // tokens remain in `tokens_` and are omitted from decoded output when
+  // `include_stop_str_in_output` is false.
+  mutable size_t matched_stop_token_count_ = 0;
 
   // is the sequence closed.
   bool closed_ = false;
@@ -524,17 +735,8 @@ class Sequence final {
 
   std::atomic<bool> cancelled_{false};
 
-  // kvcache store copy async result
-  std::shared_ptr<std::atomic<int32_t>> termination_flag_;
-  std::vector<std::shared_ptr<std::atomic<uint32_t>>> prefetch_results_;
-
-  Timer timer_;
-  bool is_timeout_set_ = false;
-
   // whether the last token is handled
   std::atomic<bool> last_token_handled_{false};
-
-  std::string request_id_;
 
   // Multi-round beam search result caching
   int32_t beam_width_cached_ = 0;

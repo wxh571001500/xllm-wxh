@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,15 +25,21 @@ limitations under the License.
 namespace xllm {
 namespace function_call {
 
-DeepSeekV32Detector::DeepSeekV32Detector() : BaseFormatDetector() {
-  bot_token_ = "<｜DSML｜function_calls>";
-  eot_token_ = "</｜DSML｜function_calls>";
+DeepSeekV32Detector::DeepSeekV32Detector()
+    : DeepSeekV32Detector("<｜DSML｜function_calls>",
+                          "</｜DSML｜function_calls>") {}
+
+DeepSeekV32Detector::DeepSeekV32Detector(
+    const std::string& tool_calls_start_token,
+    const std::string& tool_calls_end_token)
+    : BaseFormatDetector() {
+  bot_token_ = tool_calls_start_token;
+  eot_token_ = tool_calls_end_token;
   invoke_end_token_ = "</｜DSML｜invoke>";
 
   // Regex patterns for DeepSeek-V3.2 DSML format
-  function_calls_regex_ = std::regex(
-      "<｜DSML｜function_calls>([\\s\\S]*?)</｜DSML｜function_calls>",
-      std::regex_constants::ECMAScript);
+  function_calls_regex_ = std::regex(bot_token_ + "([\\s\\S]*?)" + eot_token_,
+                                     std::regex_constants::ECMAScript);
   // Note: For streaming, we need to match even without closing tag
   // The third group will be empty if no closing tag is found
   // Use non-greedy match for content, but ensure we match the closing tag if
@@ -63,6 +69,9 @@ DeepSeekV32Detector::DeepSeekV32Detector() : BaseFormatDetector() {
       std::regex_constants::ECMAScript);
   utf8_buffer_.clear();
 }
+
+DeepSeekV4Detector::DeepSeekV4Detector()
+    : DeepSeekV32Detector("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>") {}
 
 std::pair<std::string, std::string> DeepSeekV32Detector::split_incomplete_utf8(
     const std::string& str) const {
@@ -105,8 +114,7 @@ std::pair<std::string, std::string> DeepSeekV32Detector::split_incomplete_utf8(
   return {str.substr(0, start_pos), str.substr(start_pos)};
 }
 
-// Dump parameters to JSON string with sorted keys for stable prefix comparison
-// across streaming chunks (unordered_map iteration order is undefined).
+// Serialize completed parameters in a deterministic key order.
 static std::string params_to_json_sorted(
     const std::unordered_map<std::string, nlohmann::json>& params) {
   std::vector<std::string> keys;
@@ -467,6 +475,9 @@ DeepSeekV32Detector::parse_parameters_from_xml(
         if (param_type == "true") {
           parameters[param_name] = param_value;
         } else {
+          if (param_value.empty()) {
+            return parameters;
+          }
           // Use partial_json_loads for non-string types
           auto [parsed_value, _] = partial_json_loads(param_value, Allow::ALL);
           parameters[param_name] = parsed_value;
@@ -1060,92 +1071,46 @@ StreamingParseResult DeepSeekV32Detector::parse_streaming_increment(
         current_tool_id_ = 0;
         prev_tool_call_arr_.clear();
         streamed_args_for_tool_.clear();
-        streamed_args_for_tool_.push_back("");
         current_tool_name_sent_ = false;
       }
-
-      // Ensure arrays are large enough for current tool
       while (prev_tool_call_arr_.size() <=
              static_cast<size_t>(current_tool_id_)) {
         prev_tool_call_arr_.push_back({});
-      }
-      while (streamed_args_for_tool_.size() <=
-             static_cast<size_t>(current_tool_id_)) {
         streamed_args_for_tool_.push_back("");
       }
 
-      // 1. Send tool name if not sent yet
+      // Send tool name as soon as it is available.
       if (!current_tool_name_sent_) {
         all_calls.push_back(ToolCallItem(current_tool_id_, func_name, ""));
         current_tool_name_sent_ = true;
       }
 
-      // 2. Parse current parameters (partial or complete)
-      auto current_params =
-          parse_parameters_from_xml(invoke_content, !is_tool_end);
-      // Use sorted-key dump so find_common_prefix is stable across chunks
-      std::string current_args_json = params_to_json_sorted(current_params);
-
-      // 3. Calculate and send incremental arguments
-      size_t sent_len = streamed_args_for_tool_[current_tool_id_].length();
-      std::string argument_diff;
-
-      if (is_tool_end) {
-        // If complete, send everything remaining
-        if (sent_len < current_args_json.length()) {
-          argument_diff = current_args_json.substr(sent_len);
-        }
-      } else {
-        // If partial, send stable prefix diff
-        if (prev_tool_call_arr_[current_tool_id_].find("arguments") !=
-            prev_tool_call_arr_[current_tool_id_].end()) {
-          std::string prev_args_json =
-              prev_tool_call_arr_[current_tool_id_]["arguments"];
-
-          if (current_args_json != prev_args_json) {
-            std::string prefix =
-                find_common_prefix(prev_args_json, current_args_json);
-            if (prefix.length() > sent_len) {
-              argument_diff = prefix.substr(sent_len);
-            }
-          }
-        }
-      }
-
-      if (!argument_diff.empty()) {
-        auto [complete_argument_diff, incomplete_tail] =
-            split_incomplete_utf8(argument_diff);
-        (void)incomplete_tail;
-        argument_diff = std::move(complete_argument_diff);
-      }
-
-      if (!argument_diff.empty()) {
-        all_calls.push_back(
-            ToolCallItem(current_tool_id_, std::nullopt, argument_diff));
-        streamed_args_for_tool_[current_tool_id_] += argument_diff;
-      }
-
-      // Update the stored arguments (store as JSON string)
+      // A later parameter can change earlier JSON bytes. Cache the current
+      // snapshot for finish-time fallback, but send arguments only when the
+      // invoke closes.
+      auto params = parse_parameters_from_xml(invoke_content, !is_tool_end);
+      std::string arguments = params_to_json_sorted(params);
       prev_tool_call_arr_[current_tool_id_]["name"] = func_name;
-      prev_tool_call_arr_[current_tool_id_]["arguments"] = current_args_json;
+      prev_tool_call_arr_[current_tool_id_]["arguments"] = arguments;
 
-      // Check if tool call is complete (has closing tag)
-      if (is_tool_end) {
-        // Remove completed invoke and everything before it.
-        // This mirrors ds32_de.py behavior:
-        // self._buffer = current_text[invoke_match.end():]
-        size_t match_length = invoke_match.length();
-        size_t match_end_in_current_text =
-            invoke_match.position() + match_length;
-        buffer_ = current_text.substr(match_end_in_current_text);
-        current_text = buffer_;
-
-        current_tool_id_++;
-        current_tool_name_sent_ = false;
-        continue;
+      if (!is_tool_end) {
+        break;
       }
-      // Incomplete invoke: return streamed calls so far, wait for more chunks
-      break;
+      streamed_args_for_tool_[current_tool_id_] = arguments;
+      all_calls.push_back(
+          ToolCallItem(current_tool_id_, std::nullopt, arguments));
+
+      // Remove completed invoke and everything before it.
+      // This mirrors ds32_de.py behavior:
+      // self._buffer = current_text[invoke_match.end():]
+      size_t match_length = invoke_match.length();
+      size_t match_end_in_current_text = invoke_match.position() + match_length;
+      buffer_ = current_text.substr(match_end_in_current_text);
+      current_text = buffer_;
+
+      current_tool_id_++;
+      current_tool_name_sent_ = false;
+      continue;
     }
 
     // No more invoke blocks found

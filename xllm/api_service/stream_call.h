@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,15 +18,20 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <butil/iobuf.h>
 #include <glog/logging.h>
+#include <google/protobuf/message.h>
 #include <json2pb/pb_to_json.h>
 
 #include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
+#include "anthropic.pb.h"
+#include "api_service/anthropic_json.h"
 #include "api_service/call.h"
 #include "core/common/types.h"
+#include "core/util/verbose_trace_logger.h"
 
 namespace xllm {
 
@@ -40,8 +45,9 @@ class StreamCall : public Call {
              ::google::protobuf::Closure* done,
              Request* request,
              Response* response,
-             bool use_arena = false)
-      : Call(controller),
+             bool use_arena = false,
+             bool is_http_request = false)
+      : Call(controller, request_body_x_request_id(request), is_http_request),
         done_(done),
         request_(request),
         response_(response),
@@ -51,7 +57,8 @@ class StreamCall : public Call {
       pa_ = controller_->CreateProgressiveAttachment();
 
       // Send the first SSE response
-      controller_->http_response().set_content_type("text/event-stream");
+      controller_->http_response().set_content_type(
+          "text/event-stream; charset=utf-8");
       controller_->http_response().set_status_code(200);
       controller_->http_response().SetHeader("Connection", "keep-alive");
       controller_->http_response().SetHeader("Cache-Control", "no-cache");
@@ -59,12 +66,11 @@ class StreamCall : public Call {
       done_->Run();
 
     } else {
-      controller_->http_response().SetHeader("Content-Type",
-                                             "text/javascript; charset=utf-8");
+      controller_->http_response().set_content_type("application/json");
     }
 
     json_options_.bytes_to_base64 = false;
-    json_options_.jsonify_empty_array = true;
+    json_options_.jsonify_empty_array = false;
   }
 
   ~StreamCall() override {
@@ -86,11 +92,24 @@ class StreamCall : public Call {
             response, &json_output, json_options_, &err_msg)) {
       return finish_with_error(StatusCode::UNKNOWN, err_msg);
     }
+    XLLM_VERBOSE_TRACE() << "event=response_serialized x-request-id="
+                         << x_request_id_;
+    return true;
+  }
+
+  // For non-streaming plain-text responses.
+  bool write_text_and_finish(std::string_view text) {
+    controller_->http_response().set_content_type("text/plain; charset=utf-8");
+    controller_->response_attachment().append(text.data(), text.size());
+    XLLM_VERBOSE_TRACE() << "event=response_serialized x-request-id="
+                         << x_request_id_;
     return true;
   }
 
   bool finish_with_error(const StatusCode& code,
                          const std::string& error_message) {
+    XLLM_VERBOSE_TRACE() << "event=request_error x-request-id=" << x_request_id_
+                         << " message=" << error_message;
     if (!stream_) {
       controller_->SetFailed(error_message);
 
@@ -103,21 +122,23 @@ class StreamCall : public Call {
     return true;
   }
 
-  // For stream response
-  bool write(Response& response) {
+  // Writes one SSE event ("data: {json}\n\n"). Stream chunks may use a
+  // different proto type from the non-streaming response. Returns false on
+  // serialization failure or client disconnect.
+  bool write(const google::protobuf::Message& message) {
     io_buf_.clear();
     io_buf_.append("data: ");
     butil::IOBufAsZeroCopyOutputStream json_output(&io_buf_);
     std::string err_msg;
     if (!json2pb::ProtoMessageToJson(
-            response, &json_output, json_options_, &err_msg)) {
+            message, &json_output, json_options_, &err_msg)) {
       LOG(ERROR) << "Failed to convert proto to json: " << err_msg;
       return false;
     }
     io_buf_.append("\n\n");
 
     connection_status_ |= pa_->Write(io_buf_);
-    return true;
+    return connection_status_ == 0;
   }
 
   // For stream response
@@ -126,6 +147,8 @@ class StreamCall : public Call {
     io_buf_.append("data: [DONE]\n\n");
 
     pa_->Write(io_buf_);
+    XLLM_VERBOSE_TRACE() << "event=stream_closed x-request-id="
+                         << x_request_id_;
     return true;
   }
 
@@ -168,15 +191,33 @@ class AnthropicCall : public StreamCall<proto::AnthropicMessagesRequest,
                 ::google::protobuf::Closure* done,
                 proto::AnthropicMessagesRequest* request,
                 proto::AnthropicMessagesResponse* response,
-                bool use_arena = false)
+                bool use_arena = false,
+                bool is_http_request = false)
       : StreamCall<proto::AnthropicMessagesRequest,
                    proto::AnthropicMessagesResponse>(controller,
                                                      done,
                                                      request,
                                                      response,
-                                                     use_arena) {}
+                                                     use_arena,
+                                                     is_http_request) {
+    // Anthropic responses require empty content arrays to remain visible.
+    this->json_options_.jsonify_empty_array = true;
+  }
 
   ~AnthropicCall() {}
+
+  bool write_and_finish(proto::AnthropicMessagesResponse& response) {
+    std::string json;
+    std::string err_msg;
+    if (!api_service::proto_to_anthropic_json(
+            response, this->json_options_, &json, &err_msg)) {
+      return this->finish_with_error(StatusCode::UNKNOWN, err_msg);
+    }
+    this->controller_->response_attachment().append(json);
+    XLLM_VERBOSE_TRACE() << "event=response_serialized x-request-id="
+                         << this->x_request_id_;
+    return true;
+  }
 
   // Write SSE event with Anthropic format: event: <type>\ndata: <json>\n\n
   bool write(const std::string& event_type, const std::string& json_data) {
@@ -198,13 +239,14 @@ class AnthropicCall : public StreamCall<proto::AnthropicMessagesRequest,
     this->io_buf_.append("event: ");
     this->io_buf_.append(event_type);
     this->io_buf_.append("\ndata: ");
-    butil::IOBufAsZeroCopyOutputStream json_output(&this->io_buf_);
+    std::string json;
     std::string err_msg;
-    if (!json2pb::ProtoMessageToJson(
-            message, &json_output, this->json_options_, &err_msg)) {
+    if (!api_service::proto_to_anthropic_json(
+            message, this->json_options_, &json, &err_msg)) {
       LOG(ERROR) << "Failed to convert proto to json: " << err_msg;
       return false;
     }
+    this->io_buf_.append(json);
     this->io_buf_.append("\n\n");
     this->connection_status_ |= this->pa_->Write(this->io_buf_);
     return this->connection_status_ == 0;

@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +20,9 @@ limitations under the License.
 #include <iomanip>
 
 #include "common/global_flags.h"
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
 #include "layers/common/dp_utils.h"
@@ -86,7 +89,9 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
   }
 
   // Deep EP initialization check
-  enable_deep_ep_ = FLAGS_expert_parallel_degree == 2 && ep_size > 1;
+  enable_deep_ep_ =
+      ::xllm::EPLBConfig::get_instance().expert_parallel_degree() == 2 &&
+      ep_size > 1;
   if (enable_deep_ep_) {
     // for now, we only implement the deep ep for decode stage.
     // so we will assume the max_token_num is limited to max_batch_size * (1+K)
@@ -103,16 +108,20 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     torch::ScalarType combine_dtype = options_.dtype().toScalarType();
     int64_t combine_token_size = hidden_size_ * get_dtype_size(combine_dtype);
     // Ensure calculation base is at least ep_size
-    int64_t effective_seqs =
-        std::max((int64_t)FLAGS_max_seqs_per_batch, (int64_t)ep_size);
-    // NOTE: FLAGS_max_seqs_per_batch represents the maximum total batch size,
-    // regardless of the dp size. To ensure robust scheduling and account
-    // for the worst-case scenario, we must guarantee that each rank is capable
-    // of handling the maximum possible number of tokens. Therefore, we define
-    // max_num_tokens_per_rank as the full maximum value, without dividing by
-    // either the rank count or the dp size.
+    int64_t effective_seqs = std::max(
+        (int64_t)::xllm::SchedulerConfig::get_instance().max_seqs_per_batch(),
+        (int64_t)ep_size);
+    // NOTE: ::xllm::SchedulerConfig::get_instance().max_seqs_per_batch()
+    // represents the maximum total batch size, regardless of the dp size. To
+    // ensure robust scheduling and account for the worst-case scenario, we must
+    // guarantee that each rank is capable of handling the maximum possible
+    // number of tokens. Therefore, we define max_num_tokens_per_rank as the
+    // full maximum value, without dividing by either the rank count or the dp
+    // size.
     int64_t max_num_tokens_per_rank =
-        (1 + FLAGS_num_speculative_tokens) * effective_seqs * topk_;
+        (1 +
+         ::xllm::SpeculativeConfig::get_instance().num_speculative_tokens()) *
+        effective_seqs * topk_;
 
     // make sure that all layers share the same deep ep instance
     //  so that the memory footprint is minimized
@@ -464,7 +473,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
                      selected_expert_info,
                      enable_all2all_communication);
 
-  // Communciation Step 1: Dipatch
+  // Communication Step 1: Dipatch
   // intermediate outputs that are used both in dispatch and combine
   torch::Tensor gather_by_rank_index;
   torch::Tensor token_sum;
@@ -599,7 +608,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
     gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
   }
 
-  // Communciation Step 2: Combine
+  // Communication Step 2: Combine
   if (enable_all2all_communication) {
     int64_t num_token_expand = hidden_states_2d.size(0) * topk_;
     // Delegate pack, layout generation and combine to DeepEP
@@ -613,7 +622,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
     // create a wait event for the current stream to finish computation
     auto current_stream = device_.current_stream();
     routed_stream_->wait_stream(*current_stream);
-    // pure communciation kernel: dispatch
+    // pure communication kernel: dispatch
     {
       torch::StreamGuard stream_guard = routed_stream_->set_stream_guard();
       gemm2_out = deep_ep_->combine_step_comm(combine_send_layout,
@@ -674,7 +683,7 @@ torch::Tensor FusedMoEImpl::forward_experts(const torch::Tensor& hidden_states,
     return final_hidden_states;
   }
 
-  // Communciation Step 3: AllReduce for non-all2all communication
+  // Communication Step 3: AllReduce for non-all2all communication
   // shared experts can be parallelized with the final communication step
   // during moe computation.
   auto current_stream = device_.current_stream();
@@ -714,8 +723,8 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
                                     const ModelInputParams& input_params) {
   // we only support all2all communication for decode stage for now
   bool enable_all2all_communication =
-      enable_deep_ep_ && std::all_of(input_params.dp_is_decode.begin(),
-                                     input_params.dp_is_decode.end(),
+      enable_deep_ep_ && std::all_of(input_params.parallel.dp_is_decode.begin(),
+                                     input_params.parallel.dp_is_decode.end(),
                                      [](int32_t val) { return val == 1; });
 
   bool is_dp_ep_parallel =
@@ -730,7 +739,7 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
   if (need_gather_and_slice) {
     input = parallel_state::gather(input,
                                    parallel_args_.dp_local_process_group_,
-                                   input_params.dp_global_token_nums);
+                                   input_params.parallel.dp_global_token_nums);
   }
   // MoE Gate
   auto router_logits = gate_(input);

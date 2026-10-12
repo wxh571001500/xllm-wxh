@@ -1,0 +1,366 @@
+# Copyright 2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""NPU rotary-embedding kernels."""
+
+from __future__ import annotations
+
+import torch
+import torch_npu
+
+
+def has_fused_qk_rotary(head_dim: int) -> bool:
+    """Return whether the fused CANN QK-RoPE op supports this head_dim.
+
+    ``npu_apply_rotary_pos_emb`` supports head_dim 64 and 128 only; this is
+    the single place to update when the CANN support domain changes.
+    """
+    return head_dim in (64, 128)
+
+
+def apply_qk_rotary(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply joint half-layout RoPE to Q/K with shared full-width tables.
+
+    Q/K have shape [tokens, heads, head_dim]; the tables have shape
+    [1, tokens, 1, head_dim] (see :func:`expand_half_rope_table`). Raises
+    ``ValueError`` when the cos/sin width does not match the Q/K head_dim.
+    CANN rounds the fused arithmetic differently from separate BF16
+    multiply/add operations, so model-level parity must be validated before
+    enabling this path. The CANN operator updates Q/K in place, so private
+    contiguous copies preserve the caller's inputs.
+    """
+    head_dim = query.size(-1)
+    if key.size(-1) != head_dim:
+        raise ValueError(f"q head_dim {head_dim} does not match k head_dim {key.size(-1)}")
+    if cosine.size(-1) != head_dim or sine.size(-1) != head_dim:
+        raise ValueError(f"cos/sin table width ({cosine.size(-1)}, {sine.size(-1)}) does not match head_dim {head_dim}")
+    query_out, key_out = torch_npu.npu_apply_rotary_pos_emb(
+        query.clone(memory_format=torch.contiguous_format).unsqueeze(0),
+        key.clone(memory_format=torch.contiguous_format).unsqueeze(0),
+        cosine,
+        sine,
+        layout="BSND",
+        rotary_mode="half",
+    )
+    return query_out.squeeze(0), key_out.squeeze(0)
+
+
+def expand_half_rope_table(half_table: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Duplicate a half-width cos/sin table into the fused-op full-width layout.
+
+    ``half_table`` is ``[num_tokens, head_dim // 2]`` as returned by
+    ``gather_half_rope_cos_sin``; the result is ``[1, num_tokens, 1, head_dim]``.
+    Raises ``ValueError`` when the half width does not match ``head_dim``, so
+    a mismatched rotary cache fails fast instead of silently producing a
+    wrong-width table.
+    """
+    if half_table.dim() != 2 or half_table.size(-1) * 2 != head_dim:
+        raise ValueError(f"half table shape {tuple(half_table.shape)} does not match head_dim {head_dim}")
+    num_tokens = half_table.size(0)
+    return torch.cat((half_table, half_table), dim=-1).view(1, num_tokens, 1, head_dim)
+
+
+def has_split_qkv_rmsnorm_mrope_specialization(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> bool:
+    """Return whether the AOT fused QKV specialization is available."""
+    return torch.ops.xllm_ops.has_split_qkv_rmsnorm_mrope_specialization(
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+    )
+
+
+def build_split_qkv_rmsnorm_mrope_gather_pattern(
+    rope_dim: int,
+    mrope_section: list[int],
+    is_interleaved: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the fused kernel's persistent mRoPE byte-offset table."""
+    return torch.ops.xllm_ops.build_split_qkv_rmsnorm_mrope_gather_pattern(
+        rope_dim,
+        mrope_section,
+        is_interleaved,
+        device,
+    )
+
+
+def split_qkv_rmsnorm_mrope(
+    qkvg: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    gather_pattern: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split Q/G/K/V and apply fused Q/K RMSNorm plus mRoPE."""
+    return torch.ops.xllm_ops.split_qkv_rmsnorm_mrope(
+        qkvg,
+        q_weight,
+        k_weight,
+        cos_sin,
+        gather_pattern,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+    )
+
+
+def fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    *,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    cos: torch.Tensor | None = None,
+    sin: torch.Tensor | None = None,
+    interleaved: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply per-head QK-RMSNorm and RoPE to a packed QKV projection.
+
+    Args:
+        qkv: Packed projection of shape ``[num_tokens, q_size + 2 * kv_size]``.
+        num_heads_q: Query heads on this rank.
+        num_heads_k: Key heads on this rank.
+        num_heads_v: Value heads on this rank; derived from ``qkv`` here.
+        head_dim: Size of one head.
+        eps: RMSNorm epsilon shared by the query and key norms.
+        q_weight: Query RMSNorm weight of shape ``[head_dim]``.
+        k_weight: Key RMSNorm weight of shape ``[head_dim]``.
+        cos_sin_cache: Interleaved cosine/sine table indexed by position.
+        position_ids: Position of every token.
+        cos: Unused on NPU; the kernel reads ``cos_sin_cache`` directly.
+        sin: Unused on NPU; the kernel reads ``cos_sin_cache`` directly.
+        interleaved: Unused on NPU; the kernel always uses the split layout.
+
+    Returns:
+        Query, key and value, each of shape ``[num_tokens, heads * head_dim]``.
+        They may be views into one fused buffer, so a caller must not write
+        into them in place.
+    """
+    del num_heads_v, cos, sin, interleaved
+    from .triton.split_qkv_rmsnorm_rope import (
+        split_qkv_rmsnorm_rope,
+    )
+
+    return split_qkv_rmsnorm_rope(
+        qkv,
+        cos_sin_cache,
+        position_ids,
+        q_weight,
+        k_weight,
+        num_heads_q * head_dim,
+        num_heads_k * head_dim,
+        head_dim,
+        eps,
+    )
+
+
+@torch.library.custom_op("xllm_python::interleaved_rotary_embedding", mutates_args=())
+def interleaved_rotary_embedding(
+    value: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+) -> torch.Tensor:
+    """Apply RoPE to a tensor whose rotary halves are interleaved.
+
+    Args:
+        value: Tensor of shape ``[num_tokens, num_heads, head_dim]``.
+        cosine: Cosine table broadcastable over ``value``.
+        sine: Sine table broadcastable over ``value``.
+
+    Returns:
+        A tensor with the shape and dtype of ``value``.
+    """
+    num_tokens, num_heads, head_dim = value.shape
+    output = torch_npu.npu_interleave_rope(value.view(num_tokens, num_heads, 1, head_dim), cosine, sine)
+    return output.view(num_tokens, num_heads, head_dim)
+
+
+def inplace_partial_rotary_mul(
+    value: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    start: int,
+    end: int,
+) -> None:
+    """Apply interleaved RoPE to one slice of ``value`` in place."""
+    if value.dim() == 2:
+        value_4d = value.unsqueeze(1).unsqueeze(1)
+    elif value.dim() == 3:
+        value_4d = value.unsqueeze(1)
+    else:
+        raise ValueError("inplace_partial_rotary_mul expects a 2D or 3D tensor")
+    torch.ops.xllm_ops.inplace_partial_rotary_mul(
+        value_4d,
+        cosine,
+        sine,
+        "interleave",
+        [start, end],
+    )
+
+
+@interleaved_rotary_embedding.register_fake
+def _interleaved_rotary_embedding_fake(
+    value: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+) -> torch.Tensor:
+    del cosine, sine
+    return torch.empty_like(value)
+
+
+def mrope(
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_dim: int,
+    *,
+    mrope_section: list[int],
+    rotary_mode: str = "half",
+    cache_mode: str = "interleave",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply multi-dimensional RoPE (mRoPE) to query and key tensors.
+
+    Wraps ``torch_npu.npu_mrope``.
+
+    Args:
+        positions: ``[3, num_tokens]`` position ids (time/height/width), dtype int64.
+        q: ``[num_tokens, q_size]`` query tensor.
+        k: ``[num_tokens, kv_size]`` key tensor.
+        cos_sin_cache: ``[max_pos, head_dim]`` cos/sin table.
+        head_dim: Per-head dimension.
+        mrope_section: Section sizes for time/height/width.
+        rotary_mode: Rotation mode (default ``"half"``).
+        cache_mode: Cache layout mode (default ``"interleave"``).
+
+    Returns:
+        Rotated (q, k) with same shapes as inputs.
+    """
+    import torch_npu
+
+    return torch_npu.npu_mrope(
+        positions,
+        q,
+        k,
+        cos_sin_cache,
+        head_dim,
+        mrope_section=list(mrope_section),
+        rotary_mode=rotary_mode,
+        cache_mode=cache_mode,
+    )
+
+
+def vision_rotary_mul(
+    value: torch.Tensor,
+    cos_full: torch.Tensor,
+    sin_full: torch.Tensor,
+) -> torch.Tensor:
+    """Apply RoPE via ``torch_npu.npu_rotary_mul`` (neox/half mode).
+
+    Args:
+        value: ``(total_tokens, num_heads, head_dim)``.
+        cos_full: ``(1, total_tokens, 1, head_dim)``.
+        sin_full: ``(1, total_tokens, 1, head_dim)``.
+
+    Returns:
+        Rotated tensor with same shape as ``value``.
+    """
+    import torch_npu
+
+    return torch_npu.npu_rotary_mul(value.unsqueeze(0).contiguous(), cos_full, sin_full).squeeze(0)
+
+
+def npu_inplace_partial_rotary_mul(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_start_dim: int,
+    rope_head_dim: int,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """In-place partial interleaved RoPE on the ``[rope_start_dim:]`` slice.
+
+    Mirrors C++ ``apply_partial_rope`` (deepseek_sparse_attention.cpp:151-190):
+    x is 3D ``[M, n_head, head_dim]``; cos/sin are 2D ``[M, rope_head_dim]``
+    (per-token, no head dim). Reshaped to 4D for the NPU kernel
+    (``aclnnInplacePartialRotaryMul``, rotary_mode="interleave",
+    partial_slice=[rope_start_dim, rope_start_dim+rope_head_dim] -- a half-open
+    range, NOT [start, length]). Modifies x in place.
+    """
+    x4d = x.unsqueeze(2)  # [M, n_head, 1, head_dim]
+    cos4d = cos.view(cos.size(0), 1, 1, cos.size(1))
+    sin_cache = -sin if inverse else sin
+    sin4d = sin_cache.view(sin.size(0), 1, 1, sin.size(1))
+    torch.ops.xllm_ops.npu_inplace_partial_rotary_mul(
+        x4d,
+        cos4d,
+        sin4d,
+        "interleave",
+        [int(rope_start_dim), int(rope_start_dim + rope_head_dim)],
+    )
+    return x
+
+
+def rope_siso(
+    qk: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_dim: int,
+    is_neox_style: bool = True,
+) -> torch.Tensor:
+    """Apply partial RoPE in place to the first ``rope_dim`` channels."""
+    from .triton.rope_siso import rope_forward_triton_siso
+
+    return rope_forward_triton_siso(
+        qk,
+        cos,
+        sin,
+        rope_dim=rope_dim,
+        is_neox_style=is_neox_style,
+    )
+
+
+__all__ = [
+    "apply_qk_rotary",
+    "build_split_qkv_rmsnorm_mrope_gather_pattern",
+    "fused_qk_norm_rope",
+    "has_split_qkv_rmsnorm_mrope_specialization",
+    "inplace_partial_rotary_mul",
+    "interleaved_rotary_embedding",
+    "mrope",
+    "npu_inplace_partial_rotary_mul",
+    "rope_siso",
+    "split_qkv_rmsnorm_mrope",
+    "vision_rotary_mul",
+]

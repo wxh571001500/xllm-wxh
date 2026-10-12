@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,9 +15,19 @@ limitations under the License.
 
 #include "sequence_kv_state.h"
 
+#include <algorithm>
+#include <limits>
+
 namespace xllm {
 
 namespace {
+// Empty block list returned by read views when a BlockType is absent from the
+// map. Static so the returned Slice / reference stays valid.
+const std::vector<Block>& empty_blocks() {
+  static const std::vector<Block> kEmpty;
+  return kEmpty;
+}
+
 void try_replace_unique_blocks(std::vector<Block>&& matched_shared_blocks,
                                uint32_t* num_owned_shared_blocks,
                                std::vector<Block>* owned_blocks) {
@@ -32,10 +42,6 @@ void try_replace_unique_blocks(std::vector<Block>&& matched_shared_blocks,
 }
 }  // namespace
 
-size_t KVCacheState::shared_kv_blocks_num() const {
-  return num_owned_shared_blocks_;
-}
-
 size_t KVCacheState::kv_cache_tokens_num() const {
   return kv_cache_tokens_num_;
 }
@@ -47,38 +53,188 @@ void KVCacheState::set_kv_cache_tokens_num(size_t num) {
 void KVCacheState::incr_kv_cache_tokens_num(size_t num) {
   CHECK(kv_cache_tokens_num_ + num <= current_max_tokens_capacity());
   kv_cache_tokens_num_ += num;
+  slice_window_pos_ += num;
 }
 
-void KVCacheState::add_kv_blocks(const std::vector<Block>& new_blocks) {
-  blocks_.insert(blocks_.end(), new_blocks.begin(), new_blocks.end());
+void KVCacheState::incr_kv_cache_tokens_num_up_to(size_t new_target) {
+  const size_t capacity = current_max_tokens_capacity();
+  // Drift check: the counter was already advanced past capacity by an earlier
+  // call. Failing here loudly names the producer instead of silently letting
+  // the drift propagate to batch_input_builder's CHECK.
+  CHECK_LE(kv_cache_tokens_num_, capacity)
+      << "kv_cache_tokens_num_ drifted past capacity: " << kv_cache_tokens_num_
+      << " > " << capacity;
+  CHECK_LE(new_target, capacity)
+      << "incr_kv_cache_tokens_num_up_to target above capacity: " << new_target
+      << " > " << capacity;
+  if (new_target > kv_cache_tokens_num_) {
+    const size_t delta = new_target - kv_cache_tokens_num_;
+    kv_cache_tokens_num_ = new_target;
+    slice_window_pos_ += delta;
+  }
 }
 
-void KVCacheState::incr_shared_kv_blocks_num(size_t num) {
-  CHECK(num_owned_shared_blocks_ + num <= num_kv_blocks());
-  num_owned_shared_blocks_ += num;
+Slice<Block> KVCacheState::blocks(BlockType type) const {
+  const auto it = composite_blocks_.find(type);
+  return it == composite_blocks_.end() ? Slice<Block>(empty_blocks())
+                                       : Slice<Block>(it->second);
 }
 
-void KVCacheState::add_shared_kv_blocks(std::vector<Block>&& blocks,
-                                        size_t current_total_num_tokens) {
-  if (blocks.empty()) {
+std::vector<Block>* KVCacheState::mutable_blocks(BlockType type) {
+  return &composite_blocks_[type];
+}
+
+size_t KVCacheState::num_blocks(BlockType type) const {
+  const auto it = composite_blocks_.find(type);
+  return it == composite_blocks_.end() ? 0 : it->second.size();
+}
+
+bool KVCacheState::has_any_blocks() const {
+  // Cache-bearing types only; EMBEDDING is a per-sequence resource block, not
+  // token cache, and must not count toward "the sequence already holds cache".
+  for (const BlockType type : {BlockType::KV,
+                               BlockType::SWA,
+                               BlockType::C1,
+                               BlockType::C2,
+                               BlockType::C4,
+                               BlockType::C128}) {
+    const auto it = composite_blocks_.find(type);
+    if (it != composite_blocks_.end() && !it->second.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<int32_t> KVCacheState::cache_slots(BlockType type,
+                                               int32_t pos_start,
+                                               int32_t pos_end) {
+  const auto it = composite_blocks_.find(type);
+  CHECK(it != composite_blocks_.end() && !it->second.empty())
+      << "no cache blocks available";
+  const std::vector<Block>& bs = it->second;
+
+  std::vector<int32_t> slots;
+  slots.reserve(pos_end - pos_start);
+
+  const size_t block_size = bs[0].size();
+  for (int32_t i = pos_start; i < pos_end; ++i) {
+    const int32_t block_id = bs[i / block_size].id();
+    const int32_t block_offset = i % block_size;
+    slots.push_back(block_id * block_size + block_offset);
+  }
+  return slots;
+}
+
+void KVCacheState::add_blocks(BlockType type,
+                              const std::vector<Block>& new_blocks) {
+  remember_block_size(type, new_blocks);
+  std::vector<Block>& bs = composite_blocks_[type];
+  bs.insert(bs.end(), new_blocks.begin(), new_blocks.end());
+}
+
+void KVCacheState::remember_block_size(BlockType type,
+                                       const std::vector<Block>& blocks) {
+  for (const Block& block : blocks) {
+    if (!block.is_valid()) {
+      continue;
+    }
+    const auto [it, inserted] = block_sizes_.emplace(type, block.size());
+    CHECK(inserted || it->second == block.size())
+        << "block size changed for cache type " << static_cast<int32_t>(type);
     return;
   }
+}
+
+void KVCacheState::incr_shared_blocks_num(BlockType type, size_t num) {
+  uint32_t& shared = num_owned_shared_blocks_[type];
+  CHECK(shared + num <= num_blocks(type));
+  shared += num;
+}
+
+void KVCacheState::set_shared_blocks_num(BlockType type, size_t num) {
+  CHECK_LE(num, num_blocks(type));
+  num_owned_shared_blocks_[type] = static_cast<uint32_t>(num);
+}
+
+void KVCacheState::erase_blocks(BlockType type) {
+  composite_blocks_.erase(type);
+  block_sizes_.erase(type);
+  num_owned_shared_blocks_.erase(type);
+  num_cached_blocks_.erase(type);
+}
+
+std::vector<Block> KVCacheState::take_blocks(BlockType type) {
+  auto it = composite_blocks_.find(type);
+  if (it == composite_blocks_.end()) {
+    num_owned_shared_blocks_.erase(type);
+    num_cached_blocks_.erase(type);
+    block_sizes_.erase(type);
+    return {};
+  }
+  std::vector<Block> blocks = std::move(it->second);
+  composite_blocks_.erase(it);
+  block_sizes_.erase(type);
+  num_owned_shared_blocks_.erase(type);
+  num_cached_blocks_.erase(type);
+  return blocks;
+}
+
+size_t KVCacheState::shared_blocks_num(BlockType type) const {
+  const auto it = num_owned_shared_blocks_.find(type);
+  return it == num_owned_shared_blocks_.end() ? 0 : it->second;
+}
+
+size_t KVCacheState::shared_tokens_num() const {
+  // Shared token count is a sequence-level value: shared_blocks * block_size
+  // is the same across cache-bearing block types by construction (composite
+  // trim keeps every leaf aligned to a common safe_hit). Read it off any type
+  // that carries shared blocks. Use the first VALID block in the vector for
+  // block_size -- vec[0] may be an invalid placeholder in the gap-tolerant
+  // SWA case (last_hit at position K, vec_len = K+1, positions [0..K-1] may
+  // include invalid placeholders), and reading .size() off an invalid Block
+  // returns 0.
+  for (const auto& [type, shared] : num_owned_shared_blocks_) {
+    if (shared == 0) {
+      continue;
+    }
+    const Slice<Block> bs = blocks(type);
+    for (const auto& b : bs) {
+      if (b.is_valid()) {
+        return static_cast<size_t>(shared) * b.size();
+      }
+    }
+  }
+  return 0;
+}
+
+void KVCacheState::add_shared_blocks(BlockType type,
+                                     std::vector<Block>&& shared_blocks,
+                                     size_t current_total_num_tokens) {
+  if (shared_blocks.empty()) {
+    return;
+  }
+  remember_block_size(type, shared_blocks);
+  const size_t matched_blocks = shared_blocks.size();
+  std::vector<Block>& bs = composite_blocks_[type];
+  uint32_t& shared = num_owned_shared_blocks_[type];
   // The number of matched blocks may be fewer than the number of blocks held by
   // the sequence itself. In this case, try to replace the blocks computed by
   // the sequence with blocks from the prefix_cache and release the computed
   // blocks to save kv_cache as much as possible.
-  if (blocks.size() <= blocks_.size()) {
-    try_replace_unique_blocks(
-        std::move(blocks), &num_owned_shared_blocks_, &blocks_);
+  if (shared_blocks.size() <= bs.size()) {
+    try_replace_unique_blocks(std::move(shared_blocks), &shared, &bs);
+    num_cached_blocks_[type] =
+        std::max(num_cached_blocks(type), matched_blocks);
     return;
   }
 
-  blocks_.clear();
-  num_owned_shared_blocks_ = blocks.size();
-  blocks_ = std::move(blocks);
+  bs.clear();
+  shared = shared_blocks.size();
+  bs = std::move(shared_blocks);
 
   // update the kv cache position
-  size_t num_shared_tokens = blocks_.size() * blocks_[0].size();
+  size_t num_shared_tokens = bs.size() * bs[0].size();
   // It is possible that num_shared_tokens == current_total_num_tokens,
   // indicating that the exact same prompt has been received again. In this
   // case, it becomes necessary to adjust the kv cache position to the
@@ -86,51 +242,152 @@ void KVCacheState::add_shared_kv_blocks(std::vector<Block>&& blocks,
   // should be immutable ideally, but it remains safe to regenerate the kv
   // cache in this context, given the utiliztion of the exact same token.
   if (num_shared_tokens == current_total_num_tokens) {
-    size_t block_size = blocks_[0].size();
+    size_t block_size = bs[0].size();
     CHECK_GT(block_size, 0);
     num_shared_tokens =
         ((current_total_num_tokens - 1) / block_size) * block_size;
-    if (num_owned_shared_blocks_ > 0) {
-      num_owned_shared_blocks_--;
-      blocks_.pop_back();
+    if (shared > 0) {
+      shared--;
+      bs.pop_back();
     }
   }
   CHECK_LT(num_shared_tokens, current_total_num_tokens);
+  // `shared` may be one block shorter than the raw match after the
+  // exact-repeat pop above. Only the retained prefix is mounted on this
+  // sequence, so it is also the cache insertion cursor.
+  num_cached_blocks_[type] = shared;
   // update the kv cache position
   kv_cache_tokens_num_ = num_shared_tokens;
 }
 
-size_t KVCacheState::current_max_tokens_capacity() const {
-  if (blocks_.empty()) {
-    return 0;
+void KVCacheState::mount_composite_shared(BlockType type,
+                                          std::vector<Block>&& shared_blocks) {
+  if (shared_blocks.empty()) {
+    return;
   }
-  // all blocks have the same size
-  const size_t block_size = blocks_[0].size();
-  return blocks_.size() * block_size;
+  remember_block_size(type, shared_blocks);
+  std::vector<Block>& bs = composite_blocks_[type];
+  CHECK(bs.empty()) << "mount_composite_shared: existing blocks under type "
+                    << static_cast<int32_t>(type);
+  const size_t count = shared_blocks.size();
+  bs = std::move(shared_blocks);
+  num_owned_shared_blocks_[type] = static_cast<uint32_t>(count);
+  // The probe vector length is the actual matched logical reach for this
+  // state and BlockType. For SWA it may include invalid placeholders before
+  // the deepest hit; insert() uses this as a position cursor, not as a count
+  // of valid physical blocks.
+  num_cached_blocks_[type] = count;
 }
 
-// returns allocated cache blocks
-Slice<Block> KVCacheState::kv_blocks() const { return blocks_; }
+void KVCacheState::replace_composite_blocks(BlockType type,
+                                            std::vector<Block>&& blocks,
+                                            size_t num_shared_blocks,
+                                            size_t cache_publish_cursor) {
+  CHECK_LE(num_shared_blocks, blocks.size());
+  CHECK_LE(cache_publish_cursor, blocks.size());
+  remember_block_size(type, blocks);
+  composite_blocks_[type] = std::move(blocks);
+  num_owned_shared_blocks_[type] = static_cast<uint32_t>(num_shared_blocks);
+  num_cached_blocks_[type] = cache_publish_cursor;
+}
 
-std::vector<Block>* KVCacheState::mutable_kv_blocks() { return &blocks_; }
+size_t KVCacheState::num_cached_blocks(BlockType type) const {
+  const auto it = num_cached_blocks_.find(type);
+  return it == num_cached_blocks_.end() ? 0 : it->second;
+}
 
-// get the number of blocks
-size_t KVCacheState::num_kv_blocks() const { return blocks_.size(); }
+const std::map<BlockType, size_t>& KVCacheState::num_cached_blocks() const {
+  return num_cached_blocks_;
+}
 
-std::vector<int32_t> KVCacheState::kv_cache_slots(int32_t pos_start,
-                                                  int32_t pos_end) {
-  CHECK(!blocks_.empty()) << "no cache blocks available";
+void KVCacheState::set_num_cached_blocks(BlockType type, size_t n) {
+  num_cached_blocks_[type] = n;
+}
 
-  std::vector<int32_t> slots;
-  slots.reserve(pos_end - pos_start);
+void KVCacheState::set_slice_window_size(uint32_t size) {
+  CHECK(size > 0);
+  CHECK(!blocks(BlockType::SWA).empty());
+  slice_window_size_ = size;
+  slice_window_pos_ = 0;
+  slice_window_buffer_ = size;
+}
 
-  const size_t block_size = blocks_[0].size();
-  for (int32_t i = pos_start; i < pos_end; ++i) {
-    const int32_t block_id = blocks_[i / block_size].id();
-    const int32_t block_offset = i % block_size;
-    slots.push_back(block_id * block_size + block_offset);
+void KVCacheState::update_slice_window_pos() {
+  if (slice_window_size_ > 0) {
+    if (slice_window_pos_ >= slice_window_buffer_) {
+      // Preserve the legacy cursor contract for non-composite block managers.
+      // CompositeBlockManager exposes DSA SWA tables as absolute logical
+      // columns instead.
+      slice_window_pos_ = slice_window_pos_ % slice_window_size_;
+    }
   }
-  return slots;
+}
+
+size_t KVCacheState::current_max_tokens_capacity() const {
+  const Slice<Block> kv = blocks(BlockType::KV);
+  if (!kv.empty()) {
+    const auto size_it = block_sizes_.find(BlockType::KV);
+    CHECK(size_it != block_sizes_.end());
+    return kv.size() * size_it->second;
+  }
+  // DSV4: only the compressed incremental groups (C4 / C128, and the V4.1
+  // TOKEN groups C1 / C2) have a linear token capacity. The SWA ring is
+  // excluded on purpose -- its committed tokens keep advancing past
+  // ring_capacity * block_size, so counting it here would make
+  // incr_kv_cache_tokens_num's CHECK fail.
+  size_t capacity = 0;
+  for (const BlockType type :
+       {BlockType::C1, BlockType::C2, BlockType::C4, BlockType::C128}) {
+    const Slice<Block> bs = blocks(type);
+    if (bs.empty()) {
+      continue;
+    }
+    const auto size_it = block_sizes_.find(type);
+    CHECK(size_it != block_sizes_.end());
+    const size_t group_capacity = bs.size() * size_it->second;
+    capacity =
+        capacity == 0 ? group_capacity : std::min(capacity, group_capacity);
+  }
+  return capacity;
+}
+
+std::vector<std::pair<BlockType, const std::vector<Block>*>>
+KVCacheState::multi_block_export_view() const {
+  std::vector<std::pair<BlockType, const std::vector<Block>*>> view;
+  view.reserve(kMultiBlockExportOrder.size());
+  for (const BlockType type : kMultiBlockExportOrder) {
+    const auto it = composite_blocks_.find(type);
+    if (it != composite_blocks_.end() && !it->second.empty()) {
+      view.emplace_back(type, &it->second);
+    }
+  }
+  return view;
+}
+
+bool KVCacheState::has_multi_block_export() const {
+  for (const BlockType type : kMultiBlockExportOrder) {
+    const auto it = composite_blocks_.find(type);
+    if (it != composite_blocks_.end() && !it->second.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int32_t KVCacheState::get_embedding_block_id() const {
+  const auto it = composite_blocks_.find(BlockType::EMBEDDING);
+  if (it == composite_blocks_.end() || it->second.empty() ||
+      !it->second[0].is_valid()) {
+    return -1;
+  }
+  return it->second[0].id();
+}
+
+int32_t KVCacheState::get_linear_block_id() const {
+  const Slice<Block> linear_blocks = blocks(BlockType::LINEAR);
+  return linear_blocks.empty() || !linear_blocks.back().is_valid()
+             ? -1
+             : linear_blocks.back().id();
 }
 
 void KVCacheState::set_transfer_kv_info(TransferKVInfo&& info) {
@@ -141,20 +398,53 @@ std::optional<TransferKVInfo>& KVCacheState::transfer_kv_info() {
   return transfer_kv_info_;
 }
 
+size_t KVCacheState::next_transfer_block_idx() const {
+  return next_transfer_block_idx_;
+}
+
+void KVCacheState::set_next_transfer_block_idx(size_t idx) {
+  next_transfer_block_idx_ = idx;
+}
+
+void KVCacheState::advance_transfer_block_idx(size_t idx) {
+  next_transfer_block_idx_ = std::max(next_transfer_block_idx_, idx);
+}
+
+size_t KVCacheState::next_group_transfer_block_idx(BlockType type) const {
+  const auto it = next_group_transfer_block_idxes_.find(type);
+  return it == next_group_transfer_block_idxes_.end() ? 0 : it->second;
+}
+
+void KVCacheState::advance_group_transfer_block_idx(BlockType type,
+                                                    size_t idx) {
+  size_t& cursor = next_group_transfer_block_idxes_[type];
+  cursor = std::max(cursor, idx);
+}
+
 void KVCacheState::reset() {
   kv_cache_tokens_num_ = 0;
-  num_owned_shared_blocks_ = 0;
-  blocks_.clear();
+  prefix_cache_matched_ = false;
+  num_owned_shared_blocks_.clear();
+  num_cached_blocks_.clear();
+  pushed_local_block_count_ = 0;
+  composite_blocks_.clear();
+  block_sizes_.clear();
+  src_blocks_.clear();
+  need_swap_ = false;
   transfer_kv_info_.reset();
+  next_transfer_block_idx_ = 0;
+  next_group_transfer_block_idxes_.clear();
 }
 
 void KVCacheState::process_beam_search(std::optional<Block> new_block) {
-  blocks_.clear();
-  blocks_ = std::move(src_blocks_);
+  // Beam search only operates on the flat attention KV group.
+  std::vector<Block>& kv = composite_blocks_[BlockType::KV];
+  kv.clear();
+  kv = std::move(src_blocks_);
 
   if (new_block.has_value()) {
-    blocks_.pop_back();
-    blocks_.emplace_back(new_block.value());
+    kv.pop_back();
+    kv.emplace_back(new_block.value());
   }
 }
 

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -47,7 +47,7 @@ struct Options {
   // the number of slots per block, default 128, value must be multiple of 16
   PROPERTY(int32_t, block_size) = 128;
 
-  // 0 means that cache size is caculated by available memory
+  // 0 means that cache size is calculated by available memory
   PROPERTY(int64_t, max_cache_size) = 0;
 
   // maximum memory utilization allowed, default 0.9
@@ -55,6 +55,15 @@ struct Options {
 
   // enable prefix cache
   PROPERTY(bool, enable_prefix_cache) = true;
+
+  // maximum encoder cache size in MB (0 disables encoder cache)
+  PROPERTY(int64_t, max_encoder_cache_size) = 0;
+
+  // maximum processor cache item count (default 256; 0 disables)
+  PROPERTY(int64_t, max_processor_cache_items) = 256;
+
+  // active linear-state slots. 0 derives capacity from the KV cache budget.
+  PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
 
   // number of decoding tokens per sequence
   // in speculative decoding, it is the number of speculative tokens + 1
@@ -64,6 +73,8 @@ struct Options {
   PROPERTY(int32_t, num_speculative_tokens) = 0;
 
   PROPERTY(std::string, speculative_algorithm) = "mtp";
+
+  PROPERTY(std::string, draft_sampling_mode) = "greedy";
 
   PROPERTY(int32_t, speculative_suffix_cache_max_depth) = 64;
 
@@ -77,10 +88,25 @@ struct Options {
 
   PROPERTY(bool, speculative_suffix_use_tree_spec) = false;
 
+  PROPERTY(bool, enable_adaptive_speculative_decode) = false;
+
+  PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
+
   // enable speculative decode
   PROPERTY(bool, enable_speculative_decode) = false;
 
+  PROPERTY(bool, enable_mtp_draft_body_tp1) = false;
+
   PROPERTY(bool, is_draft_engine) = false;
+
+  // Query rows per draft sequence, used for graph sequence-capacity admission
+  // and block-diffusion model geometry. The captured draft graph stays width 1.
+  // 1 means the rows are already one per sequence.
+  PROPERTY(int32_t, draft_graph_query_width) = 1;
+
+  // DFlash2 proposal attention (XFIA) is enabled only for the prelaunch mode:
+  // A3, Python, DP/CP 1, schedule overlap, and the same PD/adaptive limits.
+  PROPERTY(bool, enable_dflash_xfia) = false;
 
   PROPERTY(int32_t, world_size) = 1;
 
@@ -111,14 +137,40 @@ struct Options {
   // Context parallelism size
   PROPERTY(int32_t, cp_size) = 1;
 
+  // tensor parallelism size
+  // Default set as 1
+  PROPERTY(int32_t, tp_size) = 1;
+
+  // sequence parallelism size
+  // Default set as 1
+  PROPERTY(int32_t, sp_size) = 1;
+
+  // classifier-free guidance parallelism size
+  // Default set as 1
+  PROPERTY(int32_t, cfg_size) = 1;
+
+  // vae patch parallelism size
+  // Default set as 1
+  PROPERTY(int32_t, vae_size) = 1;
+
+  // text encoder tensor parallelism size
+  // Default set as 1
+  PROPERTY(int32_t, text_encoder_tp_size) = 1;
+
   // enable enable_schedule_overlap to improve runtime execution efficiency.
   PROPERTY(bool, enable_schedule_overlap) = true;
 
   // enable chunked prefill.
   PROPERTY(bool, enable_chunked_prefill) = true;
 
-  // enable prefill-only sequence parallel.
-  PROPERTY(bool, enable_prefill_sp) = false;
+  // Flash Communication 1 (FC1) sequence-parallel optimization.
+  PROPERTY(bool, enable_flashcomm1) = false;
+
+  PROPERTY(int32_t, flashcomm1_min_prefill_tokens) = 8192;
+
+  PROPERTY(bool, enable_mmrs_fusion) = false;
+
+  PROPERTY(std::string, mmrs_comm_mode) = "aiv";
 
   // enable returning aux_hidden_states in graph executor output.
   PROPERTY(bool, enable_graph_aux_hidden_states) = false;
@@ -145,9 +197,6 @@ struct Options {
   // support `PUSH` and `PULL`
   PROPERTY(std::string, kv_cache_transfer_mode) = "PUSH";
 
-  // device_ip needed in disaggregated prefill and decode execution.
-  PROPERTY(std::optional<std::string>, device_ip);
-
   // transfer_listen_port needed in disaggregated prefill and decode execution.
   PROPERTY(uint16_t, transfer_listen_port) = 26000;
 
@@ -158,9 +207,6 @@ struct Options {
 
   PROPERTY(bool, enable_online_preempt_offline) = true;
 
-  // enable kvcache upload to service.
-  PROPERTY(bool, enable_cache_upload) = false;
-
   // host block factor, e.g. host block num = host_blocks_factor * hbm block num
   PROPERTY(double, host_blocks_factor) = 0.0;
 
@@ -169,6 +215,8 @@ struct Options {
 
   // store transfer protocol.
   PROPERTY(std::string, store_protocol) = "tcp";
+
+  PROPERTY(std::string, store_rdma_devices) = "";
 
   // The address information of the Master (IP:Port for default mode and
   // etcd://IP:Port;IP:Port;...;IP:Port for high availability mode)
@@ -183,7 +231,10 @@ struct Options {
   PROPERTY(std::string, store_local_hostname) = "";
 
   // Prefetch from kvcache store copy batch size
-  PROPERTY(uint32_t, prefetch_bacth_size) = 2;
+  PROPERTY(uint32_t, prefetch_batch_size) = 2;
+
+  // Maximum idle time for a Store prefetch stream. Zero disables the timeout.
+  PROPERTY(uint32_t, prefetch_timeout) = 120000;
 
   // Layer wise H2D copy batchs
   PROPERTY(uint32_t, layers_wise_copy_batchs) = 4;
@@ -194,6 +245,14 @@ struct Options {
 
   // start with offline inference, default is false
   PROPERTY(bool, enable_offline_inference) = false;
+
+  // enable RL sleep/wakeup memory mode (SleepableAllocator). Propagated from
+  // the user-facing Options so that the engine and worker route the offline
+  // sleep()/wake_up() to the VMM-backed allocator instead of xtensor.
+  PROPERTY(bool, enable_sleep_mode) = false;
+
+  // disable per-request statistic logs.
+  PROPERTY(bool, disable_log_stats) = false;
 
   // the path to spawn worker binary
   PROPERTY(std::string, spawn_worker_path) = "";
@@ -217,6 +276,12 @@ struct Options {
 
   // enable CUDA graph/ACL graph for performance optimization
   PROPERTY(bool, enable_graph) = false;
+  // enable graph-mode decode without padding
+  PROPERTY(bool, enable_graph_mode_decode_no_padding) = false;
+  // enable piecewise graph for prefill
+  PROPERTY(bool, enable_prefill_piecewise_graph) = false;
+  // maximum number of tokens for graph execution
+  PROPERTY(int32_t, max_tokens_for_graph_mode) = 2048;
 
   // beam width for beam search
   PROPERTY(int32_t, beam_width) = 128;

@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -75,6 +75,8 @@ class MMChatServiceImpl : public APIServiceImpl<MMChatCall> {
   DISALLOW_COPY_AND_ASSIGN(MMChatServiceImpl);
 
   VLMMaster* master_ = nullptr;
+  const std::string tool_call_parser_format_;
+  const std::string reasoning_parser_format_;
 };
 
 }  // namespace xllm

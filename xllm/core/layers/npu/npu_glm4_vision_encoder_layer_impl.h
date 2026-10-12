@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -32,7 +32,6 @@ limitations under the License.
 #include "atb_speed/log.h"
 #include "atb_speed/utils/model_factory.h"
 #include "core/framework/model/model_args.h"
-#include "core/framework/model/model_input_params.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "loader/glm4_vision_encoder_loader.h"
 #include "nlohmann/json.hpp"
@@ -50,6 +49,8 @@ class NpuGlm4VisionEncoderLayerImpl : public BaseLayer {
 
   ~NpuGlm4VisionEncoderLayerImpl() override = default;
 
+  void merge_loaded_weights() override;
+
   int64_t init_layer() override;
 
   torch::Tensor forward(torch::Tensor& x,
@@ -57,7 +58,6 @@ class NpuGlm4VisionEncoderLayerImpl : public BaseLayer {
                         torch::Tensor& sin_pos,
                         torch::Tensor& cu_seqlen,
                         std::vector<int>& cu_seqlen_vec,
-                        ModelInputParams& input_params,
                         int node_id = 0,
                         aclrtEvent* event = nullptr,
                         std::atomic<bool>* event_flag = nullptr);
@@ -67,7 +67,6 @@ class NpuGlm4VisionEncoderLayerImpl : public BaseLayer {
                                torch::Tensor& sin_pos,
                                torch::Tensor& cu_seqlen,
                                std::vector<int>& cu_seqlen_vec,
-                               ModelInputParams& input_params,
                                bool is_prefill);
 
   void param_from_args(atb_speed::glm::VisionEncoderLayerParam& param,

@@ -1,8 +1,24 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 syntax = "proto3";
 
 option go_package = "jd.com/jd-infer/xllm;xllm";
 package xllm.proto;
 
+import "common.proto";
 import "google/protobuf/struct.proto";
 
 // Anthropic API Protocol Definitions
@@ -41,7 +57,8 @@ message AnthropicStructList {
 }
 
 message AnthropicContentBlock {
-  // Type of content block: "text", "image", "tool_use", "tool_result"
+  // Type of content block: "text", "image", "tool_use", "tool_result",
+  // "thinking", or "redacted_thinking"
   string type = 1;
 
   // Text content (for text type)
@@ -68,6 +85,15 @@ message AnthropicContentBlock {
 
   // Whether tool result is an error (for tool_result type)
   optional bool is_error = 9;
+
+  // Thinking content (for thinking type)
+  optional string thinking = 10;
+
+  // Opaque thinking signature (for thinking type)
+  optional string signature = 11;
+
+  // Redacted thinking data (for redacted_thinking type)
+  optional string data = 12;
 }
 
 message AnthropicContentBlockList {
@@ -103,6 +129,15 @@ message AnthropicToolChoice {
 
   // Name of specific tool (required when type is "tool")
   optional string name = 2;
+}
+
+message AnthropicOutputConfig {
+  optional string effort = 1;
+}
+
+message AnthropicThinkingConfig {
+  string type = 1;
+  optional int32 budget_tokens = 2;
 }
 
 message AnthropicMessagesRequest {
@@ -144,10 +179,30 @@ message AnthropicMessagesRequest {
 
   // Top-P (nucleus) sampling (optional)
   optional float top_p = 13;
+
+  // Whether to ignore the end of sequence token. xLLM extension.
+  optional bool ignore_eos = 14;
+
+  // Fields injected by xllm-service for disaggregated prefill/decode routing.
+  optional string service_request_id = 15;
+  repeated int32 token_ids = 16;
+  Routing routing = 17;
+  optional string source_xservice_addr = 18;
+
+  // request trace headers from client.
+  optional string x_request_id = 19;
+  optional string x_request_time = 20;
+
+  // Reasoning output preference supplied by the Anthropic Messages API.
+  optional AnthropicOutputConfig output_config = 21;
+
+  // Thinking configuration supplied by the Anthropic Messages API.
+  optional AnthropicThinkingConfig thinking = 22;
 }
 
 message AnthropicDelta {
-  // Type of delta: "text_delta" or "input_json_delta"
+  // Type of delta: "text_delta", "input_json_delta", "thinking_delta",
+  // or "signature_delta"
   optional string type = 1;
 
   // Text content (for text_delta)
@@ -161,6 +216,9 @@ message AnthropicDelta {
 
   // Stop sequence that triggered the stop
   optional string stop_sequence = 5;
+
+  // Opaque thinking signature (for signature_delta)
+  optional string signature = 6;
 }
 
 message AnthropicStreamEvent {

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,10 +15,10 @@ limitations under the License.
 
 #include "npu_word_embedding_impl.h"
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
-// DECLARE_string(rank_tablefile);
-DECLARE_string(communication_backend);
+
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/parallel_config.h"
 namespace xllm {
 namespace layer {
 
@@ -30,24 +30,30 @@ void NpuWordEmbeddingImpl::param_from_args(
 
   if (parallel_args.world_size() > 1) {
     if (parallel_args.mapping_data().empty()) {
-      const bool use_local_tp = (dp_size_ > 1) || (cp_size_ > 1);
-      if (use_local_tp) {
-        param.tensorParallelInfo.rank = dp_local_tp_rank_;
-        param.tensorParallelInfo.worldSize = dp_local_tp_size_;
+      // Shard embed on dp-local TP (cp*tp); runs before CP localize.
+      const bool use_cp_unaware_tp = (dp_size_ > 1) || (cp_size_ > 1);
+      const int32_t cp_unaware_tp_size = parallel_args.world_size() / dp_size_;
+      if (use_cp_unaware_tp) {
+        param.tensorParallelInfo.rank =
+            parallel_args.rank() % cp_unaware_tp_size;
+        param.tensorParallelInfo.worldSize = cp_unaware_tp_size;
       } else {
         param.tensorParallelInfo.rank = parallel_args.rank();
         param.tensorParallelInfo.worldSize = parallel_args.world_size();
       }
       const int32_t tp_group_id =
-          use_local_tp ? (parallel_args.rank() / dp_local_tp_size_) : 0;
+          use_cp_unaware_tp ? (parallel_args.rank() / cp_unaware_tp_size) : 0;
       param.tensorParallelInfo.commDomain = std::to_string(tp_group_id);
-      param.tensorParallelInfo.backend = FLAGS_communication_backend;
+      param.tensorParallelInfo.backend =
+          ::xllm::ParallelConfig::get_instance().communication_backend();
     } else {
+      // Use WORD_EMBED_TP (dp-local), not ATTN_TP.
       atb_speed::common::ParallelInfo parallelInfo =
-          parallel_args.mapping().Get(atb_speed::base::ATTN_TP);
+          parallel_args.mapping().Get(atb_speed::base::WORD_EMBED_TP);
       param.tensorParallelInfo.rank = parallelInfo.rank;
       param.tensorParallelInfo.worldSize = parallelInfo.rankIds.size();
-      param.tensorParallelInfo.backend = FLAGS_communication_backend;
+      param.tensorParallelInfo.backend =
+          ::xllm::ParallelConfig::get_instance().communication_backend();
       parallelInfo.InitCommDomain(param.tensorParallelInfo.hcommInfo,
                                   param.tensorParallelInfo.commDomain);
     }
@@ -65,11 +71,12 @@ NpuWordEmbeddingImpl::NpuWordEmbeddingImpl(const ModelContext& context)
   atOutTensors_.resize(1);
   dtype_ = c10::typeMetaToScalarType(options.dtype());
 
-  if (FLAGS_enable_manual_loader) {
-    loader_ = std::make_unique<WordEmbeddingManualLoader>(1, context);
-  } else {
-    loader_ = std::make_unique<WordEmbeddingLoader>(1, context);
-  }
+  loader_ = std::make_unique<WordEmbeddingLoader>(
+      1,
+      context,
+      ::xllm::LoadConfig::get_instance().enable_manual_loader()
+          ? LoadMode::kManual
+          : LoadMode::kEager);
 }
 
 int64_t NpuWordEmbeddingImpl::init_layer() {

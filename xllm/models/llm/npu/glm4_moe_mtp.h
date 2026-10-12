@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include "core/framework/config/scheduler_config.h"
 #include "core/layers/common/rotary_embedding_util.h"
 #include "glm4_moe.h"
 #include "mtp_model_base.h"
@@ -30,7 +31,9 @@ class Glm4MoeMtpModelImpl
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
 
-    int32_t mask_value = FLAGS_enable_chunked_prefill ? -9984 : 1;
+    int32_t mask_value =
+        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill() ? -9984
+                                                                         : 1;
     attn_mask_ = layer::AttentionMask(options.device(),
                                       options.dtype().toScalarType(),
                                       /*mask_value=*/mask_value);
@@ -40,6 +43,19 @@ class Glm4MoeMtpModelImpl
         model_args.max_position_embeddings(),
         model_args.rope_theta(),
         options);
+  }
+
+ protected:
+  void prepare_legacy_expert_array(
+      const torch::Tensor& hidden_states,
+      const ModelInputParams& input_params) override {
+    auto& expert_input = const_cast<ExpertInput&>(input_params.expert);
+    expert_input.expert_array =
+        torch::arange(0,
+                      hidden_states.size(0) * num_experts_per_tok_,
+                      torch::TensorOptions()
+                          .dtype(torch::kInt32)
+                          .device(hidden_states.device()));
   }
 };
 TORCH_MODULE(Glm4MoeMtpModel);

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,13 +46,11 @@ ShmChannel::ShmChannel(int dp_group,
             << " and size: " << options.output_shm_size();
 }
 
-bool ShmChannel::execute_model_with_shm(const RawForwardInput& input,
+bool ShmChannel::execute_model_with_shm(const ForwardInput& input,
                                         RawForwardOutput& raw_output) {
-  // write to shared memory, then wait output.
   if (input_shm_manager_) {
-    int use_shm_ret = input_shm_manager_->raw_input_write(input);
-    if (use_shm_ret < 0) {
-      // fallback
+    bool use_shm_ret = input_shm_manager_->input_write(input);
+    if (!use_shm_ret) {
       enable_shm_ = false;
       LOG(ERROR)
           << "RemoteWorker SharedMemoryManager write failed, fallback to brpc.";
@@ -64,10 +62,9 @@ bool ShmChannel::execute_model_with_shm(const RawForwardInput& input,
 }
 
 void ShmChannel::execute_model_async(
-    const RawForwardInput& input,
+    const ForwardInput& input,
     folly::Promise<std::optional<RawForwardOutput>>& promise) {
   if (enable_shm_) {
-    // write to shared memory, then wait output.
     RawForwardOutput raw_output;
     bool shm_success = execute_model_with_shm(input, raw_output);
     if (shm_success) {

@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,6 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/common/rotary_embedding_util.h"
 #include "llm_model_base.h"
@@ -29,22 +32,31 @@ class OxygenModelImpl : public QWen3ModelImpl {
                               torch::Tensor positions,
                               std::vector<KVCache>& kv_caches,
                               const ModelInputParams& input_params) {
-    bool use_deepstack = input_params.deep_stacks.size() > 0;
+    bool use_deepstack = input_params.multimodal.deep_stacks.size() > 0;
     std::vector<torch::Tensor> deep_stacks;
 
     if (tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
       positions = torch::tensor({0}).to(torch::kInt32).to(tokens.device());
     }
-    auto inputs_embeds = input_params.input_embedding;
+    auto inputs_embeds = input_params.embedding.input_embedding;
     torch::Tensor h;
     if (inputs_embeds.defined()) {
       h = inputs_embeds;
     } else {
       h = npu_embed_tokens_(tokens, 0);
     }
+
+    // Share the interlayer addnorm residual buffer across all decoder layers.
+    torch::Tensor residual;
+    if (::xllm::KernelConfig::get_instance().enable_interlayer_addnorm()) {
+      residual = torch::zeros_like(h, h.options());
+      set_residual(residual);
+    }
+
     if (use_deepstack) {
-      deep_stacks = input_params.deep_stacks;  // [num_deepstack, hidden_size]
+      deep_stacks =
+          input_params.multimodal.deep_stacks;  // [num_deepstack, hidden_size]
     }
     auto target_cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
@@ -74,21 +86,21 @@ class OxygenModelImpl : public QWen3ModelImpl {
 
     torch::Tensor attn_mask;
     // for chunked prefill, generate the attn mask.
-    if (!input_params.batch_forward_type.is_decode()) {
-      if (FLAGS_enable_chunked_prefill) {
-        int max_kv_seq = input_params.kv_max_seq_len;
-        int num_sequences = input_params.num_sequences;
+    if (!input_params.meta.batch_forward_type.is_decode()) {
+      if (::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
+        int max_kv_seq = input_params.meta.kv_max_seq_len;
+        int num_sequences = input_params.meta.num_sequences;
         if (num_sequences > 0) {
           std::vector<torch::Tensor> req_mask_vec;
           req_mask_vec.reserve(num_sequences);
 
           for (int j = 0; j < num_sequences; j++) {
-            auto mask =
-                attn_mask_.gen_append_mask(input_params.q_seq_lens_vec[j],
-                                           input_params.kv_seq_lens_vec[j],
-                                           max_kv_seq,
-                                           cos_pos.dtype().toScalarType(),
-                                           cos_pos.device());
+            auto mask = attn_mask_.gen_append_mask(
+                input_params.attention.host.q_seq_lens[j],
+                input_params.attention.host.kv_seq_lens[j],
+                max_kv_seq,
+                cos_pos.dtype().toScalarType(),
+                cos_pos.device());
             req_mask_vec.emplace_back(mask);
           }
           attn_mask = torch::cat(req_mask_vec, 0);
@@ -105,9 +117,10 @@ class OxygenModelImpl : public QWen3ModelImpl {
       aclrtEvent* event{nullptr};
       std::atomic<bool>* event_flag{nullptr};
 
-      if (input_params.layer_synchronizer != nullptr) {
-        event = input_params.layer_synchronizer->get_event(i);
-        event_flag = input_params.layer_synchronizer->get_event_flag(i);
+      if (input_params.parallel.layer_synchronizer != nullptr) {
+        event = input_params.parallel.layer_synchronizer->get_event(i);
+        event_flag =
+            input_params.parallel.layer_synchronizer->get_event_flag(i);
       }
       if (!input_params.synchronize_layer(i)) {
         return ModelOutput();
@@ -125,8 +138,7 @@ class OxygenModelImpl : public QWen3ModelImpl {
             event_flag);
       if (use_deepstack) {
         if (deep_stacks.size() > 0 && i < deep_stacks.size()) {
-          h = deepstack_process(
-              h, input_params.visual_pos_masks, deep_stacks[i]);
+          h = h + deep_stacks[i];
         }
       }
     }

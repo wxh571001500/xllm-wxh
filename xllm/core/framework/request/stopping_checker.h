@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -36,7 +36,8 @@ class StoppingChecker {
                   const std::vector<std::vector<int32_t>>& stop_sequences);
 
   FinishReason check(const Slice<int32_t>& token_ids,
-                     size_t num_prompt_tokens) const;
+                     size_t num_prompt_tokens,
+                     size_t* matched_stop_token_count = nullptr) const;
 
   inline void set_max_generated_tokens(size_t tokens) {
     max_generated_tokens_ = tokens;
@@ -74,6 +75,8 @@ class StoppingChecker {
   inline std::vector<std::vector<int32_t>>& get_stop_sequences() {
     return stop_sequences_;
   }
+
+  size_t get_max_stop_sequence_token_count() const;
 
  private:
   size_t max_generated_tokens_ = 5120;

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,15 +15,26 @@ limitations under the License.
 
 #pragma once
 
-#include <memory>
-#include <string>
-
-#include "parallel_args.h"
-#include "process_group.h"
+#include "core/framework/parallel_state/collective_communicator_base.h"
 
 namespace xllm {
 
-class CollectiveCommunicator {
+bool can_reuse_tp_group_for_moe(int32_t dp_size,
+                                int32_t tp_size,
+                                int32_t moe_tp_size);
+
+// Selects the communicator that MoE TP collectives use for the given layout.
+// DP1 with an equivalent TP rank set reuses the TP communicator so dense and
+// MoE all-reduces share one resource; every other layout keeps the world
+// process group. Only selects between the two passed pointers and never
+// creates a new communicator.
+ProcessGroup* select_moe_tp_group(ProcessGroup* tp_group,
+                                  ProcessGroup* process_group,
+                                  int32_t dp_size,
+                                  int32_t tp_size,
+                                  int32_t moe_tp_size);
+
+class CollectiveCommunicator : public CollectiveCommunicatorBase {
  public:
   CollectiveCommunicator(int global_rank,
                          int world_size,
@@ -33,23 +44,25 @@ class CollectiveCommunicator {
   ~CollectiveCommunicator() = default;
 
   void create_process_groups(const std::string& master_addr,
-                             const torch::Device& device);
+                             const torch::Device& device) override;
 
   // init communicator and return parallel args.
-  const ParallelArgs* parallel_args();
+  const ParallelArgs* parallel_args() override;
 
  private:
   std::unique_ptr<ParallelArgs> parallel_args_;
   std::unique_ptr<ProcessGroup> process_group_;
   std::unique_ptr<ProcessGroup> dp_local_process_group_;
   std::unique_ptr<ProcessGroup> tp_group_;
+  std::unique_ptr<ProcessGroup> encoder_dp_group_;
   std::unique_ptr<ProcessGroup> single_rank_group_;
-  // Reserved owner for a future standalone SP group. The current code path
-  // aliases ParallelArgs::sp_group_ to tp_group_ instead of constructing a
-  // separate communicator, so this stays empty for now.
-  std::unique_ptr<ProcessGroup> sp_group_;
+  // Owns a standalone CP ProcessGroup for orthogonal model-side CP.
+  std::unique_ptr<ProcessGroup> cp_group_;
+  std::unique_ptr<ProcessGroup> dcp_group_;
   std::unique_ptr<ProcessGroup> moe_tp_group_;
   std::unique_ptr<ProcessGroup> moe_ep_group_;
+  std::unique_ptr<ProcessGroup> mc2_group_;
+  std::unique_ptr<ProcessGroup> eplb_group_;
 };
 
 }  // namespace xllm

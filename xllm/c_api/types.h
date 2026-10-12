@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,6 +27,9 @@ extern "C" {
 // Maximum length for meta string fields (includes '\0' terminator)
 #define XLLM_META_STRING_FIELD_MAX_LEN 128
 
+// Major version of the public C ABI. A mismatch requires recompilation.
+#define XLLM_C_ABI_VERSION_MAJOR 1
+
 // Export Macro Definition
 #ifndef XLLM_CAPI_EXPORT
 #define XLLM_CAPI_EXPORT __attribute__((visibility("default")))
@@ -43,8 +46,8 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   /** Whether to enable chunked prefill for inference */
   bool enable_chunked_prefill;
 
-  /** Whether to enable prefill-only sequence parallel */
-  bool enable_prefill_sp;
+  /** Context parallel size. Backend and model support is required. */
+  uint32_t cp_size;
 
   /** Whether to enable prefix cache optimization */
   bool enable_prefix_cache;
@@ -60,6 +63,30 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
 
   /** Whether to enable shared memory for model execution */
   bool enable_shm;
+
+  /** Whether to enable graph execution for REC */
+  bool enable_graph;
+
+  /** Whether to enable REC fast sampler */
+  bool enable_rec_fast_sampler;
+
+  /** Whether to enable prefill piecewise graph for REC */
+  bool enable_prefill_piecewise_graph;
+
+  /** Whether to enable xattention one-stage execution for REC */
+  bool enable_xattention_one_stage;
+
+  /** Whether to enable graph-mode decode without padding for REC */
+  bool enable_graph_mode_decode_no_padding;
+
+  /** Whether to enable block copy kernel */
+  bool enable_block_copy_kernel;
+
+  /** Whether to keep REC top-k outputs sorted */
+  bool enable_topk_sorted;
+
+  /** Whether to enable rec prefill only */
+  bool enable_rec_prefill_only;
 
   /** KVCache transfer listen port */
   uint32_t transfer_listen_port;
@@ -115,6 +142,15 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   /** Maximum GPU memory utilization ratio for model inference */
   float max_memory_utilization;
 
+  /** Maximum REC worker pipeline concurrency */
+  uint32_t rec_worker_max_concurrency;
+
+  /** FlashInfer attention workspace buffer size in bytes. */
+  uint32_t flashinfer_workspace_buffer_size;
+
+  /** Maximum number of requests in the request queue */
+  uint32_t request_queue_size;
+
   /** Model task type (generate/embed) */
   char task[XLLM_META_STRING_FIELD_MAX_LEN];
 
@@ -123,9 +159,6 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
 
   /** Instance role (DEFAULT/PREFILL/DECODE/MIX) */
   char instance_role[XLLM_META_STRING_FIELD_MAX_LEN];
-
-  /** Device IP address for NPU communication */
-  char device_ip[XLLM_META_STRING_FIELD_MAX_LEN];
 
   /** Master address for multi-node distributed serving (e.g. 10.18.1.1:9999) */
   char master_node_addr[XLLM_META_STRING_FIELD_MAX_LEN];
@@ -145,11 +178,13 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   /** Draft hf model path (empty string = no draft model) */
   char draft_model[XLLM_META_STRING_FIELD_MAX_LEN];
 
-  /**
-   * Devices to run the draft model on (e.g. npu:0, npu:0,npu:1).
-   * Empty string = use the same devices as main model
-   */
-  char draft_devices[XLLM_META_STRING_FIELD_MAX_LEN];
+  // CPU affinity settings, format be like:
+  // 1,2,3
+  // meaning ith thread attach to logical processor 1,2,3
+  // or
+  // 1-8
+  // meaning ith thread will be attached to first 8 logical processors
+  char cpu_affinity[XLLM_META_STRING_FIELD_MAX_LEN];
 } XLLM_InitLLMOptions;
 
 /**
@@ -199,6 +234,9 @@ typedef struct XLLM_CAPI_EXPORT XLLM_RequestParams {
 
   /** Beam search width (0 = disable beam search) */
   uint32_t beam_width;
+
+  /** Final number of beam search results to return (0 = use beam_width) */
+  uint32_t num_return_sequences;
 
   /** Number of top log probabilities to return */
   int64_t top_logprobs;
@@ -261,6 +299,9 @@ typedef struct XLLM_CAPI_EXPORT XLLM_Usage {
 
   /** Total tokens used (prompt + completion) */
   int32_t total_tokens;
+
+  /** Number of prompt tokens served from prefix cache */
+  int32_t cached_tokens;
 } XLLM_Usage;
 
 /**
@@ -323,6 +364,37 @@ typedef struct XLLM_CAPI_EXPORT XLLM_Choices {
   size_t entries_size;
 } XLLM_Choices;
 
+/**
+ * @brief REC/OneRec specific output extension aligned by choice index
+ */
+typedef struct XLLM_CAPI_EXPORT XLLM_RecOutput {
+  /** Choice index this REC extension belongs to */
+  uint32_t index;
+
+  /** Selected REC item ids for this choice */
+  int64_t* item_ids;
+
+  /** Number of item ids in the item_ids array */
+  size_t item_ids_size;
+
+  /** Token-aligned REC/OneRec logprobs for this choice */
+  float* rec_token_logprobs;
+
+  /** Number of entries in rec_token_logprobs */
+  size_t rec_token_logprobs_size;
+} XLLM_RecOutput;
+
+/**
+ * @brief List of REC/OneRec specific output extensions
+ */
+typedef struct XLLM_CAPI_EXPORT XLLM_RecOutputs {
+  /** Pointer to array of REC output entries */
+  XLLM_RecOutput* entries;
+
+  /** Number of entries in the REC output array */
+  size_t entries_size;
+} XLLM_RecOutputs;
+
 #define XLLM_ERROR_INFO_MAX_LEN 512
 
 /**
@@ -352,6 +424,9 @@ typedef struct XLLM_CAPI_EXPORT XLLM_Response {
 
   /** Token usage statistics for the request */
   XLLM_Usage usage;
+
+  /** REC/OneRec specific response extensions */
+  XLLM_RecOutputs rec_outputs;
 } XLLM_Response;
 
 /**

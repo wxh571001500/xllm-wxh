@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,10 @@ limitations under the License.
 #include "qwen3_next_hybrid_decoder_layer_base.h"
 
 #include <algorithm>
+#include <optional>
+#include <tuple>
+
+#include "common/flash_comm1_context.h"
 
 namespace xllm {
 namespace layer {
@@ -106,32 +110,49 @@ void Qwen3HybridDecoderLayerImplBase::verify_loaded_weights(
 
 torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
     torch::Tensor& x,
+    std::optional<torch::Tensor>& residual,
     torch::Tensor& positions,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
-    const ModelInputParams& input_params) {
+    const ModelInputParams& input_params,
+    const torch::Tensor& mrope_cos_sin) {
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
   // Pre-attention norm
-  torch::Tensor residual = x;
-  x = input_norm_(x);
+  if (!residual.has_value()) {
+    residual = x;
+    x = std::get<0>(input_norm_->forward(x));
+  } else {
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx) &&
+        residual.value().size(0) != x.size(0)) {
+      residual = maybe_shard_residual(residual.value(), *fc1_ctx);
+    }
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      CHECK_EQ(residual.value().size(0), x.size(0))
+          << "FC1 input residual and hidden states must share the same "
+          << "padded local sequence layout.";
+    }
+    std::tie(x, residual) = input_norm_->forward(x, residual);
+  }
 
   // Attention
   if (attention_) {
-    x = attention_->forward(positions, x, attn_metadata, kv_cache);
+    x = attention_->forward(
+        positions, x, attn_metadata, kv_cache, mrope_cos_sin);
   } else {
     x = linear_attention_->forward(x, attn_metadata, kv_cache, input_params);
   }
 
-  auto orig_dtype = x.dtype();
-  if (orig_dtype == torch::kBFloat16) {
-    x = x.to(torch::kFloat32);
-    residual = residual.to(torch::kFloat32);
-  }
-  x = x + residual;
-
   // Post-attention norm
-  residual = x;
-  x = x.to(orig_dtype);
-  x = post_norm_(x);
+  // Ensure the residual layout matches the attention output before post_norm.
+  if (fc1_ctx && is_sequence_sharded(*fc1_ctx) && residual.has_value() &&
+      residual.value().size(0) != x.size(0)) {
+    residual = maybe_shard_residual(residual.value(), *fc1_ctx);
+    CHECK_EQ(residual.value().size(0), x.size(0))
+        << "FC1 post-attention residual and hidden states must share the same "
+        << "padded local sequence layout.";
+  }
+
+  std::tie(x, residual) = post_norm_->forward(x, residual);
 
   // MLP forward
   if (moe_mlp_) {
@@ -140,14 +161,15 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
     x = mlp_(x);
   }
 
-  orig_dtype = x.dtype();
-  if (orig_dtype == torch::kBFloat16) {
-    x = x.to(torch::kFloat32);
-    residual = residual.to(torch::kFloat32);
-  }
-  x = x + residual;
-  x = x.to(orig_dtype);
   return x;
+}
+
+torch::Tensor Qwen3HybridDecoderLayerImplBase::build_mrope_cos_sin(
+    const torch::Tensor& positions) const {
+  if (attention_) {
+    return attention_->build_mrope_cos_sin(positions);
+  }
+  return {};
 }
 
 }  // namespace layer

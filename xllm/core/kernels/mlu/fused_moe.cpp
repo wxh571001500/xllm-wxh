@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -48,6 +48,31 @@ std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(
                                   e_score_correction_bias,
                                   reduce_weight,
                                   expert_id);
+  return std::make_tuple(reduce_weight, expert_id);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> moe_softplus_topk(
+    const torch::Tensor& input,
+    int64_t topk,
+    const std::optional<torch::Tensor>& input_ids,
+    const std::optional<torch::Tensor>& tid2eid,
+    const std::optional<torch::Tensor>& bias,
+    float route_scale) {
+  std::vector<int64_t> out_shape = input.sizes().vec();
+  out_shape.pop_back();
+  out_shape.push_back(topk);
+  auto reduce_weight = torch::empty(
+      out_shape, torch::dtype(torch::kFloat).device(input.device()));
+  auto expert_id = torch::empty(
+      out_shape, torch::dtype(torch::kInt32).device(input.device()));
+  tmo::torch_api::moe_softplus_topk(input,
+                                    input_ids,
+                                    tid2eid,
+                                    bias,
+                                    topk,
+                                    route_scale,
+                                    reduce_weight,
+                                    expert_id);
   return std::make_tuple(reduce_weight, expert_id);
 }
 

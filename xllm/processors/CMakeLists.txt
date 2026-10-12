@@ -1,8 +1,23 @@
 include(cc_library)
-include(cc_test)
+
+cc_library(
+  NAME
+    processor_cache
+  HDRS
+    processor_cache.h
+  SRCS
+    processor_cache.cpp
+  DEPS
+    :common
+    :util
+    glog::glog
+    torch
+)
 
 # Define the base dependencies
 set(BASE_DEPS
+  :multimodal
+  :processor_cache
   :common
   :kv_cache
   :prefix_cache
@@ -19,20 +34,60 @@ cc_library(
   NAME 
     processors
   HDRS
+    transforms.h
+    audio_utils.h
+    cacheable_multimodal_processor.h
+    multimodal_processor.h
+    audio_processor.h
     image_processor.h
+    prompt_processor.h
     clip_image_processor.h
-    minicpmv_image_processor.h
-    qwen2_vl_image_processor.h
+    clip_prompt_processor.h
     glm4v_image_processor.h
-    pywarpper_image_processor.h
-    input_processor.h
+    joyai_asr_audio_processor.h
+    joyai_asr_prompt_processor.h
+    kimi25_image_processor.h
+    glm4v_prompt_processor.h
+    glm4v_video_processor.h
+    minicpmv_image_processor.h
+    minicpmv_prompt_processor.h
+    mistral3_image_processor.h
+    mistral3_prompt_processor.h
+    qwen2_vl_prompt_processor.h
+    qwen2_vl_image_processor.h
+    qwen2_vl_video_processor.h
+    qwen3_omni_video_processor.h
+    qwen3_omni_image_processor.h
+    qwen3_vl_prompt_processor.h
+    qwen3_vl_video_processor.h
+    qwen3_omni_audio_processor.h
+    qwen3_omni_prompt_processor.h
+    video_processor.h
   SRCS
-    image_processor.cpp
+    transforms.cpp
+    cacheable_multimodal_processor.cpp
+    multimodal_processor.cpp
     clip_image_processor.cpp
-    minicpmv_image_processor.cpp
-    qwen2_vl_image_processor.cpp
+    clip_prompt_processor.cpp
     glm4v_image_processor.cpp
-    pywarpper_image_processor.cpp
+    joyai_asr_audio_processor.cpp
+    joyai_asr_prompt_processor.cpp
+    kimi25_image_processor.cpp
+    glm4v_prompt_processor.cpp
+    glm4v_video_processor.cpp
+    minicpmv_image_processor.cpp
+    minicpmv_prompt_processor.cpp
+    mistral3_image_processor.cpp
+    mistral3_prompt_processor.cpp
+    qwen2_vl_prompt_processor.cpp
+    qwen2_vl_image_processor.cpp
+    qwen2_vl_video_processor.cpp
+    qwen3_omni_video_processor.cpp
+    qwen3_omni_image_processor.cpp
+    qwen3_vl_prompt_processor.cpp
+    qwen3_vl_video_processor.cpp
+    qwen3_omni_audio_processor.cpp
+    qwen3_omni_prompt_processor.cpp
   DEPS
     ${BASE_DEPS}
 )

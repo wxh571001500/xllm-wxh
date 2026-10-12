@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,12 +16,17 @@ limitations under the License.
 
 #include "request_params.h"
 
-#include <google/protobuf/util/json_util.h>
+#include <type_traits>
 
 #include "core/common/global_flags.h"
 #include "core/common/instance_name.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/service_config.h"
 #include "core/util/uuid.h"
 #include "request.h"
+// Pulls in RequestSamplingParam and SchedulerParam definitions for the
+// projection helpers below.
+#include "request_state.h"
 
 namespace xllm {
 namespace {
@@ -51,6 +56,17 @@ std::string generate_anthropic_chat_request_id() {
   return "anthropiccmpl-" + InstanceName::name()->get_name_hash() + "-" +
          short_uuid.random();
 }
+
+void apply_beam_search_logprobs_default(
+    RequestParams& params,
+    bool probability_params_explicitly_set) {
+  if (params.beam_width > 1 && !probability_params_explicitly_set) {
+    params.logprobs = true;
+    params.top_logprobs = static_cast<int64_t>(params.beam_width);
+  }
+}
+
+nlohmann::json proto_struct_to_json(const google::protobuf::Struct& pb_struct);
 
 // Handle tool_choice conversion from Anthropic format to internal format
 std::string handle_tool_choice(
@@ -101,10 +117,9 @@ std::vector<JsonTool> handle_tools(
 
     // Convert input_schema to JSON
     if (tool.has_input_schema()) {
-      std::string json_str;
-      google::protobuf::util::MessageToJsonString(tool.input_schema(),
-                                                  &json_str);
-      json_tool.function.parameters = nlohmann::json::parse(json_str);
+      json_tool.function.parameters = proto_struct_to_json(tool.input_schema());
+    } else {
+      json_tool.function.parameters = nlohmann::json::object();
     }
 
     tools.push_back(std::move(json_tool));
@@ -199,6 +214,9 @@ RequestParams::RequestParams(const proto::CompletionRequest& request,
   if (request.has_skip_special_tokens()) {
     skip_special_tokens = request.skip_special_tokens();
   }
+  if (request.has_include_stop_str_in_output()) {
+    include_stop_str_in_output = request.include_stop_str_in_output();
+  }
   if (request.has_ignore_eos()) {
     ignore_eos = request.ignore_eos();
   }
@@ -222,6 +240,11 @@ RequestParams::RequestParams(const proto::CompletionRequest& request,
   if (request.has_beam_width()) {
     beam_width = request.beam_width();
   }
+  if (request.has_num_return_sequences()) {
+    num_return_sequences = request.num_return_sequences();
+  }
+  apply_beam_search_logprobs_default(
+      *this, /*probability_params_explicitly_set=*/request.has_logprobs());
   if (request.has_add_special_tokens()) {
     add_special_tokens = request.add_special_tokens();
   } else {
@@ -303,6 +326,20 @@ std::vector<xllm::JsonTool> parse_tools_from_proto(
 
 template <typename ChatRequest>
 void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
+  if constexpr (std::is_same_v<ChatRequest, proto::ChatRequest>) {
+    if (request.has_response_format()) {
+      const std::string& type = request.response_format().type();
+      if (type == "json_object") {
+        if (ServiceConfig::get_instance().enable_json_object_output()) {
+          params.response_format = ResponseFormatType::JSON_OBJECT;
+        }
+      } else {
+        params.response_format_error =
+            "Unsupported response_format.type: " + type +
+            "; only json_object is supported";
+      }
+    }
+  }
   if (request.has_request_id()) {
     params.request_id = request.request_id();
   }
@@ -378,6 +415,9 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
   if (request.has_skip_special_tokens()) {
     params.skip_special_tokens = request.skip_special_tokens();
   }
+  if (request.has_include_stop_str_in_output()) {
+    params.include_stop_str_in_output = request.include_stop_str_in_output();
+  }
   if (request.has_ignore_eos()) {
     params.ignore_eos = request.ignore_eos();
   }
@@ -414,6 +454,13 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
   if (request.has_beam_width()) {
     params.beam_width = request.beam_width();
   }
+  if (request.has_num_return_sequences()) {
+    params.num_return_sequences = request.num_return_sequences();
+  }
+  apply_beam_search_logprobs_default(
+      params,
+      /*probability_params_explicitly_set=*/
+      request.has_logprobs() || request.has_top_logprobs());
 
   if (request.has_add_special_tokens()) {
     params.add_special_tokens = request.add_special_tokens();
@@ -475,6 +522,7 @@ RequestParams::RequestParams(const proto::EmbeddingRequest& request,
 RequestParams::RequestParams(const proto::MMEmbeddingRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
+  request_id = generate_embedding_request_id();
   if (request.has_service_request_id()) {
     service_request_id = request.service_request_id();
   }
@@ -496,7 +544,7 @@ RequestParams::RequestParams(const proto::RerankRequest& request,
   x_request_time = x_rtime;
   max_tokens = 1;
   streaming = false;
-  if (FLAGS_enable_qwen3_reranker) {
+  if (::xllm::ModelConfig::get_instance().enable_qwen3_reranker()) {
     logprobs = true;
   } else {
     is_embeddings = true;
@@ -509,7 +557,19 @@ RequestParams::RequestParams(const proto::AnthropicMessagesRequest& request,
   request_id = generate_anthropic_chat_request_id();
   x_request_id = x_rid;
   x_request_time = x_rtime;
+  if (x_request_id.empty() && request.has_x_request_id()) {
+    x_request_id = request.x_request_id();
+  }
+  if (x_request_time.empty() && request.has_x_request_time()) {
+    x_request_time = request.x_request_time();
+  }
 
+  if (request.has_service_request_id()) {
+    service_request_id = request.service_request_id();
+  }
+  if (request.has_source_xservice_addr()) {
+    source_xservice_addr = request.source_xservice_addr();
+  }
   max_tokens = static_cast<uint32_t>(request.max_tokens());
   if (request.has_stream()) {
     streaming = request.stream();
@@ -527,11 +587,21 @@ RequestParams::RequestParams(const proto::AnthropicMessagesRequest& request,
     stop = std::vector<std::string>(request.stop_sequences().begin(),
                                     request.stop_sequences().end());
   }
+  if (request.has_ignore_eos()) {
+    ignore_eos = request.ignore_eos();
+  }
   tool_choice = std::move(handle_tool_choice(request));
   tools = std::move(handle_tools(request));
 }
 
 bool RequestParams::verify_params(OutputCallback callback) const {
+  if (!response_format_error.empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        response_format_error,
+                        service_request_id,
+                        source_xservice_addr);
+    return false;
+  }
   if (n == 0) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "n should be greater than 0",
@@ -576,17 +646,58 @@ bool RequestParams::verify_params(OutputCallback callback) const {
     return false;
   }
 
-  if (logprobs) {
-    if (echo) {
+  if (num_return_sequences > 0) {
+    if (beam_width <= 0) {
       CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "logprobs is not supported with echo",
+                          "num_return_sequences requires beam_width > 0",
                           service_request_id,
                           source_xservice_addr);
       return false;
     }
+    if (num_return_sequences < beam_width) {
+      CALLBACK_WITH_ERROR(
+          StatusCode::INVALID_ARGUMENT,
+          "num_return_sequences must be greater than or equal to beam_width",
+          service_request_id,
+          source_xservice_addr);
+      return false;
+    }
+  }
+
+  if (logprobs && echo) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "logprobs is not supported with echo",
+                        service_request_id,
+                        source_xservice_addr);
+    return false;
+  }
+
+  // top_logprobs becomes the k of torch::topk() whenever logprobs are in
+  // effect. Beam search forces logprobs on downstream
+  // (RequestSamplingParam::enable_beam_search), so a beam request with
+  // logprobs=false must be validated too; otherwise an oversized count would
+  // only surface as a throw inside the sampler at execution time. The raw field
+  // is checked first so that a negative count is reported as a client error
+  // rather than silently repaired by the beam normalization.
+  if (logprobs || beam_width > 1) {
     if (top_logprobs < 0 || top_logprobs > 2000) {
       CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                           "logprobs must be between 0 and 2000",
+                          service_request_id,
+                          source_xservice_addr);
+      return false;
+    }
+    // Beam search raises top_logprobs to at least beam_width, so also validate
+    // the value that will actually be used. Derive it through the same helper
+    // so the rule is not duplicated here.
+    RequestSamplingParam effective;
+    effective.logprobs = logprobs;
+    effective.top_logprobs = top_logprobs;
+    effective.enable_beam_search(beam_width);
+    if (effective.top_logprobs > 2000) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "beam_width must be at most 2000 (it sets the "
+                          "top_logprobs used for beam expansion)",
                           service_request_id,
                           source_xservice_addr);
       return false;
@@ -611,6 +722,44 @@ bool RequestParams::verify_params(OutputCallback callback) const {
     return false;
   }
   return true;
+}
+
+RequestSamplingParam RequestParams::to_sampling_param(size_t best_of) const {
+  RequestSamplingParam sampling_param;
+  sampling_param.frequency_penalty = frequency_penalty;
+  sampling_param.presence_penalty = presence_penalty;
+  sampling_param.repetition_penalty = repetition_penalty;
+  sampling_param.temperature = temperature;
+  sampling_param.top_p = top_p;
+  sampling_param.top_k = top_k;
+  sampling_param.logprobs = logprobs;
+  sampling_param.top_logprobs = top_logprobs;
+  sampling_param.is_embeddings = is_embeddings;
+  if (best_of > n) {
+    // enable logprobs for best_of to generate sequence logprob
+    sampling_param.logprobs = true;
+  }
+  // Beam-search fields (beam_width / num_return_sequences) are intentionally
+  // NOT mapped here: they are model-specific. LLM copies beam_width and then
+  // normalizes logprobs/top_logprobs for beam expansion, REC copies both
+  // fields, and VLM omits them entirely. Each factory layers them on as needed.
+  return sampling_param;
+}
+
+SchedulerParam RequestParams::to_scheduler_param() const {
+  SchedulerParam scheduler_param;
+  scheduler_param.offline = offline;
+  scheduler_param.priority = priority;
+  if (!offline) {
+    scheduler_param.ttft_slo_ms = ttft_slo_ms;
+    scheduler_param.tpot_slo_ms = tpot_slo_ms;
+    scheduler_param.ttlt_slo_ms = ttlt_slo_ms;
+    scheduler_param.tpot_priority_weight = tpot_priority_weight;
+    scheduler_param.ttft_priority_weight = ttft_priority_weight;
+    scheduler_param.ttlt_priority_weight = ttlt_priority_weight;
+    scheduler_param.priority_weight = priority_weight;
+  }
+  return scheduler_param;
 }
 
 }  // namespace xllm

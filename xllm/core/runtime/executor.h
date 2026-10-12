@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,6 +27,8 @@ limitations under the License.
 
 namespace xllm {
 
+class ProcessGroup;
+
 class Executor final {
  public:
   Executor(CausalLM* model,
@@ -35,6 +37,8 @@ class Executor final {
            const runtime::Options& options);
 
   virtual ~Executor() = default;
+
+  void set_dp_process_group(ProcessGroup* group);
 
   ForwardInput prepare_inputs(Batch& batch);
 
@@ -45,6 +49,14 @@ class Executor final {
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& params);
+
+  void prepare_graph_input(const torch::Tensor& tokens,
+                           const torch::Tensor& positions,
+                           std::vector<KVCache>& kv_caches,
+                           const ModelInputParams& params);
+
+  bool prepare_static_mtp_graph_tasks(const SpecVerifyGraphTaskSignal& signal,
+                                      const Stream& signal_stream);
 
  private:
   std::unique_ptr<ExecutorImpl> impl_;

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,21 +18,24 @@ limitations under the License.
 #include <map>
 #include <vector>
 
-#include "core/layers/npu/npu_base_layer.h"
+#include "base_loader.h"
 
 namespace xllm {
 namespace layer {
 
 class Qwen2DecoderLoader : public BaseLoader {
  public:
-  Qwen2DecoderLoader(uint64_t weight_count, const ModelContext& context);
+  Qwen2DecoderLoader(uint64_t weight_count,
+                     const ModelContext& context,
+                     LoadMode mode = LoadMode::kEager);
 
   void load_state_dict(const StateDict& state_dict) override;
   void verify_loaded_weights() const override;
-  void merge_loaded_weights() override;
 
  protected:
-  int device_id_;
+  void merge_host_at_weights() override;
+
+  int device_id_ = 0;
 };
 
 }  // namespace layer

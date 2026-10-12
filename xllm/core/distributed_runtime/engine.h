@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,14 +19,19 @@ limitations under the License.
 
 #include <unordered_map>
 
+#include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/config/kv_cache_config.h"
+#include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
+#include "runtime/decode_graph_bucket.h"
 #include "runtime/options.h"
 
 namespace xllm {
+
 class Engine {
  public:
   virtual ~Engine() = default;
@@ -55,6 +60,15 @@ class Engine {
   // return the model args
   virtual const ModelArgs& model_args() const { return args_; }
 
+  virtual bool set_speculative_validate_time_predictor(
+      const SpeculativeProfileRegistry::ValidateTimePredictor&) {
+    return false;
+  }
+
+  virtual runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const {
+    return {};
+  }
+
   // return the tokenizer args
   virtual const TokenizerArgs& tokenizer_args() const {
     return tokenizer_args_;
@@ -68,14 +82,17 @@ class Engine {
                               const int32_t src_dp_rank,
                               const std::vector<uint64_t>& src_cluster_ids,
                               const std::vector<std::string>& src_addrs,
-                              const std::vector<int64_t>& src_k_cache_ids,
-                              const std::vector<int64_t>& src_v_cache_ids,
-                              const std::vector<uint64_t>& src_blocks,
                               const int32_t dst_dp_rank,
-                              const std::vector<uint64_t>& dst_blocks) {
+                              const std::vector<KVTransferMapping>& mappings) {
     NOT_IMPLEMENTED();
     return false;
   };
+
+  // Number of cache shards in one DP group, independent of submitted results.
+  virtual uint32_t host_transfer_worker_count() const {
+    NOT_IMPLEMENTED();
+    return 0;
+  }
 
   virtual std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
       const uint32_t dp_rank,
@@ -93,21 +110,15 @@ class Engine {
 
   virtual void prefetch_from_storage(
       const uint32_t dp_rank,
-      const std::vector<BlockTransferInfo>& block_transfer_info,
-      std::shared_ptr<std::atomic<int32_t>> flag,
-      std::vector<std::shared_ptr<std::atomic<uint32_t>>>* prefetch_results) {
-    NOT_IMPLEMENTED();
-  };
-
-  virtual void get_device_info(std::vector<std::string>& device_ips,
-                               std::vector<uint16_t>& ports) {
+      std::shared_ptr<const StoragePrefetchRequest> request,
+      PrefetchResult::StopPredicate stop_requested,
+      PrefetchResult::DoneCallback done) {
     NOT_IMPLEMENTED();
   };
 
   virtual void get_cache_info(std::vector<uint64_t>& cluster_ids,
                               std::vector<std::string>& addrs,
-                              std::vector<int64_t>& k_cache_ids,
-                              std::vector<int64_t>& v_cache_ids) {
+                              std::vector<uint16_t>& ports) {
     NOT_IMPLEMENTED();
   };
 
@@ -123,30 +134,29 @@ class Engine {
 
   virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,
-                            const std::vector<std::string>& device_ips,
                             const std::vector<uint16_t>& ports,
-                            const int32_t src_dp_size) {
+                            const int32_t src_dp_size,
+                            const int32_t src_kv_split_size = 1) {
     NOT_IMPLEMENTED();
     return false;
   };
 
   virtual bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                               const std::vector<std::string>& addrs,
-                              const std::vector<std::string>& device_ips,
                               const std::vector<uint16_t>& ports,
-                              const int32_t dp_size) {
+                              const int32_t src_dp_size,
+                              const int32_t src_kv_split_size = 1) {
     NOT_IMPLEMENTED();
     return false;
   };
 
-  // D2D link for weight transfer - each worker links to one remote addr
-  // device_ips: one ip per worker, in worker order
-  virtual bool link_d2d(const std::vector<std::string>& device_ips) {
+  // P2P link for weight transfer - each worker links to one remote addr.
+  virtual bool link_p2p(const std::vector<std::string>& remote_addrs) {
     NOT_IMPLEMENTED();
     return false;
   };
 
-  virtual bool unlink_d2d(const std::vector<std::string>& device_ips) {
+  virtual bool unlink_p2p(const std::vector<std::string>& remote_addrs) {
     NOT_IMPLEMENTED();
     return false;
   };
@@ -156,8 +166,24 @@ class Engine {
     return false;
   };
 
+  virtual bool update_weights(const std::string& weights_path) {
+    LOG(FATAL) << " update_weights is not implemented!";
+    return false;
+  }
+
   virtual bool wakeup(const WakeupOptions& options) {
     LOG(FATAL) << " wakeup is not implemented!";
+    return false;
+  };
+
+  // Start/stop online timeline profiling on all workers. CUDA only for now.
+  virtual bool start_profile() {
+    LOG(ERROR) << "start_profile is not implemented for this engine!";
+    return false;
+  };
+
+  virtual bool stop_profile() {
+    LOG(ERROR) << "stop_profile is not implemented for this engine!";
     return false;
   };
 
@@ -174,17 +200,21 @@ class Engine {
     return false;
   };
 
-  struct KVCacheCapacity {
-    int64_t n_blocks = 0;
-    int64_t n_pages = 0;  // for continuous kvcache
-    int64_t cache_size_in_bytes = 0;
-    int64_t slot_size = 0;
-    int64_t index_slot_size = 0;
-    int64_t linear_slot_size = 0;
-    int64_t n_layers = 0;
-  };
-
  protected:
+  void configure_prefix_cache(runtime::Options& options) const {
+    const bool enable_xtensor = KVCacheConfig::get_instance().enable_xtensor();
+    if (options.enable_prefix_cache() && enable_xtensor) {
+      options.enable_prefix_cache(false);
+      LOG(INFO) << "Disabling prefix cache for model "
+                << model_args().model_type()
+                << ": enable_xtensor=" << enable_xtensor;
+    }
+    if (!options.is_draft_engine()) {
+      KVCacheConfig::get_instance().enable_prefix_cache(
+          options.enable_prefix_cache());
+    }
+  }
+
   // model args
   ModelArgs args_;
 

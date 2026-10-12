@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -65,6 +65,10 @@ class Glm47Detector : public BaseFormatDetector {
   // String-based parsing helpers (replaces regex to avoid stack overflow)
   std::vector<std::pair<size_t, size_t>> find_tool_call_ranges(
       const std::string& text) const;
+
+  std::string extract_normal_text(
+      const std::string& text,
+      const std::vector<std::pair<size_t, size_t>>& ranges) const;
 
   std::pair<std::string, std::string> parse_tool_call_content(
       const std::string& content) const;

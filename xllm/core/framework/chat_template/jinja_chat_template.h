@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,21 +24,22 @@ limitations under the License.
 
 #include "core/common/message.h"
 #include "core/common/types.h"
+#include "framework/chat_template/chat_template.h"
 #include "framework/tokenizer/tokenizer_args.h"
 
 namespace xllm {
 
 // A chat template implementation that uses jinja2 as the template engine.
-class JinjaChatTemplate {
+class JinjaChatTemplate : public ChatTemplate {
  public:
-  JinjaChatTemplate(const TokenizerArgs& args);
+  explicit JinjaChatTemplate(const TokenizerArgs& args);
 
-  std::optional<std::string> apply(const ChatMessages& messages) const;
+  std::optional<std::string> apply(const ChatMessages& messages) const override;
 
   std::optional<std::string> apply(
       const ChatMessages& messages,
       const std::vector<xllm::JsonTool>& json_tools,
-      const nlohmann::ordered_json& chat_template_kwargs) const;
+      const nlohmann::ordered_json& chat_template_kwargs) const override;
 
  protected:
   // apply the template to the values in the json object

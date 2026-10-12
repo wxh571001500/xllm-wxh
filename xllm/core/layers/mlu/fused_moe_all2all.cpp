@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -61,7 +61,7 @@ void FusedMoEImpl::select_experts_all2all(
       deep_ep_buffer_.dispatch_send_token_tensor.slice(0, 0, dispatch_bytes)
           .view({num_token_expand, deep_ep_params_.dispatch_token_size});
 
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     xllm::kernel::ScaledQuantizeParams scaled_quantize_params;
     scaled_quantize_params.x = hidden_states_2d;
     // use dispatch_send_token_tensor buffer for input to reduce memory
@@ -103,7 +103,7 @@ void FusedMoEImpl::select_experts_all2all(
   // collect the selected tensor
   selected_expert_info.reduce_weight = reduce_weight;
   selected_expert_info.combine_idx = combine_idx;
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     selected_expert_info.input_scale = hidden_states_scale;
   }
 }
@@ -157,17 +157,18 @@ FusedMoEImpl::CombineResult FusedMoEImpl::combine_step(
 
 torch::Tensor FusedMoEImpl::forward_experts_all2all(
     const torch::Tensor& hidden_states,
-    const std::optional<RouteInfo>& route_info) {
-  init_streams(hidden_states);
-
+    const std::optional<RouteInfo>& route_info,
+    const std::optional<torch::Tensor>& input_ids) {
   torch::Tensor shared_expert_output;
   torch::IntArrayRef hidden_states_shape = hidden_states.sizes();
   torch::ScalarType hidden_states_dtype = hidden_states.dtype().toScalarType();
   torch::Tensor hidden_states_2d =
       hidden_states.reshape({-1, hidden_states.size(-1)});
 
-  RouteInfo route = get_route(
-      hidden_states_2d, /*enable_all2all_communication=*/true, route_info);
+  RouteInfo route = get_route(hidden_states_2d,
+                              /*enable_all2all_communication=*/true,
+                              route_info,
+                              input_ids);
 
   int64_t group_gemm_max_dim = deep_ep_params_.max_num_tokens_recv / topk_;
   int64_t expert_size = w13_.size(0);
@@ -189,7 +190,7 @@ torch::Tensor FusedMoEImpl::forward_experts_all2all(
   // use the buffer during initialization for the output
   torch::Tensor expand_hidden_states = dispatch_recv_token_tensor_head_;
   std::optional<torch::Tensor> output_tail = std::nullopt;
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     output_tail = dispatch_recv_token_tensor_tail_;
     // update selected_expert_info with the tail (input scale)
     selected_expert_info.input_scale = output_tail;

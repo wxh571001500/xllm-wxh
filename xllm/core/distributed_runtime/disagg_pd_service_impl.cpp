@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,9 +19,12 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/types.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/sampling/json_object_grammar.h"
 #include "distributed_runtime/llm_engine.h"
 #include "framework/request/request_output.h"
 #include "scheduler/disagg_pd_scheduler.h"
+#include "util/utils.h"
 
 namespace xllm {
 
@@ -35,12 +38,39 @@ DisaggPDServiceImpl::DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
   }
 }
 
+std::shared_ptr<const JsonObjectGrammar>
+DisaggPDServiceImpl::get_json_object_grammar(bool reasoning_enabled,
+                                             std::string* error) {
+  std::lock_guard<std::mutex> lock(json_object_grammar_mutex_);
+  std::shared_ptr<const JsonObjectGrammar>& grammar =
+      reasoning_enabled ? json_reasoning_grammar_ : json_object_grammar_;
+  if (grammar == nullptr) {
+    grammar = JsonObjectGrammar::create_from_tokenizer(
+        *engine_->tokenizer(),
+        engine_->model_args().eos_token_id(),
+        engine_->model_args().stop_token_ids(),
+        engine_->model_args().vocab_size(),
+        reasoning_enabled,
+        error);
+  }
+  return grammar;
+}
+
 std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
     const proto::DisaggRequest& req) {
-  // create a new request
-  // TODO: Should to support best_of > 1 case, now we only consider
-  // to allocate blocks for the first sequence in the request.
-  // But request maybe expend_sequence in running stage.
+  // best_of > 1 in disaggregated PD requires prefix cache on the decode
+  // instance: only the first sequence's KV is pulled from prefill, and
+  // the remaining best_of-1 sequences are expanded locally and reuse the
+  // first sequence's prompt KV via prefix cache.
+  if (req.best_of() > 1 &&
+      !::xllm::KVCacheConfig::get_instance().enable_prefix_cache()) {
+    LOG(ERROR) << "best_of > 1 in disaggregated PD mode requires "
+               << "prefix caching enabled on the decode instance, "
+               << "request_id=" << req.req_id()
+               << ", best_of=" << req.best_of();
+    return nullptr;
+  }
+
   std::string prompt = req.prompt();
   std::vector<int> prompt_tokens(req.prompt_tokens().begin(),
                                  req.prompt_tokens().end());
@@ -55,6 +85,8 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
   sampling_param.logprobs = req.logprobs();
   sampling_param.top_logprobs = req.top_logprobs();
   sampling_param.is_embeddings = req.is_embeddings();
+  sampling_param.json_object = req.json_object();
+  const bool json_object = sampling_param.json_object;
 
   SchedulerParam scheduler_param;
   scheduler_param.offline = req.offline();
@@ -119,7 +151,21 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
                          scheduler_->enable_schedule_overlap(),
                          output_callback,
                          batch_output_callback);
+  req_state.include_stop_str_in_output = req.include_stop_str_in_output();
 
+  if (json_object) {
+    std::string grammar_error;
+    req_state.json_object_grammar =
+        get_json_object_grammar(req.json_reasoning_enabled(), &grammar_error);
+    if (req_state.json_object_grammar == nullptr) {
+      LOG(ERROR) << "Failed to initialize json_object constraint: "
+                 << grammar_error << ", request_id=" << req.req_id();
+      return nullptr;
+    }
+    req_state.json_reasoning_enabled = req.json_reasoning_enabled();
+  }
+
+  req_state.pd_reservation_id = req.reservation_id();
   auto new_request = std::make_shared<Request>(req.req_id(),
                                                req.x_request_id(),
                                                req.x_request_time(),
@@ -129,6 +175,16 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
 
   // add one sequence, rest will be added by scheduler
   return new_request;
+}
+
+void DisaggPDServiceImpl::release_reservation(
+    const proto::ReleaseReservationRequest* request,
+    proto::ReleaseReservationResponse* response) {
+  const bool released = scheduler_->release_reservation(
+      request->req_id(), request->reservation_id());
+  response->set_result(released
+                           ? proto::ReleaseReservationResponse::RELEASED
+                           : proto::ReleaseReservationResponse::NOT_WAITING);
 }
 
 void DisaggPDServiceImpl::decode_recv_new_requests(
@@ -148,8 +204,15 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
     Sequence* sequence = sequences[0].get();
 
     if (!scheduler_->try_allocate(sequence)) {
-      // FIXME: set status code
-      resp->set_status_code(404);
+      if (scheduler_->exceeds_decode_capacity(sequence)) {
+        LOG(ERROR) << "Decode cannot fit request prompt at any load, "
+                   << "request_id=" << req.req_id()
+                   << ", prompt_tokens=" << sequence->num_prompt_tokens();
+        resp->set_status_code(kDecodeAddNewPromptTooLongStatusCode);
+      } else {
+        // Current cache pressure can be relieved, so Prefill may retry.
+        resp->set_status_code(404);
+      }
     } else {
       // push the request to scheduler request buffer
       bool success =
@@ -165,19 +228,69 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
       auto dp_rank = sequence->dp_rank();
       resp->set_dp_rank(dp_rank);
 
-      size_t shared_num = sequence->kv_state().shared_kv_blocks_num();
-      auto blocks = sequence->kv_state().kv_blocks();
-
-      // Collect block IDs
       std::vector<int32_t> block_ids;
-      block_ids.reserve(blocks.size() - shared_num);
-      for (size_t i = shared_num; i < blocks.size(); i++) {
-        int32_t block_id = blocks[i].id();
-        *(resp->mutable_blocks_ids()->Add()) = block_id;
-        block_ids.push_back(block_id);
+      if (sequence->kv_state().has_multi_block_export()) {
+        const auto export_view = sequence->kv_state().multi_block_export_view();
+        for (const auto& [block_type, blocks_ptr] : export_view) {
+          proto::KVTransferGroup* group = resp->add_groups();
+          group->set_group_id(cache_group_id(block_type));
+          // D-side shared count for this group. P advances its per-group
+          // transfer cursor to this value so it starts pushing at the first
+          // block D actually needs. SWA / LINEAR under DECODE role return
+          // 0 (prefix cache off), which is a no-op advance and reproduces
+          // the pre-existing "push everything" behavior. C4 / C128 may
+          // return >0 and let P skip the leading shared blocks.
+          group->set_remote_shared_num(static_cast<uint32_t>(
+              sequence->kv_state().shared_blocks_num(block_type)));
+          group->mutable_ids()->Reserve(blocks_ptr->size());
+          for (const auto& block : *blocks_ptr) {
+            // Invalid placeholders are legitimate for SWA: the sliding
+            // window release loop leaves moved-from Blocks in place so
+            // positional indexing stays stable, and both P and D produce
+            // the same invalid pattern for the slid-out window. Ship them
+            // as max-uint64 sentinels; BatchInputBuilder skips
+            // positions where the local block id is negative, so the
+            // remote id at those positions is never dereferenced. The
+            // CHECK below only refuses invalid blocks under types where
+            // slide-out cannot produce them (C4 / C128), preserving the
+            // guard for genuine allocation bugs.
+            const int64_t block_id = block.is_valid() ? block.id() : -1;
+            if (!block.is_valid()) {
+              CHECK(block_type == BlockType::SWA)
+                  << "Decode allocated an invalid grouped KV block under a "
+                  << "non-SWA leaf, group_id=" << cache_group_id(block_type);
+            }
+            group->mutable_ids()->Add(static_cast<uint64_t>(block_id));
+          }
+        }
+      } else {
+        const size_t shared_num =
+            sequence->kv_state().shared_blocks_num(BlockType::KV);
+        const auto blocks = sequence->kv_state().blocks(BlockType::KV);
+
+        // Collect block IDs
+        block_ids.reserve(blocks.size() - shared_num);
+        proto::KVTransferGroup* group = resp->add_groups();
+        group->set_group_id(cache_group_id(BlockType::KV));
+        group->set_remote_shared_num(static_cast<uint32_t>(shared_num));
+        group->mutable_ids()->Reserve(blocks.size() - shared_num);
+        for (size_t i = shared_num; i < blocks.size(); i++) {
+          int32_t block_id = blocks[i].id();
+          group->mutable_ids()->Add(block_id);
+          block_ids.push_back(block_id);
+        }
+      }
+      if (has_linear_attention_layers(engine_->model_args())) {
+        const int32_t linear_state_id = sequence->get_linear_state_slot_id();
+        CHECK_GE(linear_state_id, 0)
+            << "Decode did not allocate a linear-state slot.";
+        proto::KVTransferGroup* group = resp->add_groups();
+        group->set_group_id(cache_group_id(BlockType::LINEAR));
+        group->add_ids(static_cast<uint64_t>(linear_state_id));
       }
       // XTensor mode: calculate and return GlobalXTensor offsets
-      if (FLAGS_enable_xtensor && !block_ids.empty()) {
+      if (::xllm::KVCacheConfig::get_instance().enable_xtensor() &&
+          !block_ids.empty()) {
         std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>
             layer_offsets;
         if (engine_->get_xtensor_offsets_for_blocks(
@@ -226,12 +339,20 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
     std::vector<uint64_t> cluster_ids(gen.cluster_ids().begin(),
                                       gen.cluster_ids().end());
     std::vector<std::string> addrs(gen.addrs().begin(), gen.addrs().end());
-    std::vector<int64_t> k_cache_ids(gen.k_cache_ids().begin(),
-                                     gen.k_cache_ids().end());
-    std::vector<int64_t> v_cache_ids(gen.v_cache_ids().begin(),
-                                     gen.v_cache_ids().end());
-    std::vector<uint64_t> block_ids(gen.block_ids().begin(),
-                                    gen.block_ids().end());
+    std::vector<KVTransferMapping> source_mappings;
+    source_mappings.reserve(gen.source_groups_size());
+    for (const proto::KVTransferGroup& proto_group : gen.source_groups()) {
+      KVTransferMapping mapping;
+      mapping.group_id = proto_group.group_id();
+      mapping.remote_ids.assign(proto_group.ids().begin(),
+                                proto_group.ids().end());
+      source_mappings.emplace_back(std::move(mapping));
+    }
+    torch::Tensor mtp_bootstrap_embedding;
+    if (gen.has_mtp_bootstrap_embedding()) {
+      mtp_bootstrap_embedding =
+          util::proto_to_torch(gen.mtp_bootstrap_embedding());
+    }
 
     bool success = scheduler_->decode_recv_first_generation(
         gen.req_id(),
@@ -239,16 +360,17 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         first_token.has_logprob(),
         first_token.logprob(),
         first_token.time_to_first_token_latency_seconds(),
+        gen.upstream_elapsed_seconds(),
         std::move(top_tokens),
         std::move(top_logprobs),
         gen.kv_cache_transfer_mode(),
         std::move(cluster_ids),
         std::move(addrs),
-        std::move(k_cache_ids),
-        std::move(v_cache_ids),
-        std::move(block_ids),
+        std::move(source_mappings),
         gen.dp_size(),
-        gen.dp_rank());
+        gen.dp_rank(),
+        mtp_bootstrap_embedding,
+        gen.num_cached_tokens());
     if (!success) {
       response->set_ok(false);
       return;
@@ -266,14 +388,17 @@ void DisaggPDServiceImpl::link_instance(
                                     request->cluster_ids().end());
   std::vector<std::string> addrs(request->addrs().begin(),
                                  request->addrs().end());
-  std::vector<std::string> device_ips(request->device_ips().begin(),
-                                      request->device_ips().end());
   std::vector<uint16_t> ports(request->ports().begin(), request->ports().end());
   int32_t dp_size = request->dp_size();
+  int32_t kv_split_size = request->kv_split_size();
 
   // Call scheduler's link_instance method
-  bool success = scheduler_->link_instance(
-      request->instance_name(), cluster_ids, addrs, device_ips, ports, dp_size);
+  bool success = scheduler_->link_instance(request->instance_name(),
+                                           cluster_ids,
+                                           addrs,
+                                           ports,
+                                           dp_size,
+                                           kv_split_size);
 
   if (!success) {
     LOG(ERROR) << "Failed to link instance: " << request->instance_name();
@@ -292,14 +417,17 @@ void DisaggPDServiceImpl::unlink_instance(
                                     request->cluster_ids().end());
   std::vector<std::string> addrs(request->addrs().begin(),
                                  request->addrs().end());
-  std::vector<std::string> device_ips(request->device_ips().begin(),
-                                      request->device_ips().end());
   std::vector<uint16_t> ports(request->ports().begin(), request->ports().end());
   int32_t dp_size = request->dp_size();
+  int32_t kv_split_size = request->kv_split_size();
 
   // Call scheduler's unlink_instance method
-  bool success = scheduler_->unlink_instance(
-      request->instance_name(), cluster_ids, addrs, device_ips, ports, dp_size);
+  bool success = scheduler_->unlink_instance(request->instance_name(),
+                                             cluster_ids,
+                                             addrs,
+                                             ports,
+                                             dp_size,
+                                             kv_split_size);
 
   if (!success) {
     LOG(ERROR) << "Failed to unlink instance: " << request->instance_name();

@@ -1,5 +1,4 @@
 include(cc_library)
-include(cc_test)
 
 include_directories(.)
 if(USE_NPU)
@@ -10,17 +9,22 @@ endif()
 add_subdirectory(batch)
 add_subdirectory(xtensor)
 add_subdirectory(block)
+add_subdirectory(config)
 add_subdirectory(chat_template)
 add_subdirectory(kv_cache)
+add_subdirectory(kv_cache_transfer)
 add_subdirectory(model)
 add_subdirectory(parallel_state)
 add_subdirectory(prefix_cache)
-add_subdirectory(request)
-add_subdirectory(sampling)
+add_subdirectory(multimodal)
+add_subdirectory(encoder_cache)
 add_subdirectory(state_dict)
 add_subdirectory(tokenizer)
+add_subdirectory(sampling)
+add_subdirectory(request)
 add_subdirectory(eplb)
 add_subdirectory(dit_cache)
+add_subdirectory(speculative)
 
 
 cc_library(
@@ -54,21 +58,7 @@ cc_library(
   SRCS
     model_context.cpp
   DEPS
+    :platform
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
 )
-
-cc_test(
-  NAME
-    hf_model_loader_test
-  SRCS
-    hf_model_loader_test.cpp
-  DEPS
-    :model_loader
-    :xllm_server
-    GTest::gtest_main
-)
-
-# Resolve static link order between xtensor and xllm_server for this test target.
-target_link_libraries(hf_model_loader_test PRIVATE
-  "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")

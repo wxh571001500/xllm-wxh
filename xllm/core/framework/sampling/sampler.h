@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -34,8 +34,22 @@ class Sampler final {
   }
 
   // logits: [batch_size, vocab_size]
-  SampleOutput forward(torch::Tensor& logits,
-                       const SamplingParameters& params) const;
+  SampleOutput forward(
+      torch::Tensor& logits,
+      const SamplingParameters& params,
+      const torch::Tensor& filter_mask = torch::Tensor()) const;
+
+  // Applies every in-place logit processor from the sampling parameters
+  // (frequency/presence penalties, repetition penalties, then the token
+  // bitmask or the dense filter mask) and returns the row subset to sample
+  // from: `logits` itself unless the parameters select sample indices.
+  // forward() builds on this; callers that only need the processed logits
+  // (e.g. greedy speculative verification, which samples separately) can
+  // call it directly and skip the sampling passes.
+  static torch::Tensor apply_logits_processors(
+      torch::Tensor& logits,
+      const SamplingParameters& params,
+      const torch::Tensor& filter_mask = torch::Tensor());
 
   // helper functions
   // probs: [..., vocab_size]

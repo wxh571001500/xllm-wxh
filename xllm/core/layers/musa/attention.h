@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,33 +17,27 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-#include <cassert>
-#include <cstdint>
+#include <memory>
 #include <optional>
+#include <tuple>
 
-#include "framework/state_dict/state_dict.h"
-#include "framework/state_dict/utils.h"
-#include "musa_layer_base.h"
+#include "framework/kv_cache/kv_cache.h"
+#include "layers/common/attention_metadata.h"
 
-namespace xllm::layer {
+namespace xllm {
+namespace layer {
 
-class AttentionImpl : public MUSALayerBaseImpl {
+class BaseAttentionImpl;
+
+class AttentionImpl final : public torch::nn::Module {
  public:
-  explicit AttentionImpl(ModelArgs const& args,
-                         QuantArgs const& quant_args,
-                         ParallelArgs const& parallel_args,
-                         torch::TensorOptions const& options);
+  AttentionImpl() = default;
 
   AttentionImpl(int64_t num_heads,
                 int64_t head_size,
                 float scale,
                 int64_t num_kv_heads,
                 int64_t sliding_window);
-
-  ~AttentionImpl() {};
-
-  torch::Tensor forward(torch::Tensor& input,
-                        ForwardParams& fwd_params) override;
 
   std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
       const AttentionMetadata& attn_metadata,
@@ -52,19 +46,11 @@ class AttentionImpl : public MUSALayerBaseImpl {
       torch::Tensor& value,
       KVCache& kv_cache);
 
-  void load_state_dict(StateDict const& state_dict) override;
-
  private:
-  int32_t num_heads_;
-  int32_t num_kv_heads_;
-  int32_t head_dim_;
-  int32_t q_size_;
-  int32_t kv_size_;
-  int32_t hidden_size_;
-  float rms_eps;
-  float scaling_;
-  constexpr static int32_t weight_num_ = 7;
+  std::shared_ptr<BaseAttentionImpl> attention_impl_;
+  torch::Tensor output_buf_;
 };
 TORCH_MODULE(Attention);
 
-}  // namespace xllm::layer
+}  // namespace layer
+}  // namespace xllm

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,8 +24,17 @@ limitations under the License.
 #include <atomic>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 
+#include "core/framework/config/beam_search_config.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/rec_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/model_loader.h"
+#include "core/util/cpu_affinity.h"
 #include "helper.h"
 
 XLLM_CAPI_EXPORT XLLM_REC_Handler* xllm_rec_create(void) {
@@ -57,11 +66,13 @@ XLLM_CAPI_EXPORT void xllm_rec_init_options_default(
 XLLM_CAPI_EXPORT bool xllm_rec_initialize(
     XLLM_REC_Handler* handler,
     const char* model_path,
-    const char* devices,
     const XLLM_InitOptions* init_options) {
-  if (!handler || !model_path || !devices) return false;
+  if (!handler || !model_path) return false;
 
   try {
+    xllm::CpuAffinity::get_instance().set_cpu_affinity(
+        init_options->cpu_affinity);
+
     XLLM_InitOptions xllm_init_options;
     xllm::helper::set_init_options(
         xllm::helper::BackendType::REC, init_options, &xllm_init_options);
@@ -79,9 +90,7 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
     xllm::Options options;
     options.model_path(model_path)
         .task_type(xllm_init_options.task)
-        .devices(devices)
         .draft_model_path(xllm_init_options.draft_model)
-        .draft_devices(xllm_init_options.draft_devices)
         .backend("rec")
         .block_size(xllm_init_options.block_size)
         .max_cache_size(xllm_init_options.max_cache_size)
@@ -98,7 +107,6 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         .expert_parallel_degree(xllm_init_options.expert_parallel_degree)
         .enable_chunked_prefill(xllm_init_options.enable_chunked_prefill)
         .master_node_addr(xllm_init_options.master_node_addr)
-        .device_ip(xllm_init_options.device_ip)
         .transfer_listen_port(xllm_init_options.transfer_listen_port)
         .nnodes(xllm_init_options.nnodes)
         .node_rank(xllm_init_options.node_rank)
@@ -116,32 +124,102 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
     // @TODO: Currently, gflags are configured through hard coding, which needs
     // to be improved in the future. For example, a separate gflags
     // configuration file can be provided to the so for setting gflags.
+    //
+    // REC so still has two configuration paths:
+    // - some request/runtime code reads FLAGS_* directly
+    // - master/worker construction reads xllm::Options
+    //
+    // The fields copied from init options below are read from FLAGS_* today.
+    // beam_width/block_size/max_tokens/max_seqs are also represented in
+    // Options, so duplicated values must stay aligned.
     FLAGS_beam_width = xllm_init_options.beam_width;
     FLAGS_max_decode_rounds = xllm_init_options.max_decode_rounds;
     FLAGS_max_seqs_per_batch = xllm_init_options.max_seqs_per_batch;
     FLAGS_max_tokens_per_batch = xllm_init_options.max_tokens_per_batch;
     FLAGS_block_size = xllm_init_options.block_size;
+    if (xllm_init_options.flashinfer_workspace_buffer_size >
+        static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+      LOG(ERROR) << "flashinfer_workspace_buffer_size["
+                 << xllm_init_options.flashinfer_workspace_buffer_size
+                 << "] exceeds supported int32 range";
+      return false;
+    }
+    xllm::BeamSearchConfig::get_instance()
+        .beam_width(xllm_init_options.beam_width)
+        .enable_block_copy_kernel(xllm_init_options.enable_block_copy_kernel)
+        .enable_topk_sorted(xllm_init_options.enable_topk_sorted);
+    xllm::RecConfig::get_instance()
+        .max_decode_rounds(xllm_init_options.max_decode_rounds)
+        .enable_rec_prefill_only(xllm_init_options.enable_rec_prefill_only)
+        .enable_rec_fast_sampler(xllm_init_options.enable_rec_fast_sampler)
+        .enable_xattention_one_stage(
+            xllm_init_options.enable_xattention_one_stage)
+        .rec_worker_max_concurrency(
+            xllm_init_options.rec_worker_max_concurrency);
+    if (xllm_init_options.request_queue_size > 0) {
+      xllm::RecConfig::get_instance().request_queue_size(
+          xllm_init_options.request_queue_size);
+    }
+    xllm::SchedulerConfig::get_instance()
+        .max_seqs_per_batch(xllm_init_options.max_seqs_per_batch)
+        .max_tokens_per_batch(xllm_init_options.max_tokens_per_batch)
+        .max_tokens_per_chunk_for_prefill(
+            xllm_init_options.max_tokens_per_chunk_for_prefill)
+        .enable_schedule_overlap(xllm_init_options.enable_schedule_overlap)
+        .enable_chunked_prefill(xllm_init_options.enable_chunked_prefill);
+    xllm::KVCacheConfig::get_instance()
+        .block_size(xllm_init_options.block_size)
+        .enable_prefix_cache(xllm_init_options.enable_prefix_cache);
+    xllm::ModelConfig::get_instance().flashinfer_workspace_buffer_size(
+        static_cast<int32_t>(
+            xllm_init_options.flashinfer_workspace_buffer_size));
+    xllm::ExecutionConfig::get_instance()
+        .enable_graph(xllm_init_options.enable_graph)
+        .enable_prefill_piecewise_graph(
+            xllm_init_options.enable_prefill_piecewise_graph)
+        .enable_graph_mode_decode_no_padding(
+            xllm_init_options.enable_graph_mode_decode_no_padding);
 
-    FLAGS_enable_graph = true;
-    FLAGS_rec_worker_max_concurrency = 2;
-    FLAGS_enable_rec_fast_sampler = true;
-    FLAGS_enable_prefill_piecewise_graph = true;
-    FLAGS_enable_xattention_one_stage = false;
-    FLAGS_enable_graph_mode_decode_no_padding = true;
-    // FLAGS_enable_rec_prefill_only = true;
-    FLAGS_enable_topk_sorted = false;
-
-    options.enable_graph(FLAGS_enable_graph);
+#if !defined(USE_NPU) && !defined(USE_CUDA) && !defined(USE_MUSA)
+    xllm::BeamSearchConfig::get_instance().enable_block_copy_kernel(false);
+#endif
+    // Keep dual-source settings aligned with the Config values above.
+    options.enable_graph(::xllm::ExecutionConfig::get_instance().enable_graph())
+        .beam_width(::xllm::BeamSearchConfig::get_instance().beam_width())
+        .rec_worker_max_concurrency(
+            ::xllm::RecConfig::get_instance().rec_worker_max_concurrency());
+    LOG(INFO)
+        << "REC C API runtime config:"
+        << ", enable_rec_prefill_only="
+        << ::xllm::RecConfig::get_instance().enable_rec_prefill_only()
+        << ", enable_constrained_decoding="
+        << ::xllm::RecConfig::get_instance().enable_constrained_decoding()
+        << ", enable_prefix_cache="
+        << ::xllm::KVCacheConfig::get_instance().enable_prefix_cache()
+        << ", enable_schedule_overlap="
+        << ::xllm::SchedulerConfig::get_instance().enable_schedule_overlap()
+        << ", enable_chunked_prefill="
+        << ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()
+        << ", enable_rec_fast_sampler="
+        << ::xllm::RecConfig::get_instance().enable_rec_fast_sampler()
+        << ", max_decode_rounds="
+        << ::xllm::RecConfig::get_instance().max_decode_rounds();
 
     handler->master = std::make_unique<xllm::RecMaster>(options);
     handler->master->run();
 
-    size_t cpu_cores = std::thread::hardware_concurrency();
-    size_t thread_num = std::clamp((cpu_cores == 0) ? 8 : cpu_cores / 2,
-                                   static_cast<size_t>(4),
-                                   static_cast<size_t>(16));
-    handler->executor =
-        std::make_unique<folly::CPUThreadPoolExecutor>(thread_num);
+    size_t available_cpu_cores_count =
+        static_cast<size_t>(xllm::CpuAffinity::get_available_cpu_cores_count());
+    LOG(INFO) << "Available CPU cores count " << available_cpu_cores_count;
+    size_t thread_num = std::clamp(
+        (available_cpu_cores_count == 0) ? 8 : available_cpu_cores_count / 2,
+        static_cast<size_t>(8),
+        static_cast<size_t>(16));
+
+    auto thread_factory = std::make_shared<xllm::CpuAffinityThreadFactory>(
+        /*prefix=*/"XllmRecExec");
+    handler->executor = std::make_unique<folly::CPUThreadPoolExecutor>(
+        thread_num, std::move(thread_factory));
 
     std::filesystem::path model_path_fs =
         std::filesystem::path(model_path).lexically_normal();

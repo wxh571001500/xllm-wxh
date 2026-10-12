@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,9 +15,12 @@ limitations under the License.
 
 #pragma once
 
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_output.h"
-#include "core/framework/model/npu_dp_ep_padding.h"
 #include "core/framework/model_context.h"
+#include "core/framework/parallel_state/npu_dp_ep_padding.h"
 #include "core/layers/npu/npu_qwen3_moe_decoder_layer_impl.h"
 #include "llm_model_base.h"
 
@@ -109,9 +112,7 @@ class Qwen3MoeDecoderLayerImpl : public torch::nn::Module {
     decoder_layer_->reload_weights_from_device();
   }
 
-  layer::BaseManualLoader* get_manual_loader() {
-    return decoder_layer_->get_manual_loader();
-  }
+  layer::BaseLoader* get_loader() { return decoder_layer_->get_loader(); }
 
   void refresh_rolling_weights() { decoder_layer_->refresh_rolling_weights(); }
 
@@ -123,7 +124,11 @@ TORCH_MODULE(Qwen3MoeDecoderLayer);
 class Qwen3MoeModelImpl : public torch::nn::Module {
  public:
   Qwen3MoeModelImpl(const ModelContext& context)
-      : device_(context.get_tensor_options().device()) {
+      : device_(context.get_tensor_options().device()),
+        aux_capture_(
+            context.get_model_args(),
+            context.get_tensor_options(),
+            ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch()) {
     auto options = context.get_tensor_options();
     auto model_args = context.get_model_args();
     auto parallel_args = context.get_parallel_args();
@@ -143,7 +148,9 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
         options);
 
     atb_pos_emb_ = layer::NpuPosEmbedding(context);
-    int32_t mask_value = FLAGS_enable_chunked_prefill ? -9984 : 1;
+    int32_t mask_value =
+        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill() ? -9984
+                                                                         : 1;
     attn_mask_ = layer::AttentionMask(options.device(),
                                       options.dtype().toScalarType(),
                                       /*mask_value=*/mask_value);
@@ -165,54 +172,6 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
     for (int i = 0; i < parallel_args.world_size(); i += dp_local_tp_size_) {
       indices.push_back(i);
     }
-
-    // Eagle3: layer ids to capture (can be read from layers_to_capture in
-    // config.json)
-    if (FLAGS_speculative_algorithm == "Eagle3") {
-      const auto& layer_ids_from_config = model_args.layers_to_capture();
-      if (!layer_ids_from_config.empty()) {
-        set_eagle3_layers_to_capture(
-            std::make_optional<std::vector<int32_t>>(layer_ids_from_config));
-      } else {
-        set_eagle3_layers_to_capture();
-      }
-      // Pre-allocate aux output buffer [max_tokens_per_batch, hidden_size *
-      // num_captured]
-      const size_t num_captured = layers_to_capture_set_.size();
-      const int64_t aux_dim =
-          model_args.hidden_size() * static_cast<int64_t>(num_captured);
-      aux_output_buffer_ =
-          torch::empty({FLAGS_max_tokens_per_batch, aux_dim}, options);
-    }
-  }
-
-  torch::Tensor deepstack_process(torch::Tensor hidden_states,
-                                  torch::Tensor visual_pos_masks,
-                                  torch::Tensor visual_embeds) {
-    visual_pos_masks = visual_pos_masks.to(hidden_states.device());
-    auto selected = hidden_states.index({visual_pos_masks});
-    auto local_this = selected + visual_embeds;
-    hidden_states.index_put_({visual_pos_masks}, local_this);
-    return hidden_states;
-  }
-
-  void set_eagle3_layers_to_capture(
-      const std::optional<std::vector<int32_t>>& layer_ids = std::nullopt) {
-    capture_aux_hidden_states_ = true;
-    layers_to_capture_set_.clear();
-    if (!layer_ids.has_value()) {
-      int32_t num_layers = static_cast<int32_t>(layers_.size());
-      layers_to_capture_set_.insert(2);
-      layers_to_capture_set_.insert(num_layers / 2);
-      layers_to_capture_set_.insert(num_layers - 3);
-    } else {
-      // Config uses 0-based layer indices, same as default {2, n/2, n-3}
-      for (int32_t val : layer_ids.value()) {
-        layers_to_capture_set_.insert(val);
-      }
-    }
-    LOG(INFO) << "layers_to_capture_set_ size: "
-              << layers_to_capture_set_.size();
   }
 
   // tokens: [num_tokens]
@@ -227,7 +186,7 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
         positions = torch::tensor({0}).to(torch::kInt32).to(device_);
       }
     }
-    auto inputs_embeds = input_params.input_embedding;
+    auto inputs_embeds = input_params.embedding.input_embedding;
     torch::Tensor h;
     if (inputs_embeds.defined()) {
       h = inputs_embeds;
@@ -275,34 +234,35 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
 
     torch::Tensor attn_mask;
     // for chunked prefill, generate the attn mask.
-    if (!input_params.batch_forward_type.is_decode()) {
-      max_seq_len_ = FLAGS_enable_chunked_prefill
-                         ? std::max(input_params.kv_max_seq_len, max_seq_len_)
-                         : 128;
-      if (FLAGS_enable_chunked_prefill) {
+    if (!input_params.meta.batch_forward_type.is_decode()) {
+      max_seq_len_ =
+          ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()
+              ? std::max(input_params.meta.kv_max_seq_len, max_seq_len_)
+              : 128;
+      if (::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
         attn_mask = attn_mask_.get_attn_mask(
             max_seq_len_, cos_pos.dtype().toScalarType(), cos_pos.device());
 
-        int batch_size = input_params.q_seq_lens_vec.size();
+        int batch_size = input_params.attention.host.q_seq_lens.size();
         if (batch_size > 0) {
           std::vector<torch::Tensor> req_mask_vec;
           req_mask_vec.reserve(batch_size);
 
           for (int j = 0; j < batch_size; j++) {
-            int start = input_params.kv_seq_lens_vec[j] -
-                        input_params.q_seq_lens_vec[j];
-            int end = input_params.kv_seq_lens_vec[j];
+            int start = input_params.attention.host.kv_seq_lens[j] -
+                        input_params.attention.host.q_seq_lens[j];
+            int end = input_params.attention.host.kv_seq_lens[j];
 
             auto req_mask_slice = attn_mask.slice(0, start, end);
             req_mask_vec.emplace_back(req_mask_slice);
           }
           attn_mask = torch::cat(req_mask_vec, 0);
         }
-      } else if (input_params.batch_forward_type.is_prefill()) {
+      } else if (input_params.meta.batch_forward_type.is_prefill()) {
         attn_mask = attn_mask_.get_attn_mask(max_seq_len_, dtype_, device_);
       }
     }
-    auto deep_stacks = input_params.deep_stacks;
+    auto deep_stacks = input_params.multimodal.deep_stacks;
     int deep_stack_size = deep_stacks.size();
 
     int64_t input_length = h.size(0);
@@ -312,39 +272,24 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
         torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
     ModelInputParams& input_params_new =
         const_cast<ModelInputParams&>(input_params);
-    input_params_new.expert_array = expert_array;
+    input_params_new.expert.expert_array = expert_array;
 
     RollingLayerGuard rolling_guard(rolling_mgr_);
 
     std::optional<torch::Tensor> residual;
-    if (FLAGS_enable_intralayer_addnorm) {
+    if (::xllm::KernelConfig::get_instance().enable_intralayer_addnorm()) {
       residual = torch::zeros_like(h);
     }
-    const int64_t num_tokens = h.size(0);
-    const int64_t hidden_size = h.size(-1);
-    size_t capture_idx = 0;
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event = nullptr;
       std::atomic<bool>* event_flag = nullptr;
-      if (input_params.layer_synchronizer != nullptr) {
-        event = input_params.layer_synchronizer->get_event(i);
-        event_flag = input_params.layer_synchronizer->get_event_flag(i);
+      if (input_params.parallel.layer_synchronizer != nullptr) {
+        event = input_params.parallel.layer_synchronizer->get_event(i);
+        event_flag =
+            input_params.parallel.layer_synchronizer->get_event_flag(i);
       }
       if (!input_params.synchronize_layer(i)) {
         return ModelOutput();
-      }
-
-      if (capture_aux_hidden_states_ &&
-          layers_to_capture_set_.count(static_cast<int32_t>(i)) != 0) {
-        // auto aux_h = h;
-        auto aux_h =
-            (FLAGS_enable_intralayer_addnorm) ? h + residual.value() : h;
-        aux_output_buffer_.slice(0, 0, num_tokens)
-            .slice(1,
-                   static_cast<int64_t>(capture_idx) * hidden_size,
-                   static_cast<int64_t>(capture_idx + 1) * hidden_size)
-            .copy_(aux_h.reshape({num_tokens, hidden_size}));
-        capture_idx++;
       }
 
       auto& layer = layers_[i];
@@ -362,18 +307,16 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
       rolling_guard.after_layer(layer_index);
 
       if (deep_stack_size && i < deep_stack_size) {
-        h = deepstack_process(h, input_params.visual_pos_masks, deep_stacks[i]);
+        h = h + deep_stacks[i];
       }
+      // Intralayer add-norm splits the stream, so pass residual for the add.
+      aux_capture_.capture_layer(layer_index, h, residual);
     }
 
-    if (FLAGS_enable_intralayer_addnorm) h = h + residual.value();
+    if (::xllm::KernelConfig::get_instance().enable_intralayer_addnorm())
+      h = h + residual.value();
     auto hidden_states = norm_(h, 0);
-    if (capture_aux_hidden_states_) {
-      torch::Tensor aux_hidden_states =
-          aux_output_buffer_.slice(0, 0, num_tokens);
-      return ModelOutput(hidden_states, torch::Tensor(), aux_hidden_states);
-    }
-    return ModelOutput(hidden_states);
+    return aux_capture_.finalize(hidden_states);
   }
 
   // load the weight from the checkpoint
@@ -448,11 +391,11 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
     }
   }
 
-  std::vector<layer::BaseManualLoader*> get_decoder_loaders() {
-    std::vector<layer::BaseManualLoader*> loaders;
+  std::vector<layer::BaseLoader*> get_decoder_loaders() {
+    std::vector<layer::BaseLoader*> loaders;
     loaders.reserve(layers_.size());
     for (auto& layer : layers_) {
-      loaders.push_back(layer->get_manual_loader());
+      loaders.push_back(layer->get_loader());
     }
     return loaders;
   }
@@ -489,10 +432,7 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
   std::vector<int64_t> mrope_section_;
   RollingLoadManager* rolling_mgr_ = nullptr;
 
-  // egale3
-  std::unordered_set<int32_t> layers_to_capture_set_;
-  bool capture_aux_hidden_states_ = false;
-  torch::Tensor aux_output_buffer_;
+  AuxHiddenCapture aux_capture_;
 };
 TORCH_MODULE(Qwen3MoeModel);
 
@@ -505,13 +445,15 @@ class Qwen3MoeForCausalLMImpl
 TORCH_MODULE(Qwen3MoeForCausalLM);
 
 // register the causal model
-REGISTER_CAUSAL_MODEL(qwen3_moe, Qwen3MoeForCausalLM);
+REGISTER_CAUSAL_MODEL_WITH_VARNAME(qwen3_moe_atb,
+                                   qwen3_moe_atb,
+                                   Qwen3MoeForCausalLM);
 
 // register the model args
 // example config:
 // https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/config.json
 // https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json
-REGISTER_MODEL_ARGS(qwen3_moe, [&] {
+REGISTER_MODEL_ARGS_WITH_VARNAME(qwen3_moe_atb, qwen3_moe_atb, [&] {
   LOAD_ARG_OR(model_type, "model_type", "qwen3_moe");
   LOAD_ARG_OR(dtype, "torch_dtype", "");
   LOAD_ARG_OR(attention_bias, "attention_bias", false);
@@ -541,10 +483,6 @@ REGISTER_MODEL_ARGS(qwen3_moe, [&] {
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);
   LOAD_ARG_OR(vocab_size, "vocab_size", 151936);
   LOAD_ARG_OR(mlp_only_layers, "mlp_only_layers", std::vector<int>());
-
-  // Eagle3: layer ids (0-based) to capture from config, e.g.
-  // "layers_to_capture": [2, 14, 25]; defaults to empty if missing
-  LOAD_ARG_OR(layers_to_capture, "layers_to_capture", std::vector<int32_t>{});
 
   SET_ARG(stop_token_ids, std::unordered_set<int32_t>({args->eos_token_id()}));
 });

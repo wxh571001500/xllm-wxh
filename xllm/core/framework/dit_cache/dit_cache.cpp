@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,28 +17,51 @@ limitations under the License.
 
 namespace xllm {
 
-bool DiTCache::init(const DiTCacheConfig& cfg) {
+bool DiTCache::init(const DiTCacheConfig& cfg,
+                    const ParallelArgs& parallel_args) {
   active_cache_ = create_dit_cache(cfg);
-  if (!active_cache_) {
+  active_cond_cache_ = create_dit_cache(cfg);
+  if (!active_cache_ || !active_cond_cache_) {
     return false;
   }
-  active_cache_->init(cfg);
+  active_cache_->init(cfg, parallel_args);
+  active_cond_cache_->init(cfg, parallel_args);
   return true;
 }
 
-bool DiTCache::on_before_block(const CacheBlockIn& blockin) {
-  return active_cache_->on_before_block(blockin);
+torch::Tensor DiTCache::get_tensor_or_empty(const TensorMap& m,
+                                            const std::string& k) {
+  auto it = m.find(k);
+  if (it != m.end()) return it->second;
+  return torch::Tensor();
 }
 
-CacheBlockOut DiTCache::on_after_block(const CacheBlockIn& blockin) {
-  return active_cache_->on_after_block(blockin);
+bool DiTCache::on_before_block(const CacheBlockIn& block_input, bool use_cfg) {
+  if (use_cfg) {
+    return active_cond_cache_->on_before_block(block_input);
+  }
+  return active_cache_->on_before_block(block_input);
 }
 
-bool DiTCache::on_before_step(const CacheStepIn& stepin) {
+CacheBlockOut DiTCache::on_after_block(const CacheBlockIn& block_input,
+                                       bool use_cfg) {
+  if (use_cfg) {
+    return active_cond_cache_->on_after_block(block_input);
+  }
+  return active_cache_->on_after_block(block_input);
+}
+
+bool DiTCache::on_before_step(const CacheStepIn& stepin, bool use_cfg) {
+  if (use_cfg) {
+    return active_cond_cache_->on_before_step(stepin);
+  }
   return active_cache_->on_before_step(stepin);
 }
 
-CacheStepOut DiTCache::on_after_step(const CacheStepIn& stepin) {
+CacheStepOut DiTCache::on_after_step(const CacheStepIn& stepin, bool use_cfg) {
+  if (use_cfg) {
+    return active_cond_cache_->on_after_step(stepin);
+  }
   return active_cache_->on_after_step(stepin);
 }
 

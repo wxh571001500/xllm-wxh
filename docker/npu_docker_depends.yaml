@@ -1,0 +1,240 @@
+# ==========================================================================
+# xLLM development image - external third-party dependency manifest (single source of truth)
+# ==========================================================================
+# Consumer: the xllm-deps-bundle skill in the xllm-dockerfile repository. It
+#           reads this file, builds the declared artifacts in temporary
+#           containers, and assembles them into one self-extracting run bundle
+#           (op run packages + python wheels + metadata + env-var setup) that
+#           gets installed inside the container alongside xllm itself.
+#
+# Design principles
+#   1. This file is self-contained: it describes which external components xLLM
+#      needs, their versions, how to build them, and how to verify them. The
+#      image repository and build scripts must not hard-code component details.
+#   2. It contains no environment-specific data, such as proxy addresses, local
+#      paths, or host names; the build environment or CLI supplies those.
+#   3. Component changes only require editing this file and rerunning the skill
+#      workflow; the Dockerfile does not need manual updates.
+#
+# Version compatibility rules
+#   The source branch of operator components must match the CANN version in the
+#   runtime image. See the release notes under
+#   gitcode.com/cann/release-management for the official mapping. Resolution order:
+#     1) If compilation reports a missing header or symbol, locate the header in
+#        the image first and identify which CANN version provides it.
+#     2) Compare other branches in the upstream repository. A release branch may
+#        track an unreleased toolchain while master still supports the current
+#        CANN version. In practice, ops-transformer 9.2.0 uses
+#        graph/error_codes.h, which requires CANN 9.2.0, while CANN 9.1.0 has
+#        graph/ge_error_codes.h. master uses ge_error_codes.h, builds with
+#        CANN 9.1.0, and contains every operator required by this manifest.
+#     3) Declare requires_cann and select a build image with --build-image only
+#        after confirming that a newer toolchain is required. Whether artifacts
+#        built with a different CANN version can load in the runtime image is
+#        not an officially supported combination; verify it with symbol checks
+#        and real-device tests.
+# ==========================================================================
+
+schema_version: 1
+
+# The components list is also the installation order in the final image.
+# For type=ascend-op-run components, unset ASCEND_CUSTOM_OPP_PATH before
+# installation and prepend the vendor directory to ASCEND_CUSTOM_OPP_PATH after
+# installation. Components installed later are placed earlier in the path.
+components:
+
+  # ---- Operator run package (built per SoC; contains kernel binaries and loaded by OPP vendors) ----
+  - name: cann-ops-transformer-run
+    type: ascend-op-run
+    repo: https://gitcode.com/cann/ops-transformer.git
+    # Track the moving master branch: upstream keeps evolving and xLLM needs
+    # the latest operators. The build records the actual commit it compiled;
+    # reusing artifacts after master moves prints a HEAD-mismatch warning -
+    # force a rebuild with `bundle --force` when freshness matters.
+    ref: master
+    source_dir: ops-transformer
+    build:
+      # System dependencies recommended by the upstream install_deps.sh. They
+      # are installed only in the temporary build container, not the bundle.
+      system_packages: [pigz, dos2unix, patch, make]
+      requirements: requirements.txt
+      cmd: >-
+        bash build.sh --pkg --soc={soc} --vendor_name={vendor_name}
+        --ops={ops} -j{jobs} -O3
+      vars:
+        vendor_name: ops_transformer
+        # Operators currently required by xLLM. Keep this comma-separated list
+        # on one line and append new operators here.
+        ops: quant_lightning_indexer_v2,quant_lightning_indexer_v2_metadata,sparse_flash_mla,sparse_flash_mla_metadata,mega_moe,key_pool,pool_key_indexer,sparse_flash_attention
+    artifacts:
+      - build_out/*.run
+    install:
+      # Command line used to install the package in the image. {artifact} is
+      # the package path placeholder. Option meanings:
+      #   --quiet            Non-interactive mode, required by docker build.
+      #   --force            Skip the shared-library check because the image
+      #                      build has no NPU driver or device.
+      #   --install-for-all  Make the package usable by non-root users, which
+      #                      is common for development images.
+      cmd: bash {artifact} --quiet --force --install-for-all
+    verify:
+      # Device-free checks that also run in docker build, where no NPU device
+      # or host driver is available.
+      # Compare the CANN version recorded in the package with the runtime image
+      # so cross-version builds are visible.
+      - |
+        echo "  package custom_opp_compiler_version=$(sed -n 's/^custom_opp_compiler_version=//p' {vendor_dir}/version.info) / image CANN=$(basename ${ASCEND_HOME_PATH:-unknown})"
+      # Every declared operator must be present in the package. Use
+      # ascendc/<op> as the canonical location because *_metadata operators
+      # only have host-side implementations, without dynamic/*.py or kernels.
+      # Also require a non-empty kernel root directory for the target SoC to
+      # prove that the package was built for that SoC and is not empty.
+      - |
+        _v={vendor_dir}
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          _k="$_v/op_impl/ai_core/tbe/kernel/$_soc"
+          test -d "$_k" || { echo "missing SoC kernel root directory: $_k"; exit 8; }
+          test -n "$(ls -A "$_k" 2>/dev/null)" || { echo "empty SoC kernel directory: $_k"; exit 8; }
+        done
+        for _op in $(echo {ops} | tr ',' ' '); do
+          test -n "$(ls -d $_v/op_impl/ai_core/tbe/*_impl/ascendc/$_op 2>/dev/null)" || { echo "operator missing from package: $_op"; exit 8; }
+        done
+        echo "  operators complete: $(echo {ops} | tr ',' ' ') | kernels for all SoCs in ({soc})"
+      # package must not contain undeclared ops: stale artifacts from a previous
+      # build would shadow the correct implementation via vendor priority
+      - |
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          XLLM_BINCFG="{vendor_dir}/op_impl/ai_core/tbe/kernel/config/$_soc/binary_info_config.json" \
+          XLLM_OPS="{ops}" python3 -c 'import json,os;cfg=json.load(open(os.environ["XLLM_BINCFG"]));d={"".join(p.capitalize() for p in o.split("_")) for o in os.environ["XLLM_OPS"].split(",")};e=sorted(set(cfg)-d);import sys; print(",".join(e)); sys.exit(1) if e else print("  no undeclared ops")'
+        done
+      # The op_api library must exist because it provides aclnn entry points.
+      - test -n "$(ls {vendor_dir}/op_api/lib/*.so* 2>/dev/null)"
+      # CANN dynamically loads these libraries through ASCEND_CUSTOM_OPP_PATH at
+      # runtime, so they do not depend on LD_LIBRARY_PATH. Verify that their own
+      # dependencies can be resolved by the dynamic linker.
+      # ldd -r exits 0 even when symbols stay unresolved, so scan its output
+      # instead of trusting the exit code; print the log on failure.
+      - |
+        ldd -r {vendor_dir}/op_api/lib/*.so* > /tmp/opapi_ldd.log 2>&1 || true
+        if grep -Eqi 'undefined symbol|not found' /tmp/opapi_ldd.log; then
+          cat /tmp/opapi_ldd.log; exit 8
+        fi
+        echo "  op_api library dependencies are self-resolving (no LD_LIBRARY_PATH needed)"
+
+  # ---- Torch extension wheel (JIT wrapper, py3-none-any, SoC-independent) ----
+  - name: cann-ops-transformer-torch-ext
+    type: python-wheel
+    repo: https://gitcode.com/cann/ops-transformer.git
+    # Same moving master branch as cann-ops-transformer-run (shared source_dir:
+    # both components build from one checkout at one commit).
+    ref: master
+    source_dir: ops-transformer
+    build:
+      system_packages: [pigz, dos2unix, patch, make]
+      requirements: torch_extension/requirements.txt
+      cmd: bash build.sh --torch_extension_only
+    artifacts:
+      - build_out/*.whl
+    verify:
+      # Device-free check that the wheel is installed and its distribution
+      # metadata is visible.
+      - python3 -c "import importlib.metadata as m; print('  cann-ops-transformer', m.version('cann_ops_transformer'))"
+    verify_device:
+      # Requires a device because it imports torch and torch_npu. It cannot run
+      # during image build, which has no NPU device or host driver.
+      - python3 -c "import cann_ops_transformer; from cann_ops_transformer import ops; names=[n for n in dir(ops) if not n.startswith('_')]; print('  torch_ext exposed operators:', len(names)); print('  sample:', sorted(names)[:8])"
+
+  # ---- vLLM-Ascend operator run package (MoE hidden-state pre-op) ----
+  - name: vllm-ascend-ops-run
+    type: ascend-op-run
+    # for a2/a5 is expected to fail the SoC kernel check below - that is
+    # intentional fail-fast behavior.
+    # hc_pre ships arch35 (A3/ascend910_93) kernels only; components whose
+    # supported_socs excludes the current soc are skipped at build time.
+    supported_socs: [ascend910_93]
+    repo: https://github.com/vllm-project/vllm-ascend.git
+    # Track the moving main branch (upstream keeps evolving). The actual
+    # compiled commit is recorded in the bundle metadata (components[].commit)
+    # and after install in vendors/xllm_deps_metadata/ - use that for
+    # traceability instead of pinning a ref here.
+    # sparse_flash_attention comes from ops-transformer above; this package
+    # only carries hc_pre.
+    ref: main
+    source_dir: vllm-ascend
+    build:
+      cmd: >-
+        bash csrc/build.sh --pkg --soc={soc} --vendor_name={vendor_name}
+        --ops={ops} -j{jobs} -O3
+      vars:
+        vendor_name: llm_ascend
+        ops: hc_pre
+    artifacts:
+      - csrc/build_out/*.run
+    install:
+      cmd: bash {artifact} --quiet --force --install-for-all
+    verify:
+      # Device-free checks that run inside the bundle install as well.
+      # Compare the CANN version recorded in the package with the target
+      # image so cross-version builds are visible.
+      - |
+        echo "  package custom_opp_compiler_version=$(sed -n 's/^custom_opp_compiler_version=//p' {vendor_dir}/version.info) / image CANN=$(basename ${ASCEND_HOME_PATH:-unknown})"
+      # Every declared operator must be present in the package (ascendc/<op>
+      # is the canonical location), and the target-SoC kernel root directory
+      # must exist and be non-empty.
+      - |
+        _v={vendor_dir}
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          _k="$_v/op_impl/ai_core/tbe/kernel/$_soc"
+          test -d "$_k" || { echo "missing SoC kernel root directory: $_k"; exit 8; }
+          test -n "$(ls -A "$_k" 2>/dev/null)" || { echo "empty SoC kernel directory: $_k"; exit 8; }
+        done
+        for _op in $(echo {ops} | tr ',' ' '); do
+          test -n "$(ls -d $_v/op_impl/ai_core/tbe/*_impl/ascendc/$_op 2>/dev/null)" || { echo "operator missing from package: $_op"; exit 8; }
+        done
+        echo "  operators complete: $(echo {ops} | tr ',' ' ') | kernels for all SoCs in ({soc})"
+      # package must not contain undeclared ops: stale artifacts from a previous
+      # build would shadow the correct implementation via vendor priority
+      - |
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          XLLM_BINCFG="{vendor_dir}/op_impl/ai_core/tbe/kernel/config/$_soc/binary_info_config.json" \
+          XLLM_OPS="{ops}" python3 -c 'import json,os;cfg=json.load(open(os.environ["XLLM_BINCFG"]));d={"".join(p.capitalize() for p in o.split("_")) for o in os.environ["XLLM_OPS"].split(",")};e=sorted(set(cfg)-d);import sys; print(",".join(e)); sys.exit(1) if e else print("  no undeclared ops")'
+        done
+      # The op_api library must exist because it provides aclnn entry points;
+      # its own dependencies must resolve without LD_LIBRARY_PATH (CANN loads
+      # it through ASCEND_CUSTOM_OPP_PATH at runtime).
+      - test -n "$(ls {vendor_dir}/op_api/lib/*.so* 2>/dev/null)"
+      # ldd -r exits 0 even when symbols stay unresolved, so scan its output
+      # instead of trusting the exit code; print the log on failure.
+      - |
+        ldd -r {vendor_dir}/op_api/lib/*.so* > /tmp/opapi_ldd.log 2>&1 || true
+        if grep -Eqi 'undefined symbol|not found' /tmp/opapi_ldd.log; then
+          cat /tmp/opapi_ldd.log; exit 8
+        fi
+        echo "  op_api library dependencies are self-resolving (no LD_LIBRARY_PATH needed)"
+
+  # ---- Linear-attention operator library wheel (built per SoC) ----
+  - name: flash-linear-attention-npu
+    type: python-wheel
+    repo: https://github.com/flashserve/flash-linear-attention-npu.git
+    ref: v26.9.1              # Immutable tag for commit 3ca0586a61493d2e9b6fbee99a0ac33d4b033b77.
+    source_dir: flash-linear-attention-npu
+    build:
+      requirements: requirements.txt
+      soc_env: FLA_NPU_SOC          # This repository selects the SoC with this variable.
+      cmd: python3 scripts/build_wheel.py
+    artifacts:
+      - dist/*.whl
+    install:
+      # Always install wheels with --no-deps to prevent pip from changing the
+      # pinned torch, torch_npu, numpy, and CANN dependency set.
+      # Therefore, every Requires-Dist entry absent from the base image must be
+      # declared here. The deps stage downloads them into the artifact
+      # directory, the final stage installs them offline, and any undeclared
+      # missing dependency fails the Requires-Dist reconciliation script.
+      # expecttest is a runtime dependency declared by this wheel but not
+      # included in the base image.
+      pip_deps: [expecttest]
+    verify:
+      - python3 -c "import importlib.metadata as m; print('  ', [(d.name, d.version) for d in m.distributions() if d.name.lower().replace('_','-').startswith('flash-linear-attention')])"
+    verify_device:
+      - python3 -c "import fla_npu; from fla_npu.ops import ascendc; print('  fla_npu ok, ascendc.chunk_fwd_o:', hasattr(ascendc, 'chunk_fwd_o'))"

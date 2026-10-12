@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -45,7 +45,8 @@ class XServiceClient {
   ~XServiceClient();
   bool init(const std::string& etcd_addr,
             const std::string& instance_name = "",
-            const BlockManagerPool* block_manager_pool = nullptr);
+            const BlockManagerPool* block_manager_pool = nullptr,
+            const std::string& etcd_namespace = "");
   void set_scheduler(Scheduler* scheduler);
   void set_engine(Engine* engine);
   bool initialize_done() { return initialize_done_; }
@@ -69,8 +70,10 @@ class XServiceClient {
   bool reconcile_registration();
   void reconcile_registration_loop();
 
-  void handle_master_service_watch(const etcd::Response& response);
-  void handle_xservices_watch(const etcd::Response& response);
+  void handle_master_service_watch(const etcd::Response& response,
+                                   const uint64_t& prefix_len);
+  void handle_xservices_watch(const etcd::Response& response,
+                              const uint64_t& prefix_len);
 
   // connect to specific xllm_service
   bool connect_to_xservice(const std::string& xservice_addr);
@@ -115,5 +118,16 @@ class XServiceClient {
   Scheduler* scheduler_ = nullptr;                        // not own
   Engine* engine_ = nullptr;  // not own, for xtensor info
 };
+
+// Builds the in-process instance record from a GetInstanceInfo response.
+//
+// `kv_split_size` is copied verbatim so that proto3's 0 -- "the field was not
+// present" -- stays distinguishable from a declared 1. Collapsing the two is a
+// silent mis-addressing risk: the transfer plan keys on the peer's DECLARED
+// width, and a peer that never declared one must be refused, not assumed to be
+// 1. See plan_kv_split_widths(). `cp_index_write_mode` follows the same
+// verbatim contract for the write mode.
+InstanceInfo instance_info_from_proto(
+    const xllm_service::proto::InstanceMetaInfo& response);
 
 }  // namespace xllm

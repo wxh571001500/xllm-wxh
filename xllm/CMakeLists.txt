@@ -13,16 +13,27 @@ if(XLLM_BUILD_VERSION STREQUAL "")
   set(XLLM_BUILD_VERSION "unknown")
 endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/core/common")
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/core/common/xllm_build_info.h"
-     "#pragma once\n\n#define XLLM_BUILD_VERSION \"${XLLM_BUILD_VERSION}\"\n")
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/core/common/xllm_build_info.h.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/core/common/xllm_build_info.h"
+  @ONLY)
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
 # Set warning-as-error for xllm code (third-party headers are marked as SYSTEM)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(
-    $<$<COMPILE_LANGUAGE:CXX>:-Werror>
-    $<$<COMPILE_LANGUAGE:C>:-Werror>
-  )
+  if(USE_MUSA)
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:CXX>:-Wno-defaulted-function-deleted>
+      $<$<COMPILE_LANGUAGE:CXX>:-Wno-sign-conversion>
+      $<$<COMPILE_LANGUAGE:CXX>:-Wno-inconsistent-missing-override>
+      $<$<COMPILE_LANGUAGE:CXX>:-Wno-conversion>
+    )
+  else()
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:CXX>:-Werror>
+      $<$<COMPILE_LANGUAGE:C>:-Werror>
+    )
+  endif()
 
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options(
@@ -60,7 +71,7 @@ if(GENERATE_SO)
       c_api/internal/rec.cpp
       c_api/internal/helper.cpp
     DEPS
-      :flags
+      :config
       :master
       absl::strings
       Boost::serialization
@@ -78,9 +89,10 @@ else()
     SRCS
       xllm.cpp
     DEPS
-      :flags
+      :config
       :xllm_server
       :master
+      :util
       absl::strings
       Boost::serialization
       gflags::gflags
@@ -92,11 +104,11 @@ else()
 endif()
 
 # link brpc
-target_link_libraries(xllm PRIVATE glog::glog brpc leveldb::leveldb protobuf::libprotobuf ${OpenCV_LIBS})
+target_link_libraries(xllm PRIVATE glog::glog brpc leveldb::leveldb protobuf::libprotobuf ${OpenCV_LIBS} ${FFMPEG_LIBRARIES})
 add_dependencies(xllm brpc-static)
 
 if(USE_NPU)
-  set(COMMON_LIBS torch_npu torch_python Python::Python ascendcl atb_customize hccl c_sec nnopbase ms_tools_ext)
+  set(COMMON_LIBS torch_npu torch_python Python::Python ascendcl atb_customize unified_dlog hccl c_sec nnopbase ms_tools_ext)
 elseif(USE_MLU)
   set(COMMON_LIBS Python::Python)
 endif()
@@ -105,8 +117,14 @@ if(USE_MSPTI)
   list(APPEND COMMON_LIBS mspti)
 endif()
 target_link_libraries(xllm PUBLIC ${COMMON_LIBS})
-if (USE_MUSA)
+if(USE_MUSA)
   target_link_libraries(xllm PUBLIC atomic musa_python torch_cpu c10)
+endif()
+
+if(USE_MUSA)
+  target_link_options(xllm PRIVATE
+    "LINKER:--whole-archive,$<TARGET_FILE:runtime>,--no-whole-archive"
+  )
 endif()
 
 # install xllm

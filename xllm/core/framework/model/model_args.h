@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,6 +21,7 @@ limitations under the License.
 #include <optional>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -29,7 +30,20 @@ limitations under the License.
 
 namespace xllm {
 
+inline constexpr std::string_view kDFlashDraftModelType = "DFlashDraftModel";
+inline constexpr std::string_view kDSparkDraftModelType = "DSparkDraftModel";
+inline constexpr std::string_view kDFlash2DraftModelType = "DFlash2DraftModel";
+
+inline constexpr bool is_dflash2_draft_model_type(std::string_view model_type) {
+  return model_type == kDFlash2DraftModelType;
+}
+
 struct ModelArgs {
+  // Expose every plain-data field to the generic property reflection layer so
+  // the embedded Python model executor can receive the full, already-parsed
+  // config without a hand-maintained field whitelist (see property_reflect.h).
+  REFLECT_PROPERTIES(ModelArgs);
+
   PROPERTY(std::string, model_type);
 
   PROPERTY(std::string, dtype);
@@ -59,6 +73,36 @@ struct ModelArgs {
   PROPERTY(std::optional<int64_t>, decoder_n_kv_heads);
 
   PROPERTY(int64_t, vocab_size) = -1;
+  PROPERTY(int64_t, draft_vocab_size) = 0;
+
+  // DSpark: low-rank dim of the Markov head. 0 = disabled (plain DFlash /
+  // non-DSpark models).
+  PROPERTY(int64_t, markov_rank) = 0;
+  PROPERTY(int32_t, dspark_num_layers) = 0;
+  PROPERTY(int32_t, dspark_block_size) = 0;
+  // True only when SparseAttnSharedkv accepts explicit DSpark SWA indices.
+  // False selects the CANN 9.0-compatible q_len=1 row fallback.
+  PROPERTY(bool, dspark_use_native_sas) = false;
+
+  // DSpark ConfidenceHead switches. When enabled, DSpark's ForCausalLM
+  // registers a `confidence_head.proj` layer used for adaptive-speculative
+  // pruning acceptance-probability estimation. `with_markov` toggles whether
+  // the head is applied on `concat(hidden, markov_embedding[prev])` (True in
+  // released dspark_qwen3_*b_block* checkpoints) or on `hidden` alone.
+  PROPERTY(bool, enable_confidence_head) = false;
+  PROPERTY(bool, confidence_head_with_markov) = false;
+
+  // DFlash2 local-convolution and candidate-selector geometry.
+  PROPERTY(int32_t, dflash2_block_size) = 0;
+  PROPERTY(int32_t, dflash2_conv_group_size) = 0;
+  PROPERTY(int32_t, dflash2_conv_kernel_size) = 0;
+  PROPERTY(int32_t, dflash2_selector_rank) = 0;
+  PROPERTY(int32_t, dflash2_selector_top_k) = 0;
+
+  // Worker-stamped for block-diffusion drafts that must run eager.
+  PROPERTY(bool, requires_eager_execution) = false;
+  // Minimum input rows an idle/empty shard must still materialize.
+  PROPERTY(int32_t, dummy_token_count) = 1;
 
   PROPERTY(bool, use_qk_norm) = false;
   PROPERTY(float, rms_norm_eps) = 0.0f;
@@ -83,6 +127,7 @@ struct ModelArgs {
   PROPERTY(float, rope_scaling_mscale) = 0.0f;
   PROPERTY(float, rope_scaling_mscale_all_dim) = 0.0f;
   PROPERTY(std::vector<int64_t>, rope_scaling_mrope_section);
+  PROPERTY(bool, rope_scaling_mrope_interleaved) = false;
 
   // the maximum sequence length to use for rotary position embeddings.
   PROPERTY(int64_t, max_position_embeddings) = 0;
@@ -130,6 +175,7 @@ struct ModelArgs {
   PROPERTY(int32_t, n_group) = 0;
   PROPERTY(int32_t, topk_group) = 0;
   PROPERTY(std::string, scoring_func);
+  PROPERTY(float, swiglu_limit) = 0.0f;
   // deepseek v2/v3 MLA
   PROPERTY(bool, enable_mla) = false;
   PROPERTY(int32_t, qk_nope_head_dim) = 0;
@@ -139,18 +185,82 @@ struct ModelArgs {
   PROPERTY(int32_t, kv_lora_rank) = 0;
   // deepseek v3/v3.2 MTP
   PROPERTY(int32_t, num_nextn_predict_layers) = 0;
+  PROPERTY(int64_t, mtp_start_layer_idx) = -1;
+  PROPERTY(std::string, mtp_mlp_type) = "moe";
 
   // deepseek v3.2 indexer
   PROPERTY(int32_t, index_head_dim) = 0;
   PROPERTY(int32_t, index_n_heads) = 0;
   PROPERTY(int32_t, index_topk) = 0;
+  PROPERTY(int32_t, index_kpool) = 1;
+  PROPERTY(bool, index_kpool_compress) = false;
+  PROPERTY(bool, index_kpool_always_select_tail) = false;
   PROPERTY(bool, indexer_rope_interleave) = false;
+  // IndexCache: https://arxiv.org/abs/2603.12201
+  PROPERTY(int32_t, index_topk_freq) = 1;
+  PROPERTY(std::string, index_topk_pattern);
+  PROPERTY(int32_t, index_skip_topk_offset) = 0;
+  PROPERTY(bool, index_share_for_mtp_iteration) = false;
+  PROPERTY(std::vector<std::string>, indexer_types) = {};
+  PROPERTY(std::vector<std::string>, mlp_layer_types) = {};
+
+  // deepseek v4
+  PROPERTY(int32_t, rope_head_dim) = 0;
+  PROPERTY(int32_t, o_lora_rank) = 0;
+  PROPERTY(int32_t, o_groups) = 0;
+  PROPERTY(std::vector<int32_t>, compress_ratios);
+  // deepseek v4.1: layers that own a Compressor and publish the shared
+  // compressed main-KV / index caches; all other CSA2 layers reuse them.
+  PROPERTY(std::vector<int32_t>, kv_source_layer_ids) = {};
+  // deepseek v4.1: layers that own an Indexer and compute fresh Top-K
+  // indices; all others reuse the latest Top-K.
+  PROPERTY(std::vector<int32_t>, index_source_layer_ids) = {};
+  PROPERTY(float, compress_rope_theta) = 0.0f;
+  PROPERTY(int32_t, window_size) = 0;
+  PROPERTY(int32_t, n_activated_experts) = 0;
+  PROPERTY(int32_t, n_hash_layers) = 0;
+  PROPERTY(float, factor) = 0.0f;
+  PROPERTY(float, beta_fast) = 0.0f;
+  PROPERTY(float, beta_slow) = 0.0f;
+  PROPERTY(std::string, scale_fmt);
+  PROPERTY(int32_t, hc_mult) = 0;
+  PROPERTY(int32_t, hc_sinkhorn_iters) = 0;
+  PROPERTY(float, hc_eps) = 1e-6f;
+  PROPERTY(int64_t, max_batch_size) = 0;
+  PROPERTY(int64_t, max_seq_len) = 0;
+
+  // deepseek v4.1 (Flash): CSA2/CED candidate block pool, engram sparse-recall
+  // tables and DSpark draft MoE geometry. Loaded from the HF config's
+  // text_config by the deepseek_v41 args loader; those HF text_config fields
+  // are the semantic source of truth. Defaults are "disabled" sentinels
+  // (-1 / 0 / empty), not released-model values.
+  // (kv_source_layer_ids / index_source_layer_ids live next to
+  // compress_ratios above.)
+  PROPERTY(int32_t, candidate_source_layer_id) = -1;
+  PROPERTY(int32_t, candidate_topk_blocks) = 0;
+  PROPERTY(int32_t, candidate_block_size) = 0;
+  PROPERTY(std::vector<int32_t>, engram_layer_ids) = {};
+  PROPERTY(std::vector<int64_t>, engram_num_embeddings) = {};
+  PROPERTY(int32_t, engram_max_ngram_size) = 0;
+  PROPERTY(int32_t, engram_vocab_size) = 0;
+  PROPERTY(int32_t, engram_n_heads) = 0;
+  PROPERTY(int32_t, engram_head_dim) = 0;
+  // -1 = "unset": matches DeepseekV41Config.engram_pad_token_id in
+  // xllm/python/models/deepseek_v41.py, whose guard rejects an enabled engram
+  // with an unset pad id. Keep this and the deepseek_v41 loader default equal.
+  PROPERTY(int32_t, engram_pad_token_id) = -1;
+  PROPERTY(int32_t, engram_compressed_vocab_size) = 0;
+  PROPERTY(int32_t, dspark_n_routed_experts) = 0;
+  PROPERTY(int32_t, dspark_num_experts_per_tok) = 0;
+  // image_token_id is shared with the multimodal token ids below; the
+  // deepseek_v41 args loader applies the V4.1 default (-1) itself.
 
   PROPERTY(int32_t, vision_start_token_id) = 0;
   PROPERTY(int32_t, vision_end_token_id) = 0;
   PROPERTY(int32_t, vision_token_id) = 0;
   PROPERTY(int32_t, image_token_id) = 0;
   PROPERTY(int32_t, video_token_id) = 0;
+  PROPERTY(int32_t, audio_token_id) = 0;
 
   // glm4v moe
   PROPERTY(int32_t, image_start_token_id) = 0;
@@ -176,11 +286,14 @@ struct ModelArgs {
   // qwen3 next initialized with 0, and will be loaded in model file
   PROPERTY(bool, attn_output_gate) = false;
   PROPERTY(int32_t, full_attention_interval) = 0;
+  PROPERTY(std::vector<int32_t>, full_attn_layers) = {};
   PROPERTY(int32_t, linear_conv_kernel_dim) = 0;
   PROPERTY(int32_t, linear_key_head_dim) = 0;
   PROPERTY(int32_t, linear_value_head_dim) = 0;
   PROPERTY(int64_t, linear_num_key_heads) = 0;
   PROPERTY(int32_t, linear_num_value_heads) = 0;
+  PROPERTY(float, linear_lower_bound) = -5.0f;
+  PROPERTY(std::string, mamba_ssm_dtype);
   PROPERTY(int32_t, shared_expert_intermediate_size) = 0;
   PROPERTY(float, partial_rotary_factor) = 0.0f;
   PROPERTY(std::vector<std::string>, layer_types) = {};
@@ -239,6 +352,9 @@ struct ModelArgs {
   // Vision model's mm_projection_dim
   PROPERTY(int64_t, mm_projection_dim) = 0;
 
+  // Vision model's mm_projector_hidden_size
+  PROPERTY(int64_t, mm_projector_hidden_size) = 0;
+
   PROPERTY(int64_t, mm_spatial_merge_size) = 0;
   PROPERTY(int64_t, mm_spatial_patch_size) = 0;
 
@@ -287,6 +403,44 @@ struct ModelArgs {
   PROPERTY(int, mm_tokens_per_second) = 0;
   PROPERTY(int, mm_temporal_patch_size) = 0;
 
+  // qwen3_omni_moe_thinker related args
+
+  // qwen3_omni qwen2vl video processor args
+  PROPERTY(int64_t, mm_position_id_per_seconds) = 0;
+  PROPERTY(double, mm_fps) = 0;
+
+  // qwen3_omni whisper processor related args
+  PROPERTY(bool, mm_use_audio_in_video) = false;
+  PROPERTY(int64_t, mm_audio_feature_size) = 0;
+  PROPERTY(int64_t, mm_audio_hop_length) = 0;
+  PROPERTY(int64_t, mm_audio_chunk_length) = 0;
+  PROPERTY(int64_t, mm_audio_n_fft) = 0;
+  PROPERTY(double, mm_audio_padding_value) = 0.0;
+  PROPERTY(double, mm_audio_dither) = 0.0;
+  PROPERTY(bool, mm_audio_return_attention_mask) = false;
+  PROPERTY(std::string, mm_audio_padding_side) = "right";
+
+  PROPERTY(bool, mm_audio_truncation) = false;
+  PROPERTY(int64_t, mm_audio_padding_strategy) = 0;
+  PROPERTY(int64_t, mm_audio_max_length) = 0;
+  PROPERTY(int64_t, mm_audio_pad_to_multiple_of) = 0;
+  PROPERTY(bool, mm_audio_do_normalize) = false;
+  PROPERTY(bool, mm_audio_return_token_timestamps) = false;
+
+  // qwen3_omni audio encoder related args
+  PROPERTY(int32_t, audio_start_token_id) = 0;
+  PROPERTY(int32_t, audio_end_token_id) = 0;
+  PROPERTY(int64_t, mm_audio_num_attention_heads) = 0;
+  PROPERTY(int64_t, mm_audio_hidden_size) = 0;
+  PROPERTY(int64_t, mm_audio_downsample_hidden_size) = 0;
+  PROPERTY(int64_t, mm_audio_max_source_positions) = 0;
+  PROPERTY(bool, mm_audio_scale_embedding) = false;
+  PROPERTY(int64_t, mm_audio_n_window) = 0;
+  PROPERTY(int64_t, mm_audio_n_window_infer) = 0;
+  PROPERTY(int64_t, mm_audio_conv_chunksize) = 0;
+  PROPERTY(int64_t, mm_audio_encoder_layers) = 0;
+  PROPERTY(int64_t, mm_audio_output_dim) = 0;
+
   // VLM model projector's mm_projector_type
   PROPERTY(std::string, mm_projector_type);
 
@@ -325,6 +479,24 @@ struct ModelArgs {
   PROPERTY(std::vector<double>, mm_image_normalize_mean) = {};
   PROPERTY(std::vector<double>, mm_image_normalize_std) = {};
 
+  // KIMI_K25
+  PROPERTY(int64_t, mm_init_pos_emb_width) = 64;
+  PROPERTY(int64_t, mm_init_pos_emb_height) = 64;
+  PROPERTY(int64_t, mm_init_pos_emb_time) = 4;
+  PROPERTY(int64_t, mm_km_in_patch_limit) = 16384;
+  PROPERTY(int64_t, mm_km_patch_size) = 14;
+  PROPERTY(std::vector<int64_t>, mm_km_image_mean) = {};
+  PROPERTY(std::vector<int64_t>, mm_km_image_std) = {};
+  PROPERTY(int64_t, mm_km_merge_kernel_size) = 2;
+  PROPERTY(int64_t, mm_km_fixed_output_tokens) = -1;
+  PROPERTY(int64_t, mm_km_patch_limit_on_one_side) = 512;
+  PROPERTY(int64_t, mm_km_in_patch_limit_each_frame) = 4096;
+  PROPERTY(int64_t, mm_km_in_patch_limit_video) = 200;
+  PROPERTY(float, mm_km_sample_fps) = 2.0;
+  PROPERTY(int64_t, mm_km_max_num_frames_each_video) = 2;
+  PROPERTY(int64_t, mm_km_temporal_merge_kernel_size) = 4;
+  PROPERTY(std::string, mm_km_timestamp_mode) = "hh:mm:ss.fff";
+
   // GLM
   PROPERTY(bool, mm_video_do_rescale) = false;
   PROPERTY(std::vector<double>, mm_video_normalize_mean) = {};
@@ -344,10 +516,26 @@ struct ModelArgs {
   PROPERTY(int, mm_image_temporal_patch_size) = 0;
   PROPERTY(int, mm_image_merge_size) = 0;
 
+  // GLM-5.3-Flash per-token resize budget. When both are > 0 the image
+  // processor uses the token-budget smart_resize (pixels_per_token =
+  // temporal_patch_size * (patch_size * merge_size)^2); otherwise it falls back
+  // to the legacy pixel-budget resize.
+  PROPERTY(int, mm_image_min_tokens) = 0;
+  PROPERTY(int, mm_image_max_tokens) = 0;
+
   // GLM
   PROPERTY(int, mm_video_patch_size) = 0;
   PROPERTY(int, mm_video_temporal_patch_size) = 0;
   PROPERTY(int, mm_video_merge_size) = 0;
+
+  // GLM-5.3-Flash per-token resize budget for video (see mm_image_*).
+  PROPERTY(int, mm_video_min_tokens) = 0;
+  PROPERTY(int, mm_video_max_tokens) = 0;
+
+  // Qwen3-Omni per-frame pixel budget for video, loaded from
+  // preprocessor_config.json (video_max_pixels). When > 0 it overrides the
+  // default VIDEO_MAX_TOKEN_NUM * factor^2 budget in the omni video processor.
+  PROPERTY(int64_t, mm_video_max_pixels) = 0;
 
   PROPERTY(int, mm_image_feature_size) = 0;
   PROPERTY(int, mm_scale_resolution) = 0;
@@ -359,6 +547,26 @@ struct ModelArgs {
   PROPERTY(int64_t, mm_image_token_index) = 0;
   PROPERTY(int64_t, mm_pad_token_id) = 0;
 
+  // mm audio begin
+  // JoyaiASR
+  PROPERTY(int64_t, mm_audio_sampling_rate) = 16000;
+  PROPERTY(int64_t, mm_audio_num_mel_bins) = 80;
+  PROPERTY(int64_t, mm_audio_frame_length) = 400;
+  PROPERTY(int64_t, mm_audio_frame_shift) = 160;
+  PROPERTY(int64_t, mm_audio_max_frames) = 3000;
+  PROPERTY(int64_t, mm_audio_downsample_rate) = 2;
+  PROPERTY(std::vector<double>, mm_audio_cmvn_means) = {};
+  PROPERTY(std::vector<double>, mm_audio_cmvn_inverse_std) = {};
+  PROPERTY(int64_t, mm_audio_idim) = 80;
+  PROPERTY(int64_t, mm_audio_d_model) = 1280;
+  PROPERTY(int64_t, mm_audio_n_layers) = 16;
+  PROPERTY(int64_t, mm_audio_n_head) = 20;
+  PROPERTY(int64_t, mm_audio_kernel_size) = 33;
+  PROPERTY(int64_t, mm_audio_pe_maxlen) = 5000;
+
+  // ctc head
+  PROPERTY(int64_t, mm_audio_ctc_pad_token_id) = 151643;
+
   // whether to tie weight embeddings
   PROPERTY(bool, tie_word_embeddings) = false;
 
@@ -368,13 +576,35 @@ struct ModelArgs {
   PROPERTY(int32_t, max_window_layers) = 0;
 
   PROPERTY(int32_t, query_num) = 0;
-  PROPERTY(bool, image_embedding_mode) = false;
+  PROPERTY(bool, encoder_embedding_mode) = false;
+  PROPERTY(bool, embedding_mode) = false;
 
   // number of speculative decoding tokens
   PROPERTY(int64_t, num_speculative_tokens) = 0;
 
-  // Eagle3: layer indices (0-based) to capture aux hidden states, from config
+  // Enables the target-side runtime path for an embedded Eagle3 draft.
+  PROPERTY(bool, enable_embedded_eagle3_draft) = false;
+
+  // Workaround knob: maximum prefill requests admitted concurrently on each
+  // DP rank for models that need bounded prefill concurrency.
+  // Zero keeps the limit disabled.
+  PROPERTY(int32_t, max_concurrent_prefills_per_dp) = 0;
+
+  // Layer indices whose residual streams feed a speculative draft.
   PROPERTY(std::vector<int32_t>, layers_to_capture) = {};
+
+  // Eagle3.1 draft variants (speculators-format checkpoints). The per-head QK
+  // RMSNorm switch reuses the shared use_qk_norm field above.
+  // Apply a single RMSNorm over the concatenated target aux hidden states
+  // before the fc projection.
+  PROPERTY(bool, norm_before_fc) = false;
+  // Use the hidden_norm output as the attention residual base.
+  PROPERTY(bool, norm_before_residual) = false;
+  // Feed post-final-norm hidden states back across draft steps.
+  PROPERTY(bool, norm_output) = false;
+  // Apply a per-chunk RMSNorm to each aux hidden state before the fc
+  // projection (mutually exclusive with norm_before_fc).
+  PROPERTY(bool, fc_norm) = false;
 
   // VAE related args
   PROPERTY(int64_t, in_channels) = -1;
@@ -397,12 +627,76 @@ struct ModelArgs {
   PROPERTY(bool, use_quant_conv) = false;
   PROPERTY(bool, use_post_quant_conv) = false;
 
+  // Wan_2.2_ VAE related args (base_dim, dim_mult, latents_mean, latents_std,
+  // num_res_blocks, attn_scales, temporal_downsample, dropout are reused from
+  // qwen_image_edit_2509 vae args above)
+  PROPERTY(int64_t, vae_scale_factor_temporal) = 0;
+  PROPERTY(int64_t, vae_scale_factor_spatial) = 0;
+  PROPERTY(bool, vae_is_residual) = false;
+
+  PROPERTY(float, batch_norm_eps) = 1e-04f;
+  PROPERTY(float, batch_norm_momentum) = 0.1f;
+  PROPERTY(std::vector<int64_t>, ae_patch_size) = {};
+
   // dit related args
   PROPERTY(int64_t, joint_attention_dim) = 0;
   PROPERTY(int64_t, pooled_projection_dim) = 0;
   PROPERTY(bool, guidance_embeds) = true;
   PROPERTY(std::vector<int64_t>, axes_dims_rope) = {};
   PROPERTY(int64_t, num_single_layers) = 0;
+
+  PROPERTY(float, mlp_ratio) = 3.0f;
+  PROPERTY(int, timestep_guidance_channels) = 256;
+  PROPERTY(int64_t, patch_size) = 1;
+  PROPERTY(std::vector<int64_t>, wan_patch_size) = { 1, 2, 2 };
+  PROPERTY(bool, cross_attn_norm) = true;
+  PROPERTY(double, eps) = 1e-6;
+  PROPERTY(int64_t, ffn_dim) = 13824;
+  PROPERTY(int64_t, time_freq_dim) = 256;
+  PROPERTY(int64_t, dit_in_channels) = 36;
+  PROPERTY(int64_t, dit_out_channels) = 16;
+  PROPERTY(std::string, qk_norm) = "rms_norm_across_heads";
+  PROPERTY(int64_t, rope_max_seq_len) = 1024;
+  PROPERTY(int64_t, text_embed_dim) = 4096;
+  PROPERTY(int64_t, image_embed_dim) = -1;
+  PROPERTY(int64_t, added_kv_proj_dim) = -1;
+  PROPERTY(int64_t, pos_embed_seq_len) = -1;
+
+  // MiniMax-H3 DiT related args
+  PROPERTY(int64_t, num_refiner_layers) = 0;
+  PROPERTY(int64_t, audio_in_channels) = 0;
+  PROPERTY(int64_t, time_embed_hidden_dim) = 0;
+  PROPERTY(int64_t, time_embed_dim) = 0;
+  PROPERTY(int64_t, rope_freq_dim) = 0;
+  PROPERTY(float, qk_norm_eps) = 1e-5f;
+  PROPERTY(float, final_norm_eps) = 1e-5f;
+
+  // cola-dlm dit related args
+  PROPERTY(int64_t, txt_dim) = 0;
+  PROPERTY(int64_t, txt_in_channels) = 0;
+  PROPERTY(int64_t, txt_out_channels) = 0;
+  PROPERTY(int64_t, emb_dim) = 0;
+  PROPERTY(int64_t, heads) = 0;
+  PROPERTY(int64_t, rope_dim) = 0;
+  PROPERTY(int64_t, expand_ratio) = 0;
+  PROPERTY(int64_t, block_size) = 0;
+  PROPERTY(int64_t, latent_dim) = 0;
+  PROPERTY(bool, qk_bias) = false;
+  PROPERTY(float, norm_eps) = 1e-5f;
+
+  // cola-dlm vae related args
+  PROPERTY(int64_t, vae_dim) = 0;
+  PROPERTY(int64_t, vae_num_heads) = 0;
+  PROPERTY(int64_t, encoder_num_blocks) = 0;
+  PROPERTY(int64_t, decoder_num_blocks) = 0;
+  PROPERTY(int64_t, shared_heads_kv) = 0;
+  PROPERTY(int64_t, vae_rope_theta) = 0;
+  PROPERTY(int64_t, vae_block_size) = 0;
+  PROPERTY(int64_t, vae_patch_size) = 0;
+  PROPERTY(bool, encoder_last_ln) = true;
+  PROPERTY(float, shifting_factor) = 0.0f;
+  PROPERTY(float, scaling_factor) = 0.0f;
+  PROPERTY(bool, use_variation) = true;
 
   // t5 related args
   PROPERTY(int64_t, d_model) = 0;
@@ -422,6 +716,83 @@ struct ModelArgs {
   PROPERTY(float, max_shift) = 0;
   PROPERTY(int64_t, base_image_seq_len) = 0;
   PROPERTY(int64_t, max_image_seq_len) = 0;
+  PROPERTY(float, shift_terminal) = 0;
+  PROPERTY(float, beta_start) = 0.0001f;
+  PROPERTY(float, beta_end) = 0.02f;
+  PROPERTY(std::string, beta_schedule) = "linear";
+  PROPERTY(std::vector<float>, trained_betas) = {};
+  PROPERTY(int64_t, solver_order) = 2;
+  PROPERTY(std::string, prediction_type) = "flow_prediction";
+  PROPERTY(bool, thresholding) = false;
+  PROPERTY(float, dynamic_thresholding_ratio) = 0.995f;
+  PROPERTY(float, sample_max_value) = 1.0f;
+  PROPERTY(bool, predict_x0) = true;
+  PROPERTY(std::string, solver_type) = "bh2";
+  PROPERTY(bool, lower_order_final) = true;
+  PROPERTY(std::vector<int64_t>, disable_corrector) = {};
+  PROPERTY(bool, use_karras_sigmas) = false;
+  PROPERTY(bool, use_exponential_sigmas) = false;
+  PROPERTY(bool, use_beta_sigmas) = false;
+  PROPERTY(bool, use_flow_sigmas) = true;
+  PROPERTY(float, flow_shift) = 3.0f;
+  PROPERTY(std::string, timestep_spacing) = "linspace";
+  PROPERTY(int64_t, steps_offset) = 0;
+  PROPERTY(std::string, final_sigmas_type) = "zero";
+  PROPERTY(bool, rescale_betas_zero_snr) = false;
+  PROPERTY(std::string, time_shift_type) = "exponential";
+
+  // qwen_image_edit_2509 vae related args
+  PROPERTY(int64_t, base_dim) = 0;
+  PROPERTY(int64_t, z_dim) = 0;
+  PROPERTY(std::vector<int64_t>, dim_mult) = {};
+  PROPERTY(std::vector<double>, attn_scales) = {};
+  PROPERTY(std::vector<bool>, temperal_downsample) = {};
+  PROPERTY(int64_t, num_res_blocks) = 0;
+  PROPERTY(double, dropout) = 0;
+  PROPERTY(std::vector<double>, latents_mean) = {};
+  PROPERTY(std::vector<double>, latents_std) = {};
+
+  // MiniMax-H3 VAE related args
+  PROPERTY(std::vector<int64_t>, spatial_downsample_factors) = {};
+  PROPERTY(std::vector<int64_t>, temporal_downsample_factors) = {};
+  PROPERTY(std::string, spatial_padding_mode) = "reflect";
+  PROPERTY(int64_t, decoder_num_register_tokens) = 0;
+  PROPERTY(int64_t, decoder_ffn_mult) = 0;
+  PROPERTY(float, decoder_rope_theta) = 0.0f;
+  PROPERTY(float, decoder_rope_dim_ratio) = 0.0f;
+  PROPERTY(float, decoder_norm_eps) = 1e-5f;
+  PROPERTY(int64_t, encoder_dim) = 0;
+  PROPERTY(std::vector<int64_t>, encoder_rates) = {};
+  PROPERTY(int64_t, decoder_dim) = 0;
+  PROPERTY(std::vector<int64_t>, decoder_rates) = {};
+  PROPERTY(std::vector<int64_t>, decoder_kernel_sizes) = {};
+  PROPERTY(std::vector<int64_t>, resblock_kernel_sizes) = {};
+  PROPERTY(int64_t, sampling_rate) = 32000;
+  PROPERTY(int64_t, clip_length) = 0;
+  PROPERTY(int64_t, token_drop) = 0;
+
+  // qwen_image_edit_2511 dit related args
+  PROPERTY(bool, zero_cond_t) = false;
+  PROPERTY(bool, use_additional_t_cond) = false;
+  PROPERTY(bool, use_layer3d_rope) = false;
+
+  // JoyImage-Edit-Plus dit related args
+  PROPERTY(double, mlp_width_ratio) = 4.0;
+  PROPERTY(int64_t, text_dim) = 4096;
+  PROPERTY(std::vector<int64_t>, rope_dim_list) = { 16, 56, 56 };
+  PROPERTY(int64_t, rope_theta_dit) = 10000;
+
+  // JoyOV2 DiT / XVAE / XDAC related args
+  PROPERTY(int64_t, share_expert_dim) = 0;
+  PROPERTY(int64_t, moe_hidden_size) = 0;
+  PROPERTY(float, dit_top_p) = 0.0f;
+  PROPERTY(bool, sandwich_norm) = false;
+  PROPERTY(std::vector<int64_t>, mrope_section) = {};
+  PROPERTY(int64_t, num_encoder_layers) = 0;
+  PROPERTY(int64_t, scale_factor_spatial) = 0;
+  PROPERTY(int64_t, scale_factor_temporal) = 0;
+  PROPERTY(std::vector<int64_t>, block_in_channels) = {};
+  PROPERTY(std::vector<bool>, temporal_downsample) = {};
 };
 
 // Qwen hybrid models may describe full-attention layers explicitly via
@@ -431,12 +802,17 @@ inline bool is_full_attention_layer(const ModelArgs& args, int64_t layer_id) {
   if (layer_id >= 0 &&
       layer_id < static_cast<int64_t>(hybrid_layer_types.size())) {
     const auto& layer_type = hybrid_layer_types[layer_id];
-    return layer_type == "full_attention" || layer_type == "attention";
+    // deepseek_sparse_attention (glm5_next DSA layers) is a full-attention
+    // variant: it uses paged KV, not the linear (conv/ssm) state cache. Treat
+    // it as full attention here so capacity estimation and per-layer dispatch
+    // classify it correctly (mirrors is_linear_attention_layer's exclusion).
+    return layer_type == "full_attention" || layer_type == "attention" ||
+           layer_type == "deepseek_sparse_attention";
   }
 
   int32_t attention_interval = args.full_attention_interval();
-  if (attention_interval <= 0) {
-    attention_interval = 4;
+  if (attention_interval <= 1) {
+    return true;
   }
   return (layer_id + 1) % attention_interval == 0;
 }
@@ -448,19 +824,55 @@ inline bool has_linear_attention_layers(const ModelArgs& args) {
                        hybrid_layer_types.end(),
                        [](const std::string& layer_type) {
                          return layer_type != "full_attention" &&
-                                layer_type != "attention";
+                                layer_type != "attention" &&
+                                layer_type != "deepseek_sparse_attention";
                        });
   }
   return args.full_attention_interval() > 1;
 }
 
+// Closed set by design: a new target variant must be enumerated here rather
+// than matched by a "qwen3_5_" prefix, so draft bodies ("qwen3_5_mtp") are not
+// silently promoted onto the target spec-verify path.
+inline bool is_qwen3_5_target_model_type(std::string_view model_type) {
+  return model_type == "qwen3_5" || model_type == "qwen3_5_moe" ||
+         model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text";
+}
+
+inline bool is_glm5_next_target_model_type(std::string_view model_type) {
+  return model_type == "glm5_3_flash" || model_type == "glm5_next";
+}
+
+inline bool is_glm5_next_target_model(const ModelArgs& args) {
+  return is_glm5_next_target_model_type(args.model_type());
+}
+
+// Keep the NPU compressed KPool rollout on a closed model/configuration set.
+// Other indexer models and GLM5 configurations that do not compress multiple
+// rows while guaranteeing causal tail selection retain their packed layout.
+inline bool uses_npu_compressed_kpool_tail(const ModelArgs& args) {
+#if defined(USE_NPU)
+  return args.index_kpool() > 1 && args.index_kpool_compress() &&
+         args.index_kpool_always_select_tail() &&
+         is_glm5_next_target_model_type(args.model_type());
+#else
+  (void)args;
+  return false;
+#endif
+}
+
 inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << "ModelArgs: [model_type: " << args.model_type();
-  os << ", image_embedding_mode: " << args.image_embedding_mode();
+  os << ", encoder_embedding_mode: " << args.encoder_embedding_mode();
+  os << ", embedding_mode: " << args.embedding_mode();
   os << ", dtype: " << args.dtype();
   os << ", hidden_size: " << args.hidden_size();
   os << ", hidden_act: " << args.hidden_act();
   os << ", intermediate_size: " << args.intermediate_size();
+  os << ", moe_intermediate_size: " << args.moe_intermediate_size();
+  os << ", n_routed_experts: " << args.n_routed_experts();
+  os << ", n_activated_experts: " << args.n_activated_experts();
+  os << ", num_experts_per_tok: " << args.num_experts_per_tok();
   os << ", n_layers: " << args.n_layers();
   os << ", n_encoder_layers: " << args.n_encoder_layers();
   os << ", head_dim: " << args.head_dim();
@@ -588,6 +1000,8 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", mm_image_temporal_patch_size: "
      << args.mm_image_temporal_patch_size();
   os << ", mm_image_merge_size: " << args.mm_image_merge_size();
+  os << ", mm_image_min_tokens: " << args.mm_image_min_tokens();
+  os << ", mm_image_max_tokens: " << args.mm_image_max_tokens();
   os << ", mm_image_token_index: " << args.mm_image_token_index();
   os << ", mm_video_normalize_mean: [";
   for (const auto& mean : args.mm_video_normalize_mean()) {
@@ -604,6 +1018,9 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", mm_video_temporal_patch_size: "
      << args.mm_video_temporal_patch_size();
   os << ", mm_video_merge_size: " << args.mm_video_merge_size();
+  os << ", mm_video_min_tokens: " << args.mm_video_min_tokens();
+  os << ", mm_video_max_tokens: " << args.mm_video_max_tokens();
+  os << ", mm_video_max_pixels: " << args.mm_video_max_pixels();
   os << ", mm_pad_token_id: " << args.mm_pad_token_id();
   os << ", tie_word_embeddings: " << args.tie_word_embeddings();
   os << ", use_sliding_window: " << args.use_sliding_window();

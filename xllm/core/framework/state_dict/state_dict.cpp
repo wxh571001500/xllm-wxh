@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -51,6 +51,10 @@ torch::ScalarType get_dtype(const Dtype& dtype) {
       return torch::kFloat8_e5m2;
     case Dtype::F8_E4M3:
       return torch::kFloat8_e4m3fn;
+    case Dtype::F8_E8M0:
+      // UE8M0 exponent-only scales (e.g. DeepSeek V4.1 .scale tensors).
+      // Expose the raw bytes; the python dequant decodes 2^(b-127).
+      return torch::kUInt8;
     case Dtype::I16:
       return torch::kInt16;
     case Dtype::F16:
@@ -157,7 +161,7 @@ torch::Tensor StateDict::get_sharded_tensor(const std::string& tensor_name,
   }
 
   CHECK(dim_size % world_size == 0)
-      << "can't devide tensor evenly on " << dim << " with dim: " << dim_size
+      << "can't divide tensor evenly on " << dim << " with dim: " << dim_size
       << " world_size: " << world_size;
   const auto chunks = tensor.chunk(world_size, dim);
   return chunks[rank];
@@ -191,6 +195,11 @@ StateDict StateDict::get_dict_with_prefix(
   auto tensors = get_dict_with_prefix(prefix);
   tensors.transform_func_ = std::move(transform_func);
   return tensors;
+}
+
+bool StateDict::has(const std::string& tensor_name) const {
+  const auto it = dict_.find(tensor_name);
+  return it != dict_.end();
 }
 
 StateDictFromSafeTensor::StateDictFromSafeTensor(

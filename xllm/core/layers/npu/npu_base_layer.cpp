@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,6 +23,7 @@ limitations under the License.
 #include <torch_npu/csrc/framework/utils/OpPreparation.h>
 #endif
 #include "core/common/global_flags.h"
+#include "core/framework/config/execution_config.h"
 
 namespace xllm {
 namespace layer {
@@ -61,7 +62,7 @@ atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
                                     int node_id,
                                     aclrtEvent* event,
                                     std::atomic<bool>* event_flag) {
-  // TODO（by zhangminchao1@jd.com): Stream management needs to be refactored
+  // TODO: Stream management needs to be refactored
   // for better separation of concerns Current issues:
   // 1. ACLGraph capture requires execution on a non-default stream, so we
   // temporarily set the current stream
@@ -80,11 +81,24 @@ atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
   //   However, libtorch_npu current stream is set to default stream after
   //   capture ends, causing inconsistency between ATB context and the actual
   //   execution stream
-  if (FLAGS_enable_graph) {
-    void* stream = c10_npu::getCurrentNPUStream(device_.index()).stream();
-    context_->SetExecuteStream(stream);
+  if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
+    aclrtStream stream = c10_npu::getCurrentNPUStream(device_.index()).stream();
+    std::vector<aclrtStream> execute_streams = context_->GetExecuteStreams();
+    atb::Status stream_status = atb::NO_ERROR;
+    if (execute_streams.size() > 1) {
+      execute_streams[0] = stream;
+      stream_status = context_->SetExecuteStreams(execute_streams);
+    } else {
+      stream_status = context_->SetExecuteStream(stream);
+    }
+    if (stream_status != atb::NO_ERROR) {
+      LOG(ERROR) << "Failed to bind ATB execute streams, status="
+                 << stream_status;
+      return stream_status;
+    }
   }
-  // if (FLAGS_enable_graph && !graph_captured_) {
+  // if (::xllm::ExecutionConfig::get_instance().enable_graph() &&
+  // !graph_captured_) {
   //   void* stream = c10_npu::getCurrentNPUStream(device_.index()).stream();
   //   aclmdlRICaptureStatus status;
   //   aclmdlRI modelRI;

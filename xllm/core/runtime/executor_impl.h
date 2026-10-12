@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "common/macros.h"
 #include "framework/batch/batch.h"
@@ -27,12 +28,27 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/model/model_output.h"
 #include "options.h"
+#include "platform/stream.h"
+#include "platform/stream_event.h"
 
 namespace xllm {
+
+class ProcessGroup;
+
+struct SpecVerifyGraphTaskSignal {
+  int64_t linear_state_id = 0;
+  int64_t num_accepted_tokens = 0;
+  int64_t spec_width = 0;
+  int64_t block_table_width = 0;
+  int64_t base_kv_seq_len = 0;
+  int64_t max_kv_seq_len = 0;
+};
 
 class ExecutorImpl {
  public:
   virtual ~ExecutorImpl() = default;
+
+  virtual void set_dp_process_group(ProcessGroup* /*group*/) {}
 
   virtual ForwardInput prepare_inputs(Batch& batch) = 0;
 
@@ -43,6 +59,17 @@ class ExecutorImpl {
                           const torch::Tensor& positions,
                           std::vector<KVCache>& kv_caches,
                           const ModelInputParams& params) = 0;
+
+  virtual void prepare_graph_input(const torch::Tensor& /*tokens*/,
+                                   const torch::Tensor& /*positions*/,
+                                   std::vector<KVCache>& /*kv_caches*/,
+                                   const ModelInputParams& /*params*/) {}
+
+  virtual bool prepare_static_mtp_graph_tasks(
+      const SpecVerifyGraphTaskSignal& /*signal*/,
+      const Stream& /*signal_stream*/) {
+    return false;
+  }
 };
 
 }  // namespace xllm

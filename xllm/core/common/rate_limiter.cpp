@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,41 +19,39 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/framework/config/service_config.h"
 
 namespace xllm {
 
 bool RateLimiter::is_limited() {
-  int32_t num_requests =
-      num_concurrent_requests_.load(std::memory_order_relaxed);
-
-  // Check if sleeping.
-  if (num_requests == kSleeping) {
-    return true;
+  const int32_t max =
+      ::xllm::ServiceConfig::get_instance().max_concurrent_requests();
+  int32_t expected = num_concurrent_requests_.load(std::memory_order_relaxed);
+  while (true) {
+    // Check if sleeping.
+    if (expected == kSleeping) {
+      return true;
+    }
+    // Check rate limit.
+    if (max > 0 && expected >= max) {
+      COUNTER_INC(server_request_total_limit);
+      return true;
+    }
+    // Atomic check+increment. On CAS failure, `expected` is refreshed and we
+    // retry (re-checking the sleep/limit conditions above with the new value).
+    if (num_concurrent_requests_.compare_exchange_weak(
+            expected,
+            expected + 1,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+      GAUGE_SET(num_concurrent_requests, expected + 1);
+      return false;
+    }
   }
-
-  // Check rate limit.
-  if (FLAGS_max_concurrent_requests > 0 &&
-      num_requests >= FLAGS_max_concurrent_requests) {
-    COUNTER_INC(server_request_total_limit);
-    return true;
-  }
-
-  num_concurrent_requests_.fetch_add(1, std::memory_order_relaxed);
-  GAUGE_SET(num_concurrent_requests,
-            num_concurrent_requests_.load(std::memory_order_relaxed));
-
-  return false;
 }
 
 void RateLimiter::decrease_one_request() {
   num_concurrent_requests_.fetch_sub(1, std::memory_order_relaxed);
-  GAUGE_SET(num_concurrent_requests,
-            num_concurrent_requests_.load(std::memory_order_relaxed));
-}
-
-void RateLimiter::decrease_requests(size_t decrease_requests_num) {
-  num_concurrent_requests_.fetch_sub(decrease_requests_num,
-                                     std::memory_order_relaxed);
   GAUGE_SET(num_concurrent_requests,
             num_concurrent_requests_.load(std::memory_order_relaxed));
 }

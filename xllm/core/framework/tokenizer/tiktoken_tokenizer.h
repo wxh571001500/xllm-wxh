@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,7 @@ limitations under the License.
 #pragma once
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <re2/re2.h>
 
 #include <vector>
@@ -40,6 +41,8 @@ class TiktokenTokenizer : public Tokenizer {
   std::string decode(const Slice<int32_t>& ids,
                      bool skip_special_tokens) const override;
 
+  std::string decode_token(int32_t id) const override;
+
   std::optional<int32_t> token_to_id(
       const std::string_view& token) const override;
 
@@ -51,6 +54,8 @@ class TiktokenTokenizer : public Tokenizer {
 
  private:
   void load_special_tokens(const std::vector<SpecialToken>& special_tokens);
+  void load_visible_special_tokens(
+      const std::vector<std::string>& visible_special_tokens);
 
   void load_vocab(const std::string& vocab_file_path);
 
@@ -79,6 +84,9 @@ class TiktokenTokenizer : public Tokenizer {
 
   // special token ids to tokens
   absl::flat_hash_map<int32_t, std::string> special_token_decoder_;
+
+  // special tokens that should be preserved in decoded output
+  absl::flat_hash_set<int32_t> visible_special_token_ids_;
 
   // special token regex (optional)
   std::unique_ptr<re2::RE2> special_token_regex_;

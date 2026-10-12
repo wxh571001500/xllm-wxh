@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,17 +18,13 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <string>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "core/framework/kv_cache/kv_cache.h"
-#include "core/framework/model/model_input_params.h"
-#include "core/framework/model/model_output.h"
-#include "core/framework/model_context.h"
-#include "core/framework/model_loader.h"
-#include "core/layers/common/word_embedding.h"
+#include "core/framework/model/rec_causal_lm.h"
 #include "models/model_registry.h"
 #include "models/rec/rec_model_base.h"
 
@@ -46,14 +42,14 @@ class OneRecModelImpl : public torch::nn::Module {
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) {
-    (void)positions;
-    (void)kv_caches;
-
     if (!tokens.defined()) {
       return ModelOutput();
     }
+    (void)positions;
+    (void)kv_caches;
 
     const auto* onerec_params = input_params.onerec_params();
+
     const bool is_encoder_forward =
         (onerec_params != nullptr) && onerec_params->is_encoder_forward;
 
@@ -67,7 +63,7 @@ class OneRecModelImpl : public torch::nn::Module {
       return ModelOutput(hidden_states);
     }
 
-    auto cross_context = get_cross_context_embedding(onerec_params);
+    auto cross_context = resolve_cross_context(onerec_params);
     if (cross_context.defined()) {
       auto enriched_hidden_states =
           add_cross_context_bias(hidden_states, cross_context);
@@ -126,7 +122,7 @@ class OneRecModelImpl : public torch::nn::Module {
     return torch::Tensor();
   }
 
-  torch::Tensor get_cross_context_embedding(
+  torch::Tensor resolve_cross_context(
       const OneRecModelInputParams* onerec_params) const {
     if (onerec_params == nullptr) {
       return torch::Tensor();
@@ -218,9 +214,9 @@ class OneRecForConditionalGenerationImpl
 };
 TORCH_MODULE(OneRecForConditionalGeneration);
 
-using OneRecCausalLM = CausalLMImpl<OneRecForConditionalGeneration>;
-static_assert(std::is_base_of_v<CausalLM, OneRecCausalLM>,
-              "OneRec must satisfy CausalLM contract.");
+using OneRecCausalLM = RecCausalLMImpl<OneRecForConditionalGeneration>;
+static_assert(std::is_base_of_v<RecCausalLM, OneRecCausalLM>,
+              "OneRec must satisfy RecCausalLM contract.");
 
 REGISTER_REC_MODEL(onerec, OneRecForConditionalGeneration);
 

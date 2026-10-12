@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 #include <cstdint>
+#include <functional>
 
 #include "common/macros.h"
 #include "common/types.h"
@@ -28,10 +29,13 @@ class Sequence;
 class Tokenizer;
 class AsyncResponseProcessor final {
  public:
-  AsyncResponseProcessor(const Tokenizer* tokenizer,
-                         const std::optional<InstanceRole>& role,
-                         bool enable_service_routing);
-  virtual ~AsyncResponseProcessor() = default;
+  AsyncResponseProcessor(
+      const Tokenizer* tokenizer,
+      const std::optional<InstanceRole>& role,
+      bool enable_service_routing,
+      bool disable_log_stats,
+      std::function<void(std::shared_ptr<Request>)> cancel_request);
+  ~AsyncResponseProcessor();
 
   void process_completed_request(std::shared_ptr<Request> request);
 
@@ -63,7 +67,7 @@ class AsyncResponseProcessor final {
   ThreadPool rpc_threadpool_;
 
   // the threadpool to generate outputs
-  ThreadPool generate_output_threadpool_{16};
+  ThreadPool generate_output_threadpool_;
 
   // tokenizer instance to decode token ids
   std::unique_ptr<Tokenizer> tokenizer_;
@@ -74,6 +78,10 @@ class AsyncResponseProcessor final {
   // `True` means decode instance will response batch request_outputs to
   // prefill or xllm service, this will decrease rpc cost.
   bool enable_batch_response_ = false;
+
+  bool disable_log_stats_ = false;
+
+  std::function<void(std::shared_ptr<Request>)> cancel_request_;
 };
 
 }  // namespace xllm

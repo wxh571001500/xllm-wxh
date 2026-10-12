@@ -1,5 +1,4 @@
 include(cc_library)
-include(cc_test)
 
 cc_library(
   NAME
@@ -8,42 +7,64 @@ cc_library(
     api_service.h
     api_service_impl.h
     call.h
-    chat_json_utils.h
+    request_id.h
+    request_admission.h
+    chat_json_parser.h
+    completion_json_parser.h
     completion_service_impl.h
     rec_completion_service_impl.h
     chat_service_impl.h
     anthropic_service_impl.h
+    anthropic_stream_utils.h
     sample_service_impl.h
     embedding_service_impl.h
+    audio_generation_service_impl.h
     image_generation_service_impl.h
+    text_generation_service_impl.h
+    video_generation_service_impl.h
     rerank_service_impl.h
     qwen3_rerank_service_impl.h
     non_stream_call.h
+    multipart_parser.h
     service_impl_factory.h
+    serving_mode.h
     stream_call.h
     models_service_impl.h
     stream_output_parser.h
     mm_service_utils.h
+    speech_to_text_service_impl.h
     embedding_output_builder.h
     utils.h
   SRCS
     api_service.cpp
+    chat_json_parser.cpp
+    completion_json_parser.cpp
+    service_impl_factory.cpp
     call.cpp
+    request_id.cpp
+    request_admission.cpp
     completion_service_impl.cpp
     rec_completion_service_impl.cpp
     chat_service_impl.cpp
     anthropic_service_impl.cpp
+    anthropic_stream_utils.cpp
     sample_service_impl.cpp
     embedding_service_impl.cpp
+    audio_generation_service_impl.cpp
     image_generation_service_impl.cpp
+    text_generation_service_impl.cpp
+    video_generation_service_impl.cpp
     models_service_impl.cpp
     rerank_service_impl.cpp
+    multipart_parser.cpp
+    speech_to_text_service_impl.cpp
     stream_output_parser.cpp
     qwen3_rerank_service_impl.cpp
     embedding_output_builder.cpp
   DEPS
     :master
     :chat_template
+    :chat_template_base
     :util
     glog::glog
     proto::xllm_proto
@@ -54,70 +75,3 @@ cc_library(
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
 )
-
-cc_test(
-  NAME
-    anthropic_protocol_test
-  SRCS
-    anthropic_protocol_test.cpp
-  DEPS
-    proto::xllm_proto
-    GTest::gtest
-    GTest::gtest_main
-    nlohmann_json::nlohmann_json
-    glog::glog
-)
-
-# Integration test for Anthropic service - requires running server
-# Tests are prefixed with DISABLED_ in code to skip by default
-# Run manually: ./anthropic_service_test --gtest_also_run_disabled_tests
-cc_test(
-  NAME
-    anthropic_service_test
-  SRCS
-    anthropic_service_test.cpp
-  DEPS
-    GTest::gtest
-    GTest::gtest_main
-    nlohmann_json::nlohmann_json
-    glog::glog
-)
-target_link_libraries(anthropic_service_test PRIVATE brpc leveldb::leveldb OpenSSL::SSL OpenSSL::Crypto protobuf::libprotobuf)
-add_dependencies(anthropic_service_test brpc-static)
-
-cc_test(
-  NAME
-    api_service_test
-  SRCS
-    chat_json_utils_test.cpp
-  DEPS
-    api_service
-    GTest::gtest_main
-    nlohmann_json::nlohmann_json
-)
-
-cc_test(
-  NAME
-    sample_service_impl_test
-  SRCS
-    sample_service_impl_test.cpp
-  DEPS
-    api_service
-    GTest::gtest_main
-)
-
-# Integration smoke tests for OpenAI-compatible endpoints. These require a
-# running server and are disabled by default in code.
-cc_test(
-  NAME
-    openai_service_test
-  SRCS
-    openai_service_test.cpp
-  DEPS
-    GTest::gtest
-    GTest::gtest_main
-    nlohmann_json::nlohmann_json
-    glog::glog
-)
-target_link_libraries(openai_service_test PRIVATE brpc leveldb::leveldb OpenSSL::SSL OpenSSL::Crypto protobuf::libprotobuf)
-add_dependencies(openai_service_test brpc-static)

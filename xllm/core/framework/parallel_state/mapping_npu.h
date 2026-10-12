@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -104,6 +104,12 @@ class MappingNPU final {
     PROPERTY(int32_t, sp_size) = -1;
     // cp size
     PROPERTY(int32_t, cp_size) = -1;
+    PROPERTY(int32_t, layerwise_split_size) = 1;
+    // kv split size: number of ranks across which KV cache is sharded.
+    // -1 means "follow cp_size" (legacy: KV split width == CP size).
+    // 1 means no KV split (each CP rank holds a full KV replica, ATB prefix
+    // AllGather can be skipped). Other K must divide cp_size.
+    PROPERTY(int32_t, kv_split_size) = -1;
   };
 
   MappingNPU(std::string rank_table_file,
@@ -122,6 +128,18 @@ class MappingNPU final {
   void get_dp_group(ParallelInfo& parallel_info);
 
   void get_cp_group(ParallelInfo& parallel_info);
+
+  // Build the KV-split parallel group. Layout reuses get_dp_group's stride
+  // scheme so that when `attn_kv_split_.group_size() == attn_cp_.group_size()`
+  // the resulting rank_ids match attn_cp_ exactly (and the ATB
+  // ExternalCommManager de-duplicates the HCCL commDomain). When kv_split_size
+  // == 1 each rank is its own group (no AllGather participants), matching the
+  // "full-replica / skip prefix AllGather" mode.
+  void get_kv_split_group(ParallelInfo& parallel_info);
+
+  // Split every attention TP group into ordered contiguous layerwise-split
+  // subgroups.
+  void get_layerwise_split_group(ParallelInfo& parallel_info);
 
   void get_domain(ParallelInfo& src,
                   ParallelInfo& dst,
@@ -159,6 +177,8 @@ class MappingNPU final {
   ParallelInfo lm_head_dp_ = ParallelInfo();
   ParallelInfo attn_inner_sp_ = ParallelInfo();
   ParallelInfo attn_cp_ = ParallelInfo();
+  ParallelInfo attn_kv_split_ = ParallelInfo();
+  ParallelInfo attn_layerwise_split_ = ParallelInfo();
 
   int32_t lccl_comm_domain_lower_bound_;
   int32_t lccl_comm_domain_upper_bound_;

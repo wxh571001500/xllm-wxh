@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "executor_impl_factory.h"
+#include "framework/encoder_cache/encoder_cache.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/causal_lm.h"
 #include "framework/model/causal_vlm.h"
@@ -41,6 +42,8 @@ class VlmExecutorImpl : public ExecutorImpl {
 
   ~VlmExecutorImpl() override = default;
 
+  void set_dp_process_group(ProcessGroup* group) override;
+
   ForwardInput prepare_inputs(Batch& batch) override;
 
   ModelOutput run(const torch::Tensor& tokens,
@@ -48,15 +51,28 @@ class VlmExecutorImpl : public ExecutorImpl {
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
 
+  void prepare_graph_input(const torch::Tensor& tokens,
+                           const torch::Tensor& positions,
+                           std::vector<KVCache>& kv_caches,
+                           const ModelInputParams& params) override;
+
   virtual MMDict encode(const ModelInputParams& params);
 
- private:
   // not own
   CausalVLM* model_;
   ModelArgs args_;
   torch::Device device_;
   runtime::Options options_;
   std::unique_ptr<ExecutorImpl> llm_executor_;
+  std::unique_ptr<EncoderCache> encoder_cache_;
+
+ private:
+  // Collapse mRoPE decode positions from [3, num_tokens] to a 1-D [num_tokens]
+  // tensor. Decode rows are identical, so row 0 is what ordinary rope and the
+  // graph's 1-D persistent positions buffer expect. Only touches 2-D mRoPE
+  // positions; already-1-D or non-mRoPE positions are returned unchanged.
+  torch::Tensor collapse_mrope_decode_positions(
+      const torch::Tensor& positions) const;
 };
 // Q: backend device ?
 REGISTER_EXECUTOR("vlm", VlmExecutorImpl);

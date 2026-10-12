@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -41,22 +41,25 @@ void PDOOCServiceImpl::decode_recv_multi_generations(
                                       multi_gen.cluster_ids().end());
     std::vector<std::string> addrs(multi_gen.addrs().begin(),
                                    multi_gen.addrs().end());
-    std::vector<int64_t> k_cache_ids(multi_gen.k_cache_ids().begin(),
-                                     multi_gen.k_cache_ids().end());
-    std::vector<int64_t> v_cache_ids(multi_gen.v_cache_ids().begin(),
-                                     multi_gen.v_cache_ids().end());
-    std::vector<uint64_t> block_ids(multi_gen.block_ids().begin(),
-                                    multi_gen.block_ids().end());
+    std::vector<KVTransferMapping> source_mappings;
+    source_mappings.reserve(multi_gen.source_groups_size());
+    for (const proto::KVTransferGroup& proto_group :
+         multi_gen.source_groups()) {
+      KVTransferMapping mapping;
+      mapping.group_id = proto_group.group_id();
+      mapping.remote_ids.assign(proto_group.ids().begin(),
+                                proto_group.ids().end());
+      source_mappings.emplace_back(std::move(mapping));
+    }
 
     bool success = pd_ooc_scheduler_->decode_recv_multi_generations(
         multi_gen.req_id(),
         migration_tokens,
+        multi_gen.upstream_elapsed_seconds(),
         multi_gen.kv_cache_transfer_mode(),
         std::move(cluster_ids),
         std::move(addrs),
-        std::move(k_cache_ids),
-        std::move(v_cache_ids),
-        std::move(block_ids),
+        std::move(source_mappings),
         multi_gen.dp_size(),
         multi_gen.dp_rank());
 

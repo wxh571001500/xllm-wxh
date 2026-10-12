@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,19 +27,18 @@ limitations under the License.
 
 #include "common/options.h"
 #include "common/types.h"
+#include "core/framework/multimodal/mm_input.h"
 #include "engine.h"
 #include "framework/chat_template/jinja_chat_template.h"
-#include "framework/request/mm_input.h"
 #include "framework/request/request_output.h"
 #include "framework/request/request_params.h"
+#include "framework/request/vlm_request_factory.h"
+#include "framework/tokenizer/tokenizer.h"
 #include "master.h"
 #include "scheduler/continuous_scheduler.h"
-#include "xllm/processors/input_processor.h"
+#include "xllm/processors/multimodal_processor.h"
 
 namespace xllm {
-
-struct MMData;
-class ImageProcessor;
 
 class VLMMaster : public Master {
  public:
@@ -56,7 +55,8 @@ class VLMMaster : public Master {
   void handle_request(std::vector<Message> messages,
                       RequestParams sp,
                       std::string payload,
-                      OutputCallback callback);
+                      OutputCallback callback,
+                      bool use_prompt_as_is = false);
 
   // batch completion
   void handle_batch_request(std::vector<std::string> prompts,
@@ -84,40 +84,27 @@ class VLMMaster : public Master {
 
   int get_image_limit() { return options_.limit_image_per_prompt(); }
 
+  const std::string& model_type() const { return model_args_.model_type(); }
+
  private:
   using Task = folly::Function<void()>;
-  std::shared_ptr<Request> generate_request(std::string prompt,
-                                            MMData mm_data,
-                                            RequestParams sp,
-                                            OutputCallback callback);
-
-  std::shared_ptr<Request> generate_request(std::vector<Message> messages,
-                                            RequestParams sp,
-                                            std::string payload,
-                                            OutputCallback callback);
-
-  bool build_mm_data_from_image_urls(const std::vector<std::string>& image_urls,
-                                     MMData& mm_data);
 
   std::unique_ptr<Scheduler> scheduler_;
 
   // model args
   ModelArgs model_args_;
 
-  // thread pool for handling requests
+  // thread pool for handling requests. Its worker lambdas dereference
+  // request_factory_ and scheduler_, so the pool is explicitly reset
+  // (drained/joined) in ~VLMMaster before those members are destroyed.
   std::unique_ptr<ThreadPool> threadpool_;
 
-  // we don't know if tokenizer is thread safe, so we create one for each thread
-  // for now
-  std::unique_ptr<Tokenizer> tokenizer_;
-
-  // chat template instance
   std::unique_ptr<JinjaChatTemplate> chat_template_;
+  std::unique_ptr<MultimodalProcessorBase> processor_;
+  std::shared_ptr<Tokenizer> tokenizer_;
 
-  // input processor for vlm
-  std::unique_ptr<InputProcessor> input_processor_;
-
-  std::unique_ptr<ImageProcessor> image_processor_;
+  // builds Request aggregates from prompts/messages + multimodal data
+  std::unique_ptr<VLMRequestFactory> request_factory_;
 
   // thread for moving forward the scheduler
   std::thread loop_thread_;

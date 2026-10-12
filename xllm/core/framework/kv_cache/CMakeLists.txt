@@ -1,61 +1,90 @@
-include(cc_binary)
 include(cc_library)
-include(cc_test)
 
+cc_library(
+  NAME
+    deepseek_v4_cache_policy
+  HDRS
+    deepseek_v4_cache_policy.h
+  DEPS
+    torch
+)
+
+cc_library(
+  NAME
+    kv_cache_estimation
+  HDRS
+    cache_layout_types.h
+    kv_cache_capacity.h
+    kv_cache_estimation.h
+  SRCS
+    kv_cache_estimation.cpp
+  DEPS
+    :common
+    :deepseek_v4_cache_policy
+    :block_utils
+    :platform
+    glog::glog
+    proto::xllm_proto
+    torch
+)
 
 cc_library(
   NAME
     kv_cache
   HDRS
-    embedding_cache.h
+    cache_layout_builder.h
+    cache_layout_types.h
+    deepseek_v4_kv_cache_impl.h
+    indexed_kv_cache_impl.h
     kv_cache.h
-    kv_cache_event.h
-    kv_cache_transfer.h
-    $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.h>
-    $<$<BOOL:${USE_NPU}>:spec_kv_cache_transfer.h>
-    kv_cache_store.h
-    hierarchy_kv_cache_transfer.h
-    $<$<BOOL:${USE_NPU}>:mooncake_transfer_engine.h>
-    $<$<BOOL:${USE_NPU}>:mooncake_kv_cache_transfer.h>
-    $<$<BOOL:${USE_NPU}>:mooncake_weight_transfer.h>
+    kv_cache_impl.h
+    kv_cache_shape.h
+    kv_shard_layout.h
+    kv_cache_tensor_allocator.h
+    kv_cache_tensor_role.h
+    kv_cache_utils.h
+    layerwise_split_layout.h
+    linear_attention_kv_cache_impl.h
+    quantized_kv_cache_impl.h
   SRCS
-    embedding_cache.cpp 
+    cache_layout_builder.cpp
+    deepseek_v4_kv_cache_impl.cpp
+    indexed_kv_cache_impl.cpp
     kv_cache.cpp
-    kv_cache_transfer.cpp
-    $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.cpp>
-    $<$<BOOL:${USE_NPU}>:spec_kv_cache_transfer.cpp>
-    kv_cache_store.cpp
-    hierarchy_kv_cache_transfer.cpp
-    $<$<BOOL:${USE_NPU}>:mooncake_transfer_engine.cpp>
-    $<$<BOOL:${USE_NPU}>:mooncake_kv_cache_transfer.cpp>
-    $<$<BOOL:${USE_NPU}>:mooncake_weight_transfer.cpp>
+    kv_cache_impl.cpp
+    kv_cache_shape.cpp
+    kv_shard_layout.cpp
+    kv_cache_tensor_allocator.cpp
+    kv_cache_utils.cpp
+    linear_attention_kv_cache_impl.cpp
+    quantized_kv_cache_impl.cpp
   DEPS
+    :block_utils
     :common
-    $<$<BOOL:${USE_NPU}>:graph>
+    :deepseek_v4_cache_policy
+    :kv_cache_estimation
+    :xtensor
     glog::glog
-    $<$<BOOL:${USE_NPU}>:llm_datadist>
-    $<$<BOOL:${USE_NPU}>:c_sec>
     torch
+    $<$<BOOL:${USE_MLU}>:cndrv>
+    $<$<BOOL:${USE_NPU}>:ascendcl>
     $<$<BOOL:${USE_NPU}>:torch_npu>
-    mooncake_store
-    $<$<BOOL:${USE_NPU}>:platform_npu>
 )
 
-cc_test(
+cc_library(
   NAME
-    embedding_cache_test
+    linear_state_restore
+  HDRS
+    linear_state_restore.h
   SRCS
-    embedding_cache_test.cpp
+    linear_state_restore.cpp
   DEPS
-    :xllm_server
+    :common
     :kv_cache
-    $<$<BOOL:${USE_NPU}>:xllm_server>
-    GTest::gtest_main
+    :platform
+    :util
+    glog::glog
+    torch
+    $<$<BOOL:${USE_NPU}>:ascendcl>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
 )
-target_link_libraries(embedding_cache_test
-                      PUBLIC
-                      Python::Python
-                      $<$<BOOL:${USE_NPU}>:ascendcl>
-                      $<$<BOOL:${USE_NPU}>:hccl>
-                      $<$<BOOL:${USE_NPU}>:c_sec>
-                      $<$<BOOL:${USE_NPU}>:nnopbase>)

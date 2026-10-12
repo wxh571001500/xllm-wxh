@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,8 +20,9 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 
-#include "core/common/rec_model_utils.h"
+#include "core/util/rec_model_utils.h"
 #include "onerec_batch_input_builder.h"
+#include "onerec_xattention_batch_input_builder.h"
 #include "rec_multi_round_batch_input_builder.h"
 
 namespace xllm {
@@ -36,9 +37,21 @@ std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
     uint64_t batch_id,
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
-    ThreadPool* thread_pool) {
+    MPMCThreadPool* thread_pool) {
   switch (rec_type) {
     case RecType::kOneRec:
+      if (is_onerec_xattention_mode()) {
+        return std::make_unique<OneRecXAttentionBatchInputBuilder>(
+            sequence_groups,
+            allowed_max_tokens,
+            input_embeddings_vec,
+            mm_data_vec,
+            swap_block_transfer_infos,
+            batch_id,
+            args,
+            batch_forward_type,
+            thread_pool);
+      }
       return std::make_unique<OneRecBatchInputBuilder>(
           sequence_groups,
           allowed_max_tokens,

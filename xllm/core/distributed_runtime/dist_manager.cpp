@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,11 +19,12 @@ limitations under the License.
 
 #include "comm_channel.h"
 #include "common/health_check_manager.h"
+#include "core/framework/config/service_config.h"
 #include "distributed_runtime/collective_service.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "framework/parallel_state/process_group.h"
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_MLU) || defined(USE_DCU)
 #include "platform/numa_utils.h"
 #endif
 #include "remote_worker.h"
@@ -88,7 +89,7 @@ std::unique_ptr<CommChannel> create_channel(const std::string& worker_addrs,
   return channel;
 }
 
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_MLU) || defined(USE_DCU)
 void setup_numa_affinity_and_isolation(
     const runtime::Options& options,
     std::vector<int32_t>& device_numa_nodes,
@@ -146,7 +147,7 @@ void DistManager::setup_multi_node_workers(
     const std::string& master_node_addr) {
   const auto& devices = options.devices();
 
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_MLU) || defined(USE_DCU)
   std::vector<int32_t> device_numa_nodes;
   std::vector<bool> force_spawn_for_numa_isolation;
   setup_numa_affinity_and_isolation(
@@ -182,12 +183,28 @@ void DistManager::setup_multi_node_workers(
   /* TODO(CP): support smem  + CP */
   const int32_t dp_local_tp_size = world_size / dp_size;
 
-  LOG(INFO) << "Multi-node serving world_size = " << world_size
-            << ", each_node_ranks = " << each_node_ranks
-            << ", current node rank = " << options.node_rank()
-            << ", nnodes = " << options.nnodes() << ", dp_size = " << dp_size
-            << ", cp_size = " << cp_size << ", ep_size = " << ep_size
-            << ", tp_size = " << dp_local_tp_size;
+  const auto& model_backend = options.backend();
+  if (model_backend == "dit") {
+    const int32_t tp_size = options.tp_size();
+    const int32_t sp_size = options.sp_size();
+    const int32_t cfg_size = options.cfg_size();
+    const int32_t vae_size = options.vae_size();
+    const int32_t text_encoder_tp_size = options.text_encoder_tp_size();
+    LOG(INFO) << "Multi-node serving world_size = " << world_size
+              << ", each_node_ranks = " << each_node_ranks
+              << ", current node rank = " << options.node_rank()
+              << ", nnodes = " << options.nnodes() << ", dp_size = " << dp_size
+              << ", tp_size = " << tp_size << ", sp_size = " << sp_size
+              << ", cfg_size = " << cfg_size << ", vae_size = " << vae_size
+              << ", text_encoder_tp_size = " << text_encoder_tp_size;
+  } else {
+    LOG(INFO) << "Multi-node serving world_size = " << world_size
+              << ", each_node_ranks = " << each_node_ranks
+              << ", current node rank = " << options.node_rank()
+              << ", nnodes = " << options.nnodes() << ", dp_size = " << dp_size
+              << ", cp_size = " << cp_size << ", ep_size = " << ep_size
+              << ", tp_size = " << dp_local_tp_size;
+  }
 
   CHECK_EQ((world_size % dp_size), 0)
       << "Global world size must be divisible by dp size in multi-node "
@@ -196,7 +213,6 @@ void DistManager::setup_multi_node_workers(
   runtime::Options worker_server_options = options;
   worker_server_options.world_size(world_size);
   WorkerType worker_type("LLM");
-  const auto& model_backend = options.backend();
   if (model_backend == "llm") {
     if (options.task_type() == "generate") {
       worker_type = WorkerType::LLM;
@@ -219,6 +235,8 @@ void DistManager::setup_multi_node_workers(
     }
   } else if (model_backend == "rec") {
     worker_type = WorkerType::REC;
+  } else if (model_backend == "dit") {
+    worker_type = WorkerType::DIT;
   } else {
     LOG(FATAL) << "Unsupported " << model_backend << " in multi-node.";
   }
@@ -228,10 +246,11 @@ void DistManager::setup_multi_node_workers(
     // Node1: 0, 1, 2, 3
     // Node2: 0+4, 1+4, 2+4, 3+4
     const int32_t rank = i + base_rank;
+    worker_server_options.server_idx(rank);
 
     // we use spawn process worker to launch a xllm instance
     // when start a offline inference task with multi-gpu/npu/mpu/...
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_MLU) || defined(USE_DCU)
     bool use_spawn_worker = (options.enable_offline_inference() && i > 0) ||
                             force_spawn_for_numa_isolation[i];
     if (force_spawn_for_numa_isolation[i]) {
@@ -307,7 +326,7 @@ void DistManager::setup_multi_node_workers(
     }
     // Start background health check thread with 3(magic num) second interval
     HealthCheckManager::instance().start_health_check_thread(
-        FLAGS_health_check_interval_ms);
+        ::xllm::ServiceConfig::get_instance().health_check_interval_ms());
 
     LOG(INFO) << "Started cluster health check thread";
   }

@@ -1,0 +1,192 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <glog/logging.h>
+#include <pybind11/pybind11.h>
+#include <torch/torch.h>
+
+#include <cstdint>
+#include <memory>
+#include <torch/csrc/distributed/c10d/Work.hpp>
+#include <unordered_map>
+#include <vector>
+
+#include "core/framework/model/causal_lm.h"
+#include "core/framework/model/causal_vlm.h"
+#include "core/framework/model/model_args.h"
+#include "core/framework/model_context.h"
+
+namespace xllm {
+
+class ProcessGroup;
+#if defined(USE_NPU)
+class MegaMoeCommResource;
+#endif
+
+namespace detail {
+void share_python_model_weights(pybind11::object& draft_model,
+                                const pybind11::object& target_model);
+
+int64_t python_mega_moe_max_num_tokens_per_rank(int64_t max_seqs_per_batch,
+                                                int64_t num_speculative_tokens,
+                                                int64_t dp_size);
+
+int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
+    int64_t max_tokens_per_batch,
+    int64_t max_seqs_per_batch,
+    int64_t num_speculative_tokens);
+}  // namespace detail
+
+// Inherits CausalVLM so that ``--backend vlm --model_impl python`` can route a
+// Python VLM (e.g. GLM-5.3-Flash-VL) through the VLM engine while
+// PyExecutorImpl drives it. The CausalVLM ``encode`` / ``get_input_embeddings``
+// virtuals are stubbed: in the Python path, PyExecutorImpl::run calls the
+// Python model's own encode/get_input_embeddings via pybind (they are never
+// reached here).
+class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
+ public:
+  explicit PyCausalLM(const ModelContext& context, bool is_vlm);
+  ~PyCausalLM() override;
+
+  ModelOutput forward(const torch::Tensor& tokens,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>& kv_caches,
+                      const ModelInputParams& parameters) override;
+
+  MMDict encode(const ModelInputParams& parameters) override {
+    LOG(FATAL) << "PyCausalLM::encode must not be called directly; "
+               << "PyExecutorImpl drives the Python model's encode via pybind.";
+    return MMDict{};
+  }
+
+  torch::Tensor get_input_embeddings(
+      const torch::Tensor& input_ids,
+      const ModelInputParams& input_params) override {
+    LOG(FATAL) << "PyCausalLM::get_input_embeddings must not be called "
+               << "directly; PyExecutorImpl drives it via pybind.";
+    return torch::Tensor();
+  }
+
+  torch::Tensor logits(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes) override;
+
+  // Three-arg overload used by the speculative-decode path: hands MTP the
+  // selected hidden rows via out_hidden while the projection itself reuses
+  // the two-arg path (mirrors CausalVLMImpl::logits' generic fallback).
+  torch::Tensor logits(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes,
+                       torch::Tensor& out_hidden) override;
+
+  ModelOutput write_context_kv(const torch::Tensor& target_hidden,
+                               const torch::Tensor& positions,
+                               const torch::Tensor& device_cache_slots,
+                               std::vector<KVCache>& kv_caches,
+                               const ModelInputParams& input_params) override;
+
+  DFlash2CandidateOutput dflash2_candidates(
+      const torch::Tensor& hidden_states,
+      const torch::Tensor& unary_logits,
+      const torch::Tensor& anchor_token_ids) override;
+
+  torch::Tensor dspark_markov_bias(
+      const torch::Tensor& previous_token_ids) override;
+
+  torch::Tensor dspark_confidence_probs(
+      const torch::Tensor& hidden_all,
+      const torch::Tensor& prev_matrix) override;
+
+  bool has_dspark_confidence_head() const override;
+
+  void load_model(std::unique_ptr<ModelLoader> loader) override;
+
+  torch::Device device() const override { return device_; }
+  const torch::TensorOptions& options() const override { return options_; }
+
+  void prepare_expert_weight(int32_t layer_id,
+                             const std::vector<int32_t>& expert_ids) override;
+  void start_expert_weight_transfer(int32_t layer_id) override;
+  void update_expert_weight(int32_t layer_id) override;
+  bool last_prepare_expert_weight_ok(int32_t layer_id) const override;
+
+  bool share_weights_from(CausalLM& source) override;
+
+  void tp_all_reduce(torch::Tensor& tensor);
+  torch::Tensor tp_all_gather(const torch::Tensor& tensor, int64_t dim);
+  torch::Tensor dp_all_gather(
+      const torch::Tensor& tensor,
+      const std::vector<int32_t>& execution_token_counts);
+  void moe_tp_all_reduce(torch::Tensor& tensor);
+  void moe_ep_all_reduce(torch::Tensor& tensor);
+  void eplb_batch_isend_irecv(const pybind11::list& operation_types,
+                              const pybind11::list& tensors,
+                              const pybind11::list& remote_ranks);
+  void eplb_wait_batch_isend_irecv();
+
+  static PyCausalLM* active_instance();
+  static void set_active_instance(PyCausalLM* py_causal_lm);
+
+  pybind11::object& python_model() { return py_model_; }
+  const pybind11::object& config_dict() const { return config_dict_; }
+  int64_t cp_size() const { return cp_size_; }
+  int64_t kv_split_size() const { return kv_split_size_; }
+  int64_t kv_split_rank() const { return kv_split_rank_; }
+
+ private:
+  pybind11::dict build_config_dict(
+      const ParallelArgs& parallel_args,
+      const SpeculativeRuntimeConfig& speculative_runtime_config) const;
+  const pybind11::object& get_or_build_python_kv_caches(
+      std::vector<KVCache>& kv_caches);
+
+  ModelArgs model_args_;
+  torch::TensorOptions options_;
+  torch::Device device_;
+  bool enable_mla_ = false;
+
+  int64_t tp_size_ = 1;
+  int64_t tp_rank_ = 0;
+  int64_t dp_size_ = 1;
+  int64_t dp_rank_ = 0;
+  int64_t moe_tp_size_ = 1;
+  int64_t moe_tp_rank_ = 0;
+  int64_t ep_size_ = 1;
+  int64_t ep_rank_ = 0;
+  int64_t cp_size_ = 1;
+  int64_t cp_rank_ = 0;
+  int64_t layerwise_split_size_ = 1;
+  int64_t layerwise_split_rank_ = 0;
+  int64_t kv_split_size_ = 1;
+  int64_t kv_split_rank_ = 0;
+  ProcessGroup* tp_group_ = nullptr;
+  ProcessGroup* dp_group_ = nullptr;
+  ProcessGroup* moe_tp_group_ = nullptr;
+  ProcessGroup* moe_ep_group_ = nullptr;
+  ProcessGroup* eplb_group_ = nullptr;
+#if defined(USE_NPU)
+  std::shared_ptr<MegaMoeCommResource> mega_moe_comm_resource_;
+#endif
+
+  pybind11::object py_model_;
+  pybind11::object config_dict_;
+  pybind11::object python_kv_caches_;
+  std::unordered_map<int32_t, bool> last_prepare_expert_weight_ok_;
+  c10::intrusive_ptr<c10d::Work> eplb_p2p_work_;
+
+  static thread_local PyCausalLM* active_instance_;
+};
+
+}  // namespace xllm

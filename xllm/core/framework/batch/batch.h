@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,10 +21,11 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <limits>
+#include <optional>
 #include <vector>
 
+#include "core/framework/multimodal/mm_data.h"
 #include "framework/batch/batch_forward_type.h"
-#include "framework/request/mm_data.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
 #include "framework/request/sequences_group.h"
@@ -59,8 +60,8 @@ class Batch {
   void refresh_forward_type();
 
   void set_swap_block_transfer_infos(
-      std::vector<BlockTransferInfo>* swap_block_transfer_infos) {
-    swap_block_transfer_infos_ = swap_block_transfer_infos;
+      std::vector<BlockTransferInfo> swap_block_transfer_infos) {
+    swap_block_transfer_infos_ = std::move(swap_block_transfer_infos);
   }
 
   void set_batch_id() {
@@ -74,6 +75,8 @@ class Batch {
   }
 
   uint64_t batch_id() const { return batch_id_; }
+
+  void require_host_restore() { requires_host_restore_ = true; }
 
   // get the number of sequences in the batch
   size_t size() const { return sequences_.size(); }
@@ -90,12 +93,17 @@ class Batch {
   ForwardInput prepare_rec_forward_input(uint32_t num_decoding_tokens,
                                          uint32_t min_decoding_batch_size,
                                          const ModelArgs& args,
-                                         ThreadPool* thread_pool = nullptr);
+                                         MPMCThreadPool* thread_pool = nullptr);
 
-  // Convert Batch to pb type, which will be pass to remote worker.
-  RawForwardInput prepare_forward_input(const ModelArgs& args,
-                                        ThreadPool* thread_pool,
-                                        int32_t cp_size = 1);
+  // Prepare ForwardInput for distributed transport.
+  ForwardInput prepare_forward_input(const ModelArgs& args,
+                                     ThreadPool* thread_pool,
+                                     int32_t cp_size = 1);
+
+  // Pin KV pages and per-request state slots until this batch is retired.
+  // With schedule overlap, an earlier batch can finish a request while this
+  // batch still reads/writes its KV, LINEAR or EMBEDDING cache.
+  void retain_cache_blocks();
 
   // process output
   //
@@ -107,10 +115,12 @@ class Batch {
   // The boolean parameter `replace_fake_token` indicates
   // whether the current stage is the second stage.
   void process_sample_output(const SampleOutput& sample_output,
-                             bool replace_fake_token);
+                             bool replace_fake_token,
+                             bool force_requested_beam_result_size = false);
 
   void process_sample_output(const RawForwardOutput& raw_output,
-                             bool replace_fake_token);
+                             bool replace_fake_token,
+                             OptionalModelArgsRef model_args = std::nullopt);
 
   // process output for beam search kernel
   void process_beam_search_output(const RawForwardOutput& raw_output,
@@ -139,6 +149,7 @@ class Batch {
   // Get all sequences from either sequences_ or sequence_groups_
   // Used by RecEngine to access sequences for stopping checker evaluation
   std::vector<Sequence*> get_sequences();
+  std::vector<Sequence*> get_sequences() const;
 
  private:
   struct OutputTarget {
@@ -147,7 +158,9 @@ class Batch {
     bool from_sample_slot = false;
   };
 
+  void stamp_host_restore(ForwardInput& forward_input);
   void refresh_output_targets();
+  void refresh_onerec_prefill_output_targets();
   bool update_sequence_state(Sequence* seq, bool replace_fake_token);
 
   void append_token_for_sequence(Sequence* seq,
@@ -155,7 +168,7 @@ class Batch {
                                  int token_idx,
                                  bool replace_fake_token);
 
-  void process_beam_search();
+  void process_beam_search(bool force_requested_result_size = false);
   bool has_partial_finished_beam_group() const;
 
   std::unordered_map<uint32_t, uint32_t> cal_seq_exchange_index(
@@ -165,7 +178,8 @@ class Batch {
 
   std::vector<Sequence*> sequences_;
   std::vector<SequencesGroup*> sequence_groups_;
-  std::vector<BlockTransferInfo>* swap_block_transfer_infos_ = nullptr;
+  std::vector<BlockTransferInfo> swap_block_transfer_infos_;
+  std::vector<Block> retained_cache_blocks_;
 
   // max number of tokens to process for each sequence
   // default to max value
@@ -184,6 +198,7 @@ class Batch {
   BatchForwardType batch_forward_type_;
 
   uint64_t batch_id_ = UNINITIALIZED_BATCH_ID;
+  bool requires_host_restore_ = false;
 };
 
 }  // namespace xllm

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,7 +24,11 @@ std::unique_ptr<Tokenizer> TokenizerFactory::create_tokenizer(
     TokenizerArgs tokenizer_args,
     bool proxy) {
   std::unique_ptr<Tokenizer> tokenizer;
-  if (tokenizer_args.tokenizer_type() == "fast") {
+  if (tokenizer_args.tokenizer_type() == "rwkv") {
+    LOG(INFO) << "Create RWKV trie tokenizer.";
+    tokenizer =
+        std::make_unique<RwkvTokenizer>(model_weights_path, tokenizer_args);
+  } else if (tokenizer_args.tokenizer_type() == "fast") {
     // 1. fast tokenizer
     LOG(INFO) << "Create fast tokenizer.";
     tokenizer = std::make_unique<FastTokenizer>(tokenizer_args);

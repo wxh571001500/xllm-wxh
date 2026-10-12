@@ -1,0 +1,726 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "models/llm/py_causal_lm.h"
+
+#include <glog/logging.h>
+#include <pybind11/stl.h>
+#include <torch/python.h>
+
+#include <algorithm>
+#include <memory>
+#include <string>
+
+#include "core/framework/config/disagg_pd_config.h"
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/model/model_output.h"
+#include "core/framework/model_loader.h"
+#include "core/framework/parallel_state/parallel_state.h"
+#include "core/framework/parallel_state/process_group.h"
+#include "core/framework/state_dict/state_dict.h"
+#include "core/util/pybind_helper.h"
+#include "models/py_model_helper.h"
+
+#if defined(USE_NPU)
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/parallel_state/mega_moe_comm_resource.h"
+#include "core/kernels/npu/npu_ops_api.h"
+#include "platform/npu/npu_layer_synchronizer.h"
+#endif
+
+namespace py = pybind11;
+
+namespace xllm {
+
+namespace detail {
+
+void share_python_model_weights(py::object& draft_model,
+                                const py::object& target_model) {
+  // Keep the draft's own head/embedding when the checkpoint ships them (DSpark
+  // carries a trained mask-token basis); borrow the target's only when None.
+  if (draft_model.attr("lm_head").is_none()) {
+    draft_model.attr("lm_head") = target_model.attr("lm_head");
+  }
+  py::object draft_body = draft_model.attr("model");
+  py::object target_body = target_model.attr("model");
+  if (draft_body.attr("embed_tokens").is_none()) {
+    draft_body.attr("embed_tokens") = target_body.attr("embed_tokens");
+  }
+}
+
+int64_t python_mega_moe_max_num_tokens_per_rank(int64_t max_seqs_per_batch,
+                                                int64_t num_speculative_tokens,
+                                                int64_t dp_size) {
+  CHECK_GT(max_seqs_per_batch, 0);
+  CHECK_GE(num_speculative_tokens, 0);
+  CHECK_GT(dp_size, 0);
+
+  const int64_t speculative_width = num_speculative_tokens + 1;
+  const int64_t global_rows = max_seqs_per_batch * speculative_width;
+  // The cap sizes the HCCL AllToAll buffer and is fixed once at startup, so it
+  // must cover the worst-case gather of every execution path the model may take
+  // at runtime, regardless of the static graph switch:
+  //   - ACL Graph gathers a balanced DP-local shape: ceil(global_rows/dp_size)
+  //     rows per rank, i.e. ((global_rows + dp_size - 1) / dp_size) * dp_size
+  //     total.
+  //   - Eager's compact gather sums each rank's real count; up to dp_size-1
+  //     other ranks can be simultaneously empty (contributing their floored
+  //     dummy row from dp_execution_token_counts) while one rank carries the
+  //     full global_rows budget, i.e. global_rows + dp_size - 1 total.
+  // A graph batch can fall back to eager per-batch, so the cap cannot assume
+  // the graph layout. The eager bound dominates the balanced graph bound for
+  // all dp_size (ceil(global_rows/dp_size)*dp_size <= global_rows + dp_size -
+  // 1), so a single eager formula covers both.
+  return global_rows + dp_size - 1;
+}
+
+int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
+    int64_t max_tokens_per_batch,
+    int64_t max_seqs_per_batch,
+    int64_t num_speculative_tokens) {
+  CHECK_GT(max_tokens_per_batch, 0);
+  CHECK_GT(max_seqs_per_batch, 0);
+  CHECK_GE(num_speculative_tokens, 0);
+
+  const int64_t speculative_width = num_speculative_tokens + 1;
+  const int64_t max_decode_tokens = max_seqs_per_batch * speculative_width;
+  // Qwen3.5 uses MegaMoe for both prefill and token-owner decode. It does not
+  // gather DP tokens before dispatch, so no empty-rank dummy rows are added.
+  return std::max(max_tokens_per_batch, max_decode_tokens);
+}
+
+}  // namespace detail
+
+namespace {
+
+py::list build_python_kv_caches(std::vector<KVCache>& kv_caches) {
+  py::list python_caches;
+  for (KVCache& kv_cache : kv_caches) {
+    python_caches.append(
+        py::make_tuple(optional_tensor(kv_cache.get_k_cache()),
+                       optional_tensor(kv_cache.get_v_cache()),
+                       optional_tensor(kv_cache.get_index_cache()),
+                       optional_tensor(kv_cache.get_conv_cache()),
+                       optional_tensor(kv_cache.get_ssm_cache()),
+                       optional_tensor(kv_cache.get_swa_cache())));
+  }
+  return python_caches;
+}
+
+}  // namespace
+
+PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
+    : model_args_(context.get_model_args()),
+      options_(context.get_tensor_options()),
+      device_(context.get_tensor_options().device()),
+      enable_mla_(context.get_model_args().enable_mla()) {
+  ensure_python_interpreter();
+
+  const ParallelArgs& parallel_args = context.get_parallel_args();
+  tp_group_ = parallel_args.tp_group_;
+  cp_size_ = parallel_args.cp_size();
+  cp_rank_ = parallel_args.cp_rank();
+  layerwise_split_size_ = parallel_args.layerwise_split_size();
+  kv_split_size_ = parallel_args.kv_split_size_effective();
+  kv_split_rank_ = parallel_args.kv_split_rank();
+  // tp_group_ and cp_group_ are already the final, orthogonally-split groups:
+  // the collective communicator narrows tp_group_ to world/(dp*cp) and builds a
+  // separate cp_group_ over the cp-strided ranks. Read each dimension from its
+  // own group instead of carving CP back out of tp_group_. TP and CP are
+  // orthogonal: a rank can shard both attention heads (TP) and sequence tokens
+  // (CP) at once, so both dimensions may be > 1 simultaneously.
+  tp_size_ = (tp_group_ != nullptr) ? tp_group_->world_size() : 1;
+  tp_rank_ = (tp_group_ != nullptr) ? tp_group_->rank() : 0;
+  dp_group_ = parallel_args.dp_local_process_group_;
+  dp_size_ = (dp_group_ != nullptr) ? dp_group_->world_size() : 1;
+  dp_rank_ = (dp_group_ != nullptr) ? dp_group_->rank() : 0;
+  ep_size_ = parallel_args.ep_size();
+
+  CHECK(parallel_args.moe_tp_group_ != nullptr);
+  moe_tp_group_ = parallel_args.moe_tp_group_;
+  if (ep_size_ > 1) {
+    CHECK(parallel_args.moe_ep_group_ != nullptr);
+    moe_ep_group_ = parallel_args.moe_ep_group_;
+  }
+  moe_tp_size_ = (moe_tp_group_ != nullptr) ? moe_tp_group_->world_size() : 1;
+  moe_tp_rank_ = (moe_tp_group_ != nullptr) ? moe_tp_group_->rank() : 0;
+  ep_rank_ = (moe_ep_group_ != nullptr) ? moe_ep_group_->rank() : 0;
+  if (EPLBConfig::get_instance().enable_eplb()) {
+    CHECK(parallel_args.eplb_group_ != nullptr)
+        << "Python EPLB requires a dedicated EPLB process group.";
+    eplb_group_ = parallel_args.eplb_group_;
+    if (moe_ep_group_ != nullptr) {
+      CHECK_EQ(eplb_group_->rank(), moe_ep_group_->rank())
+          << "EPLB and MoE EP groups must use the same rank ordering.";
+      CHECK_EQ(eplb_group_->world_size(), moe_ep_group_->world_size())
+          << "EPLB and MoE EP groups must use the same world size.";
+    }
+  }
+
+#if defined(USE_NPU)
+  const auto& kernel_config = KernelConfig::get_instance();
+  const auto& eplb_config = EPLBConfig::get_instance();
+  const auto& model_type = model_args_.model_type();
+  const bool is_glm_mega_moe_model = model_type == "glm_moe_dsa";
+  const bool is_qwen3_5_mega_moe_model =
+      model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text";
+  const bool enable_glm_mega_moe = kernel_config.enable_mega_moe() &&
+                                   is_glm_mega_moe_model && ep_size_ > 1 &&
+                                   eplb_config.expert_parallel_degree() == 2 &&
+                                   !eplb_config.enable_eplb();
+  const bool enable_qwen3_5_mega_moe =
+      kernel_config.enable_mega_moe() && is_qwen3_5_mega_moe_model;
+  if (enable_qwen3_5_mega_moe) {
+    CHECK_GT(tp_size_, 1)
+        << "Qwen3.5 MegaMoe token ownership requires attention TP > 1.";
+    CHECK_GT(dp_size_, 1) << "Qwen3.5 MegaMoe token ownership requires DP > 1.";
+    CHECK_EQ(cp_size_, 1)
+        << "Qwen3.5 MegaMoe token ownership requires CP == 1.";
+    CHECK_EQ(moe_tp_size_, 1)
+        << "Qwen3.5 MegaMoe token ownership requires MoE TP == 1.";
+    CHECK_EQ(ep_size_, parallel_args.world_size())
+        << "Qwen3.5 MegaMoe token ownership requires EP == world size.";
+  }
+  const bool enable_mega_moe = enable_glm_mega_moe || enable_qwen3_5_mega_moe;
+  if (enable_mega_moe) {
+    CHECK(moe_ep_group_ != nullptr)
+        << "Python MegaMoE requires a MoE EP process group.";
+    CHECK(kernel::npu::has_mega_moe())
+        << "Python MegaMoE requires aclnnMegaMoe.";
+    MegaMoeCommSpec comm_spec;
+    comm_spec.group_name = moe_ep_group_->hccl_comm_name(/*init_comm=*/true);
+    comm_spec.hccl_comm = moe_ep_group_->hccl_comm();
+    comm_spec.ep_world_size = moe_ep_group_->world_size();
+    comm_spec.device_index = device_.index();
+    if (enable_qwen3_5_mega_moe) {
+      comm_spec.max_num_tokens_per_rank =
+          detail::python_qwen3_5_mega_moe_max_num_tokens_per_rank(
+              static_cast<int64_t>(
+                  SchedulerConfig::get_instance().max_tokens_per_batch()),
+              static_cast<int64_t>(
+                  SchedulerConfig::get_instance().max_seqs_per_batch()),
+              static_cast<int64_t>(model_args_.num_speculative_tokens()));
+    } else {
+      const int64_t dp_factor =
+          std::max(static_cast<int64_t>(dp_size_), int64_t{1});
+      comm_spec.max_num_tokens_per_rank =
+          detail::python_mega_moe_max_num_tokens_per_rank(
+              static_cast<int64_t>(
+                  SchedulerConfig::get_instance().max_seqs_per_batch()),
+              static_cast<int64_t>(model_args_.num_speculative_tokens()),
+              dp_factor);
+    }
+    mega_moe_comm_resource_ =
+        moe_ep_group_->acquire_mega_moe_comm_resource(comm_spec);
+    CHECK(mega_moe_comm_resource_ != nullptr)
+        << "Failed to acquire Python MegaMoE communication resource.";
+  }
+#endif
+
+  py::gil_scoped_acquire gil;
+  // deepseek_v4 and deepseek_v41 python models own their TP/moe_tp/EP splits
+  // internally, so PyCausalLM must not init those process groups here.
+  const bool is_deepseek_v4 = model_args_.model_type() == "deepseek_v4" ||
+                              model_args_.model_type() == "deepseek_v41";
+  const bool needs_python_process_group =
+      !is_deepseek_v4 || dp_size_ > 1 || cp_size_ > 1;
+  if (needs_python_process_group) {
+    py::object init_process_group =
+        py::module_::import("xllm.python.distributed")
+            .attr("init_process_group");
+    CHECK(!parallel_args.python_rendezvous_host_.empty());
+    CHECK_GT(parallel_args.python_rendezvous_port_, 0);
+    const int32_t global_rank = parallel_args.rank();
+    const int32_t global_world_size = parallel_args.world_size();
+    if (!is_deepseek_v4 && tp_size_ > 1) {
+      init_process_group("tp",
+                         parallel_args.python_rendezvous_host_,
+                         parallel_args.python_rendezvous_port_,
+                         tp_rank_,
+                         tp_size_,
+                         c10::str(device_),
+                         global_rank,
+                         global_world_size,
+                         global_rank / tp_size_);
+    }
+    if (dp_size_ > 1) {
+      init_process_group("dp",
+                         parallel_args.python_rendezvous_host_,
+                         parallel_args.python_rendezvous_port_,
+                         dp_rank_,
+                         dp_size_,
+                         c10::str(device_),
+                         global_rank,
+                         global_world_size,
+                         global_rank % (global_world_size / dp_size_));
+    }
+    if (!is_deepseek_v4 && moe_tp_size_ > 1) {
+      init_process_group("moe_tp",
+                         parallel_args.python_rendezvous_host_,
+                         parallel_args.python_rendezvous_port_,
+                         moe_tp_rank_,
+                         moe_tp_size_,
+                         c10::str(device_),
+                         global_rank,
+                         global_world_size,
+                         global_rank / moe_tp_size_);
+    }
+    if (!is_deepseek_v4 && ep_size_ > 1) {
+      init_process_group("moe_ep",
+                         parallel_args.python_rendezvous_host_,
+                         parallel_args.python_rendezvous_port_,
+                         ep_rank_,
+                         ep_size_,
+                         c10::str(device_),
+                         global_rank,
+                         global_world_size,
+                         global_rank % moe_tp_size_);
+    }
+    if (cp_size_ > 1) {
+      const int32_t cp_group_index =
+          (global_rank / (cp_size_ * tp_size_)) * tp_size_ +
+          global_rank % tp_size_;
+      init_process_group("cp",
+                         parallel_args.python_rendezvous_host_,
+                         parallel_args.python_rendezvous_port_,
+                         cp_rank_,
+                         cp_size_,
+                         c10::str(device_),
+                         global_rank,
+                         global_world_size,
+                         cp_group_index,
+                         tp_size_);
+    }
+    const int32_t kv_split_size = parallel_args.kv_split_size_effective();
+    if (!is_deepseek_v4 && cp_size_ == 1 && kv_split_size > 1) {
+      CHECK_EQ(tp_size_ % kv_split_size, 0);
+      const int32_t dcp_stride = tp_size_ / kv_split_size;
+      const int32_t dcp_rank = parallel_args.kv_split_rank();
+      const auto& dcp_topology = parallel_args.dcp_topology_;
+      const int32_t dcp_group_index =
+          dcp_topology.has_value()
+              ? dcp_topology->group_index
+              : dp_rank_ * dcp_stride + tp_rank_ % dcp_stride;
+      init_process_group(
+          "dcp",
+          parallel_args.python_rendezvous_host_,
+          parallel_args.python_rendezvous_port_,
+          dcp_rank,
+          kv_split_size,
+          c10::str(device_),
+          global_rank,
+          global_world_size,
+          dcp_group_index,
+          dcp_topology.has_value() ? py::none() : py::cast(dcp_stride),
+          dcp_topology.has_value() ? py::cast(dcp_topology->group_ranks)
+                                   : py::none());
+    }
+    if (!is_deepseek_v4 && layerwise_split_size_ > 1) {
+      CHECK_EQ(tp_size_ % layerwise_split_size_, 0)
+          << "layerwise_split_size must divide Python attention TP size";
+      const int32_t layerwise_group_index =
+          (global_rank / tp_size_) * (tp_size_ / layerwise_split_size_) +
+          tp_rank_ / layerwise_split_size_;
+      layerwise_split_rank_ = tp_rank_ % layerwise_split_size_;
+      init_process_group("layerwise",
+                         parallel_args.python_rendezvous_host_,
+                         parallel_args.python_rendezvous_port_,
+                         layerwise_split_rank_,
+                         layerwise_split_size_,
+                         c10::str(device_),
+                         global_rank,
+                         global_world_size,
+                         layerwise_group_index);
+    }
+  }
+  std::string module_name = context.get_model_args().model_type().empty()
+                                ? std::string("Qwen3ForCausalLM")
+                                : context.get_model_args().model_type();
+  // Keep the internal Python class-resolution key behind this typed bridge.
+  if (is_vlm && module_name == "glm5_next") {
+    module_name = "glm5_next_vl";
+  }
+
+  py::module_ registry = py::module_::import("xllm.python.registry");
+  py::object model_cls = registry.attr("get_model_class")(py::str(module_name));
+  config_dict_ = build_config_dict(parallel_args,
+                                   context.get_speculative_runtime_config());
+  py_model_ = model_cls(config_dict_);
+  py_model_.attr("eval")();
+}
+
+PyCausalLM::~PyCausalLM() {
+  clear_python_object(python_kv_caches_);
+  clear_python_object(py_model_);
+  clear_python_object(config_dict_);
+#if defined(USE_NPU)
+  mega_moe_comm_resource_.reset();
+#endif
+}
+
+const py::object& PyCausalLM::get_or_build_python_kv_caches(
+    std::vector<KVCache>& kv_caches) {
+  if (!python_kv_caches_) {
+    python_kv_caches_ = build_python_kv_caches(kv_caches);
+  }
+  return python_kv_caches_;
+}
+
+py::dict PyCausalLM::build_config_dict(
+    const ParallelArgs& parallel_args,
+    const SpeculativeRuntimeConfig& speculative_runtime_config) const {
+  py::dict d;
+  PyDictVisitor visitor(d);
+  visit_properties(model_args_, visitor);
+  visit_properties(parallel_args, visitor);
+  d["dtype"] = dtype_to_string(options_);
+  d["device"] = c10::str(device_);
+  d["enable_disagg_pd"] = DisaggPDConfig::get_instance().enable_disagg_pd();
+  d["enable_eplb"] = EPLBConfig::get_instance().enable_eplb();
+  d["use_ctc"] = ModelConfig::get_instance().use_ctc();
+  d["redundant_experts_num"] =
+      EPLBConfig::get_instance().redundant_experts_num();
+  d["eplb_use_decode_only_load"] =
+      EPLBConfig::get_instance().eplb_use_decode_only_load();
+  // Checkpoint directory: python models use it to discover side-car files
+  // shipped with the weights (e.g. optional/quarot.safetensors).
+  d["model_path"] = ModelConfig::get_instance().model();
+  d["tp_size"] = tp_size_;
+  d["tp_rank"] = tp_rank_;
+  d["dp_size"] = dp_size_;
+  d["dp_rank"] = dp_rank_;
+  d["moe_tp_size"] = moe_tp_size_;
+  d["moe_tp_rank"] = moe_tp_rank_;
+  d["ep_size"] = ep_size_;
+  d["ep_rank"] = ep_rank_;
+  d["requires_framework_kpool_tail"] =
+      uses_npu_compressed_kpool_tail(model_args_);
+  d["runtime_adaptive_speculative_decode_enabled"] =
+      speculative_runtime_config.adaptive_enabled;
+  d["is_draft_engine"] = speculative_runtime_config.is_draft_engine;
+  d["draft_query_width"] = speculative_runtime_config.draft_query_width;
+  d["dflash_xfia_enabled"] = speculative_runtime_config.dflash_xfia_enabled;
+  // cp_size is a reflected ParallelArgs PROPERTY (already in d), but cp_rank is
+  // a derived member function, so pass it explicitly for the Python executor.
+  d["cp_rank"] = cp_rank_;
+  d["layerwise_split_rank"] = layerwise_split_rank_;
+  const bool requires_eager_execution = model_args_.requires_eager_execution();
+  d["enable_graph"] = requires_eager_execution
+                          ? false
+                          : ExecutionConfig::get_instance().enable_graph();
+  d["python_graph_backend"] =
+      requires_eager_execution
+          ? std::string("off")
+          : ExecutionConfig::get_instance().python_graph_backend();
+#if defined(USE_NPU)
+  d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
+  const auto& eplb_config = EPLBConfig::get_instance();
+  if (model_args_.model_type() == "glm5_next" ||
+      model_args_.model_type() == "glm5_next_text") {
+    d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
+    d["enable_eplb"] = eplb_config.enable_eplb();
+  }
+  if (mega_moe_comm_resource_ != nullptr) {
+    d["enable_mega_moe"] = true;
+    d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
+    d["enable_eplb"] = eplb_config.enable_eplb();
+    d["mega_moe_context"] = mega_moe_comm_resource_->context_tensor();
+    d["mega_moe_ccl_buffer_size"] = mega_moe_comm_resource_->ccl_buffer_size();
+    d["mega_moe_num_max_tokens_per_rank"] =
+        mega_moe_comm_resource_->max_num_tokens_per_rank();
+  }
+#endif
+  return d;
+}
+
+void PyCausalLM::load_model(std::unique_ptr<ModelLoader> loader) {
+  py::gil_scoped_acquire gil;
+  auto& state_dicts = loader->get_state_dicts();
+  ensure_xllm_weight_loader_module();
+
+  py::list py_state_dicts;
+  for (const auto& sd : state_dicts) {
+    py_state_dicts.append(
+        py::cast(PyStateDict(sd.get()), py::return_value_policy::move));
+  }
+
+  py_model_.attr("load_weights")(py_state_dicts,
+                                 static_cast<int32_t>(tp_rank_),
+                                 static_cast<int32_t>(tp_size_));
+  const std::string& reference_model_path =
+      loader->reference_model_weights_path();
+  if (!reference_model_path.empty()) {
+    // Quantized reference models (e.g. QuaRot) transform the residual basis the
+    // draft trained against; fuse that transform into the draft's weights.
+    py_model_.attr("adapt_weights_for_reference_model")(
+        py::str(reference_model_path));
+  }
+}
+
+ModelOutput PyCausalLM::forward(const torch::Tensor& tokens,
+                                const torch::Tensor& positions,
+                                std::vector<KVCache>& kv_caches,
+                                const ModelInputParams& parameters) {
+  LOG(FATAL) << "PyCausalLM::forward() must not be called directly. "
+             << "Python model forward goes through PyExecutorImpl.";
+  return ModelOutput(torch::Tensor());
+}
+
+torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& seleted_idxes) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::object selected = optional_tensor(seleted_idxes);
+  py::object out = py_model_.attr("compute_logits")(hidden_states, selected);
+  return out.cast<torch::Tensor>();
+}
+
+torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& seleted_idxes,
+                                 torch::Tensor& out_hidden) {
+  // Expose the selected hidden rows for the speculative-decode (MTP) draft
+  // input, and project via lm_head on those already-selected rows so Python's
+  // compute_logits does not do the same index_select a second time.
+  if (seleted_idxes.defined()) {
+    torch::Tensor idxes = seleted_idxes.to(
+        torch::dtype(torch::kLong).device(hidden_states.device()));
+    out_hidden = hidden_states.index_select(/*dim=*/0, idxes);
+    return logits(out_hidden, /*seleted_idxes=*/torch::Tensor());
+  }
+  out_hidden = hidden_states;
+  return logits(hidden_states, seleted_idxes);
+}
+
+ModelOutput PyCausalLM::write_context_kv(
+    const torch::Tensor& target_hidden,
+    const torch::Tensor& positions,
+    const torch::Tensor& device_cache_slots,
+    std::vector<KVCache>& kv_caches,
+    const ModelInputParams& input_params) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::object layer_synchronizer = py::none();
+#if defined(USE_NPU)
+  if (input_params.parallel.layer_synchronizer != nullptr) {
+    layer_synchronizer = py::cast(input_params.parallel.layer_synchronizer);
+  }
+#endif
+  const py::object& python_kv_caches = get_or_build_python_kv_caches(kv_caches);
+  py::object output = py_model_.attr("write_context_kv")(target_hidden,
+                                                         positions,
+                                                         device_cache_slots,
+                                                         python_kv_caches,
+                                                         layer_synchronizer);
+  if (output.is_none()) {
+    return ModelOutput();
+  }
+  return ModelOutput(output.cast<torch::Tensor>());
+}
+
+torch::Tensor PyCausalLM::dspark_markov_bias(
+    const torch::Tensor& previous_token_ids) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  return py_model_.attr("dspark_markov_bias")(previous_token_ids)
+      .cast<torch::Tensor>();
+}
+
+DFlash2CandidateOutput PyCausalLM::dflash2_candidates(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& unary_logits,
+    const torch::Tensor& anchor_token_ids) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::tuple output = py_model_
+                         .attr("dflash2_candidates")(
+                             hidden_states, unary_logits, anchor_token_ids)
+                         .cast<py::tuple>();
+  DFlash2CandidateOutput candidates;
+  candidates.candidate_ids = output[0].cast<torch::Tensor>();
+  candidates.edge_logits = output[1].cast<torch::Tensor>();
+  return candidates;
+}
+
+torch::Tensor PyCausalLM::dspark_confidence_probs(
+    const torch::Tensor& hidden_all,
+    const torch::Tensor& prev_matrix) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::object previous = optional_tensor(prev_matrix);
+  return py_model_.attr("dspark_confidence_probs")(hidden_all, previous)
+      .cast<torch::Tensor>();
+}
+
+bool PyCausalLM::has_dspark_confidence_head() const {
+  py::gil_scoped_acquire gil;
+  return py_model_.attr("has_dspark_confidence_head")().cast<bool>();
+}
+
+void PyCausalLM::prepare_expert_weight(int32_t layer_id,
+                                       const std::vector<int32_t>& expert_ids) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  if (!py::hasattr(py_model_, "prepare_expert_weight")) {
+    last_prepare_expert_weight_ok_[layer_id] = true;
+    return;
+  }
+  const bool prepare_ok =
+      py_model_.attr("prepare_expert_weight")(layer_id, expert_ids)
+          .cast<bool>();
+  last_prepare_expert_weight_ok_[layer_id] = prepare_ok;
+}
+
+void PyCausalLM::start_expert_weight_transfer(int32_t layer_id) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  if (!py::hasattr(py_model_, "start_expert_weight_transfer")) {
+    return;
+  }
+  set_active_instance(this);
+  py_model_.attr("start_expert_weight_transfer")(layer_id);
+}
+
+void PyCausalLM::update_expert_weight(int32_t layer_id) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  if (!py::hasattr(py_model_, "update_expert_weight")) {
+    return;
+  }
+  set_active_instance(this);
+  py_model_.attr("update_expert_weight")(layer_id);
+}
+
+bool PyCausalLM::last_prepare_expert_weight_ok(int32_t layer_id) const {
+  const auto result = last_prepare_expert_weight_ok_.find(layer_id);
+  return result == last_prepare_expert_weight_ok_.end() || result->second;
+}
+
+thread_local PyCausalLM* PyCausalLM::active_instance_ = nullptr;
+
+PyCausalLM* PyCausalLM::active_instance() { return active_instance_; }
+
+void PyCausalLM::set_active_instance(PyCausalLM* py_causal_lm) {
+  active_instance_ = py_causal_lm;
+}
+
+void PyCausalLM::tp_all_reduce(torch::Tensor& tensor) {
+  if (tp_group_ != nullptr) {
+    tp_group_->allreduce(tensor);
+  }
+}
+
+torch::Tensor PyCausalLM::tp_all_gather(const torch::Tensor& tensor,
+                                        int64_t dim) {
+  if (tp_group_ == nullptr) {
+    return tensor;
+  }
+  auto gathered = tp_group_->allgather_base_sync(tensor);
+  const int64_t world_size = tp_group_->world_size();
+  const int64_t ndim = tensor.dim();
+  if (dim < 0) {
+    dim += ndim;
+  }
+  CHECK(dim >= 0 && dim < ndim)
+      << "tensor-parallel gather dimension out of range: " << dim;
+  std::vector<int64_t> permutation;
+  permutation.reserve(static_cast<size_t>(ndim + 1));
+  for (int64_t index = 1; index <= dim; ++index) {
+    permutation.push_back(index);
+  }
+  permutation.push_back(0);
+  for (int64_t index = dim + 1; index < ndim + 1; ++index) {
+    permutation.push_back(index);
+  }
+  gathered = gathered.permute(permutation);
+  auto output_shape = tensor.sizes().vec();
+  output_shape[dim] *= world_size;
+  return gathered.reshape(output_shape).contiguous();
+}
+
+torch::Tensor PyCausalLM::dp_all_gather(
+    const torch::Tensor& tensor,
+    const std::vector<int32_t>& execution_token_counts) {
+  return parallel_state::gather(tensor, dp_group_, execution_token_counts);
+}
+
+void PyCausalLM::moe_tp_all_reduce(torch::Tensor& tensor) {
+  if (moe_tp_group_ != nullptr) {
+    moe_tp_group_->allreduce(tensor);
+  }
+}
+
+void PyCausalLM::moe_ep_all_reduce(torch::Tensor& tensor) {
+  if (moe_ep_group_ != nullptr) {
+    moe_ep_group_->allreduce(tensor);
+  }
+}
+
+void PyCausalLM::eplb_batch_isend_irecv(const py::list& operation_types,
+                                        const py::list& tensors,
+                                        const py::list& remote_ranks) {
+  CHECK_EQ(operation_types.size(), tensors.size())
+      << "EPLB P2P operation types and tensors must align.";
+  CHECK_EQ(operation_types.size(), remote_ranks.size())
+      << "EPLB P2P operation types and remote ranks must align.";
+  if (tensors.size() == 0) {
+    return;
+  }
+  CHECK(eplb_group_ != nullptr)
+      << "EPLB P2P transfer requires a dedicated EPLB process group.";
+#if defined(USE_NPU)
+  CHECK(eplb_p2p_work_ == nullptr) << "EPLB P2P transfer is already in flight.";
+  std::vector<std::string> native_operation_types =
+      operation_types.cast<std::vector<std::string>>();
+  std::vector<torch::Tensor> native_tensors =
+      tensors.cast<std::vector<torch::Tensor>>();
+  std::vector<int64_t> native_remote_ranks =
+      remote_ranks.cast<std::vector<int64_t>>();
+  eplb_p2p_work_ = eplb_group_->batch_isend_irecv(
+      native_operation_types, native_tensors, native_remote_ranks);
+  CHECK(eplb_p2p_work_ != nullptr)
+      << "EPLB P2P transfer returned no work handle.";
+#else
+  LOG(FATAL) << "EPLB P2P transfer is supported only on NPU.";
+#endif
+}
+
+void PyCausalLM::eplb_wait_batch_isend_irecv() {
+#if defined(USE_NPU)
+  if (eplb_p2p_work_ == nullptr) {
+    return;
+  }
+  CHECK(eplb_p2p_work_->wait()) << "EPLB P2P transfer failed.";
+  eplb_p2p_work_.reset();
+#else
+  LOG(FATAL) << "EPLB P2P transfer is supported only on NPU.";
+#endif
+}
+
+bool PyCausalLM::share_weights_from(CausalLM& source) {
+  auto* source_model = dynamic_cast<PyCausalLM*>(&source);
+  if (source_model == nullptr) {
+    return false;
+  }
+
+  py::gil_scoped_acquire gil;
+  detail::share_python_model_weights(py_model_, source_model->py_model_);
+  return true;
+}
+
+}  // namespace xllm

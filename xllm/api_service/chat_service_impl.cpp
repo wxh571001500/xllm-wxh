@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,6 +29,7 @@ limitations under the License.
 #include <string>
 #include <unordered_set>
 
+#include "api_service/request_admission.h"
 #include "api_service/stream_output_parser.h"
 #include "api_service/utils.h"
 #include "core/common/instance_name.h"
@@ -41,6 +42,11 @@ limitations under the License.
 #include "core/util/utils.h"
 #include "core/util/uuid.h"
 #include "mm_service_utils.h"
+
+#ifdef unlikely
+#undef unlikely
+#endif
+#define unlikely(x) __builtin_expect(!!(x), 0)
 
 namespace xllm {
 namespace {
@@ -206,35 +212,6 @@ bool process_tool_call_stream(std::shared_ptr<ChatCall> call,
   return true;
 }
 
-bool get_enable_thinking_from_request(
-    const nlohmann::json& chat_template_kwargs,
-    const std::string& reasoning_parser_format) {
-  // Default to true if reasoning_parser is configured
-  // This matches chat template defaults for models like glm47 that enable
-  // thinking by default
-  bool default_value = !reasoning_parser_format.empty();
-
-  if (chat_template_kwargs.empty()) {
-    return default_value;
-  }
-
-  // Check for explicit enable_thinking or thinking setting
-  // qwen3 and glm45/glm47 use enable_thinking and deepseek-v3 uses thinking
-  if (chat_template_kwargs.contains("enable_thinking") ||
-      chat_template_kwargs.contains("thinking")) {
-    auto get_bool_val = [&](const char* key) {
-      auto it = chat_template_kwargs.find(key);
-      if (it != chat_template_kwargs.end() && it->is_boolean()) {
-        return it->get<bool>();
-      }
-      return false;
-    };
-    return get_bool_val("enable_thinking") || get_bool_val("thinking");
-  }
-
-  return default_value;
-}
-
 template <typename ChatCall>
 bool send_delta_to_client_brpc(
     std::shared_ptr<ChatCall> call,
@@ -373,9 +350,7 @@ bool send_delta_to_client_brpc(
     response.set_created(created_time);
     response.set_model(model);
     auto* proto_usage = response.mutable_usage();
-    proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
-    proto_usage->set_completion_tokens(usage.num_generated_tokens);
-    proto_usage->set_total_tokens(usage.num_total_tokens);
+    api_service::set_proto_usage(proto_usage, usage);
     if (!call->write(response)) {
       return false;
     }
@@ -460,9 +435,7 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
   if (req_output.usage.has_value()) {
     const auto& usage = req_output.usage.value();
     auto* proto_usage = response.mutable_usage();
-    proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
-    proto_usage->set_completion_tokens(usage.num_generated_tokens);
-    proto_usage->set_total_tokens(usage.num_total_tokens);
+    api_service::set_proto_usage(proto_usage, usage);
   }
 
   return call->write_and_finish(response);
@@ -597,14 +570,8 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            master->get_rate_limiter()->decrease_one_request();
             return call->finish_with_error(status.code(), status.message());
           }
-        }
-
-        if (req_output.finished || req_output.cancelled ||
-            req_output.finished_on_prefill_instance) {
-          master->get_rate_limiter()->decrease_one_request();
         }
 
         if (stream) {
@@ -628,42 +595,17 @@ void ChatServiceImpl::process_async_rpc_impl(
   const auto& target_xservice_addr = request->source_xservice_addr();
   auto callback = [master = master_](const RequestOutput& req_output) -> bool {
     req_output.log_request_status();
-    if (req_output.status.has_value()) {
-      const auto& status = req_output.status.value();
-      if (!status.ok()) {
-        // Reduce the number of concurrent requests when a request is
-        // finished with error.
-        master->get_rate_limiter()->decrease_one_request();
-        return master->handle_rpc_response(req_output);
-      }
-    }
-    // Reduce the number of concurrent requests when a request is finished
-    // or canceled.
-    if (req_output.finished || req_output.cancelled ||
-        req_output.finished_on_prefill_instance) {
-      master->get_rate_limiter()->decrease_one_request();
-    }
     return master->handle_rpc_response(req_output);
   };
 
-  // LLMMaster path (existing logic)
-  // Check if the request is being rate-limited.
   CHECK(master_ != nullptr);
-  if (master_->get_rate_limiter()->is_limited()) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.",
-        service_request_id,
-        target_xservice_addr);
-    return;
-  }
-
-  // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  if (unlikely(!models_.contains(model))) {
-    CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
-                        "Model not supported",
+  const Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (unlikely(!admission_status.ok())) {
+    CALLBACK_WITH_ERROR(admission_status.code(),
+                        admission_status.message(),
                         service_request_id,
                         target_xservice_addr);
     return;
@@ -709,7 +651,12 @@ void ChatServiceImpl::process_async_rpc_impl(
 
     request_params.decode_address = rpc_request.routing().decode_name();
   }
-  // TODO: support stream tool call parser and reasoning parser
+  // Preserve parser-relevant special tokens in decoded output
+  // so tool call detectors can match their control markers.
+  // Aligns with vLLM parser adjust_request behavior.
+  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+    request_params.skip_special_tokens = false;
+  }
 
   master_->handle_request(std::move(messages),
                           std::move(prompt_tokens),
@@ -799,7 +746,11 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     request_params.decode_address = rpc_request.routing().decode_name();
   }
 
-  const bool is_force_reasoning = get_enable_thinking_from_request(
+  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+    request_params.skip_special_tokens = false;
+  }
+
+  const bool is_force_reasoning = api_service::get_enable_thinking_from_request(
       request_params.chat_template_kwargs, reasoning_parser_format_);
 
   std::shared_ptr<StreamOutputParser> stream_parser;
@@ -840,19 +791,8 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            // Reduce the number of concurrent requests when a
-            // request is finished with error.
-            master->get_rate_limiter()->decrease_one_request();
-
             return call->finish_with_error(status.code(), status.message());
           }
-        }
-
-        // Reduce the number of concurrent requests when a request
-        // is finished or canceled.
-        if (req_output.finished || req_output.cancelled ||
-            req_output.finished_on_prefill_instance) {
-          master->get_rate_limiter()->decrease_one_request();
         }
 
         if (stream) {
@@ -879,7 +819,12 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
 MMChatServiceImpl::MMChatServiceImpl(VLMMaster* master,
                                      const std::vector<std::string>& models)
-    : APIServiceImpl(models), master_(master) {
+    : APIServiceImpl(models),
+      master_(master),
+      tool_call_parser_format_(
+          master_->options().tool_call_parser().value_or("")),
+      reasoning_parser_format_(
+          master_->options().reasoning_parser().value_or("")) {
   CHECK(master != nullptr);
 }
 
@@ -889,6 +834,12 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   const auto& model = rpc_request.model();
   if (!models_.contains(model)) {
     call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    return;
+  }
+
+  std::vector<Message> messages;
+  if (!mm_service_utils::build_messages<MMChatCall>(
+          req_messages, messages, call, master_->get_image_limit())) {
     return;
   }
 
@@ -903,19 +854,28 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
 
-  std::vector<Message> messages;
-  if (!mm_service_utils::build_messages<MMChatCall>(
-          req_messages, messages, call, master_->get_image_limit())) {
-    return;
-  }
-
   bool include_usage = false;
   if (rpc_request.has_stream_options()) {
     include_usage = rpc_request.stream_options().include_usage();
   }
 
+  const bool is_force_reasoning = api_service::get_enable_thinking_from_request(
+      request_params.chat_template_kwargs, reasoning_parser_format_);
+
+  std::shared_ptr<StreamOutputParser> stream_parser;
+  if (request_params.streaming && (!tool_call_parser_format_.empty() ||
+                                   !reasoning_parser_format_.empty())) {
+    stream_parser =
+        std::make_shared<StreamOutputParser>(request_params.tools,
+                                             tool_call_parser_format_,
+                                             reasoning_parser_format_,
+                                             is_force_reasoning);
+    CHECK(stream_parser != nullptr) << "create StreamOutputParser failed!";
+  }
+
   auto saved_streaming = request_params.streaming;
   auto saved_request_id = request_params.request_id;
+  auto saved_tools = request_params.tools;
 
   auto payload = call->take_request_payload();
 
@@ -931,25 +891,19 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
        include_usage = include_usage,
        first_message_sent = std::unordered_set<size_t>(),
        request_id = std::move(saved_request_id),
-       created_time = absl::ToUnixSeconds(absl::Now())](
-          const RequestOutput& req_output) mutable -> bool {
+       created_time = absl::ToUnixSeconds(absl::Now()),
+       json_tools = std::move(saved_tools),
+       tool_call_parser_format = tool_call_parser_format_,
+       reasoning_parser_format = reasoning_parser_format_,
+       is_force_reasoning = is_force_reasoning,
+       stream_parser =
+           stream_parser](const RequestOutput& req_output) mutable -> bool {
         req_output.log_request_status();
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            // Reduce the number of concurrent requests when a request is
-            // finished with error.
-            master->get_rate_limiter()->decrease_one_request();
-
             return call->finish_with_error(status.code(), status.message());
           }
-        }
-
-        // Reduce the number of concurrent requests when a request is finished
-        // or canceled.
-        if (req_output.finished || req_output.cancelled ||
-            req_output.finished_on_prefill_instance) {
-          master->get_rate_limiter()->decrease_one_request();
         }
 
         if (stream) {
@@ -960,10 +914,18 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
                                            request_id,
                                            created_time,
                                            model,
-                                           req_output);
+                                           req_output,
+                                           stream_parser);
         }
-        return send_result_to_client_brpc(
-            call, request_id, created_time, model, req_output);
+        return send_result_to_client_brpc(call,
+                                          request_id,
+                                          created_time,
+                                          model,
+                                          req_output,
+                                          tool_call_parser_format,
+                                          reasoning_parser_format,
+                                          is_force_reasoning,
+                                          json_tools);
       });
 }
 

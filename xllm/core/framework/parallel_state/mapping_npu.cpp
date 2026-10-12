@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,12 +17,42 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
+
 #define MAX_LCCL_COMM_DOMAIN 63
 #define ENV_enable_extra_o_proj_tp false
 #define ENV_lm_head_local_tp false
 #define ENV_hccl_moe_ep_buffer 512
 #define ENV_hccl_moe_tp_buffer 64
 #define ENV_enable_dp_partition_up true
+
+namespace {
+
+constexpr char kHcclBuffsizeEnv[] = "HCCL_BUFFSIZE";
+
+int32_t get_hccl_buffer_size_or_default(int32_t default_buffer_size) {
+  const char* env_value = std::getenv(kHcclBuffsizeEnv);
+  if (env_value == nullptr || env_value[0] == '\0') {
+    return default_buffer_size;
+  }
+
+  errno = 0;
+  char* parse_end = nullptr;
+  long parsed_value = std::strtol(env_value, &parse_end, 10);
+  if (errno != 0 || parse_end == env_value || *parse_end != '\0' ||
+      parsed_value <= 0 || parsed_value > std::numeric_limits<int32_t>::max()) {
+    LOG(WARNING) << kHcclBuffsizeEnv
+                 << " should be a positive int32 value, got: " << env_value
+                 << ". Use default " << default_buffer_size;
+    return default_buffer_size;
+  }
+
+  return static_cast<int32_t>(parsed_value);
+}
+
+}  // namespace
 
 namespace xllm {
 
@@ -42,13 +72,14 @@ MappingNPU::MappingNPU(const std::string rank_table_file,
   num_nodes_ = get_num_nodes();
   world_size_ = world_size;
   local_world_size_ = world_size / num_nodes_;
-  attn_o_proj_tp_.backend("lccl");
-  attn_inner_sp_.backend("lccl");
+  attn_o_proj_tp_.backend("hccl");
+  attn_inner_sp_.backend("hccl");
   parse_parallel_info();
   validate();
   get_tp_group(word_embed_tp_);
   get_dp_group(word_embed_dp_);
   get_tp_group(attn_tp_);
+  get_layerwise_split_group(attn_layerwise_split_);
   get_tp_group(attn_o_proj_tp_);
   get_dp_group(attn_dp_);
   get_dp_group(attn_o_proj_dp_);
@@ -60,6 +91,11 @@ MappingNPU::MappingNPU(const std::string rank_table_file,
   get_dp_group(lm_head_dp_);
   get_tp_group(attn_inner_sp_);
   get_dp_group(attn_cp_);
+  // KV-split group lives alongside attn_cp_. When kv_split_size == cp_size
+  // (the default fallback) it produces an identical rank_ids list, so the ATB
+  // ExternalCommManager will de-dup the underlying HCCL commDomain. When
+  // kv_split_size == 1 each rank becomes its own single-rank group.
+  get_kv_split_group(attn_kv_split_);
 
   // attn_cp_.group_size_ = 1;
   //  o_proj mixture of tp and dp
@@ -91,8 +127,23 @@ MappingNPU::MappingNPU(const std::string rank_table_file,
       num_lccl_per_shards * (lccl_comm_shard_id + 1);
 
   mlp_tp_.domain(std::to_string(MAX_LCCL_COMM_DOMAIN));
-  moe_ep_.buffer_size(ENV_hccl_moe_ep_buffer);
-  moe_tp_.buffer_size(ENV_hccl_moe_tp_buffer);
+  int32_t unified_buffer =
+      get_hccl_buffer_size_or_default(ENV_hccl_moe_ep_buffer);
+  word_embed_tp_.buffer_size(unified_buffer);
+  word_embed_dp_.buffer_size(unified_buffer);
+  attn_tp_.buffer_size(unified_buffer);
+  attn_dp_.buffer_size(unified_buffer);
+  attn_inner_sp_.buffer_size(unified_buffer);
+  attn_o_proj_tp_.buffer_size(unified_buffer);
+  attn_o_proj_dp_.buffer_size(unified_buffer);
+  mlp_tp_.buffer_size(unified_buffer);
+  mlp_dp_.buffer_size(unified_buffer);
+  moe_tp_.buffer_size(unified_buffer);
+  moe_ep_.buffer_size(unified_buffer);
+  lm_head_tp_.buffer_size(unified_buffer);
+  lm_head_dp_.buffer_size(unified_buffer);
+  attn_cp_.buffer_size(unified_buffer);
+  attn_layerwise_split_.buffer_size(unified_buffer);
   attn_inner_sp_.domain(attn_tp_.domain());
 }
 
@@ -160,13 +211,29 @@ void MappingNPU::parse_parallel_info() {
     attn_cp_.group_size(options_.cp_size());
   }
 
+  attn_layerwise_split_.group_size(options_.layerwise_split_size());
+  attn_layerwise_split_.backend("hccl");
+
+  const int32_t cp_group_size =
+      attn_cp_.group_size() > 0 ? attn_cp_.group_size() : 1;
+  const int32_t kv_split_group_size =
+      options_.kv_split_size() > 0 ? options_.kv_split_size() : 1;
+  attn_kv_split_.group_size(kv_split_group_size);
+  attn_kv_split_.backend("hccl");
+
+  // Embed/LMHead use dp-local TP (cp*tp), not attn_tp (CP-local).
+  const int32_t dp_local_tp_group_size =
+      attn_dp_.group_size() > 0 ? world_size_ / attn_dp_.group_size()
+                                : world_size_;
   // word embed
   word_embed_tp_ = ParallelInfo(attn_tp_);
+  word_embed_tp_.group_size(dp_local_tp_group_size);
   word_embed_dp_ = ParallelInfo(attn_dp_);
   // lm_head
   if (ENV_enable_dp_partition_up) {
     if (!ENV_lm_head_local_tp) {
       lm_head_tp_ = ParallelInfo(attn_tp_);
+      lm_head_tp_.group_size(dp_local_tp_group_size);
       lm_head_dp_ = ParallelInfo(attn_dp_);
     }
   } else {
@@ -191,6 +258,26 @@ void MappingNPU::validate() {
   if (attn_cp_.group_size() > 1) {
     CHECK(attn_dp_.group_size() == 1) << "DP size should be 1 if CP size > 1";
   }
+
+  // kv_split_size must be 1 or a divisor of cp_size (<= cp_size).
+  const int32_t kv_split = attn_kv_split_.group_size();
+  const int32_t cp_sz = std::max(1, attn_cp_.group_size());
+  CHECK(kv_split >= 1) << "kv_split size must be >= 1, got " << kv_split;
+  CHECK(kv_split <= cp_sz)
+      << "kv_split_size (" << kv_split << ") must not exceed cp_size (" << cp_sz
+      << ") in this version; cross-attnCp KV split is unsupported.";
+  CHECK(cp_sz % kv_split == 0)
+      << "cp_size (" << cp_sz << ") must be divisible by kv_split_size ("
+      << kv_split << ").";
+
+  const int32_t layerwise_split_size = attn_layerwise_split_.group_size();
+  const int32_t attn_tp_size = attn_tp_.group_size();
+  CHECK(layerwise_split_size >= 1)
+      << "layerwise_split_size must be >= 1, got " << layerwise_split_size;
+  CHECK(attn_tp_size % layerwise_split_size == 0)
+      << "attention tp size (" << attn_tp_size
+      << ") must be divisible by layerwise_split_size (" << layerwise_split_size
+      << ").";
 
   CHECK(attn_tp_.group_size() * attn_dp_.group_size() * attn_cp_.group_size() ==
         world_size_)
@@ -316,6 +403,41 @@ void MappingNPU::get_dp_group(ParallelInfo& parallel_info) {
   parallel_info.rank(local_rank);
 }
 
+void MappingNPU::get_kv_split_group(ParallelInfo& parallel_info) {
+  // Reuse the get_dp_group stride layout. The stride is world_size /
+  // group_size, so when group_size == attn_cp_.group_size() the produced
+  // rank_per_group is identical to attn_cp_'s and ATB will de-dup the HCCL
+  // commDomain. When group_size == 1 each rank is its own single-element group,
+  // i.e. no collective communication will be issued for KV split.
+  get_dp_group(parallel_info);
+}
+
+void MappingNPU::get_layerwise_split_group(ParallelInfo& parallel_info) {
+  const int32_t split_size = parallel_info.group_size();
+  std::vector<std::vector<int32_t>> rank_per_group;
+  for (const std::vector<int32_t>& tp_group : attn_tp_.rank_per_group()) {
+    if (tp_group.empty() || tp_group.front() >= world_size_) {
+      continue;
+    }
+    CHECK_EQ(tp_group.size(), static_cast<size_t>(attn_tp_.group_size()));
+    for (size_t begin = 0; begin < tp_group.size();
+         begin += static_cast<size_t>(split_size)) {
+      const size_t end = begin + static_cast<size_t>(split_size);
+      rank_per_group.emplace_back(tp_group.begin() + begin,
+                                  tp_group.begin() + end);
+    }
+  }
+
+  parallel_info.num_group(static_cast<int32_t>(rank_per_group.size()));
+  parallel_info.rank_per_group(rank_per_group);
+  auto [current_group_id, local_rank] =
+      get_current_group_id(rank_per_group, rank_);
+  CHECK(current_group_id >= 0 && local_rank >= 0)
+      << "Failed to get layerwise split group for rank " << rank_;
+  parallel_info.current_group_id(current_group_id);
+  parallel_info.rank(local_rank);
+}
+
 void MappingNPU::get_domain(ParallelInfo& src,
                             ParallelInfo& dst,
                             const int32_t start_idx) {
@@ -342,7 +464,10 @@ nlohmann::json MappingNPU::to_json() {
   // when enable lmhead, the data is output in
   // the form of a data parallel (DP) strategy.
   if (ENV_enable_dp_partition_up) {
-    lmhead_tp = attn_tp_.to_json(buffer_offset_);
+    // Emit the dp-local-TP group (lm_head_tp_, size cp*tp) — not attn_tp_ (size
+    // tp) — so the LM head shards across the full TP within a DP and does not
+    // replicate weights across CP ranks. See parse_parallel_info().
+    lmhead_tp = lm_head_tp_.to_json(buffer_offset_);
     lmhead_dp = attn_dp_.to_json(buffer_offset_);
   } else {
     lmhead_tp = mlp_tp_.to_json(buffer_offset_);
@@ -352,6 +477,7 @@ nlohmann::json MappingNPU::to_json() {
   data["moeTpSize"] = options_.moe_tp_size();
   data["attnDpSize"] = options_.dp_size();
   data["attnTpSize"] = options_.tp_size();
+  data["attnCpSize"] = options_.cp_size();
   data["worldSize"] = world_size_;
   data["rank"] = rank_;
   data["rankTableFile"] = rank_table_file_;
@@ -373,6 +499,13 @@ nlohmann::json MappingNPU::to_json() {
   data["lmHeadDp"] = lmhead_dp;
   data["lcocAttnTp"] = attn_tp_.to_json(buffer_offset_);
   data["attnCp"] = attn_cp_.to_json(buffer_offset_);
+  data["attnLayerwiseSplit"] = attn_layerwise_split_.to_json(buffer_offset_);
+  // KV split metadata. ATB layers that consume `kvSplit` use it to size the
+  // prefix AllGather (or to skip it entirely when group_size == 1).
+  // Older ATB versions ignore the unknown key, preserving backward
+  // compatibility.
+  data["kvSplitSize"] = attn_kv_split_.group_size();
+  data["kvSplit"] = attn_kv_split_.to_json(buffer_offset_);
 
   return data;
 }

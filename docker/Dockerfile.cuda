@@ -14,6 +14,7 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0a 10.0a 12.0a"
 
 ARG FLASHINFER_VERSION=0.6.2
+ARG FLASHINFER_PYTHON_VERSION=0.6.14
 ARG FLASHINFER_CUDA_ARCH_LIST="8.0 8.9 9.0a 10.0a 12.0a"
 
 ARG GET_PIP_URL="https://bootstrap.pypa.io/get-pip.py"
@@ -23,6 +24,7 @@ ARG http_proxy=
 ARG https_proxy=
 # Optional: use pypi mirror (e.g. https://pypi.tuna.tsinghua.edu.cn/simple)
 ARG UV_DEFAULT_INDEX=
+ARG PIP_INDEX_URL=
 # Optional: accelerate github https clone (e.g. https://gh-proxy.com/)
 ARG GIT_HTTPS_MIRROR_PREFIX=
 # Optional: use rustup proxy (example: https://rsproxy.cn)
@@ -100,8 +102,10 @@ ENV NVSHMEM_HOME=/usr/local
 
 # Install cmake
 RUN set -eux; \
-    url="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz"; \
-    curl -fL --retry 3 --retry-delay 2 -o /tmp/cmake.tar.gz "${url}"; \
+    github_url="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz"; \
+    url="${GIT_HTTPS_MIRROR_PREFIX}${github_url}"; \
+    curl -fL --retry 3 --retry-all-errors --retry-delay 2 \
+      -o /tmp/cmake.tar.gz "${url}"; \
     mkdir -p /opt/cmake; \
     tar -xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1; \
     rm -f /tmp/cmake.tar.gz; \
@@ -149,6 +153,27 @@ RUN set -eux; \
     rm -rf /workspace/flashinfer
 
 ENV FLASHINFER_OPS_PATH=/flashinfer_ops
+
+# Install FlashInfer globally after the AOT build. Point the Python package at
+# the TVM-FFI library linked by xLLM to avoid duplicate global registrations.
+RUN set -eux; \
+    pip install --ignore-installed "packaging>=24.2"; \
+    pip install "flashinfer-python==${FLASHINFER_PYTHON_VERSION}"; \
+    site_packages="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    tvm_ffi_lib_dir="${site_packages}/tvm_ffi/lib"; \
+    test -f "${tvm_ffi_lib_dir}/libtvm_ffi.so"; \
+    test -f "${tvm_ffi_lib_dir}/libtvm_ffi_testing.so"; \
+    cp -f "${tvm_ffi_lib_dir}/libtvm_ffi_testing.so" \
+      /usr/local/lib/libtvm_ffi_testing.so; \
+    ln -sfn /usr/local/lib/libtvm_ffi.so \
+      "${tvm_ffi_lib_dir}/libtvm_ffi.so"; \
+    ln -sfn /usr/local/lib/libtvm_ffi_testing.so \
+      "${tvm_ffi_lib_dir}/libtvm_ffi_testing.so"; \
+    test "$(stat -Lc '%d:%i' /usr/local/lib/libtvm_ffi.so)" = \
+      "$(stat -Lc '%d:%i' "${tvm_ffi_lib_dir}/libtvm_ffi.so")"; \
+    test "$(stat -Lc '%d:%i' /usr/local/lib/libtvm_ffi_testing.so)" = \
+      "$(stat -Lc '%d:%i' "${tvm_ffi_lib_dir}/libtvm_ffi_testing.so")"
+
 ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 

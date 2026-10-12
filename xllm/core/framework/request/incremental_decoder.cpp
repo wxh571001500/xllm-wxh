@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -45,7 +45,7 @@ std::string IncrementalDecoder::decode(const Slice<int32_t>& token_ids,
   // return prompt directly if prompt string is not empty
   if (output_offset_ < num_prompt_tokens_ && !prompt_.empty()) {
     // leave 6 tokens for the prefix to defeat cleanup algorithms in decode
-    // which decide to add a space or not depending on the surrouding ids.
+    // which decide to add a space or not depending on the surrounding ids.
     prefix_offset_ = num_prompt_tokens_ <= 6 ? 0 : num_prompt_tokens_ - 6;
     output_offset_ = num_prompt_tokens_;
     ss << prompt_;
@@ -55,13 +55,20 @@ std::string IncrementalDecoder::decode(const Slice<int32_t>& token_ids,
   // phase needs to skip that token. If it cannot, the decode token and that
   // token need to generate characters together.
   if (checking_prefill_token_) {
-    const auto prefill_token_text =
-        tokenizer.decode(token_ids.slice(output_offset_, output_offset_ + 1),
-                         skip_special_tokens_);
-    if (!absl::EndsWith(prefill_token_text, "�")) {
-      output_offset_ += 1;
+    // `token_ids` may be shorter than the sequence's token count: the
+    // stop-output suppression in Sequence::get_decodable_token_count() holds
+    // back the trailing tokens, so the slice handed to decode() can end exactly
+    // at output_offset_. There is then no token to inspect yet -- keep the flag
+    // set and run the check on a later call, once the token becomes visible.
+    if (output_offset_ < token_ids.size()) {
+      const auto prefill_token_text =
+          tokenizer.decode(token_ids.slice(output_offset_, output_offset_ + 1),
+                           skip_special_tokens_);
+      if (!absl::EndsWith(prefill_token_text, "�")) {
+        output_offset_ += 1;
+      }
+      checking_prefill_token_ = false;
     }
-    checking_prefill_token_ = false;
   }
 
   const auto prefix_text = tokenizer.decode(

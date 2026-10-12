@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -26,6 +26,7 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "core/framework/config/model_config.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
@@ -43,8 +44,8 @@ EmbedVLMWorkerImpl::EmbedVLMWorkerImpl(const ParallelArgs& parallel_args,
 bool EmbedVLMWorkerImpl::init_model(ModelContext& context) {
   CHECK(model_ == nullptr) << "Model is already initialized.";
 
-  context.set_image_embedding_mode(true);
-  model_ = create_vlm_embedding_model(context);
+  context.set_encoder_embedding_mode(false);
+  model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(
       model_.get(), context.get_model_args(), device_, options_);
@@ -65,12 +66,18 @@ std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
   auto flatten_positions = input.positions.to(device_);
   auto params = input.input_params.to(device_);
   auto sampling_params = input.sampling_params.to(device_, dtype_);
-
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       flatten_tokens, flatten_positions, kv_caches_, params);
-  auto hidden_states = model_output.hidden_states;
-
+  torch::Tensor hidden_states;
+  if (ModelConfig::get_instance().capture_hidden_state_layer() >= 0) {
+    CHECK(model_output.aux_hidden_states.defined())
+        << "Captured hidden states are required but the model did not return "
+           "aux_hidden_states";
+    hidden_states = model_output.aux_hidden_states;
+  } else {
+    hidden_states = model_output.hidden_states;
+  }
   ret = device_.synchronize_default_stream();
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
 
@@ -81,15 +88,28 @@ std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
   // driver prepare model output
   ForwardOutput output;
   SampleOutput sample_output;
-
   if (sampling_params.selected_token_idxes.defined() &&
       input.sampling_params.is_embeddings) {
-    EmbeddingVLM* em_model = dynamic_cast<EmbeddingVLM*>(model_.get());
-    auto embeddings =
-        em_model->pooler(hidden_states, sampling_params.selected_token_idxes);
-    sample_output.embeddings = embeddings;
+    // split full embeddings and add them to mm_embeddings
+    // so that the user could receive embeddings of images and texts
+    if (::xllm::ModelConfig::get_instance()
+            .enable_return_mm_full_embeddings()) {
+      auto q_seq_len_vec = input.input_params.attention.host.q_seq_lens;
+      torch::Tensor embeddings = hidden_states;
+      sample_output.mm_embeddings.reserve(q_seq_len_vec.size());
+      int32_t token_start_idx = 0;
+      for (auto seq_len : q_seq_len_vec) {
+        auto seq_embed =
+            embeddings.slice(0, token_start_idx, token_start_idx + seq_len);
+        sample_output.mm_embeddings.push_back({seq_embed});
+        token_start_idx += seq_len;
+      }
+    } else {
+      torch::Tensor embeddings =
+          model_->pooler(hidden_states, sampling_params.selected_token_idxes);
+      sample_output.embeddings = embeddings;
+    }
     output.sample_output = sample_output;
-    output.embedding = embeddings;
   }
   ret = device_.synchronize_default_stream();
   return output;

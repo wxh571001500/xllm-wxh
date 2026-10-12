@@ -4,50 +4,68 @@ cc_library(
   NAME
     common_layers
   HDRS
+    oxygen_vision_attention.h
     qwen2_attention.h
     qwen2_vision_attention.h
     qwen3_next_rms_norm.h
+    deepseek_v4_rotary_embedding.h
     partial_rotary_embedding.h
+    ada_layer_norm.h
     rms_norm_gated.h
     rms_norm.h
     rotary_embedding.h
     rotary_embedding_util.h
-    $<$<NOT:$<OR:$<BOOL:${USE_ILU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_NPU}>>>:fused_moe.h>
+    $<$<NOT:$<OR:$<BOOL:${USE_ILU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_NPU}>,$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MUSA}>,$<BOOL:${USE_DCU}>>>:fused_moe.h>
     dense_mlp.h
     linear.h
+    $<$<BOOL:${USE_MUSA}>:${CMAKE_CURRENT_SOURCE_DIR}/../musa/linear_block_fp8.h>
     word_embedding_impl.h
     deep_ep.h
     activation.h
     attention_metadata.h
     attention_metadata_builder.h
+    kv_shard_batch_metadata.h
+    expanded_decode_metadata_builder.h
+    dsa_metadata.h
+    dsa_metadata_builder.h
+    dsa_topk_share_plan.h
     dp_utils.h
     add_matmul.h
+    dflash2_grouped_conv.h
     moe_fused_topk.h
   SRCS
+    oxygen_vision_attention.cpp
     qwen2_attention.cpp
     qwen2_vision_attention.cpp
     qwen3_next_rms_norm.cpp
+    deepseek_v4_rotary_embedding.cpp
     partial_rotary_embedding.cpp
+    ada_layer_norm.cpp
     rms_norm_gated.cpp
     rms_norm.cpp
     rotary_embedding.cpp
     rotary_embedding_util.cpp
-    $<$<NOT:$<OR:$<BOOL:${USE_ILU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_NPU}>>>:fused_moe.cpp>
+    $<$<NOT:$<OR:$<BOOL:${USE_ILU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_NPU}>,$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MUSA}>,$<BOOL:${USE_DCU}>>>:fused_moe.cpp>
     dense_mlp.cpp
     linear.cpp
+    $<$<BOOL:${USE_MUSA}>:${CMAKE_CURRENT_SOURCE_DIR}/../musa/linear_block_fp8.cpp>
     word_embedding_impl.cpp
     deep_ep.cpp
     activation.cpp
     attention_metadata_builder.cpp
+    kv_shard_batch_metadata.cpp
+    expanded_decode_metadata_builder.cpp
+    dsa_metadata_builder.cpp
     dp_utils.cpp
     add_matmul.cpp
+    dflash2_grouped_conv.cpp
     moe_fused_topk.cpp
   DEPS
     "-Wl,--whole-archive"
     "-Wl,--no-whole-archive"
     :kv_cache
-    :prefix_cache
     :block
+    :prefix_cache
     :parallel_state
     :state_dict
     :model
@@ -56,13 +74,17 @@ cc_library(
     gflags::gflags
     torch
     :platform
+    $<$<BOOL:${USE_NPU}>:npu_layers>
     $<$<BOOL:${USE_MLU}>:mlu_layers>
-    $<$<BOOL:${USE_CUDA}>:cuda_layers>
+    $<$<AND:$<BOOL:${USE_CUDA}>,$<NOT:$<BOOL:${USE_MUSA}>>>:cuda_layers>
     $<$<BOOL:${USE_ILU}>:ilu_layers>
     $<$<BOOL:${USE_NPU}>:npu_torch_layers>
     $<$<BOOL:${USE_MUSA}>:musa_layers>
+    $<$<BOOL:${USE_DCU}>:dcu_layers>
 )
 
-if(USE_MLU)
-  add_subdirectory(tests)
+if(USE_NPU OR USE_MLU)
+  # Scan the static-library cycle three times to resolve layer symbols introduced
+  # by model registration on later passes (including RoPE and DenseMLP).
+  set_property(TARGET common_layers PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
 endif()

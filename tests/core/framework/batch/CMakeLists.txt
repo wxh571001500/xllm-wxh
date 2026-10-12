@@ -1,0 +1,60 @@
+include(cc_test)
+
+cc_test(
+  NAME
+    batch_test
+  SRCS
+    batch_test.cpp
+  DEPS
+    :config
+    :batch
+    absl::time
+    GTest::gtest_main
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+target_link_libraries(batch_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME
+    dit_batch_test
+  CPU_ONLY
+  SRCS
+    dit_batch_test.cpp
+  DEPS
+    :batch
+    GTest::gtest_main
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+target_link_libraries(dit_batch_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME
+    batch_packed_input_test
+  SRCS
+    batch_packed_input_test.cpp
+  DEPS
+    :batch
+    GTest::gtest_main
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+target_link_libraries(batch_packed_input_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)

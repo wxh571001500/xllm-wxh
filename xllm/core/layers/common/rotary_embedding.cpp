@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,8 +15,11 @@ limitations under the License.
 
 #include "rotary_embedding.h"
 
+#include <algorithm>
+
 #include "kernels/ops_api.h"
 #include "platform/device.h"
+#include "platform/platform.h"
 
 namespace xllm {
 namespace layer {
@@ -41,8 +44,8 @@ RotaryEmbeddingImpl::RotaryEmbeddingImpl(int64_t rotary_dim,
   sin_ = cos_sin_vec[1].view({-1, rotary_dim});
 
   // Pre-compute [cos_half, sin_half] format used by the CUDA/ILU/MUSA kernels.
-  const auto dev = Device::type_str();
-  if (dev == "cuda" || dev == "ilu" || dev == "musa") {
+  if (Platform::is_cuda() || Platform::is_ilu() || Platform::is_musa() ||
+      Platform::is_dcu()) {
     auto chunks = cos_sin_cache_.chunk(4, -1);
     precomputed_cos_sin_cache_ =
         torch::cat({chunks[0], chunks[2]}, -1).contiguous();
@@ -59,8 +62,8 @@ void RotaryEmbeddingImpl::forward(torch::Tensor& q,
   std::optional<torch::Tensor> position_ids;
   if (is_prompt) {
     discrete = false;
-    if (Device::type_str() == "cuda" || Device::type_str() == "npu" ||
-        Device::type_str() == "ilu" || Device::type_str() == "musa") {
+    if (Platform::is_cuda() || Platform::is_npu() || Platform::is_ilu() ||
+        Platform::is_musa() || Platform::is_dcu()) {
       position_ids = positions;
     }
   } else {
@@ -96,8 +99,8 @@ void RotaryEmbeddingImpl::forward(torch::Tensor& input,
   std::optional<torch::Tensor> position_ids;
   if (is_prompt) {
     discrete = false;
-    if (Device::type_str() == "cuda" || Device::type_str() == "npu" ||
-        Device::type_str() == "ilu") {
+    if (Platform::is_cuda() || Platform::is_npu() || Platform::is_ilu() ||
+        Platform::is_dcu()) {
       position_ids = positions;
     }
   } else {
@@ -140,6 +143,36 @@ void MRotaryEmbeddingImpl::forward(torch::Tensor& q,
                                    torch::Tensor& k,
                                    const torch::Tensor& positions,
                                    const AttentionMetadata& attn_metadata) {
+  if (attn_metadata.dsa_metadata && attn_metadata.dsa_metadata->cos.defined() &&
+      attn_metadata.dsa_metadata->sin.defined()) {
+    torch::Tensor dsa_q = q;
+    torch::Tensor dsa_k = k;
+    if (q.dim() == 2) {
+      dsa_q = q.unsqueeze(1);
+    }
+    if (k.dim() == 2) {
+      dsa_k = k.unsqueeze(1);
+    }
+
+    xllm::kernel::RotaryParams rotary_params;
+    rotary_params.q = dsa_q;
+    rotary_params.k = dsa_k;
+    rotary_params.sin = attn_metadata.dsa_metadata->sin;
+    rotary_params.cos = attn_metadata.dsa_metadata->cos;
+    rotary_params.cos_sin = get_cos_sin_cache();
+    rotary_params.position_ids = std::nullopt;
+    rotary_params.cu_query_lens = attn_metadata.q_cu_seq_lens;
+    rotary_params.interleaved = interleaved_;
+    rotary_params.discrete = false;
+    rotary_params.max_query_len =
+        std::max<int64_t>(attn_metadata.max_query_len, 1);
+    xllm::kernel::apply_rotary(rotary_params);
+
+    q = (q.dim() == 2) ? rotary_params.q.squeeze(1) : rotary_params.q;
+    k = (k.dim() == 2) ? rotary_params.k.squeeze(1) : rotary_params.k;
+    return;
+  }
+
   bool only_prefill =
       (attn_metadata.is_prefill || attn_metadata.is_chunked_prefill);
   if (!only_prefill || mrope_section_.empty()) {
@@ -218,8 +251,8 @@ DeepseekScalingRotaryEmbeddingImpl::DeepseekScalingRotaryEmbeddingImpl(
   sin_ = cos_sin_vec[1].view({-1, rotary_dim});
 
   // Pre-compute [cos_half, sin_half] format used by the CUDA/ILU/MUSA kernels.
-  const auto dev = Device::type_str();
-  if (dev == "cuda" || dev == "ilu" || dev == "musa") {
+  if (Platform::is_cuda() || Platform::is_ilu() || Platform::is_musa() ||
+      Platform::is_dcu()) {
     auto chunks = cos_sin_cache_.chunk(4, -1);
     precomputed_cos_sin_cache_ =
         torch::cat({chunks[0], chunks[2]}, -1).contiguous();
@@ -238,6 +271,9 @@ void DeepseekScalingRotaryEmbeddingImpl::forward(
   if (is_prompt) {
     discrete = false;
     position_ids = std::nullopt;
+    if (Platform::is_dcu()) {
+      position_ids = positions;
+    }
   } else {
     discrete = true;
     position_ids = positions;

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,9 +14,15 @@ limitations under the License.
 ==============================================================================*/
 
 #include "device.h"
+
+#include "core/framework/config/model_config.h"
+#include "core/platform/platform.h"
 #if defined(USE_NPU)
+#include <Python.h>
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
 #include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
+#include <torch_npu/csrc/core/npu/NPUFunctions.h>
+#include <torch_npu/csrc/libs/init_npu.h>
 #elif defined(USE_MLU)
 #include <cn_api.h>
 #include <framework/core/caching_allocator.h>
@@ -27,64 +33,27 @@ limitations under the License.
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
-
-#include "cuda/cuda_utils.h"
 #elif defined(USE_MUSA)
 #include <c10/musa/MUSAGuard.h>
 #include <musa.h>
+#elif defined(USE_DCU)
+#include <c10/hip/HIPCachingAllocator.h>
+#include <c10/hip/HIPStream.h>
+#include <hip/hip_runtime_api.h>
 #endif
 
 namespace xllm {
 
-int32_t Device::sm_count_ = 0;
-bool Device::enable_pdl_ = false;
-bool Device::support_sm90a_ = false;
-bool Device::support_sm100a_ = false;
-bool Device::support_sm100f_ = false;
-bool Device::support_sm120a_ = false;
-
 Device::Device(const torch::Device& device) : device_(device) {
-#if defined(USE_CUDA)
-  static int32_t sm_count = cuda::get_device_sm_count(device.index());
-  sm_count_ = sm_count;
-
-  static bool enable_pdl = cuda::support_pdl(device.index());
-  enable_pdl_ = enable_pdl;
-
-  static bool is_sm90a_supported = cuda::support_sm90a(device.index());
-  support_sm90a_ = is_sm90a_supported;
-
-  static bool is_sm100a_supported = cuda::support_sm100a(device.index());
-  support_sm100a_ = is_sm100a_supported;
-
-  static bool is_sm100f_supported = cuda::support_sm100f(device.index());
-  support_sm100f_ = is_sm100f_supported;
-
-  static bool is_sm120a_supported = cuda::support_sm120a(device.index());
-  support_sm120a_ = is_sm120a_supported;
+#if defined(USE_CUDA) || defined(USE_MUSA)
+  Platform::init_capabilities(device.index());
 #endif
 }
 
 Device::Device(const int32_t device_index)
-    : device_(torch::Device(type_torch(), device_index)) {
-#if defined(USE_CUDA)
-  static int32_t sm_count = cuda::get_device_sm_count(device_index);
-  sm_count_ = sm_count;
-
-  static bool enable_pdl = cuda::support_pdl(device_index);
-  enable_pdl_ = enable_pdl;
-
-  static bool is_sm90a_supported = cuda::support_sm90a(device_index);
-  support_sm90a_ = is_sm90a_supported;
-
-  static bool is_sm100a_supported = cuda::support_sm100a(device_index);
-  support_sm100a_ = is_sm100a_supported;
-
-  static bool is_sm100f_supported = cuda::support_sm100f(device_index);
-  support_sm100f_ = is_sm100f_supported;
-
-  static bool is_sm120a_supported = cuda::support_sm120a(device_index);
-  support_sm120a_ = is_sm120a_supported;
+    : device_(torch::Device(Platform::type_torch(), device_index)) {
+#if defined(USE_CUDA) || defined(USE_MUSA)
+  Platform::init_capabilities(device_index);
 #endif
 }
 
@@ -99,6 +68,8 @@ void Device::set_device() const {
   c10::cuda::set_device(index());
 #elif defined(USE_MUSA)
   c10::musa::set_device(index());
+#elif defined(USE_DCU)
+  c10::hip::set_device(index());
 #endif
 }
 
@@ -113,7 +84,7 @@ void Device::set_seed(uint64_t seed) const {
     std::lock_guard<std::mutex> lock(gen.mutex());
     gen.set_current_seed(seed);
   }
-#elif defined(USE_CUDA)
+#elif defined(USE_CUDA) || defined(USE_DCU)
   torch::cuda::manual_seed(seed);
 #elif defined(USE_MUSA)
   torch::manual_seed(seed);
@@ -127,57 +98,29 @@ int32_t Device::index() const { return device_.index(); }
 // set device before init device context
 void Device::init_device_context() const {
 #if defined(USE_NPU)
-  torch_npu::init_npu(index());
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    // Python path: full NPU runtime already initialized in main() via
+    // aclInit + torch_npu._C._npu_init(). Only switch device here.
+    c10_npu::SetDevice(index());
+  } else {
+    // torch_npu lazily resolves python functions via
+    // PyImport_ImportModule(). When a live host interpreter exists
+    // (offline pybind inference), the calling worker thread must hold the
+    // GIL, otherwise the import races with the main thread and corrupts
+    // the interpreter state. The master constructors release the GIL
+    // during engine init, so acquiring it here cannot deadlock. Standalone
+    // binaries without a live interpreter keep the legacy behavior.
+    if (Py_IsInitialized()) {
+      PyGILState_STATE gil_state = PyGILState_Ensure();
+      torch_npu::init_npu(index());
+      PyGILState_Release(gil_state);
+    } else {
+      torch_npu::init_npu(index());
+    }
+  }
 #endif
 }
-
-int Device::device_count() {
-#if defined(USE_NPU)
-  return c10_npu::device_count();
-#elif defined(USE_MLU)
-  return torch_mlu::device_count();
-#elif defined(USE_CUDA) || defined(USE_ILU)
-  return c10::cuda::device_count();
-#elif defined(USE_MUSA)
-  return c10::musa::device_count();
-#endif
-}
-
-std::string Device::type_str() {
-#if defined(USE_NPU)
-  return "npu";
-#elif defined(USE_MLU)
-  return "mlu";
-#elif defined(USE_CUDA)
-  return "cuda";
-#elif defined(USE_ILU)
-  return "ilu";
-#elif defined(USE_MUSA)
-  return "musa";
-#endif
-}
-
-torch::DeviceType Device::type_torch() {
-#if defined(USE_NPU) || defined(USE_MLU)
-  return torch::kPrivateUse1;
-#elif defined(USE_CUDA) || defined(USE_ILU)
-  return torch::kCUDA;
-#elif defined(USE_MUSA)
-  return torch::kMUSA;
-#endif
-}
-
-int32_t Device::sm_count() { return sm_count_; }
-
-bool Device::is_enable_pdl() { return enable_pdl_; }
-
-bool Device::is_support_sm90a() { return support_sm90a_; }
-
-bool Device::is_support_sm100a() { return support_sm100a_; }
-
-bool Device::is_support_sm100f() { return support_sm100f_; }
-
-bool Device::is_support_sm120a() { return support_sm120a_; }
 
 // set device before get device mem
 Device::DeviceMem Device::get_device_mem() const {
@@ -192,6 +135,8 @@ Device::DeviceMem Device::get_device_mem() const {
   cudaMemGetInfo(&free_memory, &total_memory);
 #elif defined(USE_MUSA)
   musaMemGetInfo(&free_memory, &total_memory);
+#elif defined(USE_DCU)
+  hipMemGetInfo(&free_memory, &total_memory);
 #endif
   device_mem.total_memory = static_cast<int64_t>(total_memory);
   device_mem.free_memory = static_cast<int64_t>(free_memory);
@@ -211,6 +156,8 @@ void Device::empty_cache(int32_t device_index) {
   c10::cuda::CUDACachingAllocator::emptyCache();
 #elif defined(USE_MUSA)
   c10::musa::MUSACachingAllocator::emptyCache();
+#elif defined(USE_DCU)
+  c10::hip::HIPCachingAllocator::emptyCache();
 #endif
 }
 
@@ -225,12 +172,14 @@ int Device::synchronize_default_stream() {
   c10::cuda::getCurrentCUDAStream().synchronize();
 #elif defined(USE_MUSA)
   c10::musa::getCurrentMUSAStream().synchronize();
+#elif defined(USE_DCU)
+  c10::hip::getCurrentHIPStream().synchronize();
 #endif
   return 0;
 }
 
 std::unique_ptr<Stream> Device::get_stream_from_pool(const int32_t timeout) {
-  return std::make_unique<Stream>(timeout);
+  return std::make_unique<Stream>(device_, timeout);
 }
 
 std::unique_ptr<Stream> Device::current_stream() const {
@@ -242,6 +191,8 @@ std::unique_ptr<Stream> Device::current_stream() const {
   auto current_s = c10::cuda::getCurrentCUDAStream(index());
 #elif defined(USE_MUSA)
   auto current_s = c10::musa::getCurrentMUSAStream(index());
+#elif defined(USE_DCU)
+  auto current_s = c10::hip::getCurrentHIPStream(index());
 #endif
   return std::make_unique<Stream>(current_s);
 }

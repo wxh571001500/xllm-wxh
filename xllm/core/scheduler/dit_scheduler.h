@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,7 @@ limitations under the License.
 #include <folly/MPMCQueue.h>
 #include <folly/futures/Future.h>
 
+#include <deque>
 #include <limits>
 #include <memory>
 #include <queue>
@@ -26,28 +27,36 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "common/types.h"
+#include "distributed_runtime/dit_engine.h"
+#include "distributed_runtime/engine.h"
 #include "framework/batch/dit_batch.h"
 #include "framework/request/dit_request.h"
 #include "scheduler.h"
 #include "util/threadpool.h"
 
 namespace xllm {
-class DiTEngine;
 
 class DiTAsyncResponseProcessor final {
  public:
-  DiTAsyncResponseProcessor() = default;
-  ~DiTAsyncResponseProcessor() = default;
+  explicit DiTAsyncResponseProcessor(bool disable_log_stats = false);
+  ~DiTAsyncResponseProcessor();
 
   void process_completed_request(std::shared_ptr<DiTRequest> request);
   void process_failed_request(std::shared_ptr<DiTRequest> request,
                               Status status);
 
+  // Wait for all previously scheduled response tasks to complete.
+  void wait_completion();
+
  private:
   DISALLOW_COPY_AND_ASSIGN(DiTAsyncResponseProcessor);
 
-  // the threadpool to handle responses
+  // The thread pool handles output generation and the corresponding callback
+  // in one task. Different requests can run concurrently, while each request
+  // keeps generate_output() -> output_func() ordering.
   ThreadPool response_threadpool_;
+
+  bool disable_log_stats_ = false;
 };
 
 class DiTScheduler : public SchedulerBase {
@@ -55,9 +64,10 @@ class DiTScheduler : public SchedulerBase {
   struct Options {
     // the request per batch
     PROPERTY(int32_t, max_request_per_batch) = 4;
+    PROPERTY(bool, disable_log_stats) = false;
   };
 
-  virtual ~DiTScheduler() = default;
+  ~DiTScheduler() override = default;
 
   // add a new request to scheduler.
   virtual bool add_request(std::shared_ptr<DiTRequest>& request) = 0;
@@ -65,8 +75,8 @@ class DiTScheduler : public SchedulerBase {
 
 class DiTDynamicBatchScheduler : public DiTScheduler {
  public:
-  DiTDynamicBatchScheduler(DiTEngine* engine, const Options& options);
-  virtual ~DiTDynamicBatchScheduler();
+  DiTDynamicBatchScheduler(Engine* engine, const Options& options);
+  ~DiTDynamicBatchScheduler() override;
 
   bool add_request(std::shared_ptr<DiTRequest>& request) override;
 
@@ -85,7 +95,7 @@ class DiTDynamicBatchScheduler : public DiTScheduler {
     CHECK_GT(old_value, 0) << "pending requests underflow";
   }
 
-  size_t num_pending_requests() {
+  size_t num_pending_requests() override {
     return pending_requests_.load(std::memory_order_relaxed);
   }
 
@@ -106,6 +116,10 @@ class DiTDynamicBatchScheduler : public DiTScheduler {
   // a batch of requests in running state
   std::vector<std::shared_ptr<DiTRequest>> running_requests_;
 
+  // requests popped from request_queue_ but deferred because they are not
+  // compatible with the current DiT batch.
+  std::deque<std::shared_ptr<DiTRequest>> deferred_requests_;
+
   // response handler
   std::unique_ptr<DiTAsyncResponseProcessor> response_handler_;
 
@@ -120,6 +134,9 @@ class DiTDynamicBatchScheduler : public DiTScheduler {
 
   // process the batch output
   void process_batch_output();
+
+  // Cancel queued/deferred/running requests and notify their callbacks.
+  void abort_all_requests();
 };
 
 }  // namespace xllm

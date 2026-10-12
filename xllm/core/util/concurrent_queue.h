@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -98,6 +98,19 @@ class ConcurrentQueue {
     T value = std::move(queue_.front());
     queue_.pop();
     return value;
+  }
+
+  // Non-blocking pop into an output reference. Avoids constructing an
+  // `absl::optional<T>` for move-only `T` (e.g. `folly::Function<void()>`).
+  // Returns true if an element was popped, false if the queue was empty.
+  bool try_pop(T& out) {
+    absl::MutexLock lock(&mutex_);
+    if (queue_.empty()) {
+      return false;
+    }
+    out = std::move(queue_.front());
+    queue_.pop();
+    return true;
   }
 
   // return the size of the queue

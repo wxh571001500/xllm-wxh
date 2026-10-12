@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,6 +22,7 @@ limitations under the License.
 #include <thread>
 
 #include "common/global_flags.h"
+#include "core/framework/config/service_config.h"
 
 namespace xllm {
 
@@ -49,7 +50,8 @@ bool XTensorDistClient::wait_for_server_ready(
   int try_count = 0;
   brpc::Controller cntl;
   const int sleep_time_second = 3;
-  while (try_count < FLAGS_max_reconnect_count) {
+  while (try_count <
+         ::xllm::ServiceConfig::get_instance().max_reconnect_count()) {
     cntl.Reset();
     stub_->Hello(&cntl, &req, &resp, nullptr);
     if (cntl.Failed() || !resp.ok()) {
@@ -61,7 +63,8 @@ bool XTensorDistClient::wait_for_server_ready(
     }
     try_count++;
   }
-  if (try_count >= FLAGS_max_reconnect_count) {
+  if (try_count >=
+      ::xllm::ServiceConfig::get_instance().max_reconnect_count()) {
     LOG(ERROR) << "XTensorDistClient Hello failed, global_rank: "
                << global_rank_ << ", error: " << cntl.ErrorText();
     return false;

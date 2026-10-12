@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <memory>
 
+#include "core/framework/dit_cache/dit_cache_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model_context.h"
 #include "core/framework/quant_args.h"
@@ -36,13 +37,19 @@ class DiTModelContext {
                   const std::unordered_map<std::string, ModelArgs>& model_args,
                   const std::unordered_map<std::string, QuantArgs>& quant_args,
                   const torch::TensorOptions& tensor_options,
+                  const DiTCacheConfig& dit_config,
                   const std::string& model_type);
 
   const ModelArgs& get_model_args(const std::string& component) const;
 
   const QuantArgs& get_quant_args(const std::string& component) const;
 
-#if defined(USE_NPU)
+  bool has_component(const std::string& component) const {
+    return model_args_.count(component) > 0;
+  }
+
+#if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU) || \
+    defined(USE_DCU)
   ModelContext get_model_context(const std::string& component) const;
 #endif
 
@@ -54,6 +61,8 @@ class DiTModelContext {
 
   const std::string& model_type() const { return model_type_; }
 
+  const DiTCacheConfig& get_dit_config() const { return dit_config_; }
+
 #if defined(USE_NPU)
   const atb::Context* get_atb_context() const { return context_; }
 #endif
@@ -63,6 +72,7 @@ class DiTModelContext {
   std::unordered_map<std::string, QuantArgs> quant_args_;
   ParallelArgs parallel_args_;
   torch::TensorOptions tensor_options_;
+  DiTCacheConfig dit_config_;
   std::string model_type_;
 
 #if defined(USE_NPU)

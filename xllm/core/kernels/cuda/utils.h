@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,20 +16,27 @@ limitations under the License.
 #pragma once
 
 #include <ATen/DynamicLibrary.h>
+#if defined(USE_DCU)
+#include <c10/hip/HIPGuard.h>
+#else
 #include <c10/cuda/CUDAGuard.h>
+#endif
 #include <glog/logging.h>
 #include <torch/torch.h>
+#if !defined(USE_DCU)
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/optional.h>
+#endif
 
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 
-#if defined(__CUDACC__) || defined(_NVHPC_CUDA)
+#if defined(__CUDACC__) || defined(_NVHPC_CUDA) || defined(__HIPCC__)
 #define HOST_DEVICE_INLINE __host__ __device__ __forceinline__
 #define DEVICE_INLINE __device__ __forceinline__
 #define HOST_INLINE __host__ __forceinline__
@@ -39,7 +46,9 @@ limitations under the License.
 #define HOST_INLINE inline
 #endif
 
+#if !defined(USE_DCU)
 namespace ffi = tvm::ffi;
+#endif
 
 namespace xllm::kernel::cuda {
 
@@ -48,6 +57,18 @@ HOST_DEVICE_INLINE constexpr std::enable_if_t<std::is_integral_v<T>, T>
 ceil_div(T a, T b) {
   return (a + b - 1) / b;
 }
+
+enum class ActivationType : int8_t {
+  GELU = 0,
+  RELU = 1,
+  SILU = 2,
+  SWIGLU = 3,
+  GEGLU = 4,
+  SWIGLU_BIAS = 5,
+  RELU2 = 6,
+  IDENTITY = 7,
+  INVALID_TYPE = 8
+};
 
 // torch tensor is only on cpu
 torch::Tensor get_cache_buffer(const int32_t seq_len,
@@ -103,7 +124,20 @@ std::string get_batch_decode_uri(torch::ScalarType dtype_q,
 
 std::tuple<torch::Tensor, double> split_scale_param(const torch::Tensor& scale);
 
+#if !defined(USE_DCU)
+DLDataType to_dl_data_type(torch::ScalarType scalar_type);
+
+// below are tvm-ffi related functions
 ffi::Tensor to_ffi_tensor(const torch::Tensor& torch_tensor);
+
+ffi::Optional<ffi::Tensor> to_ffi_optional_tensor(
+    const std::optional<torch::Tensor>& optional);
+
+ffi::Array<ffi::Tensor> to_ffi_array_tensors(
+    const std::vector<torch::Tensor>& torch_tensors);
+
+ffi::Optional<ffi::Array<ffi::Tensor>> to_ffi_optional_array_tensors(
+    const std::optional<std::vector<torch::Tensor>>& optional);
 
 ffi::Module get_module(const std::string& uri);
 
@@ -125,4 +159,5 @@ inline void bind_tvmffi_stream_to_current_torch_stream(
                  << " dev=" << device.index();
   }
 }
+#endif  // !defined(USE_DCU)
 }  // namespace xllm::kernel::cuda

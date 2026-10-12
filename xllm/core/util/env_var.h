@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,6 +29,7 @@ bool get_bool_env(const std::string& key, bool defaultValue);
 int64_t get_int_env(const std::string& key, int64_t defaultValue);
 
 std::string get_string_env(const std::string& name);
+std::optional<std::string> get_optional_string_env(const std::string& name);
 
 // Get the timeout in seconds for process group test operations.
 // This timeout is used when waiting for process group initialization tests
@@ -40,13 +41,16 @@ std::string get_string_env(const std::string& name);
 // insufficient.
 int64_t get_process_group_test_timeout_seconds();
 
-// Returns an optional fixed acceptance rate for speculative decoding (for
-// performance debugging only). If the XLLM_FIX_SPECULATIVE_ACCEPTANCE_RATE
-// environment variable is set to a value in [0.0, 1.0], returns
-// std::optional<double> with that value; otherwise returns std::nullopt.
-// WARNING: Using this will influence model accuracy and should not be used in
-// production.
-std::optional<double> get_fix_speculative_acceptance_rate();
+// Whether Mooncake Store prefetch measurement is enabled. When
+// XLLM_STORE_PREFETCH_STATS is true, each worker logs its per-rank read volume,
+// latency breakdown, replica tiers and a probe beyond its gated-hit prefix
+// after it closes the stream. Failed sessions log accumulated reads without
+// probing. The master logs one summary line per
+// prefetched request. The value is read once per process. Default: false.
+// Enabling it adds one synchronous Mooncake replica-tier query per prefetch
+// batch, so the logged prefetch latencies include that query; the worker logs
+// its cost separately as tier_query_time.
+bool store_prefetch_stats_enabled();
 
 }  // namespace util
 }  // namespace xllm

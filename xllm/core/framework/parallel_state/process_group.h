@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,11 +17,16 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <mutex>
+#include <string>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
+#include <vector>
 
 #if defined(USE_NPU)
 #include <torch_npu/csrc/distributed/ProcessGroupHCCL.hpp>
+
+#include "framework/parallel_state/mega_moe_comm_resource.h"
 #endif
 
 namespace xllm {
@@ -42,15 +47,19 @@ class ProcessGroup {
   ProcessGroup(int32_t rank, int32_t world_size, const torch::Device& device)
       : rank_(rank), world_size_(world_size), device_(device) {}
 
-  virtual ~ProcessGroup() = default;
+  virtual ~ProcessGroup();
 
   int32_t rank() const {
-    CHECK(pg_ != nullptr) << "Process group is not initialized.";
+    if (pg_ == nullptr) {
+      return rank_;
+    }
     return pg_->getRank();
   }
 
   int32_t world_size() const {
-    CHECK(pg_ != nullptr) << "Process group is not initialized.";
+    if (pg_ == nullptr) {
+      return world_size_;
+    }
     return pg_->getSize();
   }
 
@@ -59,6 +68,9 @@ class ProcessGroup {
   // allreduce: reduce the input tensor across all processes, and all processes
   // get the result.
   virtual void allreduce(torch::Tensor& input);
+
+  // allreduce_async: enqueue allreduce and return an async work handle.
+  virtual c10::intrusive_ptr<c10d::Work> allreduce_async(torch::Tensor& input);
 
   // allgather: gather tensors from all processes and concatenate them.
   virtual void allgather(const torch::Tensor& input,
@@ -85,6 +97,54 @@ class ProcessGroup {
   virtual void reduce_scatter(const torch::Tensor& input,
                               torch::Tensor& output);
 
+  // broadcast: in-place overwrite the input tensor on every process with the
+  // copy held by root_rank. Used to unify per-rank sampling results to a single
+  // source of truth across the consensus group.
+  virtual void broadcast(torch::Tensor& input, int32_t root_rank = 0);
+
+  // Keep input alive until the returned work has been waited on by its
+  // consumer. Returns a null work when world_size() <= 1.
+  virtual c10::intrusive_ptr<c10d::Work> broadcast_async(torch::Tensor& input,
+                                                         int32_t root_rank = 0);
+
+  virtual void all_to_all_single(
+      torch::Tensor output,
+      torch::Tensor input,
+      std::vector<int64_t> output_split_sizes = {},
+      std::vector<int64_t> input_split_sizes = {},
+      bool async_op = false,
+      c10::intrusive_ptr<c10d::Work>* async_work = nullptr);
+
+  // Point-to-point: send tensor to dst rank, recv tensor from src rank.
+  // Both are synchronous (block until complete).
+  // src/dst are group-local ranks.
+  virtual void send(const torch::Tensor& tensor, int dst, int tag = 0);
+  virtual void recv(torch::Tensor& tensor, int src, int tag = 0);
+
+  virtual std::string hccl_comm_name(bool init_comm = true);
+
+#if defined(USE_NPU)
+  // Initialize the HCCL point-to-point communicators for every peer while
+  // device memory is still available. Runs at most once per process group.
+  virtual void warmup_p2p();
+
+  // batch_isend_irecv: batched point-to-point send/recv over the underlying
+  // ProcessGroupHCCL. The EPLB group carries these operations on the
+  // all-connected HCCS super-node fabric. `op_types` entries must be "send" or
+  // "recv"; each entry pairs with the same-index tensor and remote rank.
+  // Orders each rank pair so one side sends while the other receives, then
+  // returns a work handle that owns any staging buffers. The caller controls
+  // when communication completion and receive copy-back are awaited. NPU-only.
+  virtual c10::intrusive_ptr<c10d::Work> batch_isend_irecv(
+      std::vector<std::string>& op_types,
+      std::vector<torch::Tensor>& tensors,
+      std::vector<int64_t> remote_ranks);
+
+  virtual HcclComm hccl_comm();
+  std::shared_ptr<MegaMoeCommResource> acquire_mega_moe_comm_resource(
+      const MegaMoeCommSpec& spec);
+#endif
+
  private:
   // rank of current process.
   int32_t rank_ = 0;
@@ -95,7 +155,22 @@ class ProcessGroup {
   // device of current process.
   torch::Device device_;
 
+#if defined(USE_NPU)
+  std::once_flag p2p_warmup_flag_;
+#endif
+
  protected:
+  void shutdown_backend();
+
+#if defined(USE_NPU)
+  virtual int64_t max_p2p_wave_payload_bytes() const;
+  virtual int32_t synchronize_p2p_staging();
+  virtual c10::intrusive_ptr<c10d::Work>
+  send_p2p(std::vector<torch::Tensor>& tensors, int64_t peer_rank, int32_t tag);
+  virtual c10::intrusive_ptr<c10d::Work>
+  recv_p2p(std::vector<torch::Tensor>& tensors, int64_t peer_rank, int32_t tag);
+#endif
+
 #if defined(USE_NPU) &&         \
     (TORCH_VERSION_MAJOR < 2 || \
      (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 7))
@@ -105,6 +180,13 @@ class ProcessGroup {
   std::unique_ptr<c10d_npu::ProcessGroupHCCL> pg_{nullptr};
 #else
   std::unique_ptr<c10d::Backend> pg_{nullptr};
+#endif
+
+#if defined(USE_NPU)
+  // Must be declared after pg_ so that it is destroyed first (reverse
+  // declaration order), releasing the context tensor before the HCCL
+  // communicator is torn down.
+  MegaMoeCommResourceSlot mega_moe_comm_slot_;
 #endif
 };
 
@@ -117,5 +199,19 @@ std::unique_ptr<xllm::ProcessGroup> create_process_group(
     const std::string& host,
     const std::string& group_name,
     const torch::Device& device);
+
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+// for DiT models
+std::unique_ptr<xllm::ProcessGroup> create_process_group(
+    int32_t global_rank,
+    int32_t local_rank,
+    const std::vector<int32_t>& group_ranks,
+    int32_t world_size,
+    int32_t rank_size,
+    int32_t port,
+    const std::string& host,
+    const std::string& group_name,
+    const torch::Device& device);
+#endif
 
 }  // namespace xllm

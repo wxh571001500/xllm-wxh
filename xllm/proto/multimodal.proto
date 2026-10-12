@@ -1,3 +1,18 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 syntax = "proto3";
 
 option go_package = "jd.com/jd-infer/xllm;xllm";
@@ -10,14 +25,17 @@ import "embedding_data.proto";
 
 message ImageURL {
   string url = 1;
+  map<string, string> headers = 2;
 }
 
 message VideoURL {
   string url = 1;
+  map<string, string> headers = 2;
 }
 
 message AudioURL {
   string url = 1;
+  map<string, string> headers = 2;
 }
 
 message MMInputData {
@@ -42,7 +60,7 @@ message MMChatMessage {
   optional string tool_call_id = 4;
 }
 
-// Next Id: 27
+// Next Id: 43
 message MMChatRequest {
 
   // ID of the model to use. You can use the ListModels endpoint to list available models.
@@ -63,7 +81,7 @@ message MMChatRequest {
   // string function_call = 4;
 
   // temperature of the sampling, between [0, 2]. default = 0.0
-  // higher value will make the ouput more random, while a lower value will make it more deterministic.
+  // higher value will make the output more random, while a lower value will make it more deterministic.
   // it is recommended altering this or top_p but not both.
   optional float temperature = 5;
 
@@ -102,7 +120,7 @@ message MMChatRequest {
   // the list of token ids where the API will stop generating further tokens.
   repeated int32 stop_token_ids = 16;
 
-  // repetition penalty to penalize new tokens based on their occurence in the
+  // repetition penalty to penalize new tokens based on their occurrence in the
   // text. values > 1.0 encourage the model to use new tokens, while values
   // < 1.0 encourage the model to repeat tokens. default = 1.0
   optional float repetition_penalty = 17;
@@ -145,6 +163,9 @@ message MMChatRequest {
 
   optional int32 beam_width = 32;
 
+  // Final number of beam results to return. Defaults to beam_width when unset.
+  optional int32 num_return_sequences = 42;
+
   optional bool add_special_tokens = 33;
 
   optional google.protobuf.Struct chat_template_kwargs = 34;
@@ -163,4 +184,8 @@ message MMChatRequest {
 
   // xllm_service rpc addr(ip:rpc_port) that forwards this request.
   optional string source_xservice_addr = 41;
+
+  // whether to include stop strings or stop tokens in the output text.
+  // default = false
+  optional bool include_stop_str_in_output = 43;
 }

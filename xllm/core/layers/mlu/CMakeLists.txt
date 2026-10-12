@@ -4,24 +4,80 @@ cc_library(
   NAME
     mlu_layers
   HDRS
+    dflash2_context_kv.h
     attention.h
+    dcp_batch_metadata.h
+    dcp_decode_context.h
+    dcp_indexer_candidate.h
+    dsa_topk_relay.h
+    dsa_topk_state.h
     deepseek_v2_attention.h
     deepseek_v2_decoder_layer_impl.h
+    deepseek_v2_sparse_moe_block.h
     indexer.h
-    deepseek_v32_sp_context.h
-    deepseek_v32_sp_plan.h
+    deepseek_v4/compressor.h
+    deepseek_v4/dsa_cache_mapping.h
+    deepseek_v4/dsa_empty_dp_input.h
+    deepseek_v4/dsa_metadata_builder_mlu.h
+    deepseek_v4/deepseek_v4_cp_context.h
+    deepseek_v4/deepseek_v4_indexer.h
+    deepseek_v4/deepseek_v4_attention.h
+    deepseek_v4/deepseek_v4_decoder_layer.h
+    deepseek_v4/deepseek_v4_sparse_moe_block.h
+    hyper_connection.h
+    glm5_next/glm5_next_decoder_layer.h
+    glm5_next/glm5_next_kda.h
+    glm5_next/glm5_next_kpool_indexer.h
+    glm5_next/glm5_next_pcp_context.h
+    deepseek_v32_cp_context.h
+    deepseek_v32_cp_plan.h
     moe_gate.h
     fused_moe.h
+    qwen3_5/qwen3_5_fused_moe.h
+    qwen3_5/qwen3_5_attention.h
+    qwen3_5/qwen3_5_decoder_layer.h
+    qwen3_5/qwen3_5_gated_delta_net.h
+    qwen3_5/qwen3_next_rms_norm.h
+    moe_softplus_topk.h
   SRCS
+    dflash2_context_kv.cpp
     attention.cpp
+    dcp_batch_metadata.cpp
+    dcp_decode_context.cpp
+    dcp_indexer_candidate.cpp
     deepseek_v2_attention.cpp
-    deepseek_v2_attention_sp.cpp
+    deepseek_v2_attention_dcp.cpp
+    deepseek_v2_attention_cp.cpp
+    deepseek_v2_attention_glm5_next_pcp.cpp
     deepseek_v2_decoder_layer_impl.cpp
+    deepseek_v2_sparse_moe_block.cpp
     indexer.cpp
+    deepseek_v4/compressor.cpp
+    deepseek_v4/dsa_empty_dp_input.cpp
+    deepseek_v4/dsa_metadata_builder_mlu.cpp
+    deepseek_v4/deepseek_v4_cp_context.cpp
+    deepseek_v4/deepseek_v4_indexer.cpp
+    deepseek_v4/deepseek_v4_attention.cpp
+    deepseek_v4/deepseek_v4_decoder_layer.cpp
+    deepseek_v4/deepseek_v4_sparse_moe_block.cpp
+    hyper_connection.cpp
+    glm5_next/glm5_next_decoder_layer.cpp
+    glm5_next/glm5_next_kda.cpp
+    glm5_next/glm5_next_kda_pcp.cpp
+    glm5_next/glm5_next_kpool_indexer.cpp
+    glm5_next/glm5_next_kpool_indexer_pcp.cpp
+    glm5_next/glm5_next_pcp_context.cpp
     moe_gate.cpp
     fused_moe.cpp
     fused_moe_base.cpp
     fused_moe_all2all.cpp
+    qwen3_5/qwen3_5_fused_moe.cpp
+    qwen3_5/qwen3_5_attention.cpp
+    qwen3_5/qwen3_5_decoder_layer.cpp
+    qwen3_5/qwen3_5_gated_delta_net.cpp
+    qwen3_5/qwen3_next_rms_norm.cpp
+    moe_softplus_topk.cpp
   DEPS
     :common_layers
+    :util
 )

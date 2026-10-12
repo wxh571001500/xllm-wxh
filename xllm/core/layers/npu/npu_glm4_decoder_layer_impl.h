@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -50,7 +50,7 @@ class NpuGlm4DecoderLayerImpl : public BaseLayer {
 
   ~NpuGlm4DecoderLayerImpl() override = default;
 
-  virtual int64_t init_layer() override;
+  int64_t init_layer() override;
 
   torch::Tensor forward(torch::Tensor& x,
                         torch::Tensor& cos_pos,
@@ -75,7 +75,8 @@ class NpuGlm4DecoderLayerImpl : public BaseLayer {
                                torch::Tensor& attn_mask,
                                KVCache& kv_cache,
                                ModelInputParams& input_params,
-                               bool is_prefill);
+                               bool is_prefill,
+                               bool use_graph_decode_input);
 
   void initialize_quantization_parameters(
       atb_speed::chatglm::ChatglmLayerParam& param);
@@ -86,10 +87,12 @@ class NpuGlm4DecoderLayerImpl : public BaseLayer {
   int64_t init_attn_mask();
 
   atb_speed::Model::Node prefill_node_;
-  atb_speed::Model::Node decode_node_;
+  atb_speed::Model::Node decode_graph_node_;
+  atb_speed::Model::Node decode_eager_node_;
   std::string model_name_;
   atb_speed::chatglm::ChatglmLayerParam prefill_param_;
-  atb_speed::chatglm::ChatglmLayerParam decode_param_;
+  atb_speed::chatglm::ChatglmLayerParam decode_graph_param_;
+  atb_speed::chatglm::ChatglmLayerParam decode_eager_param_;
   atb::Tensor internal_tensors_;
   atb::Tensor placeholder_;
 

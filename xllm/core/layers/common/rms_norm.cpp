@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "kernels/ops_api.h"
 #include "platform/device.h"
+#include "platform/platform.h"
 
 namespace xllm {
 namespace layer {
@@ -45,10 +46,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> RMSNormImpl::forward(
     std::optional<torch::Tensor> residual,
     std::optional<torch::Tensor> inplace_output) {
   auto org_shape = input.sizes().vec();
+
   input = input.reshape({-1, norm_dim_});
 
   torch::Tensor output;
-  if (Device::type_str() != "npu") {
+  if (!Platform::is_npu()) {
     if (inplace_output.has_value()) {
       output = inplace_output.value();
       output = output.reshape({-1, norm_dim_});
@@ -60,7 +62,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> RMSNormImpl::forward(
   std::optional<torch::Tensor> residual_out;
   if (residual.has_value()) {
     residual.value() = residual.value().reshape({-1, norm_dim_});
-    if (Device::type_str() == "mlu" || Device::type_str() == "ilu") {
+    if (Platform::is_mlu() || Platform::is_ilu()) {
       residual_out = residual.value();
     }
   }
@@ -95,8 +97,7 @@ RMSNormImpl::forward_fp8(torch::Tensor& input,
                          const torch::Tensor& fp8_scale,
                          std::optional<torch::Tensor> residual) {
   // Only supported on CUDA for now
-  CHECK(Device::type_str() == "cuda")
-      << "forward_fp8 is only supported on CUDA";
+  CHECK(Platform::is_cuda()) << "forward_fp8 is only supported on CUDA";
   CHECK(mode_ == kRmsNormMode)
       << "forward_fp8 only supports RMSNorm mode, not LayerNorm";
 
@@ -129,8 +130,29 @@ RMSNormImpl::forward_fp8(torch::Tensor& input,
 
 void RMSNormImpl::load_state_dict(const StateDict& state_dict) {
   LOAD_WEIGHT(weight);
+
+#if defined(USE_NPU)
+  // Bias loading policy for anti-outlier:
+  // rmsnorm mode: bias is optional and only enabled when checkpoint
+  //    contains "bias" (anti-outlier path).
+  if (state_dict.has("bias")) {
+    if (!bias_.defined()) {
+      bias_ = register_parameter(
+          "bias", torch::empty({norm_dim_}, weight_.options()), false);
+    }
+    LOAD_WEIGHT(bias);
+  }
+#else
   if (bias_.defined()) {
     LOAD_WEIGHT(bias);
+  }
+#endif
+}
+
+void RMSNormImpl::verify_loaded_weights(const std::string& prefix) const {
+  CHECK(weight_is_loaded_) << "weight is not loaded for " << prefix + "weight";
+  if (bias_.defined()) {
+    CHECK(bias_is_loaded_) << "bias is not loaded for " << prefix + "bias";
   }
 }
 

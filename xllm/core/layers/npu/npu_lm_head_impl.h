@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -30,7 +30,6 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/model_context.h"
 #include "loader/lm_head_loader.h"
-#include "loader/lm_head_manual_loader.h"
 #include "nlohmann/json.hpp"
 #include "npu_base_layer.h"
 #include "pytorch/adapter/utils/utils.h"
@@ -52,6 +51,11 @@ class NpuLmHeadImpl : public BaseLayer {
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const torch::Tensor& seleted_idxes,
                         int nodeId);
+
+  torch::Tensor forward_with_hidden(const torch::Tensor& hidden_states,
+                                    const torch::Tensor& seleted_idxes,
+                                    torch::Tensor& out_hidden,
+                                    int nodeId);
 
  private:
   void param_from_args(atb_speed::common::LmHeadParam& param,

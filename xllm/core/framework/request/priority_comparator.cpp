@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,7 +46,7 @@ bool DeadlineComparator::operator()(const std::shared_ptr<Request>& a,
   return remain_time_a > remain_time_b;
 }
 
-// density-first strategy. denisty = weight / latency
+// density-first strategy. density = weight / latency
 bool DensityComparator::operator()(const std::shared_ptr<Request>& a,
                                    const std::shared_ptr<Request>& b) const {
   auto& sequence_a = a->sequences()[0];
@@ -223,59 +223,67 @@ bool DecodeUrgencyDensityComparator::operator()(
 }
 
 // is_reversed = false for priority_queue comparator (default)
-// is_reversed = true for sorting comparator
+// is_reversed = true for sorting / ordered-container comparators (e.g. set)
 std::function<bool(const std::shared_ptr<Request>&,
                    const std::shared_ptr<Request>&)>
 create_comparator(const std::string& priority_strategy, bool is_reversed) {
   if (priority_strategy == "fcfs") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return FCFSComparator()(a, b) ^ is_reversed;
+      return is_reversed ? FCFSComparator()(b, a) : FCFSComparator()(a, b);
     };
   } else if (priority_strategy == "priority") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return StrictPriorityComparator()(a, b) ^ is_reversed;
+      return is_reversed ? StrictPriorityComparator()(b, a)
+                         : StrictPriorityComparator()(a, b);
     };
   } else if (priority_strategy == "deadline") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return DeadlineComparator()(a, b) ^ is_reversed;
+      return is_reversed ? DeadlineComparator()(b, a)
+                         : DeadlineComparator()(a, b);
     };
   } else if (priority_strategy == "sjf") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return SJFComparator()(a, b) ^ is_reversed;
+      return is_reversed ? SJFComparator()(b, a) : SJFComparator()(a, b);
     };
   } else if (priority_strategy == "decode_density") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return DecodeDensityComparator()(a, b) ^ is_reversed;
+      return is_reversed ? DecodeDensityComparator()(b, a)
+                         : DecodeDensityComparator()(a, b);
     };
   } else if (priority_strategy == "density") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return DensityComparator()(a, b) ^ is_reversed;
+      return is_reversed ? DensityComparator()(b, a)
+                         : DensityComparator()(a, b);
     };
-  } else if (priority_strategy == "urgency_density") {
+  } else if (priority_strategy == "multi_slo_and_prio") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return UrgencyDensityComparator()(a, b) ^ is_reversed;
+      return is_reversed ? UrgencyDensityComparator()(b, a)
+                         : UrgencyDensityComparator()(a, b);
     };
   } else if (priority_strategy == "decode_urgency_density") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return DecodeUrgencyDensityComparator()(a, b) ^ is_reversed;
+      return is_reversed ? DecodeUrgencyDensityComparator()(b, a)
+                         : DecodeUrgencyDensityComparator()(a, b);
     };
   } else if (priority_strategy == "urgency_priority") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return UrgencyPriorityComparator()(a, b) ^ is_reversed;
+      return is_reversed ? UrgencyPriorityComparator()(b, a)
+                         : UrgencyPriorityComparator()(a, b);
     };
   } else if (priority_strategy == "decode_deadline") {
     return [is_reversed](const std::shared_ptr<Request>& a,
                          const std::shared_ptr<Request>& b) {
-      return DecodeDeadlineComparator()(a, b) ^ is_reversed;
+      return is_reversed ? DecodeDeadlineComparator()(b, a)
+                         : DecodeDeadlineComparator()(a, b);
     };
   } else {
     LOG(FATAL) << "Unknown strategy: " << priority_strategy;

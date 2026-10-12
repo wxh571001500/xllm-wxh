@@ -1,11 +1,11 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +20,8 @@ limitations under the License.
 
 #include <optional>
 
+#include "core/framework/model/mtp_topk_state.h"
+
 namespace xllm {
 struct ModelOutput {
   // [num_tokens, hidden_size]
@@ -28,6 +30,8 @@ struct ModelOutput {
   torch::Tensor residual;
   // [num_tokens, ...]
   torch::Tensor aux_hidden_states;
+  // Backend-neutral state emitted for the next MTP draft step.
+  MtpTopkStatePtr mtp_topk_state;
 
   ModelOutput() = default;
 

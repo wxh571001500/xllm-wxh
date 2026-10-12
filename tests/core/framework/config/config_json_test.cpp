@@ -1,0 +1,726 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <string_view>
+
+#include "core/common/global_flags.h"
+#include "core/framework/config/config_utils.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/kv_cache_store_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/framework/config/scheduler_config.h"
+
+namespace xllm {
+namespace {
+
+inline constexpr std::string_view kInlineConfig = R"json({
+  "block_size": 16,
+  "max_memory_utilization": 0.5,
+  "enable_prefix_cache": false,
+  "max_tokens_per_batch": 8192,
+  "max_seqs_per_batch": 64,
+  "model_impl": "py",
+  "image_max_tokens_num": 384,
+  "disable_graph_warmup": true,
+  "python_graph_backend": "cudagraphs",
+  "enable_fia_decode": true
+})json";
+
+inline constexpr std::string_view kUpdatedConfig = R"json({
+  "block_size": 32,
+  "max_tokens_per_batch": 4096
+})json";
+
+inline constexpr std::string_view kMalformedConfig = R"json({
+  "block_size":
+})json";
+
+#if !defined(USE_NPU)
+TEST(KernelConfigTest, RejectsNpuOnlyDsparkNativeSas) {
+  JsonReader json_config =
+      config::parse_json_string(R"json({"enable_dspark_native_sas":true})json");
+  KernelConfig kernel_config;
+  EXPECT_DEATH(kernel_config.from_json(json_config),
+               "enable_dspark_native_sas is only supported on NPU");
+}
+#endif
+
+class ConfigJsonFileFlagGuard final {
+ public:
+  explicit ConfigJsonFileFlagGuard(const std::string& config_json_file)
+      : old_config_json_file_(FLAGS_config_json_file) {
+    FLAGS_config_json_file = config_json_file;
+  }
+
+  ~ConfigJsonFileFlagGuard() { FLAGS_config_json_file = old_config_json_file_; }
+
+ private:
+  std::string old_config_json_file_;
+};
+
+class DumpConfigJsonFlagGuard final {
+ public:
+  explicit DumpConfigJsonFlagGuard(const std::string& dump_config_json_file)
+      : old_enable_dump_config_json_(FLAGS_enable_dump_config_json),
+        old_dump_config_json_file_(FLAGS_dump_config_json_file) {
+    FLAGS_dump_config_json_file = dump_config_json_file;
+  }
+
+  ~DumpConfigJsonFlagGuard() {
+    FLAGS_enable_dump_config_json = old_enable_dump_config_json_;
+    FLAGS_dump_config_json_file = old_dump_config_json_file_;
+  }
+
+ private:
+  bool old_enable_dump_config_json_;
+  std::string old_dump_config_json_file_;
+};
+
+class CpSizeFlagGuard final {
+ public:
+  CpSizeFlagGuard() : old_cp_size_(FLAGS_cp_size) {}
+  ~CpSizeFlagGuard() { FLAGS_cp_size = old_cp_size_; }
+
+ private:
+  int32_t old_cp_size_;
+};
+
+class ConfigFlagGuard final {
+ public:
+  ConfigFlagGuard()
+      : old_block_size_(FLAGS_block_size),
+        old_max_memory_utilization_(FLAGS_max_memory_utilization),
+        old_enable_prefix_cache_(FLAGS_enable_prefix_cache),
+        old_max_tokens_per_batch_(FLAGS_max_tokens_per_batch),
+        old_max_seqs_per_batch_(FLAGS_max_seqs_per_batch),
+        old_model_impl_(FLAGS_model_impl),
+        old_image_max_tokens_num_(FLAGS_image_max_tokens_num),
+        old_python_model_path_(FLAGS_python_model_path),
+        old_disable_graph_warmup_(FLAGS_disable_graph_warmup),
+        old_python_graph_backend_(FLAGS_python_graph_backend),
+        old_enable_fia_decode_(FLAGS_enable_fia_decode) {}
+
+  ~ConfigFlagGuard() {
+    FLAGS_block_size = old_block_size_;
+    FLAGS_max_memory_utilization = old_max_memory_utilization_;
+    FLAGS_enable_prefix_cache = old_enable_prefix_cache_;
+    FLAGS_max_tokens_per_batch = old_max_tokens_per_batch_;
+    FLAGS_max_seqs_per_batch = old_max_seqs_per_batch_;
+    FLAGS_model_impl = old_model_impl_;
+    FLAGS_image_max_tokens_num = old_image_max_tokens_num_;
+    FLAGS_python_model_path = old_python_model_path_;
+    FLAGS_disable_graph_warmup = old_disable_graph_warmup_;
+    FLAGS_python_graph_backend = old_python_graph_backend_;
+    FLAGS_enable_fia_decode = old_enable_fia_decode_;
+  }
+
+ private:
+  int32_t old_block_size_;
+  double old_max_memory_utilization_;
+  bool old_enable_prefix_cache_;
+  int32_t old_max_tokens_per_batch_;
+  int32_t old_max_seqs_per_batch_;
+  std::string old_model_impl_;
+  int32_t old_image_max_tokens_num_;
+  std::string old_python_model_path_;
+  bool old_disable_graph_warmup_;
+  std::string old_python_graph_backend_;
+  bool old_enable_fia_decode_;
+};
+
+class StartupConfigGuard final {
+ public:
+  StartupConfigGuard()
+      : model_config_(ModelConfig::get_instance()),
+        execution_config_(ExecutionConfig::get_instance()),
+        kv_cache_config_(KVCacheConfig::get_instance()),
+        scheduler_config_(SchedulerConfig::get_instance()),
+        old_model_impl_(model_config_.model_impl()),
+        old_image_max_tokens_num_(model_config_.image_max_tokens_num()),
+        old_python_model_path_(model_config_.python_model_path()),
+        old_python_graph_backend_(execution_config_.python_graph_backend()),
+        old_enable_fia_decode_(execution_config_.enable_fia_decode()),
+        old_block_size_(kv_cache_config_.block_size()),
+        old_enable_prefix_cache_(kv_cache_config_.enable_prefix_cache()),
+        old_max_tokens_per_batch_(scheduler_config_.max_tokens_per_batch()),
+        old_max_seqs_per_batch_(scheduler_config_.max_seqs_per_batch()),
+        old_enable_chunked_prefill_(
+            scheduler_config_.enable_chunked_prefill()) {}
+
+  ~StartupConfigGuard() {
+    model_config_.model_impl(old_model_impl_)
+        .image_max_tokens_num(old_image_max_tokens_num_)
+        .python_model_path(old_python_model_path_);
+    execution_config_.python_graph_backend(old_python_graph_backend_)
+        .enable_fia_decode(old_enable_fia_decode_);
+    kv_cache_config_.block_size(old_block_size_)
+        .enable_prefix_cache(old_enable_prefix_cache_);
+    scheduler_config_.max_tokens_per_batch(old_max_tokens_per_batch_)
+        .max_seqs_per_batch(old_max_seqs_per_batch_)
+        .enable_chunked_prefill(old_enable_chunked_prefill_);
+  }
+
+ private:
+  ModelConfig& model_config_;
+  ExecutionConfig& execution_config_;
+  KVCacheConfig& kv_cache_config_;
+  SchedulerConfig& scheduler_config_;
+  std::string old_model_impl_;
+  int32_t old_image_max_tokens_num_;
+  std::string old_python_model_path_;
+  std::string old_python_graph_backend_;
+  bool old_enable_fia_decode_;
+  int32_t old_block_size_;
+  bool old_enable_prefix_cache_;
+  int32_t old_max_tokens_per_batch_;
+  int32_t old_max_seqs_per_batch_;
+  bool old_enable_chunked_prefill_;
+};
+
+void write_config_file(const std::filesystem::path& config_path,
+                       std::string_view config_json) {
+  std::ofstream config_file(config_path);
+  config_file << config_json;
+}
+
+nlohmann::ordered_json read_json_file(const std::filesystem::path& file_path) {
+  std::ifstream input_file(file_path);
+  EXPECT_TRUE(input_file.is_open()) << file_path;
+  return nlohmann::ordered_json::parse(input_file);
+}
+
+std::filesystem::path config_test_file_path() {
+  const std::filesystem::path source_config_path =
+      std::filesystem::path(__FILE__).parent_path() / "config_test.json";
+  if (std::filesystem::exists(source_config_path)) {
+    return source_config_path;
+  }
+
+  const std::filesystem::path copied_config_path = "config_test.json";
+  if (std::filesystem::exists(copied_config_path)) {
+    return copied_config_path;
+  }
+
+  return std::filesystem::path("tests/core/framework/config/config_test.json");
+}
+
+TEST(ModelConfigValidationTest, RejectsQwen35PythonSpeculativeDecode) {
+  const std::optional<std::string> error =
+      ModelConfig::validate_python_speculative_decode(
+          "python", "qwen3_5_moe_text", "MTP", 4);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error->find("does not support speculative decoding"),
+            std::string::npos);
+  EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
+                  "py", "qwen3_5_text", "MTP", 1)
+                  .has_value());
+}
+
+TEST(ModelConfigValidationTest, AcceptsSupportedPythonExecutionModes) {
+  EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                   "python", "qwen3_5_text", "MTP", 0)
+                   .has_value());
+  EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                   "native", "qwen3_5_text", "MTP", 4)
+                   .has_value());
+  EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                   "python", "qwen3", "MTP", 4)
+                   .has_value());
+#if defined(USE_NPU)
+  EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                   "python", "qwen3_5_text", "DSpark", 4)
+                   .has_value());
+#else
+  EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
+                  "python", "qwen3_5_text", "DSpark", 4)
+                  .has_value());
+#endif
+}
+
+TEST(ConfigJsonTest, FromJsonUsesParsedOverrides) {
+  const JsonReader json = config::parse_json_string(kInlineConfig);
+  ConfigFlagGuard flag_guard;
+  const std::string old_python_model_path = FLAGS_python_model_path;
+
+  ModelConfig model_config;
+  model_config.from_json(json);
+
+  ExecutionConfig execution_config;
+  execution_config.from_json(json);
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.from_flags();
+  kv_cache_config.from_json(json);
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.from_flags();
+  scheduler_config.from_json(json);
+
+  EXPECT_EQ(kv_cache_config.block_size(), 16);
+  EXPECT_DOUBLE_EQ(kv_cache_config.max_memory_utilization(), 0.5);
+  EXPECT_FALSE(kv_cache_config.enable_prefix_cache());
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 8192);
+  EXPECT_EQ(scheduler_config.max_seqs_per_batch(), 64);
+  // model_impl is no longer canonicalized: the raw "py" alias is preserved and
+  // recognized via is_python_model_impl(). from_json still mirrors it into the
+  // matching gflag.
+  EXPECT_EQ(model_config.model_impl(), "py");
+  EXPECT_EQ(model_config.image_max_tokens_num(), 384);
+  EXPECT_TRUE(ModelConfig::is_python_model_impl(model_config.model_impl()));
+  // model and python_model_path are command-line-only: from_json neither reads
+  // them nor touches their gflags, so both keep their pre-call values.
+  EXPECT_EQ(model_config.python_model_path(), "");
+  EXPECT_TRUE(execution_config.disable_graph_warmup());
+  EXPECT_EQ(execution_config.python_graph_backend(), "cudagraphs");
+  EXPECT_TRUE(execution_config.enable_fia_decode());
+
+  EXPECT_EQ(FLAGS_model_impl, "py");
+  EXPECT_EQ(FLAGS_python_model_path, old_python_model_path);
+  EXPECT_TRUE(FLAGS_disable_graph_warmup);
+  EXPECT_EQ(FLAGS_python_graph_backend, "cudagraphs");
+  EXPECT_TRUE(FLAGS_enable_fia_decode);
+
+  EXPECT_EQ(kv_cache_config.kv_cache_dtype(), "auto");
+  EXPECT_EQ(kv_cache_config.indexer_cache_dtype(), "auto");
+  EXPECT_EQ(scheduler_config.max_decode_token_per_sequence(), 256);
+}
+
+TEST(ExecutionConfigTest, GraphWarmupIsEnabledByDefault) {
+  const ExecutionConfig execution_config;
+
+  EXPECT_FALSE(execution_config.disable_graph_warmup());
+}
+
+TEST(KVCacheConfigValidationTest, AcceptsSupportedIndexerCacheDtypes) {
+  KVCacheConfig config;
+
+  config.indexer_cache_dtype("auto");
+  config.validate();
+
+  config.indexer_cache_dtype("int8");
+  config.validate();
+}
+
+TEST(KVCacheConfigValidationTest, RejectsUnsupportedIndexerCacheDtypes) {
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.indexer_cache_dtype("fp8");
+        config.validate();
+      },
+      "indexer_cache_dtype.*auto.*int8");
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.indexer_cache_dtype("INT8");
+        config.validate();
+      },
+      "indexer_cache_dtype.*auto.*int8");
+  EXPECT_DEATH(
+      {
+        KVCacheConfig config;
+        config.indexer_cache_dtype(" int8 ");
+        config.validate();
+      },
+      "indexer_cache_dtype.*auto.*int8");
+}
+
+TEST(ConfigJsonTest, ParallelConfigHandlesKvSplitSize) {
+  CpSizeFlagGuard flag_guard;
+  const JsonReader json = config::parse_json_string(
+      R"json({"cp_size": 1, "kv_split_size": 2})json");
+  ParallelConfig parallel_config;
+  parallel_config.from_json(json);
+
+  EXPECT_EQ(parallel_config.cp_size(), 1);
+  EXPECT_EQ(parallel_config.kv_split_size(), 2);
+  EXPECT_EQ(parallel_config.kv_split_size_effective(), 2);
+}
+
+TEST(KVCacheStoreConfigTest, ReadsAndExportsRdmaDevices) {
+  KVCacheStoreConfig default_config;
+  EXPECT_TRUE(default_config.store_rdma_devices().empty());
+  const std::vector<std::string>& option_names =
+      KVCacheStoreConfig::option_category().option_names;
+  EXPECT_NE(
+      std::find(option_names.begin(), option_names.end(), "store_rdma_devices"),
+      option_names.end());
+
+  JsonReader json_config = config::parse_json_string(
+      R"json({"store_rdma_devices":"mlx5_0,mlx5_1"})json");
+  KVCacheStoreConfig config;
+  config.from_json(json_config);
+  EXPECT_EQ(config.store_rdma_devices(), "mlx5_0,mlx5_1");
+
+  nlohmann::ordered_json exported;
+  config.append_config_json(exported);
+  EXPECT_EQ(exported.at("store_rdma_devices").get<std::string>(),
+            "mlx5_0,mlx5_1");
+}
+
+TEST(ConfigJsonTest, RegistersContextParallelCommandLineOptions) {
+  google::CommandLineFlagInfo flag_info;
+  EXPECT_TRUE(google::GetCommandLineFlagInfo("cp_size", &flag_info));
+  EXPECT_EQ(flag_info.default_value, "1");
+  EXPECT_TRUE(google::GetCommandLineFlagInfo("kv_split_size", &flag_info));
+  EXPECT_EQ(flag_info.default_value, "1");
+
+  const std::string removed_flag = std::string("enable_") + "prefill_sp";
+  EXPECT_FALSE(
+      google::GetCommandLineFlagInfo(removed_flag.c_str(), &flag_info));
+}
+
+TEST(ConfigJsonTest, RegistersExplicitFiaDecodeCommandLineOption) {
+  google::CommandLineFlagInfo flag_info;
+  EXPECT_TRUE(google::GetCommandLineFlagInfo("enable_fia_decode", &flag_info));
+  EXPECT_EQ(flag_info.default_value, "false");
+  EXPECT_FALSE(
+      google::GetCommandLineFlagInfo("disable_fia_decode", &flag_info));
+
+  const ExecutionConfig execution_config;
+  EXPECT_FALSE(execution_config.enable_fia_decode());
+}
+
+TEST(ConfigJsonTest, LoadJsonFileReadsConfigFixture) {
+  // The fixture sets more keys than ConfigFlagGuard restores, and from_json
+  // writes every resolved value back into its FLAGS_ global. FlagSaver reverts
+  // all of those writes so this fixture cannot leak flag state (values or the
+  // is_default bit) into later tests when GoogleTest shuffles the order.
+  google::FlagSaver flag_saver;
+  ConfigFlagGuard flag_guard;
+  const std::filesystem::path config_path = config_test_file_path();
+  ASSERT_TRUE(std::filesystem::exists(config_path)) << config_path;
+
+  const JsonReader json = config::load_json_file(config_path.string());
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.from_flags();
+  kv_cache_config.from_json(json);
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.from_flags();
+  scheduler_config.from_json(json);
+
+  EXPECT_EQ(kv_cache_config.block_size(), 24);
+  EXPECT_EQ(kv_cache_config.max_cache_size(), 1048576);
+  EXPECT_DOUBLE_EQ(kv_cache_config.max_memory_utilization(), 0.65);
+  EXPECT_EQ(kv_cache_config.kv_cache_dtype(), "int8");
+  EXPECT_EQ(kv_cache_config.indexer_cache_dtype(), "int8");
+  EXPECT_FALSE(kv_cache_config.enable_prefix_cache());
+  EXPECT_EQ(kv_cache_config.xxh3_128bits_seed(), 2048);
+  EXPECT_TRUE(kv_cache_config.enable_xtensor());
+  EXPECT_EQ(kv_cache_config.phy_page_granularity_size(), 4096);
+
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 2048);
+  EXPECT_EQ(scheduler_config.max_seqs_per_batch(), 32);
+  EXPECT_TRUE(scheduler_config.enable_schedule_overlap());
+  EXPECT_DOUBLE_EQ(scheduler_config.prefill_scheduling_memory_usage_threshold(),
+                   0.75);
+  EXPECT_FALSE(scheduler_config.enable_chunked_prefill());
+  EXPECT_EQ(scheduler_config.max_tokens_per_chunk_for_prefill(), 512);
+  EXPECT_EQ(scheduler_config.chunked_match_frequency(), 3);
+  EXPECT_TRUE(scheduler_config.use_zero_evict());
+  EXPECT_EQ(scheduler_config.max_decode_token_per_sequence(), 128);
+  EXPECT_EQ(scheduler_config.priority_strategy(), "priority");
+  EXPECT_FALSE(scheduler_config.enable_online_preempt_offline());
+  EXPECT_DOUBLE_EQ(scheduler_config.aggressive_coeff(), 1.5);
+  EXPECT_DOUBLE_EQ(scheduler_config.starve_threshold(), 2.0);
+  EXPECT_FALSE(scheduler_config.enable_starve_prevent());
+}
+
+TEST(ConfigJsonTest, InitializeLoadsConfigJsonFileFromFlag) {
+  ConfigFlagGuard config_flag_guard;
+  const std::filesystem::path config_path =
+      std::filesystem::temp_directory_path() / "xllm_config_json_test.json";
+  write_config_file(config_path, kInlineConfig);
+
+  ConfigJsonFileFlagGuard flag_guard(config_path.string());
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.initialize();
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.initialize();
+
+  EXPECT_EQ(kv_cache_config.block_size(), 16);
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 8192);
+
+  std::filesystem::remove(config_path);
+}
+
+TEST(ConfigJsonTest, InitializeReusesCachedConfigJsonForSameFile) {
+  ConfigFlagGuard config_flag_guard;
+  const std::filesystem::path config_path =
+      std::filesystem::temp_directory_path() /
+      "xllm_config_json_test_cached.json";
+  write_config_file(config_path, kInlineConfig);
+
+  ConfigJsonFileFlagGuard flag_guard(config_path.string());
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.initialize();
+
+  write_config_file(config_path, kUpdatedConfig);
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.initialize();
+
+  EXPECT_EQ(kv_cache_config.block_size(), 16);
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 8192);
+
+  std::filesystem::remove(config_path);
+}
+
+TEST(ConfigJsonTest, MalformedJsonFileKeepsFlagDefaults) {
+  const std::filesystem::path config_path =
+      std::filesystem::temp_directory_path() /
+      "xllm_config_json_test_malformed.json";
+  write_config_file(config_path, kMalformedConfig);
+
+  ConfigJsonFileFlagGuard flag_guard(config_path.string());
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.initialize();
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.initialize();
+
+  EXPECT_EQ(kv_cache_config.block_size(), 128);
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 10240);
+
+  std::filesystem::remove(config_path);
+}
+
+TEST(ConfigJsonTest, MissingJsonFileKeepsFlagDefaults) {
+  const std::filesystem::path config_path =
+      std::filesystem::temp_directory_path() /
+      "xllm_config_json_test_missing.json";
+  std::filesystem::remove(config_path);
+
+  ConfigJsonFileFlagGuard flag_guard(config_path.string());
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.initialize();
+
+  KVCacheStoreConfig kv_cache_store_config;
+  kv_cache_store_config.initialize();
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.initialize();
+
+  EXPECT_EQ(kv_cache_config.block_size(), 128);
+  EXPECT_DOUBLE_EQ(kv_cache_config.max_memory_utilization(), 0.8);
+  EXPECT_EQ(kv_cache_store_config.prefetch_timeout(), 120000u);
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 10240);
+  EXPECT_EQ(scheduler_config.max_seqs_per_batch(), 200);
+}
+
+TEST(ConfigPrecedenceTest, CommandLineFlagOverridesJson) {
+  // FlagSaver restores both flag values and their is_default bit, so the
+  // simulated command-line flags below do not leak into other tests.
+  google::FlagSaver flag_saver;
+
+  // Simulate `--block_size=64 --max_tokens_per_batch=2048 --model_impl=native`.
+  google::SetCommandLineOption("block_size", "64");
+  google::SetCommandLineOption("max_tokens_per_batch", "2048");
+  google::SetCommandLineOption("model_impl", "native");
+
+  // kInlineConfig sets block_size=16, compressed block tokens=4096,
+  // max_tokens_per_batch=8192,
+  // model_impl="py": all conflict with the command-line values above.
+  const JsonReader json = config::parse_json_string(kInlineConfig);
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.from_flags();
+  kv_cache_config.from_json(json);
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.from_flags();
+  scheduler_config.from_json(json);
+
+  ModelConfig model_config;
+  model_config.from_flags();
+  model_config.from_json(json);
+
+  // CLI > Config: the command-line value wins over the JSON entry.
+  EXPECT_EQ(kv_cache_config.block_size(), 64);
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 2048);
+  EXPECT_EQ(model_config.model_impl(), "native");
+
+  // The FLAGS_ writeback must not clobber the command-line value either.
+  EXPECT_EQ(FLAGS_block_size, 64);
+  EXPECT_EQ(FLAGS_max_tokens_per_batch, 2048);
+  EXPECT_EQ(FLAGS_model_impl, "native");
+}
+
+TEST(ConfigPrecedenceTest, JsonOverridesDefaultWhenFlagUnspecified) {
+  google::FlagSaver flag_saver;
+
+  // None of these flags are specified on the command line, so JSON must win
+  // over the compiled-in defaults.
+  ASSERT_FALSE(config::is_flag_specified("block_size"));
+  ASSERT_FALSE(config::is_flag_specified("enable_prefix_cache"));
+  ASSERT_FALSE(config::is_flag_specified("max_seqs_per_batch"));
+
+  const JsonReader json = config::parse_json_string(kInlineConfig);
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.from_flags();
+  kv_cache_config.from_json(json);
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.from_flags();
+  scheduler_config.from_json(json);
+
+  // Config > Defaults.
+  EXPECT_EQ(kv_cache_config.block_size(), 16);
+  EXPECT_DOUBLE_EQ(kv_cache_config.max_memory_utilization(), 0.5);
+  EXPECT_FALSE(kv_cache_config.enable_prefix_cache());
+  EXPECT_EQ(scheduler_config.max_seqs_per_batch(), 64);
+}
+
+TEST(ConfigPrecedenceTest, KeepsDefaultWhenNeitherCliNorJson) {
+  google::FlagSaver flag_saver;
+
+  // Config flags are process-global; pin the flags asserted below to their
+  // DEFINE_ defaults so this test is self-contained regardless of sibling
+  // tests. FlagSaver reverts these resets when the test ends.
+  FLAGS_enable_prefix_cache = true;
+  FLAGS_max_seqs_per_batch = 200;
+  FLAGS_priority_strategy = "fcfs";
+
+  // kUpdatedConfig only carries block_size and max_tokens_per_batch, so
+  // unrelated properties fall back to their defaults.
+  const JsonReader json = config::parse_json_string(kUpdatedConfig);
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.from_flags();
+  kv_cache_config.from_json(json);
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.from_flags();
+  scheduler_config.from_json(json);
+
+  EXPECT_TRUE(kv_cache_config.enable_prefix_cache());
+  EXPECT_EQ(scheduler_config.max_seqs_per_batch(), 200);
+  EXPECT_EQ(scheduler_config.priority_strategy(), "fcfs");
+}
+
+TEST(ConfigPrecedenceTest, InitializeAppliesCliOverConfigOverDefault) {
+  google::FlagSaver flag_saver;
+
+  // Pin the default-asserted flag so this test is self-contained regardless of
+  // sibling tests; FlagSaver reverts it on exit.
+  FLAGS_max_decode_token_per_sequence = 256;
+
+  const std::filesystem::path config_path =
+      std::filesystem::temp_directory_path() /
+      "xllm_config_precedence_test.json";
+  write_config_file(config_path, kInlineConfig);
+
+  // Command line overrides block_size; JSON still supplies the rest.
+  google::SetCommandLineOption("block_size", "64");
+  FLAGS_config_json_file = config_path.string();
+
+  KVCacheConfig kv_cache_config;
+  kv_cache_config.initialize();
+
+  SchedulerConfig scheduler_config;
+  scheduler_config.initialize();
+
+  EXPECT_EQ(kv_cache_config.block_size(), 64);               // CLI    > Config
+  EXPECT_EQ(scheduler_config.max_tokens_per_batch(), 8192);  // Config > Default
+  EXPECT_EQ(scheduler_config.max_seqs_per_batch(), 64);      // Config > Default
+  EXPECT_EQ(scheduler_config.max_decode_token_per_sequence(),
+            256);  // Default
+
+  std::filesystem::remove(config_path);
+}
+
+TEST(ConfigJsonTest, DumpStartupConfigSkipsWhenDisabled) {
+  const std::filesystem::path dump_path =
+      std::filesystem::temp_directory_path() /
+      "xllm_dump_config_json_test_disabled.json";
+  std::filesystem::remove(dump_path);
+  DumpConfigJsonFlagGuard flag_guard(dump_path.string());
+  FLAGS_enable_dump_config_json = false;
+
+  config::dump_startup_config();
+
+  EXPECT_FALSE(std::filesystem::exists(dump_path));
+}
+
+TEST(ConfigJsonTest, DumpStartupConfigWritesNonDefaultValuesOnly) {
+  const std::filesystem::path dump_path =
+      std::filesystem::temp_directory_path() /
+      "xllm_dump_config_json_test_non_default.json";
+  std::filesystem::remove(dump_path);
+  DumpConfigJsonFlagGuard flag_guard(dump_path.string());
+  StartupConfigGuard startup_config_guard;
+
+  ModelConfig::get_instance()
+      .model_impl("python")
+      .image_max_tokens_num(384)
+      .python_model_path("/tmp/xllm-python-model");
+  ExecutionConfig::get_instance()
+      .python_graph_backend("cudagraphs")
+      .enable_fia_decode(true);
+  KVCacheConfig::get_instance().block_size(256).enable_prefix_cache(false);
+  SchedulerConfig::get_instance()
+      .max_tokens_per_batch(2048)
+      .max_seqs_per_batch(128)
+      .enable_chunked_prefill(false);
+  FLAGS_enable_dump_config_json = true;
+
+  config::dump_startup_config();
+
+  ASSERT_TRUE(std::filesystem::exists(dump_path));
+  const nlohmann::ordered_json config_json = read_json_file(dump_path);
+  EXPECT_EQ(config_json.at("model_impl").get<std::string>(), "python");
+  EXPECT_EQ(config_json.at("image_max_tokens_num").get<int32_t>(), 384);
+  EXPECT_EQ(config_json.at("python_graph_backend").get<std::string>(),
+            "cudagraphs");
+  EXPECT_TRUE(config_json.at("enable_fia_decode").get<bool>());
+  EXPECT_EQ(config_json.at("block_size").get<int32_t>(), 256);
+  EXPECT_FALSE(config_json.at("enable_prefix_cache").get<bool>());
+  EXPECT_EQ(config_json.at("max_tokens_per_batch").get<int32_t>(), 2048);
+  EXPECT_EQ(config_json.at("max_seqs_per_batch").get<int32_t>(), 128);
+  EXPECT_FALSE(config_json.at("enable_chunked_prefill").get<bool>());
+
+  // model and python_model_path are command-line-only: never dumped, even when
+  // set to a non-default value.
+  EXPECT_FALSE(config_json.contains("model"));
+  EXPECT_FALSE(config_json.contains("python_model_path"));
+  EXPECT_FALSE(config_json.contains("max_cache_size"));
+  EXPECT_FALSE(config_json.contains("kv_cache_dtype"));
+  EXPECT_FALSE(config_json.contains("indexer_cache_dtype"));
+  EXPECT_FALSE(config_json.contains("priority_strategy"));
+
+  std::filesystem::remove(dump_path);
+}
+
+}  // namespace
+}  // namespace xllm

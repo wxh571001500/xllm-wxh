@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,71 +16,288 @@ limitations under the License.
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
+#include <brpc/stream.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
+#include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "common/types.h"
 #include "core/distributed_runtime/comm_channel.h"
-#include "core/runtime/params_utils.h"
+#include "core/distributed_runtime/worker_prefetch_session.h"
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
 #include "framework/sampling/sampling_params.h"
 #include "runtime/forward_params.h"
 #include "runtime/params_utils.h"
+#include "runtime/speculative_worker_impl.h"
+#include "util/env_var.h"
 #include "util/timer.h"
 
 namespace xllm {
+namespace {
+
+int32_t get_num_decode_seqs_for_schedule_overlap(const ForwardInput& input) {
+  if (input.sampling_params.sample_idxes.defined()) {
+    return static_cast<int32_t>(input.sampling_params.sample_idxes.size(0));
+  }
+
+  if (!input.input_host_buffer_has_layout) {
+    return 0;
+  }
+
+  ForwardInput unpacked_input;
+  const bool unpacked = detail::unpack_from_input_host_buffer(
+      input, torch::Device(torch::kCPU), unpacked_input);
+  if (!unpacked || !unpacked_input.sampling_params.sample_idxes.defined()) {
+    return 0;
+  }
+  return static_cast<int32_t>(
+      unpacked_input.sampling_params.sample_idxes.size(0));
+}
+
+torch::Tensor clone_cpu_tensor_view(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return tensor;
+  }
+  CHECK(tensor.device().is_cpu()) << "expected a CPU tensor view";
+  return tensor.contiguous().clone();
+}
+
+void stabilize_schedule_overlap_host_views(ForwardInput& input) {
+  input.token_ids_host = clone_cpu_tensor_view(input.token_ids_host);
+  input.positions_host = clone_cpu_tensor_view(input.positions_host);
+  input.input_params.attention.host.block_tables =
+      clone_cpu_tensor_view(input.input_params.attention.host.block_tables);
+}
+
+// Preformatted position tags for MULTI_COUNTER_ADD so the metrics loop does
+// not allocate a fresh std::string per step per position.
+std::vector<std::string> build_speculative_position_labels(
+    const runtime::Options& options) {
+  const int32_t num_speculative_tokens = options.num_speculative_tokens();
+  if (num_speculative_tokens <= 0) {
+    return {};
+  }
+  std::vector<std::string> labels;
+  labels.reserve(static_cast<size_t>(num_speculative_tokens));
+  for (int32_t position = 0; position < num_speculative_tokens; ++position) {
+    labels.emplace_back(std::to_string(position));
+  }
+  return labels;
+}
+
+// Store prefetch measurement runs on its own pool so a Store probe never
+// delays a prefetch batch on the copy pool.
+std::unique_ptr<ThreadPool> create_prefetch_stats_threadpool() {
+  if (!util::store_prefetch_stats_enabled()) {
+    return nullptr;
+  }
+  return std::make_unique<ThreadPool>(
+      /*num_threads=*/1,
+      /*cpu_binding=*/false,
+      /*pool_name=*/"WorkerService.prefetch_stats");
+}
+
+}  // namespace
 
 WorkerService::WorkerService(runtime::Options options,
                              const torch::Device& device)
-    : options_(options), device_(device), initialized_(false) {
+    : options_(options),
+      speculative_position_labels_(build_speculative_position_labels(options)),
+      initialized_(false),
+      device_(device) {
   device_.set_device();
   device_.init_device_context();
   stream_ = device_.get_stream_from_pool();
   threadpool_ = std::make_unique<ThreadPool>(
-      4, [this]() mutable { device_.set_device(); });
+      /*num_threads=*/4,
+      /*init_func=*/[this]() mutable { device_.set_device(); },
+      /*cpu_binding=*/false,
+      /*pool_name=*/"WorkerService.request");
+  prefetch_stats_threadpool_ = create_prefetch_stats_threadpool();
 }
 
 WorkerService::WorkerService(runtime::Options options,
                              const torch::Device& device,
                              std::unique_ptr<Worker> worker)
     : options_(options),
+      speculative_position_labels_(build_speculative_position_labels(options)),
+      initialized_(true),
       device_(device),
-      worker_(std::move(worker)),
-      initialized_(true) {
+      worker_(std::move(worker)) {
   device_.set_device();
   device_.init_device_context();
   stream_ = device_.get_stream_from_pool();
   threadpool_ = std::make_unique<ThreadPool>(
-      4, [this]() mutable { device_.set_device(); });
+      /*num_threads=*/4,
+      /*init_func=*/[this]() mutable { device_.set_device(); },
+      /*cpu_binding=*/false,
+      /*pool_name=*/"WorkerService.request");
+  prefetch_stats_threadpool_ = create_prefetch_stats_threadpool();
 }
 
-WorkerService::~WorkerService() = default;
+WorkerService::~WorkerService() {
+  std::vector<std::shared_ptr<WorkerPrefetchSession>> sessions;
+  {
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    sessions.reserve(prefetch_sessions_.size());
+    for (const auto& weak_session : prefetch_sessions_) {
+      if (auto session = weak_session.lock()) {
+        sessions.emplace_back(std::move(session));
+      }
+    }
+  }
+  for (const auto& session : sessions) {
+    session->shutdown();
+  }
+  threadpool_.reset();
+  copy_threadpool_.reset();
+  prefetch_stats_threadpool_.reset();
+}
+
+std::vector<SpeculativeTokenStats>
+WorkerService::record_speculative_metrics_from_output(
+    const torch::Tensor& next_tokens,
+    const std::vector<SpeculativeTokenStats>& output_stats,
+    bool is_graph_warmup) {
+  // Synthetic graph-warmup batches carry no real accept/reject signal; skip
+  // them so they do not pollute the cumulative acceptance stats.
+  if (is_graph_warmup || !options_.enable_speculative_decode()) {
+    return {};
+  }
+  if (!output_stats.empty()) {
+    if (next_tokens.defined() && next_tokens.dim() == 2) {
+      CHECK_EQ(output_stats.size(), static_cast<size_t>(next_tokens.size(0)))
+          << "speculative token stats batch mismatch";
+    }
+  }
+  if (!next_tokens.defined() || next_tokens.dim() != 2 ||
+      next_tokens.numel() == 0) {
+    return output_stats;
+  }
+  // DFlash / DSpark record metrics inline in their own worker
+  // (DFlashWorkerImpl::record_validate_metrics) with precise per-seq widths,
+  // so this generic per-tensor count would double-count them.
+  if (SpeculativeConfig::is_block_diffusion_algorithm(
+          options_.speculative_algorithm())) {
+    return output_stats;
+  }
+
+  const int64_t batch_size = next_tokens.size(0);
+  const int64_t token_width = next_tokens.size(1);
+  const int64_t num_speculative_tokens = options_.num_speculative_tokens();
+  if (num_speculative_tokens <= 0 || token_width < 2) {
+    return output_stats;
+  }
+  // Adaptive pruning may hand back a narrower validate block, so accept any
+  // width in [2, N+1] and derive the actual draft count from token_width - 1.
+  if (token_width > num_speculative_tokens + 1) {
+    return output_stats;
+  }
+  const int64_t effective_speculative_tokens = token_width - 1;
+
+  SpeculativeOutputStats stats =
+      calculate_speculative_output_stats(next_tokens, num_speculative_tokens);
+
+  const int64_t num_draft_tokens = batch_size * effective_speculative_tokens;
+  int64_t num_accepted_tokens = 0;
+  for (int64_t position = 0; position < effective_speculative_tokens;
+       ++position) {
+    const int64_t accepted =
+        stats.accepted_per_position[static_cast<size_t>(position)];
+    num_accepted_tokens += accepted;
+    MULTI_COUNTER_ADD(
+        speculative_num_accepted_tokens_per_pos,
+        speculative_position_labels_[static_cast<size_t>(position)],
+        accepted);
+  }
+  COUNTER_ADD(speculative_num_drafts_total, batch_size);
+  // Adaptive MTP records these totals inline using the actual per-sequence
+  // proposal widths. Still publish the remaining output metrics below.
+  if (output_stats.empty()) {
+    COUNTER_ADD(speculative_num_draft_tokens_total, num_draft_tokens);
+    COUNTER_ADD(speculative_num_accepted_tokens_total, num_accepted_tokens);
+  }
+  COUNTER_ADD(speculative_num_committed_tokens_total, stats.committed_tokens);
+  // Derive from the global counters, not per-instance totals, so multi-DP
+  // writers converge on one aggregate instead of overwriting the gauge.
+  const double total_drafts = COUNTER_VALUE(speculative_num_drafts_total);
+  if (total_drafts > 0) {
+    GAUGE_SET(
+        speculative_mean_acceptance_length,
+        COUNTER_VALUE(speculative_num_committed_tokens_total) / total_drafts);
+  }
+  // Per-position conditional acceptance rate = P(accept position i | position
+  // i-1 accepted) = accepted_per_pos[i] / accepted_per_pos[i-1]; position 0
+  // divides by the total draft count. Read from the global counters so multi-DP
+  // writers converge on one aggregate.
+  double prev_accepted = total_drafts;
+  for (int64_t position = 0; position < effective_speculative_tokens;
+       ++position) {
+    const std::string& position_label =
+        speculative_position_labels_[static_cast<size_t>(position)];
+    const double cur_accepted = MULTI_COUNTER_VALUE(
+        speculative_num_accepted_tokens_per_pos, position_label);
+    if (prev_accepted > 0) {
+      MULTI_GAUGE_SET(speculative_conditional_acceptance_rate_per_pos,
+                      position_label,
+                      cur_accepted / prev_accepted);
+    }
+    prev_accepted = cur_accepted;
+  }
+  if (!output_stats.empty()) {
+    return output_stats;
+  }
+  return stats.sequence_stats;
+}
 
 void WorkerService::set_worker(std::unique_ptr<Worker> worker) {
   worker_ = std::move(worker);
   initialized_ = true;
 }
 
-void WorkerService::step(ForwardInput& fwd_input,
-                         torch::Tensor& next_tokens,
-                         torch::Tensor& logprobs,
-                         torch::Tensor& top_tokens,
-                         torch::Tensor& top_logprobs,
-                         torch::Tensor& embeddings,
-                         std::vector<torch::Tensor>& mm_embeddings,
-                         torch::Tensor& expert_load_data,
-                         int32_t& prepared_layer_id,
-                         torch::Tensor& src_seq_idxes,
-                         torch::Tensor& out_tokens,
-                         torch::Tensor& out_logprobs) {
+void WorkerService::step(
+    ForwardInput& fwd_input,
+    torch::Tensor& next_tokens,
+    torch::Tensor& logprobs,
+    torch::Tensor& top_tokens,
+    torch::Tensor& top_logprobs,
+    torch::Tensor& embeddings,
+    std::vector<std::vector<torch::Tensor>>& mm_embeddings,
+    std::vector<SpeculativeTokenStats>& speculative_token_stats,
+    std::vector<torch::Tensor>& dit_images,
+    std::vector<std::string>& dit_text_output,
+    std::vector<torch::Tensor>& dit_audio,
+    torch::Tensor& expert_load_data,
+    int64_t& prepared_token,
+    torch::Tensor& src_seq_idxes,
+    torch::Tensor& out_tokens,
+    torch::Tensor& out_logprobs,
+    std::vector<JsonObjectOutputError>& json_object_errors,
+    std::vector<std::string>& failed_request_ids) {
+  speculative_token_stats.clear();
+  const bool use_default_stream =
+      !options_.enable_schedule_overlap() && options_.backend() == "llm";
+  if (options_.enable_schedule_overlap()) {
+    stabilize_schedule_overlap_host_views(fwd_input);
+  }
   // execute model
   auto future = worker_->step_async(fwd_input);
-
   if (!options_.enable_schedule_overlap()) {
     auto forward_outputs = std::move(future).get();
     // convert ForwardOutput to proto::ForwardOutput which contain Tokens.
@@ -89,64 +306,115 @@ void WorkerService::step(ForwardInput& fwd_input,
       const auto& sample_output = forward_outputs.value().sample_output;
       const auto& beam_search_output =
           forward_outputs.value().beam_search_output;
-      expert_load_data =
-          safe_to(forward_outputs.value().expert_load_data, torch::kCPU, true);
-      prepared_layer_id = forward_outputs.value().prepared_layer_id;
+      const auto& dit_forward_output =
+          forward_outputs.value().dit_forward_output;
+      expert_load_data = safe_to(forward_outputs.value().expert_load_data,
+                                 torch::kCPU,
+                                 /*non_blocking=*/true);
+      prepared_token = forward_outputs.value().prepared_token;
+      json_object_errors = forward_outputs.value().json_object_errors;
+      failed_request_ids = forward_outputs.value().failed_request_ids;
 
       {
-        c10::StreamGuard streamGuard = stream_->set_stream_guard();
-        // only driver worker (rank=0) need to fill this
-        // [num_seq, ..., embed_dim] FloatTensor
-        embeddings = safe_to(sample_output.embeddings,
-                             torch::dtype(torch::kFloat32).device(torch::kCPU),
-                             true);
-
-        mm_embeddings.clear();
-        mm_embeddings.reserve(sample_output.mm_embeddings.size());
-        for (auto mm_embedding : sample_output.mm_embeddings) {
-          mm_embeddings.emplace_back(safe_to(mm_embedding, torch::kCPU, true));
-        }
-
-        // [num_seq]
-        next_tokens = safe_to(sample_output.next_tokens, torch::kCPU, true);
-        if (next_tokens.defined()) {
-          // [num_seq]
-          logprobs = safe_to(sample_output.logprobs, torch::kCPU, true);
-
-          if (!beam_search_output.src_seq_idxes.defined()) {
-            // beam search kernel will provide final tokens/logprobs in beam
-            // search output, so keep top_tokens/top_logprobs undefined to
-            // avoid returning them.
-            // [num_seq, topk]
-            top_tokens = safe_to(sample_output.top_tokens, torch::kCPU, true);
-            // [num_seq, topk]
-            top_logprobs =
-                safe_to(sample_output.top_logprobs, torch::kCPU, true);
-          }
-        }
-
-        // beam search output
-        // [num_seq]
-        src_seq_idxes =
-            safe_to(beam_search_output.src_seq_idxes, torch::kCPU, true);
-        if (src_seq_idxes.defined()) {
-          // [num_seq]
-          out_tokens =
-              safe_to(beam_search_output.out_tokens, torch::kCPU, true);
-          // [num_seq]
-          out_logprobs =
-              safe_to(beam_search_output.out_logprobs,
+        auto copy_output_to_host = [&]() {
+          // only driver worker (rank=0) need to fill this
+          // [num_seq, ..., embed_dim] FloatTensor
+          embeddings =
+              safe_to(sample_output.embeddings,
                       torch::dtype(torch::kFloat32).device(torch::kCPU),
-                      true);
+                      /*non_blocking=*/true);
+
+          mm_embeddings.clear();
+          mm_embeddings.reserve(sample_output.mm_embeddings.size());
+          for (const auto& seq_mm_embeddings : sample_output.mm_embeddings) {
+            std::vector<torch::Tensor> seq_out;
+            seq_out.reserve(seq_mm_embeddings.size());
+            for (const auto& mm_embedding : seq_mm_embeddings) {
+              seq_out.emplace_back(
+                  safe_to(mm_embedding, torch::kCPU, /*non_blocking=*/true));
+            }
+            mm_embeddings.emplace_back(std::move(seq_out));
+          }
+
+          dit_images.clear();
+          dit_images.reserve(dit_forward_output.tensors.size());
+          for (auto dit_image : dit_forward_output.tensors) {
+            dit_images.emplace_back(
+                safe_to(dit_image, torch::kCPU, /*non_blocking=*/true));
+          }
+          dit_text_output = dit_forward_output.text_output;
+          dit_audio.clear();
+          dit_audio.reserve(dit_forward_output.audio_tensors.size());
+          for (auto audio : dit_forward_output.audio_tensors) {
+            dit_audio.emplace_back(
+                safe_to(audio, torch::kCPU, /*non_blocking=*/true));
+          }
+
+          // [num_seq]
+          next_tokens = safe_to(sample_output.next_tokens,
+                                torch::kCPU,
+                                /*non_blocking=*/true);
+          if (next_tokens.defined()) {
+            // [num_seq]
+            logprobs = safe_to(sample_output.logprobs,
+                               torch::kCPU,
+                               /*non_blocking=*/true);
+
+            if (!beam_search_output.src_seq_idxes.defined()) {
+              // beam search kernel will provide final tokens/logprobs in beam
+              // search output, so keep top_tokens/top_logprobs undefined to
+              // avoid returning them.
+              // [num_seq, topk]
+              top_tokens = safe_to(sample_output.top_tokens,
+                                   torch::kCPU,
+                                   /*non_blocking=*/true);
+              // [num_seq, topk]
+              top_logprobs = safe_to(sample_output.top_logprobs,
+                                     torch::kCPU,
+                                     /*non_blocking=*/true);
+            }
+          }
+
+          // beam search output
+          // [num_seq]
+          src_seq_idxes = safe_to(beam_search_output.src_seq_idxes,
+                                  torch::kCPU,
+                                  /*non_blocking=*/true);
+          if (src_seq_idxes.defined()) {
+            // [num_seq]
+            out_tokens = safe_to(beam_search_output.out_tokens,
+                                 torch::kCPU,
+                                 /*non_blocking=*/true);
+            // [num_seq]
+            out_logprobs =
+                safe_to(beam_search_output.out_logprobs,
+                        torch::dtype(torch::kFloat32).device(torch::kCPU),
+                        /*non_blocking=*/true);
+          }
+        };
+        if (use_default_stream) {
+          copy_output_to_host();
+        } else {
+          c10::StreamGuard stream_guard = stream_->set_stream_guard();
+          copy_output_to_host();
         }
-        auto ret = stream_->synchronize();
+        if (use_default_stream) {
+          device_.synchronize_default_stream();
+        } else {
+          stream_->synchronize();
+        }
+        speculative_token_stats = record_speculative_metrics_from_output(
+            next_tokens,
+            sample_output.speculative_token_stats,
+            forward_outputs.value().is_graph_warmup);
       }
     }
   } else {
     auto int_options = torch::TensorOptions().device(torch::kCPU);
     if (worker_->is_driver()) {
       // construct fake output tensor
-      int32_t num_decode_seqs = fwd_input.sampling_params.sample_idxes.size(0);
+      int32_t num_decode_seqs =
+          get_num_decode_seqs_for_schedule_overlap(fwd_input);
       next_tokens = torch::arange(
           -1, -1 * (num_decode_seqs + 1), -1, int_options.dtype(torch::kInt32));
       std::move(future).deferValue([](auto&&) {});
@@ -166,7 +434,15 @@ void WorkerService::create_polling_shm_thread(
         Timer timer;
         while (true) {
           ForwardInput fwd_input;
-          input_shm_manager->raw_input_read(fwd_input, device_);
+          // NPU graph task updates cannot safely overlap an H2D enqueue from
+          // the SHM polling thread. Keep scheduler overlap, but defer device
+          // materialization to WorkerImpl's ordered prepare stream.
+          const InputDeviceMaterializationPolicy materialization_policy =
+              options_.enable_schedule_overlap() && options_.enable_graph()
+                  ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
+                  : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
+          input_shm_manager->input_read(
+              fwd_input, device_, materialization_policy);
           timer.reset();
           // model output variables
           torch::Tensor next_tokens;
@@ -174,14 +450,20 @@ void WorkerService::create_polling_shm_thread(
           torch::Tensor top_tokens;
           torch::Tensor top_logprobs;
           torch::Tensor embeddings;
-          std::vector<torch::Tensor> mm_embeddings;
+          std::vector<std::vector<torch::Tensor>> mm_embeddings;
+          std::vector<SpeculativeTokenStats> speculative_token_stats;
+          std::vector<torch::Tensor> dit_images;
+          std::vector<std::string> dit_text_output;
+          std::vector<torch::Tensor> dit_audio;
           torch::Tensor expert_load_data;
-          int32_t prepared_layer_id = -1;
+          int64_t prepared_token = -1;
 
           // beam search kernel output
           torch::Tensor src_seq_idxes;
           torch::Tensor out_tokens;
           torch::Tensor out_logprobs;
+          std::vector<JsonObjectOutputError> json_object_errors;
+          std::vector<std::string> failed_request_ids;
 
           step(fwd_input,
                next_tokens,
@@ -190,23 +472,37 @@ void WorkerService::create_polling_shm_thread(
                top_logprobs,
                embeddings,
                mm_embeddings,
+               speculative_token_stats,
+               dit_images,
+               dit_text_output,
+               dit_audio,
                expert_load_data,
-               prepared_layer_id,
+               prepared_token,
                src_seq_idxes,
                out_tokens,
-               out_logprobs);
+               out_logprobs,
+               json_object_errors,
+               failed_request_ids);
 
-          output_shm_manager->raw_output_write(next_tokens,
-                                               logprobs,
-                                               top_tokens,
-                                               top_logprobs,
-                                               embeddings,
-                                               mm_embeddings,
-                                               expert_load_data,
-                                               prepared_layer_id,
-                                               src_seq_idxes,
-                                               out_tokens,
-                                               out_logprobs);
+          const bool shm_write_ok =
+              output_shm_manager->raw_output_write(next_tokens,
+                                                   logprobs,
+                                                   top_tokens,
+                                                   top_logprobs,
+                                                   embeddings,
+                                                   mm_embeddings,
+                                                   speculative_token_stats,
+                                                   dit_images,
+                                                   dit_text_output,
+                                                   dit_audio,
+                                                   expert_load_data,
+                                                   prepared_token,
+                                                   src_seq_idxes,
+                                                   out_tokens,
+                                                   out_logprobs,
+                                                   json_object_errors,
+                                                   failed_request_ids);
+          CHECK(shm_write_ok) << "Worker output shared memory write failed.";
           COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
         }
       });
@@ -286,44 +582,28 @@ void WorkerService::AllocateKVCache(
     ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, request, response, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    std::vector<std::vector<int64_t>> kv_cache_shape;
-    const bool has_index_shape =
-        request->kv_cache_shape().index_shape_size() > 0;
-    const bool has_conv_shape = request->kv_cache_shape().conv_shape_size() > 0;
-    const bool has_ssm_shape = request->kv_cache_shape().ssm_shape_size() > 0;
-    const bool enable_gdn_attention = has_conv_shape || has_ssm_shape;
-    CHECK(!(has_index_shape && enable_gdn_attention))
-        << "KVCacheShape does not support index_shape with conv/ssm shapes "
-        << "simultaneously.";
-    // Reserve for key, value, and optional extra shapes
-    kv_cache_shape.reserve(enable_gdn_attention
-                               ? kKVCacheShapeSizeWithConvAndSsm
-                               : kKVCacheShapeSizeWithIndex);
-    kv_cache_shape.emplace_back(
-        std::vector<int64_t>(request->kv_cache_shape().key_shape().begin(),
-                             request->kv_cache_shape().key_shape().end()));
-    kv_cache_shape.emplace_back(
-        std::vector<int64_t>(request->kv_cache_shape().value_shape().begin(),
-                             request->kv_cache_shape().value_shape().end()));
-    // add index shape if exists
-    if (has_index_shape) {
-      kv_cache_shape.emplace_back(
-          std::vector<int64_t>(request->kv_cache_shape().index_shape().begin(),
-                               request->kv_cache_shape().index_shape().end()));
-    } else if (enable_gdn_attention) {
-      CHECK(has_conv_shape && has_ssm_shape)
-          << "conv_shape and ssm_shape must be provided together.";
-      kv_cache_shape.emplace_back(
-          std::vector<int64_t>(request->kv_cache_shape().conv_shape().begin(),
-                               request->kv_cache_shape().conv_shape().end()));
-      kv_cache_shape.emplace_back(
-          std::vector<int64_t>(request->kv_cache_shape().ssm_shape().begin(),
-                               request->kv_cache_shape().ssm_shape().end()));
-    }
-
+    const KVCacheShape kv_cache_shape =
+        KVCacheShape::from_proto(request->kv_cache_shape());
     auto future = worker_->allocate_kv_cache_async(kv_cache_shape);
     bool status = std::move(future).get();
     response->set_ok(status);
+  });
+  return;
+}
+
+void WorkerService::SetSpeculativeValidateTimePredictor(
+    ::google::protobuf::RpcController* controller,
+    const proto::SpeculativeValidateTimePredictor* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, request, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    SpeculativeProfileRegistry::ValidateTimePredictor predictor;
+    predictor.intercept_ms = request->intercept_ms();
+    predictor.query_token_ms = request->query_token_ms();
+    predictor.query_prefix_ms = request->query_prefix_ms();
+    response->set_ok(
+        worker_->set_speculative_validate_time_predictor(predictor));
   });
   return;
 }
@@ -335,35 +615,8 @@ void WorkerService::AllocateKVCacheWithTransfer(
     ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, req, resp, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    std::vector<std::vector<int64_t>> kv_cache_shape;
-    const auto& shape_req = req->kv_cache_shape();
-    const bool has_index_shape = shape_req.index_shape_size() > 0;
-    const bool has_conv_shape = shape_req.conv_shape_size() > 0;
-    const bool has_ssm_shape = shape_req.ssm_shape_size() > 0;
-    const bool enable_gdn_attention = has_conv_shape || has_ssm_shape;
-    CHECK(!(has_index_shape && enable_gdn_attention))
-        << "KVCacheShape does not support index_shape with conv/ssm shapes "
-        << "simultaneously.";
-    kv_cache_shape.reserve(enable_gdn_attention
-                               ? kKVCacheShapeSizeWithConvAndSsm
-                               : kKVCacheShapeSizeWithIndex);
-    kv_cache_shape.emplace_back(std::vector<int64_t>(
-        shape_req.key_shape().begin(), shape_req.key_shape().end()));
-    kv_cache_shape.emplace_back(std::vector<int64_t>(
-        shape_req.value_shape().begin(), shape_req.value_shape().end()));
-    // add index shape if exists
-    if (has_index_shape) {
-      kv_cache_shape.emplace_back(std::vector<int64_t>(
-          shape_req.index_shape().begin(), shape_req.index_shape().end()));
-    } else if (enable_gdn_attention) {
-      CHECK(has_conv_shape && has_ssm_shape)
-          << "conv_shape and ssm_shape must be provided together.";
-      kv_cache_shape.emplace_back(std::vector<int64_t>(
-          shape_req.conv_shape().begin(), shape_req.conv_shape().end()));
-      kv_cache_shape.emplace_back(std::vector<int64_t>(
-          shape_req.ssm_shape().begin(), shape_req.ssm_shape().end()));
-    }
-
+    const KVCacheShape kv_cache_shape =
+        KVCacheShape::from_proto(req->kv_cache_shape());
     auto future =
         worker_->allocate_kv_cache_with_transfer_async(kv_cache_shape);
     bool status = std::move(future).get();
@@ -380,13 +633,11 @@ void WorkerService::GetCacheInfo(::google::protobuf::RpcController* controller,
     brpc::ClosureGuard done_guard(done);
     uint64_t cluster_id;
     std::string addr;
-    int64_t k_cache_id;
-    int64_t v_cache_id;
-    worker_->get_cache_info(cluster_id, addr, k_cache_id, v_cache_id);
+    uint16_t listen_port;
+    worker_->get_cache_info(cluster_id, addr, listen_port);
     resp->set_cluster_id(cluster_id);
     resp->set_addr(addr);
-    resp->set_k_cache_id(k_cache_id);
-    resp->set_v_cache_id(v_cache_id);
+    resp->set_listen_port(listen_port);
   });
   return;
 }
@@ -397,20 +648,19 @@ void WorkerService::PullKVCache(::google::protobuf::RpcController* controller,
                                 ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, req, resp, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    uint64_t src_cluster_id = req->cluster_id();
-    std::string addr = req->addr();
-    int64_t src_k_cache_id = req->k_cache_id();
-    int64_t src_v_cache_id = req->v_cache_id();
-    std::vector<uint64_t> src_blocks(req->src_blocks().begin(),
-                                     req->src_blocks().end());
-    std::vector<uint64_t> dst_blocks(req->dst_blocks().begin(),
-                                     req->dst_blocks().end());
-    auto future = worker_->pull_kv_blocks_async(src_cluster_id,
-                                                addr,
-                                                src_k_cache_id,
-                                                src_v_cache_id,
-                                                src_blocks,
-                                                dst_blocks);
+    std::vector<KVTransferMapping> mappings;
+    mappings.reserve(req->mappings_size());
+    for (const proto::KVTransferMapping& proto_mapping : req->mappings()) {
+      KVTransferMapping mapping;
+      mapping.group_id = proto_mapping.group_id();
+      mapping.local_ids.assign(proto_mapping.local_ids().begin(),
+                               proto_mapping.local_ids().end());
+      mapping.remote_ids.assign(proto_mapping.remote_ids().begin(),
+                                proto_mapping.remote_ids().end());
+      mappings.emplace_back(std::move(mapping));
+    }
+    auto future =
+        worker_->pull_kv_blocks_async(req->cluster_id(), req->addr(), mappings);
     bool status = std::move(future).get();
     resp->set_ok(status);
   });
@@ -433,83 +683,63 @@ void WorkerService::TransferBlocks(
 
 void WorkerService::PrefetchFromStorage(
     google::protobuf::RpcController* controller,
-    const proto::BlockTransferInfos* req,
+    const proto::PrefetchRequest* req,
     proto::Status* resp,
     google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   brpc::Controller* cntl = static_cast<brpc::Controller*>(controller);
 
+  StoragePrefetchRequest request;
+  if (!proto_to_storage_prefetch_request(*req, &request)) {
+    resp->set_ok(false);
+    LOG(ERROR) << "Invalid Mooncake prefetch request.";
+    return;
+  }
+
+  PrefetchSessionCallbacks callbacks;
+  callbacks.get = [worker = worker_.get()](Slice<BlockTransferInfo>& blocks,
+                                           StoreGetStats* stats) {
+    return worker->prefetch_kv_blocks(blocks, stats);
+  };
+  callbacks.probe = [worker = worker_.get()](Slice<BlockTransferInfo>& blocks) {
+    return worker->probe_kv_blocks(blocks);
+  };
+  auto session =
+      std::make_shared<WorkerPrefetchSession>(copy_threadpool_.get(),
+                                              prefetch_stats_threadpool_.get(),
+                                              std::move(request),
+                                              options_.prefetch_batch_size(),
+                                              options_.server_idx(),
+                                              std::move(callbacks));
+
+  {
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    prefetch_sessions_.erase(std::remove_if(prefetch_sessions_.begin(),
+                                            prefetch_sessions_.end(),
+                                            [](const auto& weak_session) {
+                                              return weak_session.expired();
+                                            }),
+                             prefetch_sessions_.end());
+    prefetch_sessions_.emplace_back(session);
+  }
+
   brpc::StreamId stream_id;
   brpc::StreamOptions stream_options;
-  stream_options.idle_timeout_ms = 5 * options_.prefetch_bacth_size();
+  stream_options.idle_timeout_ms = -1;
+  stream_options.handler = session.get();
+  session->retain();
   if (brpc::StreamAccept(&stream_id, *cntl, &stream_options) != 0) {
+    session->release();
     resp->set_ok(false);
     LOG(ERROR) << "Failed to accept stream!";
     return;
   }
 
-  std::vector<BlockTransferInfo> block_transfer_info;
-  proto_to_block_transfer_info(*req, block_transfer_info);
-
-  copy_threadpool_.schedule([this,
-                             block_transfer_info =
-                                 std::move(block_transfer_info),
-                             stream_id = std::move(stream_id)]() mutable {
-    Slice<BlockTransferInfo> transfer_slice{block_transfer_info};
-    bool is_completed = false;
-
-    for (size_t i = 0; i < transfer_slice.size();
-         i += options_.prefetch_bacth_size()) {
-      auto current_slice = transfer_slice.slice(
-          i,
-          std::min(i + options_.prefetch_bacth_size(), transfer_slice.size()));
-
-      auto success_cnt =
-          worker_->transfer_kv_blocks(UNINITIALIZED_BATCH_ID, current_slice);
-
-      if (success_cnt != current_slice.size() ||
-          (i + options_.prefetch_bacth_size()) >= transfer_slice.size()) {
-        is_completed = true;
-      }
-
-      butil::IOBuf buf;
-      buf.append(std::to_string(success_cnt));
-      if (brpc::StreamWrite(stream_id, buf) != 0) {
-        brpc::StreamClose(stream_id);
-        return;
-      }
-
-      if (is_completed) {
-        if (success_cnt != 0) {
-          butil::IOBuf buf_end;
-          buf_end.append("0");
-          if (brpc::StreamWrite(stream_id, buf_end) != 0) {
-            brpc::StreamClose(stream_id);
-            return;
-          }
-        }
-        break;
-      }
-    }
-  });
-
   resp->set_ok(true);
-  return;
-}
-
-void WorkerService::GetDeviceInfo(::google::protobuf::RpcController* controller,
-                                  const proto::Empty* req,
-                                  proto::DeviceInfo* resp,
-                                  ::google::protobuf::Closure* done) {
-  threadpool_->schedule([this, controller, req, resp, done]() mutable {
-    brpc::ClosureGuard done_guard(done);
-    std::string device_ip;
-    uint16_t listen_port;
-    worker_->get_device_info(device_ip, listen_port);
-    resp->set_device_ip(device_ip);
-    resp->set_listen_port(listen_port);
-  });
-  return;
+  if (google::protobuf::Closure* response_done = done_guard.release()) {
+    response_done->Run();
+  }
+  session->start(stream_id);
 }
 
 void WorkerService::LinkCluster(::google::protobuf::RpcController* controller,
@@ -521,11 +751,9 @@ void WorkerService::LinkCluster(::google::protobuf::RpcController* controller,
     std::vector<uint64_t> cluster_ids(req->cluster_ids().begin(),
                                       req->cluster_ids().end());
     std::vector<std::string> addrs(req->addrs().begin(), req->addrs().end());
-    std::vector<std::string> device_ips(req->device_ips().begin(),
-                                        req->device_ips().end());
     std::vector<uint16_t> ports(req->ports().begin(), req->ports().end());
 
-    bool status = worker_->link_cluster(cluster_ids, addrs, device_ips, ports);
+    bool status = worker_->link_cluster(cluster_ids, addrs, ports);
     resp->set_ok(status);
   });
   return;
@@ -540,39 +768,47 @@ void WorkerService::UnlinkCluster(::google::protobuf::RpcController* controller,
     std::vector<uint64_t> cluster_ids(req->cluster_ids().begin(),
                                       req->cluster_ids().end());
     std::vector<std::string> addrs(req->addrs().begin(), req->addrs().end());
-    std::vector<std::string> device_ips(req->device_ips().begin(),
-                                        req->device_ips().end());
     std::vector<uint16_t> ports(req->ports().begin(), req->ports().end());
 
-    bool status =
-        worker_->unlink_cluster(cluster_ids, addrs, device_ips, ports);
+    bool status = worker_->unlink_cluster(cluster_ids, addrs, ports);
     resp->set_ok(status);
   });
   return;
 }
 
-void WorkerService::LinkD2D(::google::protobuf::RpcController* controller,
-                            const proto::D2DLinkWorkerRequest* req,
+void WorkerService::LinkP2P(::google::protobuf::RpcController* controller,
+                            const proto::P2PLinkWorkerRequest* req,
                             proto::Status* resp,
                             ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, req, resp, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    bool status = worker_->link_d2d(req->remote_addr());
+    bool status = worker_->link_p2p(req->remote_addr());
     resp->set_ok(status);
   });
   return;
 }
 
-void WorkerService::UnlinkD2D(::google::protobuf::RpcController* controller,
-                              const proto::D2DLinkWorkerRequest* req,
+void WorkerService::UnlinkP2P(::google::protobuf::RpcController* controller,
+                              const proto::P2PLinkWorkerRequest* req,
                               proto::Status* resp,
                               ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, req, resp, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    bool status = worker_->unlink_d2d(req->remote_addr());
+    bool status = worker_->unlink_p2p(req->remote_addr());
     resp->set_ok(status);
   });
   return;
+}
+
+void WorkerService::UpdateWeights(::google::protobuf::RpcController* controller,
+                                  const proto::UpdateWeightsRequest* req,
+                                  proto::Status* resp,
+                                  ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    bool status = worker_->update_weights(req->weights_path());
+    resp->set_ok(status);
+  });
 }
 
 void WorkerService::Sleep(::google::protobuf::RpcController* controller,
@@ -603,11 +839,37 @@ void WorkerService::Wakeup(::google::protobuf::RpcController* controller,
       std::vector<WeightSegment> segments;
       segments.reserve(seg_list.segments_size());
       for (const auto& proto_seg : seg_list.segments()) {
-        segments.push_back({proto_seg.offset(), proto_seg.size()});
+        segments.emplace_back(proto_seg.offset(), proto_seg.size());
       }
       options.src_weight_segments.push_back(std::move(segments));
     }
     bool status = worker_->wakeup(options);
+    resp->set_ok(status);
+  });
+
+  return;
+}
+
+void WorkerService::StartProfile(::google::protobuf::RpcController* controller,
+                                 const proto::Empty* req,
+                                 proto::Status* resp,
+                                 ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    bool status = worker_->start_profile();
+    resp->set_ok(status);
+  });
+
+  return;
+}
+
+void WorkerService::StopProfile(::google::protobuf::RpcController* controller,
+                                const proto::Empty* req,
+                                proto::Status* resp,
+                                ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    bool status = worker_->stop_profile();
     resp->set_ok(status);
   });
 
@@ -625,8 +887,12 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
 
         Timer timer;
         ForwardInput forward_input;
-        proto_to_forward_input(
-            pb_forward_input, forward_input, options_.num_decoding_tokens());
+        CHECK(pb_forward_input->has_packed_input())
+            << "ForwardInput must be sent via packed_input";
+        packed_proto_to_forward_input(pb_forward_input->packed_input(),
+                                      forward_input,
+                                      device_,
+                                      stream_.get());
 
         // model output
         torch::Tensor next_tokens;
@@ -634,13 +900,19 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         torch::Tensor top_tokens;
         torch::Tensor top_logprobs;
         torch::Tensor embeddings;
-        std::vector<torch::Tensor> mm_embeddings;
+        std::vector<std::vector<torch::Tensor>> mm_embeddings;
+        std::vector<SpeculativeTokenStats> speculative_token_stats;
+        std::vector<torch::Tensor> dit_images;
+        std::vector<std::string> dit_text_output;
+        std::vector<torch::Tensor> dit_audio;
         torch::Tensor expert_load_data;
-        int32_t prepared_layer_id = -1;
+        int64_t prepared_token = -1;
         // beam search kernel output
         torch::Tensor src_seq_idxes;
         torch::Tensor out_tokens;
         torch::Tensor out_logprobs;
+        std::vector<JsonObjectOutputError> json_object_errors;
+        std::vector<std::string> failed_request_ids;
 
         step(forward_input,
              next_tokens,
@@ -649,22 +921,35 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
              top_logprobs,
              embeddings,
              mm_embeddings,
+             speculative_token_stats,
+             dit_images,
+             dit_text_output,
+             dit_audio,
              expert_load_data,
-             prepared_layer_id,
+             prepared_token,
              src_seq_idxes,
              out_tokens,
-             out_logprobs);
+             out_logprobs,
+             json_object_errors,
+             failed_request_ids);
         // convert to proto output
         forward_output_to_proto(next_tokens,
                                 logprobs,
                                 top_tokens,
                                 top_logprobs,
                                 embeddings,
+                                mm_embeddings,
+                                speculative_token_stats,
                                 expert_load_data,
-                                prepared_layer_id,
+                                prepared_token,
                                 src_seq_idxes,
                                 out_tokens,
                                 out_logprobs,
+                                dit_images,
+                                dit_text_output,
+                                dit_audio,
+                                json_object_errors,
+                                failed_request_ids,
                                 pb_forward_output);
         COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
       });
@@ -678,58 +963,140 @@ void WorkerService::GetLastStepResult(
   threadpool_->schedule(
       [this, controller, req, pb_forward_output, done]() mutable {
         brpc::ClosureGuard done_guard(done);
+        const bool use_default_stream =
+            !options_.enable_schedule_overlap() && options_.backend() == "llm";
 
         auto future = worker_->get_last_step_result_async();
         auto forward_outputs = std::move(future).get();
         if (forward_outputs) {
-          const auto& sample_output = forward_outputs.value().sample_output;
-          const auto& expert_load_data = safe_to(
-              forward_outputs.value().expert_load_data, torch::kCPU, true);
-          int32_t prepared_layer_id = forward_outputs.value().prepared_layer_id;
-          const auto& beam_search_output =
-              forward_outputs.value().beam_search_output;
-          c10::StreamGuard streamGuard = stream_->set_stream_guard();
-          // [num_seq, ..., embed_dim]
-          auto embeddings =
-              safe_to(sample_output.embeddings, torch::kCPU, true);
-          embeddings = safe_to(embeddings, torch::kFloat32, true);
+          const ForwardOutput& forward_output = forward_outputs.value();
+          const auto& sample_output = forward_output.sample_output;
+          int64_t prepared_token = forward_output.prepared_token;
+          const auto& beam_search_output = forward_output.beam_search_output;
+          torch::Tensor expert_load_data;
+          torch::Tensor embeddings;
+          torch::Tensor next_tokens;
+          torch::Tensor logprobs;
+          torch::Tensor top_tokens;
+          torch::Tensor top_logprobs;
+          torch::Tensor src_seq_idxes;
+          torch::Tensor out_tokens;
+          torch::Tensor out_logprobs;
+          std::vector<SpeculativeTokenStats> speculative_token_stats;
+          std::vector<torch::Tensor> dit_images;
+          std::vector<std::string> dit_text_output;
+          std::vector<torch::Tensor> dit_audio;
+          auto copy_output_to_host = [&]() {
+            if (options_.enable_schedule_overlap()) {
+              CHECK(stream_->wait_event(forward_output.ready_event))
+                  << "failed to wait forward output ready event";
+            }
+            expert_load_data = safe_to(forward_output.expert_load_data,
+                                       torch::kCPU,
+                                       /*non_blocking=*/true);
 
-          // [num_seq]
-          const auto& next_tokens =
-              safe_to(sample_output.next_tokens, torch::kCPU, true);
-          if (next_tokens.defined() || FLAGS_enable_eplb) {
-            // [num_seq] FloatTensor
-            const auto& logprobs =
-                safe_to(sample_output.logprobs, torch::kCPU, true);
-            // [num_seq, topk]
-            const auto& top_tokens =
-                safe_to(sample_output.top_tokens, torch::kCPU, true);
-            // [num_seq, topk]
-            const auto& top_logprobs =
-                safe_to(sample_output.top_logprobs, torch::kCPU, true);
-            // [num_seq]
-            const auto& src_seq_idxes =
-                safe_to(beam_search_output.src_seq_idxes, torch::kCPU, true);
-            // [num_seq]
-            const auto& out_tokens =
-                safe_to(beam_search_output.out_tokens, torch::kCPU, true);
-            // [num_seq]
-            const auto& out_logprobs =
-                safe_to(beam_search_output.out_logprobs,
-                        torch::dtype(torch::kFloat32).device(torch::kCPU),
-                        true);
-            auto ret = stream_->synchronize();
+            // [num_seq, ..., embed_dim]
+            embeddings = safe_to(sample_output.embeddings,
+                                 torch::kCPU,
+                                 /*non_blocking=*/true);
+            embeddings = safe_to(embeddings,
+                                 torch::kFloat32,
+                                 /*non_blocking=*/true);
 
+            dit_images.reserve(
+                forward_output.dit_forward_output.tensors.size());
+            for (auto image : forward_output.dit_forward_output.tensors) {
+              dit_images.emplace_back(image);
+            }
+            dit_text_output =
+                forward_outputs.value().dit_forward_output.text_output;
+            dit_audio.reserve(
+                forward_output.dit_forward_output.audio_tensors.size());
+            for (auto audio : forward_output.dit_forward_output.audio_tensors) {
+              dit_audio.emplace_back(audio);
+            }
+
+            // [num_seq]
+            next_tokens = safe_to(sample_output.next_tokens,
+                                  torch::kCPU,
+                                  /*non_blocking=*/true);
+            if (next_tokens.defined() ||
+                ::xllm::EPLBConfig::get_instance().enable_eplb()) {
+              // [num_seq] FloatTensor
+              logprobs = safe_to(sample_output.logprobs,
+                                 torch::kCPU,
+                                 /*non_blocking=*/true);
+              // [num_seq, topk]
+              top_tokens = safe_to(sample_output.top_tokens,
+                                   torch::kCPU,
+                                   /*non_blocking=*/true);
+              // [num_seq, topk]
+              top_logprobs = safe_to(sample_output.top_logprobs,
+                                     torch::kCPU,
+                                     /*non_blocking=*/true);
+              // [num_seq]
+              src_seq_idxes = safe_to(beam_search_output.src_seq_idxes,
+                                      torch::kCPU,
+                                      /*non_blocking=*/true);
+              // [num_seq]
+              out_tokens = safe_to(beam_search_output.out_tokens,
+                                   torch::kCPU,
+                                   /*non_blocking=*/true);
+              // [num_seq]
+              out_logprobs =
+                  safe_to(beam_search_output.out_logprobs,
+                          torch::dtype(torch::kFloat32).device(torch::kCPU),
+                          /*non_blocking=*/true);
+            }
+          };
+
+          if (use_default_stream) {
+            copy_output_to_host();
+          } else {
+            c10::StreamGuard stream_guard = stream_->set_stream_guard();
+            if (forward_outputs.value().ready_event != nullptr) {
+              CHECK(stream_->wait_event(forward_outputs.value().ready_event))
+                  << "wait forward output ready event failed.";
+            }
+            copy_output_to_host();
+          }
+          if (use_default_stream) {
+            device_.synchronize_default_stream();
+          } else {
+            stream_->synchronize();
+#if defined(USE_NPU)
+            DeviceMonitor::get_instance().update_active_activation_memory(
+                device_.index());
+#endif
+          }
+          speculative_token_stats = record_speculative_metrics_from_output(
+              next_tokens,
+              sample_output.speculative_token_stats,
+              forward_output.is_graph_warmup);
+
+          if (next_tokens.defined() || !dit_images.empty() ||
+              !dit_text_output.empty() || !dit_audio.empty() ||
+              ::xllm::EPLBConfig::get_instance().enable_eplb() ||
+              !forward_output.json_object_errors.empty() ||
+              !forward_output.failed_request_ids.empty()) {
+            const std::vector<std::vector<torch::Tensor>> mm_embeddings;
             forward_output_to_proto(next_tokens,
                                     logprobs,
                                     top_tokens,
                                     top_logprobs,
                                     embeddings,
+                                    mm_embeddings,
+                                    speculative_token_stats,
                                     expert_load_data,
-                                    prepared_layer_id,
+                                    prepared_token,
                                     src_seq_idxes,
                                     out_tokens,
                                     out_logprobs,
+                                    dit_images,
+                                    dit_text_output,
+                                    dit_audio,
+                                    forward_output.json_object_errors,
+                                    forward_output.failed_request_ids,
                                     pb_forward_output);
           }
         }

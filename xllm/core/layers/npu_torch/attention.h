@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,6 +24,9 @@ limitations under the License.
 #include "layers/common/attention_metadata.h"
 
 namespace xllm {
+
+class ProcessGroup;
+
 namespace layer {
 
 class AttentionImpl : public torch::nn::Module {
@@ -34,7 +37,9 @@ class AttentionImpl : public torch::nn::Module {
                 int64_t head_size,
                 float scale,
                 int64_t num_kv_heads,
-                int64_t sliding_window);
+                int64_t sliding_window,
+                bool enable_fia_decode = false,
+                ProcessGroup* dcp_group = nullptr);
 
   std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
       const AttentionMetadata& attn_metadata,
@@ -63,6 +68,8 @@ class AttentionImpl : public torch::nn::Module {
   float scale_;
   int64_t num_kv_heads_;
   int64_t sliding_window_;
+  bool enable_fia_decode_ = false;
+  ProcessGroup* dcp_group_ = nullptr;
 };
 TORCH_MODULE(Attention);
 

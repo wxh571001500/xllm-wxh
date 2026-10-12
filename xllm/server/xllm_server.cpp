@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,11 +17,106 @@ limitations under the License.
 
 #include <brpc/server.h>
 #include <butil/at_exit.h>
+#include <unistd.h>
+
+#include <array>
+#include <csignal>
 
 #include "core/common/global_flags.h"
+#include "core/framework/config/disagg_pd_config.h"
+#include "core/framework/config/distributed_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/service_config.h"
 #include "health_reporter.h"
 
 namespace xllm {
+
+namespace {
+volatile std::sig_atomic_t g_quit_flag = 0;
+
+void quit_signal_handler(int /*signum*/) { g_quit_flag = 1; }
+
+constexpr const char* kApiServiceRoutes =
+    "v1/completions => CompletionsHttp,"
+    "v1/sample => SampleHttp,"
+    "v1/chat/completions => ChatCompletionsHttp,"
+    "v1/embeddings => EmbeddingsHttp,"
+    "v1/models => ModelsHttp,"
+    "v1/image/generation => ImageGenerationHttp,"
+    "v1/audio/generation => AudioGenerationHttp,"
+    "v1/audio/transcriptions => AudioTranscriptionHttp,"
+    "v1/audio/translations => AudioTranslationHttp,"
+    "v1/text/generation => TextGenerationHttp,"
+    "v1/video/generation => VideoGenerationHttp,"
+    "v1/rerank => RerankHttp,"
+    "v1/messages => AnthropicMessagesHttp,"
+    "v2/repository/index => ModelVersionsHttp,"
+    "fork_master => ForkMasterHttp,"
+    "sleep => SleepHttp,"
+    "wakeup => WakeupHttp,"
+    "start_profile => StartProfileHttp,"
+    "stop_profile => StopProfileHttp,"
+    "pause => PauseHttp,"
+    "resume => ResumeHttp,"
+    "link_p2p => LinkP2PHttp,"
+    "unlink_p2p => UnlinkP2PHttp";
+
+constexpr const char* kForkOnlyRoute = "fork_master => ForkMasterHttp";
+
+struct ApiRouteBinding {
+  const char* name;
+  bool (*enabled)();
+  const char* routes;
+};
+
+bool is_master_node() {
+  return ::xllm::DistributedConfig::get_instance().node_rank() == 0;
+}
+
+bool is_xtensor_node() {
+  return ::xllm::DistributedConfig::get_instance().node_rank() != 0 &&
+         ::xllm::KVCacheConfig::get_instance().enable_xtensor();
+}
+
+const char* get_api_service_routes_for_current_mode() {
+  static constexpr std::array<ApiRouteBinding, 2> kBindings = {{
+      {"master_node", &is_master_node, kApiServiceRoutes},
+      {"xtensor_node", &is_xtensor_node, kForkOnlyRoute},
+  }};
+  for (const auto& binding : kBindings) {
+    if (binding.enabled()) {
+      LOG(INFO) << "Use API route mode: " << binding.name;
+      return binding.routes;
+    }
+  }
+  return nullptr;
+}
+
+void install_quit_signal_handler() {
+  g_quit_flag = 0;
+  struct sigaction sa = {};
+  sa.sa_handler = quit_signal_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+}
+
+void wait_for_quit_signal() {
+  while (!g_quit_flag) {
+    sleep(1);
+  }
+}
+
+bool configure_generic_server(brpc::Server* server,
+                              google::protobuf::Service* service,
+                              const std::string& server_name) {
+  if (server->AddService(service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+    LOG(ERROR) << "Fail to add " << server_name << " service";
+    return false;
+  }
+  return true;
+}
+}  // namespace
 
 XllmServer::XllmServer() { butil::AtExitManager exit_manager; }
 
@@ -35,69 +130,73 @@ XllmServer::~XllmServer() {
 
 bool XllmServer::start(std::unique_ptr<APIService> service) {
   server_ = std::make_unique<brpc::Server>();
-  if (FLAGS_node_rank == 0) {
-    if (server_->AddService(service.get(),
-                            brpc::SERVER_DOESNT_OWN_SERVICE,
-                            "v1/completions => CompletionsHttp,"
-                            "v1/sample => SampleHttp,"
-                            "v1/chat/completions => ChatCompletionsHttp,"
-                            "v1/embeddings => EmbeddingsHttp,"
-                            "v1/models => ModelsHttp,"
-                            "v1/image/generation => ImageGenerationHttp,"
-                            "v1/rerank => RerankHttp,"
-                            "v1/messages => AnthropicMessagesHttp,"
-                            "v2/repository/index => ModelVersionsHttp,"
-                            "fork_master => ForkMasterHttp,"
-                            "sleep => SleepHttp,"
-                            "wakeup => WakeupHttp,"
-                            "link_d2d => LinkD2DHttp,"
-                            "unlink_d2d => UnlinkD2DHttp") != 0) {
+  if (const char* routes = get_api_service_routes_for_current_mode();
+      routes != nullptr) {
+    if (server_->AddService(
+            service.get(), brpc::SERVER_DOESNT_OWN_SERVICE, routes) != 0) {
       LOG(ERROR) << "Fail to add api service";
       return false;
     }
-  } else if (FLAGS_enable_xtensor) {
-    if (server_->AddService(service.get(),
-                            brpc::SERVER_DOESNT_OWN_SERVICE,
-                            "fork_master => ForkMasterHttp") != 0) {
-      LOG(ERROR) << "Fail to add api service";
-      return false;
-    }
+  } else {
+    LOG(INFO) << "No API routes enabled on current node mode.";
   }
 
   brpc::ServerOptions options;
   // TODO: enable arean message factory later.
   // options.rpc_pb_message_factory =
   //    brpc::GetArenaRpcPBMessageFactory<1024 * 1024, 1024 * 1024 * 128>();
-  options.idle_timeout_sec = FLAGS_rpc_idle_timeout_s;
-  options.num_threads = FLAGS_num_threads;
+  options.idle_timeout_sec =
+      ::xllm::ServiceConfig::get_instance().rpc_idle_timeout_s();
+  options.num_threads = ::xllm::ServiceConfig::get_instance().num_threads();
   // Use custom health reporter for /health endpoint
   options.health_reporter = &HealthReporter::instance();
-  if (server_->Start(FLAGS_port, &options) != 0) {
-    LOG(ERROR) << "Failed to start server on port " << FLAGS_port;
+  if (server_->Start(::xllm::ServiceConfig::get_instance().port(), &options) !=
+      0) {
+    LOG(ERROR) << "Failed to start server on port "
+               << ::xllm::ServiceConfig::get_instance().port();
     return false;
   }
-  LOG(INFO) << "Brpc Server started on port " << FLAGS_port
-            << ", idle_timeout_s: " << FLAGS_rpc_idle_timeout_s
-            << ", num_threads: " << FLAGS_num_threads;
+  LOG(INFO) << "Brpc Server started on port "
+            << ::xllm::ServiceConfig::get_instance().port()
+            << ", idle_timeout_s: "
+            << ::xllm::ServiceConfig::get_instance().rpc_idle_timeout_s()
+            << ", num_threads: "
+            << ::xllm::ServiceConfig::get_instance().num_threads();
 
   listen_address_ =
       std::string(butil::endpoint2str(server_->listen_address()).c_str());
-  listen_port_ = FLAGS_port;
+  listen_port_ = ::xllm::ServiceConfig::get_instance().port();
   has_initialized_ = true;
-  // Wait until Ctrl-C is pressed, then Stop() and Join() the server.
-  server_->RunUntilAskedToQuit();
+
+  auto pid = getpid();
+  LOG(INFO) << "     Started server process [" << pid << "]";
+  LOG(INFO) << "     Waiting for application startup.";
+  LOG(INFO) << "     Application startup complete.";
+
+  install_quit_signal_handler();
+  wait_for_quit_signal();
+
+  LOG(INFO) << "     Shutting down";
+  LOG(INFO) << "     Waiting for application shutdown.";
+
+  stop();
+
+  LOG(INFO) << "     Application shutdown complete.";
+  LOG(INFO) << "     Finished server process [" << pid << "]";
 
   return true;
 }
 
 bool XllmServer::start(std::unique_ptr<DisaggPDService> service) {
   std::string addr("");
-  if (!FLAGS_host.empty()) {
-    addr = FLAGS_host + ":" + std::to_string(FLAGS_disagg_pd_port);
+  if (!::xllm::ServiceConfig::get_instance().host().empty()) {
+    addr =
+        ::xllm::ServiceConfig::get_instance().host() + ":" +
+        std::to_string(::xllm::DisaggPDConfig::get_instance().disagg_pd_port());
   }
   if (!create_server((google::protobuf::Service*)(service.get()),
                      addr,
-                     FLAGS_disagg_pd_port,
+                     ::xllm::DisaggPDConfig::get_instance().disagg_pd_port(),
                      "Disagg PD")) {
     return false;
   }
@@ -110,12 +209,14 @@ bool XllmServer::start(std::unique_ptr<DisaggPDService> service) {
 
 bool XllmServer::start(std::unique_ptr<PDOOCService> service) {
   std::string addr("");
-  if (!FLAGS_host.empty()) {
-    addr = FLAGS_host + ":" + std::to_string(FLAGS_disagg_pd_port);
+  if (!::xllm::ServiceConfig::get_instance().host().empty()) {
+    addr =
+        ::xllm::ServiceConfig::get_instance().host() + ":" +
+        std::to_string(::xllm::DisaggPDConfig::get_instance().disagg_pd_port());
   }
   if (!create_server((google::protobuf::Service*)(service.get()),
                      addr,
-                     FLAGS_disagg_pd_port,
+                     ::xllm::DisaggPDConfig::get_instance().disagg_pd_port(),
                      "PD OOC")) {
     return false;
   }
@@ -145,54 +246,18 @@ bool XllmServer::start(std::shared_ptr<CollectiveService> service,
 
 bool XllmServer::start(std::shared_ptr<WorkerService> service,
                        const std::string& addr) {
-  server_ = std::make_unique<brpc::Server>();
-  if (server_->AddService(service.get(), brpc::SERVER_DOESNT_OWN_SERVICE) !=
-      0) {
-    LOG(ERROR) << "Fail to add DistributeWorker service";
-    return false;
-  }
-
-  brpc::ServerOptions options;
-  options.idle_timeout_sec = FLAGS_rpc_idle_timeout_s;
-  options.num_threads = FLAGS_num_threads;
-  listen_address_ = addr;
-  if (server_->Start(addr.c_str(), &options) != 0) {
-    LOG(ERROR) << "Failed to start distribute server on address: " << addr;
-    return false;
-  }
-  listen_port_ = server_->listen_address().port;
-  LOG(INFO) << "DistributeWorker started on address "
-            << server_->listen_address()
-            << ", idle_timeout_sec: " << FLAGS_rpc_idle_timeout_s
-            << ", num_threads: " << FLAGS_num_threads;
-
-  return true;
+  return create_server(static_cast<google::protobuf::Service*>(service.get()),
+                       addr,
+                       -1,
+                       "DistributeWorker");
 }
 
 bool XllmServer::start(std::shared_ptr<XTensorDistService> service,
                        const std::string& addr) {
-  server_ = std::make_unique<brpc::Server>();
-  if (server_->AddService(service.get(), brpc::SERVER_DOESNT_OWN_SERVICE) !=
-      0) {
-    LOG(ERROR) << "Fail to add XTensorDist service";
-    return false;
-  }
-
-  brpc::ServerOptions options;
-  options.idle_timeout_sec = FLAGS_rpc_idle_timeout_s;
-  options.num_threads = FLAGS_num_threads;
-  listen_address_ = addr;
-  if (server_->Start(addr.c_str(), &options) != 0) {
-    LOG(ERROR) << "Failed to start XTensorDist server on address: " << addr;
-    return false;
-  }
-  listen_port_ = server_->listen_address().port;
-  LOG(INFO) << "XTensorDist server started on address "
-            << server_->listen_address()
-            << ", idle_timeout_sec: " << FLAGS_rpc_idle_timeout_s
-            << ", num_threads: " << FLAGS_num_threads;
-
-  return true;
+  return create_server(static_cast<google::protobuf::Service*>(service.get()),
+                       addr,
+                       -1,
+                       "XTensorDist");
 }
 
 bool XllmServer::create_server(google::protobuf::Service* service,
@@ -200,14 +265,14 @@ bool XllmServer::create_server(google::protobuf::Service* service,
                                int port,
                                const std::string& server_name) {
   server_ = std::make_unique<brpc::Server>();
-  if (server_->AddService(service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-    LOG(ERROR) << "Fail to add " << server_name << " service";
+  if (!configure_generic_server(server_.get(), service, server_name)) {
     return false;
   }
 
   brpc::ServerOptions options;
-  options.idle_timeout_sec = FLAGS_rpc_idle_timeout_s;
-  options.num_threads = FLAGS_num_threads;
+  options.idle_timeout_sec =
+      ::xllm::ServiceConfig::get_instance().rpc_idle_timeout_s();
+  options.num_threads = ::xllm::ServiceConfig::get_instance().num_threads();
   butil::EndPoint endpoint;
   if (!addr.empty()) {
     listen_address_ = addr;
@@ -218,19 +283,23 @@ bool XllmServer::create_server(google::protobuf::Service* service,
     }
   } else {
     endpoint = butil::EndPoint(butil::IP_ANY, port);
-    listen_address_ =
-        std::string(butil::endpoint2str(server_->listen_address()).c_str());
   }
-  listen_port_ = port > 0 ? port : server_->listen_address().port;
 
   if (server_->Start(endpoint, &options) != 0) {
     LOG(ERROR) << "Failed to start " << server_name
                << " server on address: " << endpoint;
     return false;
   }
-  LOG(INFO) << server_name << " server started on address " << endpoint
-            << ", idle_timeout_sec: " << FLAGS_rpc_idle_timeout_s
-            << ", num_threads: " << FLAGS_num_threads;
+
+  listen_address_ =
+      std::string(butil::endpoint2str(server_->listen_address()).c_str());
+  listen_port_ = server_->listen_address().port;
+
+  LOG(INFO) << server_name << " server started on address "
+            << server_->listen_address() << ", idle_timeout_sec: "
+            << ::xllm::ServiceConfig::get_instance().rpc_idle_timeout_s()
+            << ", num_threads: "
+            << ::xllm::ServiceConfig::get_instance().num_threads();
 
   return true;
 }
@@ -245,6 +314,9 @@ void XllmServer::run() {
 }
 
 void XllmServer::stop() {
+  if (!server_) {
+    return;
+  }
   server_->Stop(0);
   server_->Join();
 }

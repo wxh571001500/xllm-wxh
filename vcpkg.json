@@ -72,6 +72,11 @@
       "version>=": "1.1.10"
     },
     {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "avformat", "swscale", "swresample", "x264"]
+    },
+    {
       "name": "opencv4",
       "version>=": "4.7.0",
       "default-features": false,
@@ -100,10 +105,6 @@
     {
       "name": "eigen3",
       "version>=": "3.4.0"
-    },
-    {
-      "name": "openmpi",
-      "version>=": "4.1.6"
     }
   ],
   "builtin-baseline": "fba75d09065fcc76a25dcf386b1d00d33f5175af"

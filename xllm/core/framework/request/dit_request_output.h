@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -31,17 +31,36 @@ struct DiTGenerationOutput {
   // the index of the sequence in the request.
   size_t index;
 
-  // the generated image in torch tensor format.
+  // the generated image as encoded image bytes.
   std::string image;
 
-  // the height of the generated image.
+  // the generated video as encoded video bytes.
+  std::string video;
+
+  // the generated audio as raw WAV bytes (audio models only).
+  std::string audio;
+
+  // the generated text (text diffusion models like Cola-DLM).
+  std::string text;
+
+  // the height of the generated image/video.
   int32_t height;
 
-  // the width of the generated image.
+  // the width of the generated image/video.
   int32_t width;
 
-  // seed used for image generation.
-  int64_t seed;
+  // seed used for generation (only valid when seed_is_set is true).
+  int64_t seed = 0;
+
+  // True when the client explicitly requested a seed (omit in API response when
+  // false so stochastic runs are not reported as seed=0).
+  bool seed_is_set = false;
+
+  // number of video frames
+  int32_t num_frames = 0;
+
+  // video fps
+  double video_fps = 0.0;
 };
 
 struct DiTRequestOutput {

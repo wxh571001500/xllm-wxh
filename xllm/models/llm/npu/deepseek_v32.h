@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -54,6 +54,115 @@ class DeepseekV32DecoderLayerImpl : public torch::nn::Module {
                           event_flag);
   }
 
+  torch::Tensor forward_with_topk(torch::Tensor& x,
+                                  torch::Tensor& cos_pos,
+                                  torch::Tensor& sin_pos,
+                                  torch::Tensor& attn_mask,
+                                  KVCache& kv_cache,
+                                  const ModelInputParams& input_params,
+                                  const torch::Tensor& shared_topk_indices,
+                                  torch::Tensor* output_topk_indices,
+                                  aclrtEvent* event,
+                                  std::atomic<bool>* event_flag) {
+    return decoder_layer_->forward_with_topk(x,
+                                             cos_pos,
+                                             sin_pos,
+                                             attn_mask,
+                                             kv_cache,
+                                             input_params,
+                                             shared_topk_indices,
+                                             output_topk_indices,
+                                             event,
+                                             event_flag);
+  }
+
+  void forward_with_mtp_topk(torch::Tensor& x,
+                             torch::Tensor& cos_pos,
+                             torch::Tensor& sin_pos,
+                             torch::Tensor& attn_mask,
+                             KVCache& kv_cache,
+                             const ModelInputParams& input_params,
+                             torch::Tensor& topk_indices,
+                             int32_t index_topk,
+                             const torch::Device& device,
+                             int32_t layer_index,
+                             aclrtEvent* event,
+                             std::atomic<bool>* event_flag) {
+    const bool topk_sharing_enabled = is_topk_sharing_enabled();
+    const bool should_skip_topk = skip_topk();
+    const bool should_output_topk = output_topk();
+    const bool use_mtp_topk_fallback = should_skip_topk &&
+                                       !topk_indices.defined() &&
+                                       decoder_layer_->has_mtp_topk_fallback();
+    torch::Tensor current_topk_indices;
+    torch::Tensor shared_topk_indices;
+    torch::Tensor* output_topk_indices = nullptr;
+    if (topk_sharing_enabled) {
+      if (should_skip_topk && !use_mtp_topk_fallback) {
+        CHECK(topk_indices.defined())
+            << "DSA top-k sharing requires previous top-k indices at MTP layer "
+            << layer_index;
+        shared_topk_indices = topk_indices;
+      }
+      if (should_output_topk || use_mtp_topk_fallback) {
+        torch::Tensor index_cache = kv_cache.get_index_cache();
+        CHECK(index_cache.defined())
+            << "DSA top-k sharing requires index cache at MTP layer "
+            << layer_index;
+        current_topk_indices = torch::empty(
+            std::vector<int64_t>{x.size(0),
+                                 index_cache.size(2),
+                                 static_cast<int64_t>(index_topk)},
+            torch::TensorOptions().device(device).dtype(torch::kInt32));
+        output_topk_indices = &current_topk_indices;
+      }
+    }
+    if (use_mtp_topk_fallback) {
+      decoder_layer_->forward_with_mtp_topk_fallback(x,
+                                                     cos_pos,
+                                                     sin_pos,
+                                                     attn_mask,
+                                                     kv_cache,
+                                                     input_params,
+                                                     output_topk_indices,
+                                                     event,
+                                                     event_flag);
+    } else if (topk_sharing_enabled) {
+      forward_with_topk(x,
+                        cos_pos,
+                        sin_pos,
+                        attn_mask,
+                        kv_cache,
+                        input_params,
+                        shared_topk_indices,
+                        output_topk_indices,
+                        event,
+                        event_flag);
+    } else {
+      forward(x,
+              cos_pos,
+              sin_pos,
+              attn_mask,
+              kv_cache,
+              input_params,
+              event,
+              event_flag);
+    }
+    if (use_mtp_topk_fallback || should_output_topk) {
+      topk_indices = current_topk_indices;
+    } else if (should_skip_topk) {
+      topk_indices = shared_topk_indices;
+    }
+  }
+
+  bool is_topk_sharing_enabled() const {
+    return decoder_layer_->is_topk_sharing_enabled();
+  }
+
+  bool skip_topk() const { return decoder_layer_->skip_topk(); }
+
+  bool output_topk() const { return decoder_layer_->output_topk(); }
+
   void load_state_dict(const StateDict& state_dict) {
     decoder_layer_->load_state_dict(state_dict);
   }
@@ -76,9 +185,7 @@ class DeepseekV32DecoderLayerImpl : public torch::nn::Module {
     decoder_layer_->reload_weights_from_device();
   }
 
-  layer::BaseManualLoader* get_manual_loader() {
-    return decoder_layer_->get_manual_loader();
-  }
+  layer::BaseLoader* get_loader() { return decoder_layer_->get_loader(); }
 
   void refresh_rolling_weights() { decoder_layer_->refresh_rolling_weights(); }
 
@@ -107,6 +214,7 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
     device_ = options.device();
     dtype_ = options.dtype().toScalarType();
     num_speculative_tokens_ = model_args.num_speculative_tokens();
+    index_topk_ = model_args.index_topk();
 
     npu_embed_tokens_ =
         register_module("npu_embed_tokens", layer::NpuWordEmbedding(context));
@@ -143,12 +251,16 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
     // dp_size_=4;
     dp_size_ = parallel_args.dp_size();
     std::vector<int64_t> indices;
-    dp_local_tp_size_ = parallel_args.world_size() / dp_size_;
-    dp_rank_ = parallel_args.rank() / dp_local_tp_size_;
+    // Orthogonal CP×TP: dp_local_tp = attn_tp; DP stride = tp*cp.
+    dp_local_tp_size_ =
+        parallel_args.world_size() / (dp_size_ * parallel_args.cp_size());
+    dp_rank_ =
+        parallel_args.rank() / (dp_local_tp_size_ * parallel_args.cp_size());
     rank_ = parallel_args.rank();
     mapping_data_ = parallel_args.mapping_data();
     num_experts_per_tok_ = model_args.num_experts_per_tok();
-    for (int i = 0; i < parallel_args.world_size(); i += dp_local_tp_size_) {
+    const int32_t dp_stride = dp_local_tp_size_ * parallel_args.cp_size();
+    for (int i = 0; i < parallel_args.world_size(); i += dp_stride) {
       indices.push_back(i);
     }
   }
@@ -165,6 +277,10 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
     }
 
     auto h = npu_embed_tokens_(tokens, 0);
+    const NpuCpPlan& cp_plan = input_params.parallel.cp_plan;
+    if (cp_plan.enabled()) {
+      cp_plan.shard_model_input(h, positions);
+    }
     auto cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto cos_sin_chunks = cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
     auto cos_pos = cos_sin_chunks[0].contiguous();
@@ -172,37 +288,84 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
 
     torch::Tensor attn_mask;
     if (num_speculative_tokens_ == 0 ||
-        input_params.batch_forward_type.is_prefill()) {
+        input_params.meta.batch_forward_type.is_prefill()) {
       attn_mask = attn_mask_.get_attn_mask(128, dtype_, device_);
     } else {
       attn_mask = attn_mask_.gen_free_mask(
           num_speculative_tokens_ + 1, dtype_, device_);
     }
 
+    torch::Tensor prev_topk_indices;
     RollingLayerGuard rolling_guard(rolling_mgr_);
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event = nullptr;
       std::atomic<bool>* event_flag = nullptr;
-      if (input_params.layer_synchronizer != nullptr) {
-        event = input_params.layer_synchronizer->get_event(i);
-        event_flag = input_params.layer_synchronizer->get_event_flag(i);
+      if (input_params.parallel.layer_synchronizer != nullptr) {
+        event = input_params.parallel.layer_synchronizer->get_event(i);
+        event_flag =
+            input_params.parallel.layer_synchronizer->get_event_flag(i);
       }
       if (!input_params.synchronize_layer(i)) {
         return ModelOutput();
       }
 
       auto& layer = layers_[i];
-      const int32_t layer_index = i;
+      const int32_t layer_index = static_cast<int32_t>(i);
+      const bool topk_sharing_enabled = layer->is_topk_sharing_enabled();
+      const bool skip_topk = layer->skip_topk();
+      const bool output_topk = layer->output_topk();
+      torch::Tensor current_topk_indices;
+      torch::Tensor shared_topk_indices;
+      torch::Tensor* output_topk_indices = nullptr;
+      if (topk_sharing_enabled) {
+        if (skip_topk) {
+          CHECK(prev_topk_indices.defined())
+              << "DSA top-k sharing requires previous top-k indices at layer "
+              << layer_index;
+          shared_topk_indices = prev_topk_indices;
+        }
+        if (output_topk) {
+          torch::Tensor index_cache = kv_caches[i].get_index_cache();
+          CHECK(index_cache.defined())
+              << "DSA top-k sharing requires index cache at layer "
+              << layer_index;
+          current_topk_indices = torch::empty(
+              std::vector<int64_t>{h.size(0),
+                                   index_cache.size(2),
+                                   static_cast<int64_t>(index_topk_)},
+              torch::TensorOptions().device(device_).dtype(torch::kInt32));
+          output_topk_indices = &current_topk_indices;
+        }
+      }
       rolling_guard.before_layer(layer_index);
-      layer(h,
-            cos_pos,
-            sin_pos,
-            attn_mask,
-            kv_caches[i],
-            input_params,
-            event,
-            event_flag);
+      if (topk_sharing_enabled) {
+        layer->forward_with_topk(h,
+                                 cos_pos,
+                                 sin_pos,
+                                 attn_mask,
+                                 kv_caches[i],
+                                 input_params,
+                                 shared_topk_indices,
+                                 output_topk_indices,
+                                 event,
+                                 event_flag);
+      } else {
+        layer(h,
+              cos_pos,
+              sin_pos,
+              attn_mask,
+              kv_caches[i],
+              input_params,
+              event,
+              event_flag);
+      }
+      if (output_topk) {
+        prev_topk_indices = current_topk_indices;
+      }
       rolling_guard.after_layer(layer_index);
+    }
+    if (cp_plan.enabled()) {
+      h = cp_plan.merge_model_output(h);
     }
     auto hidden_states = norm_(h, 0);
     return ModelOutput(hidden_states);
@@ -280,11 +443,11 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
     }
   }
 
-  std::vector<layer::BaseManualLoader*> get_decoder_loaders() {
-    std::vector<layer::BaseManualLoader*> loaders;
+  std::vector<layer::BaseLoader*> get_decoder_loaders() {
+    std::vector<layer::BaseLoader*> loaders;
     loaders.reserve(layers_.size());
     for (auto& layer : layers_) {
-      loaders.push_back(layer->get_manual_loader());
+      loaders.push_back(layer->get_loader());
     }
     return loaders;
   }
@@ -317,6 +480,7 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
   nlohmann::json mapping_data_;
   int32_t num_experts_per_tok_;
   int32_t num_speculative_tokens_ = 0;
+  int32_t index_topk_ = 0;
   at::Device device_;
   torch::Dtype dtype_;
   layer::NpuWordEmbedding npu_embed_tokens_{nullptr};
@@ -394,6 +558,9 @@ REGISTER_MODEL_ARGS(deepseek_v32, [&] {
   LOAD_ARG_OR(index_head_dim, "index_head_dim", 128);
   LOAD_ARG_OR(index_n_heads, "index_n_heads", 0);
   LOAD_ARG_OR(index_topk, "index_topk", 2048);
+  LOAD_ARG_OR(index_topk_freq, "index_topk_freq", 1);
+  LOAD_ARG_OR(index_topk_pattern, "index_topk_pattern", "");
+  LOAD_ARG_OR(index_skip_topk_offset, "index_skip_topk_offset", 0);
 
   LOAD_ARG_OR_FUNC(head_dim, "head_dim", [&] {
     return 256;  // args->qk_nope_head_dim() + args->qk_rope_head_dim();

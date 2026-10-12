@@ -1,13 +1,12 @@
 include(cc_library)
 include(cc_binary)
-include(cc_test)
-
 
 cc_library(
   NAME
     runtime
   HDRS
     options.h
+    decode_graph_bucket.h
     forward_params.h
     dit_forward_params.h
     params_utils.h
@@ -17,40 +16,64 @@ cc_library(
     vlm_executor_impl.h
     base_executor_impl.h
     dit_executor.h
+    $<$<BOOL:${USE_NPU}>:acl_graph_bucket_policy.h>
     $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.h>
+    $<$<BOOL:${USE_NPU}>:acl_graph_persistent_param.h>
     $<$<BOOL:${USE_MLU}>:mlu_graph_executor_impl.h>
+    $<$<BOOL:${USE_MLU}>:mlu_graph_planner.h>
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
+    $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
+    py_executor_impl.h
+    py_attention_metadata.h
+    py_input_batch.h
+    $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.h>
     worker.h
     worker_impl.h
     llm_worker_impl.h
     vlm_worker_impl.h
-    dit_worker.h
+    dit_worker_impl.h
     embed_worker_impl.h
     embed_vlm_worker_impl.h
     rec_worker_impl.h
     mm_embed_vlm_worker_impl.h
     worker_client.h
     xservice_client.h
+    draft_model_spec_worker_impl.h
     speculative_worker_impl.h
+    speculative_worker_utils.h
     mtp_worker_impl.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
-    spec_input_builder.h
+    dflash_worker_impl.h
+    draft_model_config.h
+    dflash2_worker_impl.h
+    dspark_worker_impl.h
     forward_shared_memory_manager.h
+    worker_rendezvous.h
   SRCS
+    decode_graph_bucket.cpp
     executor.cpp
     executor_impl_factory.cpp
     base_executor_impl.cpp
     vlm_executor_impl.cpp
     dit_executor.cpp
     $<$<BOOL:${USE_NPU}>:acl_graph_executor_impl.cpp>
+    $<$<BOOL:${USE_NPU}>:acl_graph_persistent_param.cpp>
     $<$<BOOL:${USE_MLU}>:mlu_graph_executor_impl.cpp>
+    $<$<BOOL:${USE_MLU}>:mlu_graph_planner.cpp>
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
+    $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
+    py_executor_impl.cpp
+    py_attention_metadata.cpp
+    py_input_batch.cpp
+    $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
     worker.cpp
     worker_impl.cpp
+    draft_model_config.cpp
+    worker_rendezvous.cpp
     llm_worker_impl.cpp
     vlm_worker_impl.cpp
-    dit_worker.cpp
+    dit_worker_impl.cpp
     embed_worker_impl.cpp
     embed_vlm_worker_impl.cpp
     rec_worker_impl.cpp
@@ -58,11 +81,15 @@ cc_library(
     worker_client.cpp
     xservice_client.cpp
     params_utils.cpp
+    draft_model_spec_worker_impl.cpp
     speculative_worker_impl.cpp
+    speculative_worker_utils.cpp
     mtp_worker_impl.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp
-    spec_input_builder.cpp
+    dflash_worker_impl.cpp
+    dflash2_worker_impl.cpp
+    dspark_worker_impl.cpp
     forward_shared_memory_manager.cpp
   DEPS
     torch
@@ -71,9 +98,18 @@ cc_library(
     :platform
     :model_context
     :request
+    :speculative
+    :encoder_cache
     :state_dict
     :dit_cache
     :model
+    :parallel_state
+    :kv_cache
+    :kv_cache_estimation
+    :kv_cache_transfer
+    :linear_state_restore
+    :kv_transfer_completion
+    :kv_transfer_failure
     :models
     :sampler
     :tokenizer
@@ -92,88 +128,7 @@ cc_library(
     absl::flat_hash_map
     proto::xllm_proto
     $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_MLU}>::triton_jit>
+    $<$<BOOL:${USE_MUSA}>:torch_musa>
+    $<$<BOOL:${USE_DCU}>:hip::host>
 )
-
-if(USE_NPU)
-cc_test(
-  NAME
-    acl_graph_executor_test
-  SRCS
-    acl_graph_executor_test.cpp
-  DEPS
-    :xllm_server
-    :runtime
-    :model_loader
-    :batch
-    :block
-    :model
-    :models
-    :sampler
-    :kv_cache
-    GTest::gtest_main
-    torch_npu
-    atb_customize
-)
-target_link_libraries(acl_graph_executor_test
-                      PRIVATE
-                      torch_npu
-                      ascendcl
-                      hccl
-                      c_sec
-                      nnopbase
-                      )
-# Use --whole-archive for spdlog to ensure all symbols are available for xllm_atb_layers
-# This resolves the undefined reference issues in xllm_atb_layers
-target_link_options(acl_graph_executor_test PRIVATE
-  "-Wl,--whole-archive"
-  "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
-  "-Wl,--no-whole-archive")
-endif()
-
-cc_test(
-  NAME
-    spec_input_builder_test
-  SRCS
-    spec_input_builder_test.cpp
-    spec_input_builder.cpp
-  DEPS
-    torch
-    glog::glog
-    proto::xllm_proto
-    GTest::gtest_main
-)
-
-if(USE_MLU)
-cc_test(
-  NAME
-    mlu_graph_executor_test
-  SRCS
-    mlu_graph_executor_test.cpp
-  DEPS
-    :runtime
-    :model_loader
-    :batch
-    :kv_cache
-    :platform
-    GTest::gtest_main
-    torch_mlu
-)
-endif()
-
-if(USE_CUDA)
-cc_test(
-  NAME
-    cuda_graph_executor_test
-  SRCS
-    cuda_graph_executor_test.cpp
-  DEPS
-    :runtime
-    :cuda_layers
-    :batch
-    :block
-    :kv_cache
-    :kernels
-    GTest::gtest_main
-    torch
-)
-endif()

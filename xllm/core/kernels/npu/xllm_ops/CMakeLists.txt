@@ -8,16 +8,52 @@ cc_library(
     ../utils.h
   SRCS
     replace_token.cpp
+    laser_attention.cpp
+    mtp_prepare_next_draft.cpp
     top_k_top_p.cpp
+    quant_matmul.cpp
+    quantize.cpp
+    quant_dynamic.cpp
+    dequant_swiglu_quant.cpp
+    compressor.cpp
+    hc_post.cpp
+    quant_lightning_indexer.cpp
+    lightning_indexer.cpp
+    hc_pre_inv_rms.cpp
+    hc_pre_sinkhorn.cpp
+    hc_pre.cpp
+    quant_lightning_indexer_metadata.cpp
+    sparse_attn_sharedkv_metadata.cpp
+    npu_inplace_partial_rotary_mul.cpp
+    scatter_nd_update.cpp
+    reshape_and_cache_a5.cpp
+    moe_gating_top_k_hash.cpp
+    sparse_attn_sharedkv.cpp
+    x_flash_attention.cpp
+    sparse_flash_attention.cpp
+    sparse_flash_attention_lse.cpp
+    mla_preprocess.cpp
     ../utils.cpp
     beam_search.cpp
     select_unshared_kv.cpp
     beam_search_rec.cpp
+    rec_constrained_topk_fused.cpp
+    beam_search_rec_final.cpp
+    npu_mega_chunk_gdn.cpp
+    npu_mega_gdn_prefill.cpp
+    npu_mega_gdn_decode.cpp
+    npu_mega_gdn_mtp_decode.cpp
+    layer_norm_fwd.cpp
+    gamma_add_rms_norm.cpp
+  INCLUDES
+    ${PROJECT_SOURCE_DIR}/third_party/xllm_ops/build/autogen
   DEPS
     atb
+    Python::Python
     torch_npu
     gflags::gflags
     nlohmann_json::nlohmann_json
     opapi
+    ${NPU_RUNTIME_SO}
     spdlog::spdlog
 )

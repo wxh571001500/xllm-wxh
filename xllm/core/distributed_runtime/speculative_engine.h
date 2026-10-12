@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,19 +19,22 @@ limitations under the License.
 #include "engine.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
 #include "llm_engine.h"
+#include "vlm_engine.h"
 
 namespace xllm {
 
-class SpeculativeEngine : public Engine {
+template <typename TargetEngine>
+class SpeculativeEngineBase : public Engine {
  public:
   // create an engine with the given devices
-  SpeculativeEngine(const runtime::Options& options);
+  explicit SpeculativeEngineBase(const runtime::Options& options);
 
-  virtual ~SpeculativeEngine() = default;
+  ~SpeculativeEngineBase() override;
 
   bool init(MasterStatus master_status) override;
 
@@ -45,6 +48,12 @@ class SpeculativeEngine : public Engine {
   }
 
   const ModelArgs& model_args() const override { return model_args_; }
+
+  bool set_speculative_validate_time_predictor(
+      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
+      override;
+
+  runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const override;
 
   const TokenizerArgs& tokenizer_args() const override {
     return engine_->tokenizer_args();
@@ -60,43 +69,37 @@ class SpeculativeEngine : public Engine {
                       const int32_t src_dp_rank,
                       const std::vector<uint64_t>& src_cluster_ids,
                       const std::vector<std::string>& src_addrs,
-                      const std::vector<int64_t>& src_k_cache_ids,
-                      const std::vector<int64_t>& src_v_cache_ids,
-                      const std::vector<uint64_t>& src_blocks,
                       const int32_t dst_dp_rank,
-                      const std::vector<uint64_t>& dst_blocks) override;
-
-  void get_device_info(std::vector<std::string>& device_ips,
-                       std::vector<uint16_t>& ports) override;
+                      const std::vector<KVTransferMapping>& mappings) override;
 
   void get_cache_info(std::vector<uint64_t>& cluster_ids,
                       std::vector<std::string>& addrs,
-                      std::vector<int64_t>& k_cache_ids,
-                      std::vector<int64_t>& v_cache_ids) override;
+                      std::vector<uint16_t>& ports) override;
 
   bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                     const std::vector<std::string>& addrs,
-                    const std::vector<std::string>& device_ips,
                     const std::vector<uint16_t>& ports,
-                    const int32_t src_dp_size) override;
+                    const int32_t src_dp_size,
+                    const int32_t src_kv_split_size = 1) override;
 
   bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                       const std::vector<std::string>& addrs,
-                      const std::vector<std::string>& device_ips,
                       const std::vector<uint16_t>& ports,
-                      const int32_t dp_size) override;
+                      const int32_t src_dp_size,
+                      const int32_t src_kv_split_size = 1) override;
 
  protected:
-  SpeculativeEngine(const runtime::Options& options, bool use_draft_engine);
+  SpeculativeEngineBase(const runtime::Options& options, bool use_draft_engine);
 
  private:
-  bool init_model();
+  bool init_model(MasterStatus master_status);
 
   bool allocate_kv_cache();
 
-  int64_t calculate_kv_cache(int64_t cache_size_in_bytes,
-                             int64_t target_size,
-                             int64_t draft_size) const;
+  bool should_skip_external_draft_kv_cache() const;
+
+  int64_t calculate_kv_cache(const KVCacheCapacity& target_kv_cache_cap,
+                             const KVCacheCapacity& draft_kv_cache_cap) const;
 
   // dtype
   torch::ScalarType dtype_;
@@ -105,7 +108,7 @@ class SpeculativeEngine : public Engine {
   const runtime::Options options_;
 
   // engine
-  std::unique_ptr<LLMEngine> engine_;
+  std::unique_ptr<TargetEngine> engine_;
 
   // draft engine
   std::unique_ptr<LLMEngine> draft_engine_;
@@ -121,10 +124,17 @@ class SpeculativeEngine : public Engine {
   std::shared_ptr<DistManager> dist_manager_ = nullptr;
 };
 
-class SuffixSpeculativeEngine : public SpeculativeEngine {
+class SuffixSpeculativeEngine : public SpeculativeEngineBase<LLMEngine> {
  public:
   explicit SuffixSpeculativeEngine(const runtime::Options& options);
   ~SuffixSpeculativeEngine() override = default;
+};
+
+class SuffixVLMSpeculativeEngine final
+    : public SpeculativeEngineBase<VLMEngine> {
+ public:
+  explicit SuffixVLMSpeculativeEngine(const runtime::Options& options);
+  ~SuffixVLMSpeculativeEngine() override = default;
 };
 
 }  // namespace xllm

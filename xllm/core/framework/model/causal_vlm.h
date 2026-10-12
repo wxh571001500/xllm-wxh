@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -61,9 +61,50 @@ class CausalVLMImpl : public CausalVLM {
     return model_->forward(tokens, positions, kv_caches, parameters);
   }
 
+  bool is_hybrid_linear_attention() override {
+    if constexpr (detail::has_is_hybrid_linear_attention<Model>::value) {
+      return model_->is_hybrid_linear_attention();
+    } else {
+      return CausalLM::is_hybrid_linear_attention();
+    }
+  }
+
+  bool supports_mla_graph_kv_bucketing() const override {
+    if constexpr (detail::has_supports_mla_graph_kv_bucketing<Model>::value) {
+      return model_->supports_mla_graph_kv_bucketing();
+    }
+    return CausalLM::supports_mla_graph_kv_bucketing();
+  }
+
+  torch::Tensor pooler(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes) override {
+    if constexpr (detail::has_pooler<Model>::value) {
+      return model_->pooler(hidden_states, seleted_idxes);
+    } else {
+      return CausalLM::pooler(hidden_states, seleted_idxes);
+    }
+  }
+
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) override {
     return model_->logits(hidden_states, seleted_idxes);
+  }
+
+  torch::Tensor logits(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes,
+                       torch::Tensor& out_hidden) override {
+    if constexpr (detail::has_logits_with_hidden<Model>::value) {
+      return model_->logits(hidden_states, seleted_idxes, out_hidden);
+    } else {
+      if (seleted_idxes.defined()) {
+        torch::Tensor idxes = seleted_idxes.to(
+            torch::dtype(torch::kLong).device(hidden_states.device()));
+        out_hidden = hidden_states.index_select(/*dim=*/0, idxes);
+      } else {
+        out_hidden = hidden_states;
+      }
+      return model_->logits(hidden_states, seleted_idxes);
+    }
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader) override {
@@ -75,23 +116,39 @@ class CausalVLMImpl : public CausalVLM {
     return;
   }
 
-  virtual void update_expert_weight(int32_t layer_id) { return; }
+  void update_expert_weight(int32_t layer_id) override { return; }
 
 #if defined(USE_NPU)
   layer::NpuLmHead get_npu_lm_head() override {
-    return model_->get_npu_lm_head();
+    if constexpr (detail::has_get_npu_lm_head<Model>::value) {
+      return model_->get_npu_lm_head();
+    } else {
+      return CausalLM::get_npu_lm_head();
+    }
   }
 
   void set_npu_lm_head(layer::NpuLmHead& head) override {
-    model_->set_npu_lm_head(head);
+    if constexpr (detail::has_set_npu_lm_head<Model>::value) {
+      model_->set_npu_lm_head(head);
+    } else {
+      CausalLM::set_npu_lm_head(head);
+    }
   }
 
   layer::NpuWordEmbedding get_npu_word_embedding() override {
-    return model_->get_npu_word_embedding();
+    if constexpr (detail::has_get_npu_word_embedding<Model>::value) {
+      return model_->get_npu_word_embedding();
+    } else {
+      return CausalLM::get_npu_word_embedding();
+    }
   }
 
   void set_npu_word_embedding(layer::NpuWordEmbedding& embedding) override {
-    model_->set_npu_word_embedding(embedding);
+    if constexpr (detail::has_set_npu_word_embedding<Model>::value) {
+      model_->set_npu_word_embedding(embedding);
+    } else {
+      CausalLM::set_npu_word_embedding(embedding);
+    }
   }
 #endif
   layer::LmHead get_lm_head() override {

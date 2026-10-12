@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "call.h"
 #include "core/common/types.h"
+#include "core/util/verbose_trace_logger.h"
 
 namespace xllm {
 
@@ -39,14 +40,14 @@ class NonStreamCall : public Call {
                 ::google::protobuf::Closure* done,
                 Request* request,
                 Response* response,
-                bool use_arena = false)
-      : Call(controller),
+                bool use_arena = false,
+                bool is_http_request = false)
+      : Call(controller, request_body_x_request_id(request), is_http_request),
         done_(done),
         request_(request),
         response_(response),
         use_arena_(use_arena) {
-    controller_->http_response().SetHeader("Content-Type",
-                                           "text/javascript; charset=utf-8");
+    controller_->http_response().set_content_type("application/json");
 
     json_options_.bytes_to_base64 = false;
     json_options_.jsonify_empty_array = true;
@@ -76,6 +77,8 @@ class NonStreamCall : public Call {
       return finish_with_error(StatusCode::UNKNOWN, err_msg);
     }
 
+    XLLM_VERBOSE_TRACE() << "event=response_serialized x-request-id="
+                         << x_request_id_;
     return true;
   }
 
@@ -103,6 +106,8 @@ class NonStreamCall : public Call {
   // For non stream response
   bool finish_with_error(const StatusCode& code,
                          const std::string& error_message) {
+    XLLM_VERBOSE_TRACE() << "event=request_error x-request-id=" << x_request_id_
+                         << " message=" << error_message;
     controller_->SetFailed(error_message);
     return true;
   }

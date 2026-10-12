@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "layers/npu/npu_column_parallel_linear_impl.h"
 
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/parallel_config.h"
 namespace xllm {
 namespace layer {
 
@@ -28,23 +30,40 @@ void NpuColumnParallelLinearImpl::param_from_args(
 
   if (parallel_args.world_size() > 1) {
     if (parallel_args.mapping_data().empty()) {
-      if (dp_size_ > 1) {
-        param.tensorParallelInfo.rank = dp_local_tp_rank_;
-        param.tensorParallelInfo.worldSize = dp_local_tp_size_;
+      // NpuColumnParallelLinear is only used by embedding-flow projections
+      // (MTP eh_proj / rot, eagle3/dflash fc), which run BEFORE localize and
+      // see the full sequence. So it must be CP-unaware but DP-aware: shard
+      // across the dp-local-TP group (world / dp_size = cp_size * tp_size)
+      // instead of the CP-local TP (dp_local_tp_size_, size tp). When
+      // cp_size == 1 this collapses to tp_size, so non-CP runs are unchanged.
+      const bool use_cp_unaware_tp = (dp_size_ > 1) || (cp_size_ > 1);
+      const int32_t cp_unaware_tp_size = parallel_args.world_size() / dp_size_;
+      if (use_cp_unaware_tp) {
+        param.tensorParallelInfo.rank =
+            parallel_args.rank() % cp_unaware_tp_size;
+        param.tensorParallelInfo.worldSize = cp_unaware_tp_size;
       } else {
         param.tensorParallelInfo.rank = parallel_args.rank();
         param.tensorParallelInfo.worldSize = parallel_args.world_size();
       }
       param.parallelType = atb_speed::common::COLUMN_PARALLEL;
-      param.tensorParallelInfo.commDomain = std::to_string(dp_rank_);
-      param.tensorParallelInfo.backend = "lccl";
+      const int32_t tp_group_id =
+          use_cp_unaware_tp ? (parallel_args.rank() / cp_unaware_tp_size) : 0;
+      param.tensorParallelInfo.commDomain = std::to_string(tp_group_id);
+      param.tensorParallelInfo.backend =
+          ParallelConfig::get_instance().communication_backend();
     } else {
+      // Mapping (ATB) path: use the dedicated WORD_EMBED_TP group (dp-local-TP,
+      // size cp*tp). Do NOT use ATTN_TP (size tp, CP-local) — that would
+      // replicate the projection weight across CP ranks. See mapping_npu.cpp
+      // parse_parallel_info().
       param.parallelType = atb_speed::common::COLUMN_PARALLEL;
       atb_speed::common::ParallelInfo parallelInfo =
           parallel_args.mapping().Get(atb_speed::base::WORD_EMBED_TP);
       param.tensorParallelInfo.rank = parallelInfo.rank;
       param.tensorParallelInfo.worldSize = parallelInfo.rankIds.size();
-      param.tensorParallelInfo.backend = FLAGS_communication_backend;
+      param.tensorParallelInfo.backend =
+          ::xllm::ParallelConfig::get_instance().communication_backend();
       parallelInfo.InitCommDomain(param.tensorParallelInfo.hcommInfo,
                                   param.tensorParallelInfo.commDomain);
     }
@@ -63,15 +82,30 @@ NpuColumnParallelLinearImpl::NpuColumnParallelLinearImpl(
   dtype_ = c10::typeMetaToScalarType(options.dtype());
   tensor_placeholder_ = torch::zeros({1}).to(options);
   placeholder_ = atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
-  loader_ = std::make_unique<ColumParallelLinearLoader>(1, context);
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
+    loader_ = std::make_unique<ColumParallelLinearLoader>(
+        1, context, LoadMode::kManual);
+  } else {
+    loader_ = std::make_unique<ColumParallelLinearLoader>(
+        1, context, LoadMode::kEager);
+  }
 }
 
 void NpuColumnParallelLinearImpl::merge_loaded_weights() {
+  loader_->merge_loaded_weights();
   auto& at_weight_tensors = loader_->get_at_weight_tensors();
 
   atb_weight_tensors_[0] =
       atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[0]);
   init_layer();
+}
+
+void NpuColumnParallelLinearImpl::fuse_eagle3_quarot_input_rotation(
+    torch::Tensor global_rotation) {
+  auto* column_loader = dynamic_cast<ColumParallelLinearLoader*>(loader_.get());
+  CHECK(column_loader != nullptr)
+      << "NpuColumnParallelLinear loader is not ColumParallelLinearLoader";
+  column_loader->fuse_eagle3_quarot_input_rotation(global_rotation);
 }
 
 int64_t NpuColumnParallelLinearImpl::init_layer() {

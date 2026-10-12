@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,18 +17,31 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <optional>
+#include <string>
+#include <vector>
+
 #include "attention.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
+#include "kernels/ops_api.h"
 #include "layers/common/linear.h"
 #include "layers/common/partial_rotary_embedding.h"
 #include "layers/common/qwen3_next_rms_norm.h"
 
 namespace xllm {
 namespace layer {
+
+bool is_qwen3_5_model_type(const std::string& model_type);
+bool should_enable_qwen3_5_fia_decode(const std::string& model_type);
+std::optional<std::string> validate_qwen_dcp_kv_head_replicas(
+    int64_t tp_size,
+    int64_t total_num_kv_heads,
+    int64_t num_kv_head_replicas,
+    int32_t dcp_size);
 
 class Qwen3NextAttentionImpl : public torch::nn::Module {
  public:
@@ -42,7 +55,10 @@ class Qwen3NextAttentionImpl : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& positions,
                         const torch::Tensor& hidden_states,
                         const AttentionMetadata& attn_metadata,
-                        KVCache& kv_cache);
+                        KVCache& kv_cache,
+                        const torch::Tensor& mrope_cos_sin);
+
+  torch::Tensor build_mrope_cos_sin(const torch::Tensor& positions) const;
 
   void load_state_dict(const StateDict& state_dict);
 
@@ -57,6 +73,15 @@ class Qwen3NextAttentionImpl : public torch::nn::Module {
   bool attn_output_gate_;
   int32_t layer_id_;
   int32_t rank_;
+  int64_t rotary_dim_;
+  float rms_norm_eps_;
+  bool use_fused_qkv_;
+  bool is_interleaved_;
+  bool qkv_weight_reordered_ = false;
+  bool q_norm_weight_adjusted_ = false;
+  bool k_norm_weight_adjusted_ = false;
+  std::vector<int64_t> mrope_section_;
+  torch::Tensor mrope_gather_pattern_;
 
   QKVParallelLinear qkv_proj_{nullptr};
   RowParallelLinear o_proj_{nullptr};

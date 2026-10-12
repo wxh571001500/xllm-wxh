@@ -1,0 +1,240 @@
+# Copyright 2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
+
+import torch
+
+if TYPE_CHECKING:
+    from xllm.python.attention.backend import (
+        AttentionBackend,
+        AttentionMetadata,
+        LayerCache,
+    )
+    from xllm.python.model_executor.cp_utils import CpContext
+
+
+class LayerSynchronizer(Protocol):
+    """Records a per-layer completion event for the PD KV-cache transfer thread.
+
+    Implemented in C++ (``NPULayerSynchronizerImpl``) and passed in from the
+    executor; the model forward calls ``record_event`` after each layer so the
+    transfer thread can push that layer's KV cache without waiting for the whole
+    forward to finish.
+    """
+
+    def record_event(self, layer_id: int) -> bool:
+        """Return ``False`` only when recording the completion event fails."""
+        ...
+
+
+class LayerLoadSynchronizer(Protocol):
+    """Waits for grouped Host-to-device KV-cache copy events from C++."""
+
+    def synchronize_layer(self, event_index: int) -> bool: ...
+
+    def size(self) -> int: ...
+
+
+@dataclass(slots=True)
+class LayerLoadContext:
+    """Per-forward Host-load waits, independent of PD push notifications."""
+
+    synchronizer: LayerLoadSynchronizer
+    layers_per_event: int = 1
+    _completed_events: set[int] = field(default_factory=set, init=False)
+
+    def __post_init__(self) -> None:
+        if self.layers_per_event <= 0:
+            raise ValueError("Host-load layers_per_event must be positive")
+
+    def synchronize_event(self, event_index: int) -> None:
+        if event_index in self._completed_events:
+            return
+        if event_index < 0 or event_index >= self.synchronizer.size():
+            raise ValueError(f"Host-load event index out of range: {event_index}")
+        if not self.synchronizer.synchronize_layer(event_index):
+            raise RuntimeError(f"failed to wait for Host cache load event {event_index}")
+        self._completed_events.add(event_index)
+
+    def synchronize_layer(self, layer_id: int) -> None:
+        if layer_id < 0:
+            raise ValueError("Host-load layer_id must be non-negative")
+        self.synchronize_event(layer_id // self.layers_per_event)
+
+    def synchronize_all_layers(self) -> None:
+        for event_index in range(self.synchronizer.size()):
+            self.synchronize_event(event_index)
+
+
+@dataclass(frozen=True, slots=True)
+class AclGraphTask:
+    event: object
+    handle: object
+    update: Callable[[], None]
+
+
+@dataclass(slots=True)
+class AclGraphExecutionState:
+    """Persistent tensors owned by one model-execution graph entry."""
+
+    persistent_buffers: dict[tuple[object, ...], object]
+
+
+@dataclass(slots=True)
+class AclGraphCaptureContext:
+    stream: object
+    tasks: list[AclGraphTask]
+
+
+@dataclass(slots=True)
+class EplbRuntimeState:
+    """Per-forward EPLB tensors owned by the C++ worker runtime."""
+
+    expert_load_data: torch.Tensor
+    decode_token_mask: torch.Tensor | None
+    is_graph_warmup: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardContext:
+    attention_backend: AttentionBackend
+    device: torch.device
+    metadata: AttentionMetadata
+    layer_caches: list[LayerCache]
+    acl_graph: AclGraphCaptureContext | None = None
+    layer_synchronizer: LayerSynchronizer | None = None
+    execution_state: AclGraphExecutionState | None = None
+    execution_contexts: dict[type[object], object] = field(default_factory=dict)
+    # Context-Parallel sharding plan for this forward, or None when CP is off
+    # (cp_size <= 1) or the step is decode (CP is prefill-only).
+    cp_context: CpContext | None = None
+    eplb: EplbRuntimeState | None = None
+    # Values derived from per-forward metadata that are shared by multiple
+    # layers. A new ForwardContext gets a new cache, so entries never leak
+    # across requests or graph executions.
+    layer_shared_cache: dict[object, object] = field(default_factory=dict)
+    layer_load_context: LayerLoadContext | None = None
+
+
+_current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)
+
+
+@contextmanager
+def forward_context(ctx: ForwardContext):
+    token = _current_context.set(ctx)
+    try:
+        yield
+    finally:
+        _current_context.reset(token)
+
+
+def get_forward_context() -> ForwardContext:
+    ctx = _current_context.get()
+    if ctx is None:
+        raise RuntimeError("forward context is not set")
+    return ctx
+
+
+def get_forward_context_or_none() -> ForwardContext | None:
+    """Return the current forward context, or None outside a forward pass.
+
+    Layers that must not depend on the executor (e.g. the standalone stub-loader
+    align path) use this to read per-step metadata without hard-failing.
+    """
+    return _current_context.get()
+
+
+_ExecutionContextT = TypeVar("_ExecutionContextT")
+
+
+def get_execution_context(context_type: type[_ExecutionContextT]) -> _ExecutionContextT | None:
+    """Return a typed optional feature context for the active forward."""
+    context = get_forward_context().execution_contexts.get(context_type)
+    if context is None:
+        return None
+    return cast(_ExecutionContextT, context)
+
+
+def in_acl_graph() -> bool:
+    """Whether the current forward runs under ACL graph warmup/capture.
+
+    The decode graph runner always passes an ``execution_state`` (warmup and
+    capture) and an ``acl_graph`` capture context (capture only); the eager
+    runner sets neither, so eager paths stay byte-identical.
+    """
+    ctx = _current_context.get()
+    return ctx is not None and (ctx.acl_graph is not None or ctx.execution_state is not None)
+
+
+def capturing_acl_graph() -> bool:
+    """Whether the current forward is being recorded by NPUGraph capture."""
+    ctx = _current_context.get()
+    return ctx is not None and ctx.acl_graph is not None
+
+
+def record_layer_event(layer_id: int) -> None:
+    ctx = _current_context.get()
+    if ctx is not None and ctx.layer_synchronizer is not None:
+        if not ctx.layer_synchronizer.record_event(layer_id):
+            raise RuntimeError(f"failed to record layer completion event for layer {layer_id}")
+
+
+def wait_for_layer_load(layer_id: int) -> None:
+    """Wait before the layer first reads or writes restored cache/state."""
+    ctx = _current_context.get()
+    if ctx is not None and ctx.layer_load_context is not None:
+        ctx.layer_load_context.synchronize_layer(layer_id)
+
+
+def get_execution_buffer(key: tuple[object, ...], factory: Callable[[], torch.Tensor]) -> torch.Tensor:
+    """Get a tensor owned by the active model execution graph entry."""
+    state = get_forward_context().execution_state
+    if state is None:
+        return factory()
+    buffer = state.persistent_buffers.get(key)
+    if buffer is None:
+        buffer = factory()
+        state.persistent_buffers[key] = buffer
+    if not isinstance(buffer, torch.Tensor):
+        raise TypeError("execution buffer must be a torch.Tensor")
+    return buffer
+
+
+def copy_into_execution_buffer(key: tuple[object, ...], source: torch.Tensor) -> torch.Tensor:
+    """Copy ``source`` into a graph-owned buffer with a stable address.
+
+    ACL graph replay does not re-run Python. Host-updated metadata must land in
+    the same storage the captured kernels recorded. Eager execution has no
+    ``execution_state`` and returns ``source`` unchanged.
+    """
+    state = get_forward_context().execution_state
+    if state is None:
+        return source
+    buffer = get_execution_buffer(key, lambda: torch.empty_like(source))
+    if buffer.shape != source.shape or buffer.dtype != source.dtype or buffer.device != source.device:
+        raise RuntimeError(
+            "execution buffer shape/dtype/device changed for key "
+            f"{key}: got {tuple(buffer.shape)} {buffer.dtype} {buffer.device}, "
+            f"expected {tuple(source.shape)} {source.dtype} {source.device}"
+        )
+    if buffer.data_ptr() != source.data_ptr():
+        buffer.copy_(source, non_blocking=True)
+    return buffer

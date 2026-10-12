@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -66,6 +66,18 @@ GatherAsyncCtx launch_gather(const torch::Tensor& input,
   ctx.stacked = torch::empty(stacked_shape, ctx.input.options());
   ctx.token_num_list = token_num_list;
   ctx.work = process_group->allgather_base_async(ctx.input, ctx.stacked);
+  return ctx;
+}
+
+ReduceAsyncCtx launch_reduce(torch::Tensor input, ProcessGroup* process_group) {
+  ReduceAsyncCtx ctx;
+  if (!process_group || process_group->world_size() <= 1) {
+    ctx.tensor = std::move(input);
+    return ctx;
+  }
+
+  ctx.tensor = input.contiguous();
+  ctx.work = process_group->allreduce_async(ctx.tensor);
   return ctx;
 }
 

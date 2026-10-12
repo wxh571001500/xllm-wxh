@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,8 @@ limitations under the License.
 #include <torch_npu/csrc/libs/init_npu.h>
 #include <torch_npu/torch_npu.h>
 
+#include <algorithm>
+#include <cctype>
 #include <nlohmann/json.hpp>
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/framework/OpCommand.h>
@@ -97,6 +99,44 @@ void check_tensor_shapes_equal(const torch::Tensor& a,
                << "a shape: " << a.sizes() << ", b shape: " << b.sizes();
     LOG(FATAL) << func_name << ": tensor shapes do not match";
   }
+}
+
+bool is_ascend950() {
+  const char* soc_name = aclrtGetSocName();
+  return soc_name != nullptr &&
+         std::string(soc_name).find("Ascend950") != std::string::npos;
+}
+
+bool is_ascend_a3() {
+  const char* soc_name = aclrtGetSocName();
+  if (soc_name == nullptr) {
+    return false;
+  }
+
+  std::string normalized_soc_name(soc_name);
+  std::transform(normalized_soc_name.begin(),
+                 normalized_soc_name.end(),
+                 normalized_soc_name.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::toupper(character));
+                 });
+  return normalized_soc_name.find("910C") != std::string::npos ||
+         normalized_soc_name.find("910_93") != std::string::npos;
+}
+
+torch::Tensor expand_kv_heads(const torch::Tensor& tensor,
+                              int64_t num_heads,
+                              int64_t num_kv_heads) {
+  if (num_heads == num_kv_heads) {
+    return tensor;
+  }
+
+  CHECK_EQ(num_heads % num_kv_heads, 0)
+      << "num_heads must be divisible by num_kv_heads";
+  const int64_t expansion_factor = num_heads / num_kv_heads;
+  return tensor.unsqueeze(2)
+      .expand({tensor.size(0), num_kv_heads, expansion_factor, tensor.size(2)})
+      .reshape({tensor.size(0), num_heads, tensor.size(2)});
 }
 
 }  // namespace xllm::kernel::npu

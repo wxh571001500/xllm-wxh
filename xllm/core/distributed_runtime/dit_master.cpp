@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,7 +20,6 @@ limitations under the License.
 
 #include <atomic>
 #include <boost/algorithm/string.hpp>
-#include <csignal>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -28,39 +27,34 @@ limitations under the License.
 
 #include "api_service/call.h"
 #include "common/metrics.h"
+#include "core/platform/device_name_utils.h"
 #include "dit_engine.h"
 #include "framework/request/dit_request.h"
 #include "models/model_registry.h"
 #include "scheduler/scheduler_factory.h"
-#include "util/device_name_utils.h"
 #include "util/scope_guard.h"
 #include "util/timer.h"
 
 namespace xllm {
 DiTMaster::DiTMaster(const Options& options)
     : Master(options, EngineType::DIT) {
-  // construct engine
-  const auto devices =
-      DeviceNameUtils::parse_devices(options_.devices().value_or("auto"));
-  LOG(INFO) << "Creating engine with devices: "
-            << DeviceNameUtils::to_string(devices);
+  if (!is_leader()) {
+    return;
+  }
 
-  runtime::Options eng_options;
-  eng_options.model_path(options.model_path())
-      .model_id(options.model_id())
-      .devices(devices);
-
-  engine_ = std::make_unique<DiTEngine>(eng_options);
   CHECK(engine_->init());
 
   DiTScheduler::Options scheduler_options;
-  scheduler_options.max_request_per_batch(options.max_requests_per_batch());
+  scheduler_options.max_request_per_batch(options.max_requests_per_batch())
+      .disable_log_stats(options.disable_log_stats());
 
   scheduler_ = create_dit_scheduler(engine_.get(), scheduler_options);
   LOG(INFO) << "created dit scheduler in DiTMaster.";
 
-  threadpool_ =
-      std::make_unique<ThreadPool>(options.num_request_handling_threads());
+  threadpool_ = std::make_unique<ThreadPool>(
+      /*num_threads=*/options.num_request_handling_threads(),
+      /*cpu_binding=*/false,
+      /*pool_name=*/"DiTMaster.request");
   LOG(INFO) << "ThreadPool with " << options.num_request_handling_threads()
             << " threads created in DiTMaster.";
 }
@@ -92,17 +86,30 @@ void DiTMaster::handle_request(DiTRequestParams params,
     // remove the pending request after scheduling
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
 
+    // Guard the rate-limit slot acquired at the service entry. Dismissed
+    // right before DiTRequest takes ownership; any early return releases it.
+    xllm::ScopeGuard rate_limit_guard(
+        [this] { get_rate_limiter()->decrease_one_request(); });
+
     Timer timer;
     // verify the prompt
     if (!params.verify_params(callback)) {
       return;
     }
-    DiTRequestState dit_state = DiTRequestState(
-        params.input_params, params.generation_params, callback, nullptr, call);
+    DiTRequestState dit_state = DiTRequestState(params.input_params,
+                                                params.generation_params,
+                                                callback,
+                                                nullptr,
+                                                params.request_kind,
+                                                call);
+    rate_limit_guard.dismiss();
     auto request = std::make_shared<DiTRequest>(params.request_id,
                                                 params.x_request_id,
                                                 params.x_request_time,
-                                                std::move(dit_state));
+                                                std::move(dit_state),
+                                                /*service_request_id=*/"",
+                                                /*source_xservice_addr=*/"",
+                                                get_rate_limiter());
 
     if (!scheduler_->add_request(request)) {
       CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
@@ -114,7 +121,6 @@ void DiTMaster::handle_request(DiTRequestParams params,
 void DiTMaster::handle_batch_request(std::vector<DiTRequestParams> params_vec,
                                      BatchDiTOutputCallback callback) {
   const size_t num_requests = params_vec.size();
-  scheduler_->incr_pending_requests(num_requests);
   for (size_t i = 0; i < num_requests; ++i) {
     handle_request(std::move(params_vec[i]),
                    std::nullopt,
@@ -126,6 +132,11 @@ void DiTMaster::handle_batch_request(std::vector<DiTRequestParams> params_vec,
 }
 
 void DiTMaster::run() {
+  if (!is_leader()) {
+    Master::run();
+    return;
+  }
+
   const bool already_running = running_.load(std::memory_order_relaxed);
   if (already_running) {
     LOG(WARNING) << "DiTMaster is already running.";

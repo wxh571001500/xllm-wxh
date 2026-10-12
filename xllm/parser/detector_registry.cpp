@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -43,6 +43,7 @@ const std::unordered_map<std::string, std::string> auto_paser_map = {
     {"glm4_moe", "glm45"},
     {"deepseek_v32", "deepseekv32"},
     {"kimi_k2", "kimi"},
+    {"kimi_k25", "kimi_k25"},
     {"step3", "step3"},
 };
 
@@ -61,7 +62,9 @@ const std::unordered_map<std::string, DetectorFactory> paser_factories = {
     REGISTER_DETECTOR("glm45", "<think>", "</think>"),
     REGISTER_DETECTOR("glm47", "<think>", "</think>"),
     REGISTER_DETECTOR("glm5", "<think>", "</think>"),
+    REGISTER_DETECTOR("deepseek-v4", "<think>", "</think>"),
     REGISTER_DETECTOR_DEFAULT_FORCE("kimi", "◁think▷", "◁/think▷", false),
+    REGISTER_DETECTOR("kimi_k25", "<think>", "</think>"),
     REGISTER_DETECTOR("qwen3", "<think>", "</think>"),
     REGISTER_DETECTOR("qwen35", "<think>", "</think>"),
     REGISTER_DETECTOR_DEFAULT_FORCE("qwen3-thinking",

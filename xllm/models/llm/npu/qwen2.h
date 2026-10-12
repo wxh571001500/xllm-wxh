@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,7 @@ limitations under the License.
 
 #pragma once
 
+#include "core/framework/config/scheduler_config.h"
 #include "core/layers/npu/npu_qwen2_decoder_layer_impl.h"
 #include "layers/common/rotary_embedding_util.h"
 #include "llm_model_base.h"
@@ -57,7 +58,9 @@ class QWen2ModelImpl : public LlmModelImplBase<QWen2DecoderLayer> {
         model_args.max_position_embeddings(),
         model_args.rope_theta(),
         options);
-    int32_t mask_value = FLAGS_enable_chunked_prefill ? -9984 : 1;
+    int32_t mask_value =
+        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill() ? -9984
+                                                                         : 1;
     attn_mask_ = layer::AttentionMask(options.device(),
                                       options.dtype().toScalarType(),
                                       /*mask_value=*/mask_value);
@@ -79,12 +82,12 @@ class QWen2ForCausalLMImpl : public LlmForCausalLMImplBase<QWen2Model> {
 TORCH_MODULE(QWen2ForCausalLM);
 
 // register the causal model
-REGISTER_CAUSAL_MODEL(qwen2, QWen2ForCausalLM);
+REGISTER_CAUSAL_MODEL_WITH_VARNAME(qwen2_atb, qwen2_atb, QWen2ForCausalLM);
 
 // register the model args
 // example config:
 // https://huggingface.co/Qwen/Qwen2-7B-Instruct/blob/main/config.json
-REGISTER_MODEL_ARGS(qwen2, [&] {
+REGISTER_MODEL_ARGS_WITH_VARNAME(qwen2_atb, qwen2_atb, [&] {
   LOAD_ARG_OR(model_type, "model_type", "qwen2");
   LOAD_ARG_OR(dtype, "torch_dtype", "");
   LOAD_ARG_OR(vocab_size, "vocab_size", 152064);

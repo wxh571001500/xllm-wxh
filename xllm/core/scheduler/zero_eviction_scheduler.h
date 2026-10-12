@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -59,7 +59,7 @@ class BlockCapacityGuard {
 
   bool if_accept_candidate_sequences(
       const std::vector<Sequence*>& candidate_sequences,
-      const std::unique_ptr<DecodePriorityQueue>& running_queue,
+      const std::unique_ptr<RequestPriorityQueue>& running_queue,
       const std::vector<Sequence*>& running_sequences);
 
  private:
@@ -92,7 +92,7 @@ class BlockCapacityGuard {
   KVCacheManager* kv_cache_manager_;
 
   std::vector<Sequence*> candidate_sequences_;
-  std::vector<Sequence*> running_queue_;
+  std::vector<Sequence*> decode_queue_;
   std::vector<Sequence*> running_sequences_;
 
   uint32_t num_reserved_block_for_prefill_;
@@ -101,7 +101,7 @@ class BlockCapacityGuard {
 class ZeroEvictionScheduler final : public ContinuousScheduler {
  public:
   ZeroEvictionScheduler(Engine* engine, const Options& options);
-  virtual ~ZeroEvictionScheduler();
+  ~ZeroEvictionScheduler() override;
 
  private:
   void handle_prefill_requests(

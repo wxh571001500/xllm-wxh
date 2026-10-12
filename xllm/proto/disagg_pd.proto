@@ -1,3 +1,18 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 syntax = "proto3";
 
 option go_package = "jd.com/jd-infer/xllm;xllm";
@@ -5,10 +20,10 @@ package xllm.proto;
 option cc_generic_services = true;
 
 import "common.proto";
+import "tensor.proto";
 
 message ClusterInfos {
   repeated uint64 cluster_ids = 1;
-  repeated string device_ips = 2;
   repeated uint32 ports = 3;
   int32 dp_size = 4;
   repeated string addrs = 5;
@@ -70,6 +85,11 @@ message DisaggRequest {
   optional int32 ttlt_priority_weight = 36;
   optional int32 priority_weight = 37;
   string source_xservice_addr = 38;
+  bool include_stop_str_in_output = 39;
+  bool json_object = 40;
+  bool json_reasoning_enabled = 41;
+  // Identifies this reservation even when callers reuse a request ID.
+  string reservation_id = 42;
 
 }
 
@@ -79,12 +99,12 @@ message DisaggResponses {
 }
 
 message DisaggResponse {
+  reserved 3, 6, 21;
+
   // req id
   string req_id = 1;
   // http code
   int32 status_code = 2;
-  // blocks ids allocated for request.
-  repeated int32 blocks_ids = 3;
   int32 dp_rank = 4;
 
   // XTensor mode: GlobalXTensor offsets for each block (per-layer)
@@ -92,6 +112,9 @@ message DisaggResponse {
   // Layout: [layer0_block0_k, layer0_block0_v, layer0_block1_k, layer0_block1_v, ...]
   //         [layer1_block0_k, layer1_block0_v, ...]
   repeated XTensorLayerOffsets xtensor_layer_offsets = 5;
+  // Group-aware block allocation. group_id is defined by the cache layout and
+  // is opaque to the PD protocol.
+  repeated KVTransferGroup groups = 20;
 }
 
 // XTensor mode: offsets for one layer
@@ -100,6 +123,18 @@ message XTensorLayerOffsets {
   repeated uint64 k_offsets = 1;
   // V cache offsets for each block in GlobalXTensor
   repeated uint64 v_offsets = 2;
+}
+
+message KVTransferGroup {
+  int32 group_id = 1;
+  reserved 2;
+  repeated uint64 ids = 3;
+  // Number of leading blocks the D side already holds from its own prefix
+  // cache. P advances its per-group transfer cursor to this value so it
+  // starts pushing at the first block that D actually needs. Zero when D
+  // has no shared prefix (e.g. DECODE-side SWA prefix cache is off by role).
+  uint32 remote_shared_num = 4;
+  reserved 5;  // was: repeated uint32 block_valid_token_counts
 }
 
 // Deprecated: Use DisaggGenerationsRequest instead
@@ -118,8 +153,6 @@ message XTensorLayerOffsets {
 //   string kv_cache_transfer_mode = 7;
 //   repeated uint64 cluster_ids = 8;
 //   repeated string addrs = 14;
-//   repeated int64 k_cache_ids = 9;
-//   repeated int64 v_cache_ids = 10;
 //   repeated int32 block_ids = 11;
 //   int32 dp_size = 12;
 //   int32 dp_rank = 13;
@@ -138,6 +171,8 @@ message OutputUsage {
   int32 num_generated_tokens = 2;
   // the total number of tokens used in the request (prompt + completion).
   int32 num_total_tokens = 3;
+  // the number of prompt tokens served from prefix cache.
+  int32 num_cached_tokens = 4;
 }
 
 message LogProbData {
@@ -214,18 +249,24 @@ message RemoteToken {
 }
 
 message DisaggGenerationsRequest {
+  reserved 8, 13, 16;
+
   string req_id = 1;
   repeated RemoteToken tokens = 2;
   string kv_cache_transfer_mode = 3;
   repeated uint64 cluster_ids = 4;
   repeated string addrs = 5;
-  repeated int64 k_cache_ids = 6;
-  repeated int64 v_cache_ids = 7;
-  repeated int32 block_ids = 8;
   int32 dp_size = 9;
   int32 dp_rank = 10;
   string x_request_id = 11;
   string x_request_time = 12;
+  // MTP bootstrap state for the first decode draft extend.
+  Tensor mtp_bootstrap_embedding = 14;
+  // Number of prompt tokens served from the prefill prefix cache.
+  int32 num_cached_tokens = 15;
+  repeated KVTransferGroup source_groups = 20;
+  // Cumulative end-to-end latency measured by the source at handoff.
+  optional double upstream_elapsed_seconds = 21;
 }
 
 message DisaggGenerationsRequests {
@@ -236,12 +277,29 @@ message InstanceClusterInfo {
   string instance_name = 1;
   repeated uint64 cluster_ids = 2;
   repeated string addrs = 3;
-  repeated string device_ips = 4;
   repeated uint32 ports = 5;
   int32 dp_size = 6;
+  // Prefill-side effective KV-split width for link_cluster on decode.
+  int32 kv_split_size = 7;
+}
+
+message ReleaseReservationRequest {
+  string req_id = 1;
+  string reservation_id = 2;
+}
+
+message ReleaseReservationResponse {
+  enum Result {
+    UNKNOWN = 0;
+    RELEASED = 1;
+    NOT_WAITING = 2;
+  }
+  Result result = 1;
 }
 
 service DisaggPDService {
+  rpc ReleaseReservation(ReleaseReservationRequest)
+      returns (ReleaseReservationResponse) {}
   rpc AddNewRequests(DisaggRequests) returns (DisaggResponses) {}
   rpc FirstGeneration(DisaggGenerationsRequests) returns (Status) {}
   rpc MultiGenerations(DisaggGenerationsRequests) returns (Status) {}

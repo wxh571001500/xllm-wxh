@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,13 +15,13 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/torch.h>
 
 #include <vector>
 
 #include "core/framework/model/model_args.h"
-#include "core/framework/request/mm_data.h"
-#include "core/framework/request/mm_input.h"
+#include "core/framework/multimodal/mm_data.h"
 
 namespace xllm {
 
@@ -29,17 +29,20 @@ class ImageProcessor {
  public:
   virtual ~ImageProcessor() = default;
 
-  virtual bool process(const MMInput& mm_inputs, MMData& mm_datas) = 0;
-  virtual torch::Tensor resize(const torch::Tensor& image,
-                               const std::vector<int64_t>& size,
-                               int resample,
-                               bool antialias = true);
-  virtual torch::Tensor centerCrop(const torch::Tensor& image,
-                                   const std::pair<int, int>& cropSize);
-  virtual torch::Tensor rescale(const torch::Tensor& image, double scale);
-  virtual torch::Tensor normalize(const torch::Tensor& image,
-                                  const std::vector<double>& mean,
-                                  const std::vector<double>& std);
+  virtual bool process(const std::vector<torch::Tensor>& images,
+                       std::vector<MMDataItem>& output_items) const = 0;
+};
+
+class ImageNoneProcessor final : public ImageProcessor {
+ public:
+  ImageNoneProcessor() = default;
+  explicit ImageNoneProcessor(const ModelArgs&) {}
+
+  bool process(const std::vector<torch::Tensor>& images,
+               std::vector<MMDataItem>& output_items) const override {
+    LOG(ERROR) << "Image processor is not configured.";
+    return false;
+  }
 };
 
 }  // namespace xllm

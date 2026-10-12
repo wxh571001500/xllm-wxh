@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -60,11 +60,13 @@ torch::Tensor FusedMoEImpl::select_experts_base(
   token_count_slice =
       token_count.slice(0, start_expert_id_, start_expert_id_ + expert_size);
 
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     xllm::kernel::ScaledQuantizeParams scaled_quantize_params;
     scaled_quantize_params.x = hidden_states_2d;
-    scaled_quantize_params.smooth = input_smooth_.slice(
-        0, start_expert_id_, start_expert_id_ + expert_size);
+    if (input_smooth_.defined()) {
+      scaled_quantize_params.smooth = input_smooth_.slice(
+          0, start_expert_id_, start_expert_id_ + expert_size);
+    }
     scaled_quantize_params.gather_index_start_position =
         cusum_token_count.value().index({start_expert_id_}).unsqueeze(0);
     scaled_quantize_params.token_count = token_count_slice;
@@ -91,7 +93,7 @@ torch::Tensor FusedMoEImpl::select_experts_base(
   selected_expert_info.combine_idx = combine_idx;
   selected_expert_info.token_count_slice = token_count_slice;
   selected_expert_info.cusum_token_count = cusum_token_count;
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     selected_expert_info.input_scale = hidden_states_scale;
   }
 
@@ -137,14 +139,17 @@ void FusedMoEImpl::final_comm_allreduce(torch::Tensor& final_hidden_states,
 
 torch::Tensor FusedMoEImpl::forward_experts_base(
     const torch::Tensor& hidden_states,
-    const std::optional<RouteInfo>& route_info) {
+    const std::optional<RouteInfo>& route_info,
+    const std::optional<torch::Tensor>& input_ids) {
   torch::IntArrayRef hidden_states_shape = hidden_states.sizes();
   torch::ScalarType hidden_states_dtype = hidden_states.dtype().toScalarType();
   torch::Tensor hidden_states_2d =
       hidden_states.reshape({-1, hidden_states.size(-1)});
 
-  RouteInfo route = get_route(
-      hidden_states_2d, /*enable_all2all_communication=*/false, route_info);
+  RouteInfo route = get_route(hidden_states_2d,
+                              /*enable_all2all_communication=*/false,
+                              route_info,
+                              input_ids);
 
   int64_t group_gemm_max_dim = hidden_states_2d.size(0);
   int64_t expert_size = w13_.size(0);
@@ -188,8 +193,6 @@ torch::Tensor FusedMoEImpl::forward_experts_base(
   if (!enable_result_reduction_) {
     return final_hidden_states;
   }
-
-  init_streams(hidden_states);
 
   torch::Tensor shared_expert_output;
   final_comm_allreduce(

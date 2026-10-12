@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -26,7 +26,8 @@ limitations under the License.
 #include <exception>
 #include <stdexcept>
 
-#include "core/common/global_flags.h"
+#include "core/framework/config/beam_search_config.h"
+#include "core/framework/config/execution_config.h"
 #include "helper.h"
 
 XLLM_CAPI_EXPORT XLLM_LLM_Handler* xllm_llm_create(void) {
@@ -58,9 +59,8 @@ XLLM_CAPI_EXPORT void xllm_llm_init_options_default(
 XLLM_CAPI_EXPORT bool xllm_llm_initialize(
     XLLM_LLM_Handler* handler,
     const char* model_path,
-    const char* devices,
     const XLLM_InitOptions* init_options) {
-  if (!handler || !model_path || !devices) return false;
+  if (!handler || !model_path) return false;
 
   try {
     XLLM_InitOptions xllm_init_options;
@@ -80,9 +80,7 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
     xllm::Options options;
     options.model_path(model_path)
         .task_type(xllm_init_options.task)
-        .devices(devices)
         .draft_model_path(xllm_init_options.draft_model)
-        .draft_devices(xllm_init_options.draft_devices)
         .backend("llm")
         .block_size(xllm_init_options.block_size)
         .max_cache_size(xllm_init_options.max_cache_size)
@@ -98,9 +96,8 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
         .communication_backend(xllm_init_options.communication_backend)
         .expert_parallel_degree(xllm_init_options.expert_parallel_degree)
         .enable_chunked_prefill(xllm_init_options.enable_chunked_prefill)
-        .enable_prefill_sp(xllm_init_options.enable_prefill_sp)
+        .cp_size(static_cast<int32_t>(xllm_init_options.cp_size))
         .master_node_addr(xllm_init_options.master_node_addr)
-        .device_ip(xllm_init_options.device_ip)
         .transfer_listen_port(xllm_init_options.transfer_listen_port)
         .nnodes(xllm_init_options.nnodes)
         .node_rank(xllm_init_options.node_rank)
@@ -115,12 +112,12 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
         .is_local(true)
         .server_idx(xllm_init_options.server_idx);
 
-    options.enable_graph(FLAGS_enable_graph);
+    options.enable_graph(
+        ::xllm::ExecutionConfig::get_instance().enable_graph());
 
-#if !defined(USE_NPU)
-    FLAGS_enable_block_copy_kernel = false;
+#if !defined(USE_NPU) && !defined(USE_CUDA) && !defined(USE_MUSA)
+    xllm::BeamSearchConfig::get_instance().enable_block_copy_kernel(false);
 #endif
-
     handler->master = std::make_unique<xllm::LLMMaster>(options);
     handler->master->run();
 

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -39,7 +39,6 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "framework/xtensor/xtensor.h"
 #include "loader/base_loader.h"
-#include "loader/base_manual_loader.h"
 #include "platform/device.h"
 #include "pytorch/adapter/utils/utils.h"
 #include "pytorch/adapter/workspace/workspace.h"
@@ -85,7 +84,11 @@ enum class PackType : int {
   ALL_W8A8_DYNAMIC = 18,
   ALL_W8A8_DYNAMIC_ANTI = 19,
   MIX_W8A8_DYNAMIC = 20,
-  MIX_W8A8_DYNAMIC_ANTI = 21
+  MIX_W8A8_DYNAMIC_ANTI = 21,
+  ALL_W4A8 = 22,
+  MIX_W4A8 = 23,
+  ALL_W4A8_ANTI = 24,
+  MIX_W4A8_ANTI = 25
 };
 
 enum class LinearTypeV2 : int {
@@ -105,7 +108,7 @@ enum class LinearTypeV2 : int {
 class BaseLayer : public torch::nn::Module {
  public:
   explicit BaseLayer(const ModelContext& context);
-  virtual ~BaseLayer() override = default;
+  ~BaseLayer() override = default;
 
   atb::Status execute_node(atb_speed::Model::Node& node,
                            int nodeId = 0,
@@ -194,15 +197,22 @@ class BaseLayer : public torch::nn::Module {
     }
   };
 
-  // Returns the loader cast to BaseManualLoader*, or nullptr if the loader is
-  // not a BaseManualLoader (e.g., when enable_manual_loader=false).
-  virtual BaseManualLoader* get_manual_loader() {
-    return dynamic_cast<BaseManualLoader*>(loader_.get());
+  // Returns the loader when it is running in manual mode, otherwise nullptr
+  // (e.g., when enable_manual_loader=false). All manual-mode bookkeeping
+  // (pinned host buffer, rolling buffer, slice metadata, ...) lives directly
+  // on `BaseLoader`.
+  virtual BaseLoader* get_loader() {
+    return (loader_ && loader_->mode() == LoadMode::kManual) ? loader_.get()
+                                                             : nullptr;
   }
 
   virtual int64_t init_layer() { return 0; };
 
   virtual void run_task(std::string taskName, std::function<int()> task) const;
+
+  virtual void set_residual(torch::Tensor residual) { residual_ = residual; };
+
+  virtual void set_layer_id(int32_t layer_id) {};
 
  protected:
   std::unique_ptr<BaseLoader> loader_ = nullptr;
@@ -212,6 +222,7 @@ class BaseLayer : public torch::nn::Module {
   torch::ScalarType dtype_;
   std::vector<int32_t> placeholder_vec_;
   std::vector<int32_t> placeholder_vec_zero_;
+  torch::Tensor residual_;
   xllm::ParallelArgs parallel_args_;
   std::function<void(const std::string&, std::function<int()>)> run_task_func_;
   std::string quantize_type_;

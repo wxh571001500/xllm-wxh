@@ -1,5 +1,4 @@
 include(cc_library)
-include(cc_test)
 
 cc_library(
   NAME
@@ -8,23 +7,27 @@ cc_library(
     concurrent_queue.h
     blocking_counter.h
     blockingconcurrentqueue.h
+    binary_payload.h
     closure_guard.h
     concurrentqueue.h
-    device_name_utils.h
-    double_buffer.h
+    cpu_affinity.h
     env_var.h
     hash_util.h
     http_downloader.h
     json_reader.h
+    dit_model_discovery.h
     model_config_utils.h
     lightweightsemaphore.h
     net.h
     pretty_print.h
+    pybind_helper.h
+    rec_model_utils.h
     scope_guard.h
     slice.h
     spin_lock.h
     spin_rw_lock.h
     int32_map.h
+    linalg.h
     suffix_decoding_cache.h
     suffix_tree.h
     tensor_helper.h
@@ -33,13 +36,18 @@ cc_library(
     type_traits.h
     utils.h
     uuid.h
+    verbose_trace_logger.h
     shared_memory_manager.h
   SRCS
-    device_name_utils.cpp
+    binary_payload.cpp
+    cpu_affinity.cpp
     env_var.cpp
+    hash_util.cpp
     http_downloader.cpp
     # TODO. add following at next pr.
     json_reader.cpp
+    dit_model_discovery.cpp
+    linalg.cpp
     model_config_utils.cpp
     net.cpp
     pretty_print.cpp
@@ -49,8 +57,10 @@ cc_library(
     timer.cpp
     utils.cpp
     uuid.cpp
+    verbose_trace_logger.cpp
     shared_memory_manager.cpp
   DEPS
+    Folly::folly
     torch
     brpc
     OpenSSL::SSL
@@ -65,26 +75,9 @@ cc_library(
     absl::synchronization
     ${Python_LIBRARIES}
     proto::xllm_proto
-    :platform
     SMHasherSupport
     xxHash
     spdlog::spdlog
 )
 
-cc_test(
-  NAME
-    util_test
-  SRCS
-    blocking_counter_test.cpp
-    suffix_decoding_cache_test.cpp
-    threadpool_test.cpp
-  DEPS
-    util
-    absl::synchronization
-    absl::time
-    GTest::gtest_main
-    gflags::gflags
-)
-target_link_libraries(util_test PRIVATE brpc leveldb::leveldb OpenSSL::SSL OpenSSL::Crypto)
 add_dependencies(util brpc-static)
-add_dependencies(util_test brpc-static)

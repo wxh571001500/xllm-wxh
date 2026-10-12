@@ -1,8 +1,8 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/distributed_runtime/rec_master.h"
 #include "core/framework/request/request_output.h"
 #include "core/framework/request/request_params.h"
+#include "core/util/rec_model_utils.h"
 
 /**
  * @brief Opaque handle for LLM inference instance
@@ -55,6 +56,9 @@ struct XLLM_LLM_Handler {
 struct XLLM_REC_Handler {
   /** Flag indicating if REC instance is initialized and ready for inference */
   bool initialized{false};
+
+  /** Selected REC pipeline type for the loaded model */
+  xllm::RecPipelineType pipeline_type{xllm::RecPipelineType::kLlmRecDefault};
 
   /** List of loaded recommendation model IDs */
   std::vector<std::string> model_ids;
@@ -127,6 +131,7 @@ XLLM_Response* build_error_response(const std::string& request_id,
  */
 XLLM_Response* build_success_response(const InferenceType& inference_type,
                                       const xllm::RequestOutput& output,
+                                      xllm::RecPipelineType rec_pipeline_type,
                                       const std::string& request_id,
                                       int64_t created_time,
                                       const std::string& model);

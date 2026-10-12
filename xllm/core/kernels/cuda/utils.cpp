@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,16 +15,22 @@ limitations under the License.
 
 #include "utils.h"
 
+#include <ATen/DLConvertor.h>
 #include <c10/core/Device.h>
 #include <cuda_runtime.h>
+#if !defined(USE_DCU)
 #include <dlfcn.h>
 #include <dlpack/dlpack.h>
+#endif
 
 #include <cstdlib>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 #include "core/platform/device.h"
+#include "core/platform/platform.h"
 #include "core/util/env_var.h"
 #include "core/util/utils.h"
 
@@ -43,6 +49,7 @@ const std::unordered_map<torch::ScalarType, std::string_view>
         {torch::kUInt64, "u64"},
 };
 
+#if !defined(USE_DCU)
 void ensure_tvm_ffi_global_symbols() {
   // Ensure that TVMFFIEnvGetStream and other TVM FFI symbols are globally
   // visible for offline inference
@@ -94,11 +101,12 @@ void ensure_tvm_ffi_global_symbols() {
   });
 }
 
-DLDataType get_data_type_for_dlpack_v1(const torch::Tensor& t) {
+DLDataType torch_scalar_type_to_dl_data_type_impl(torch::ScalarType scalar_type,
+                                                  int64_t element_bits) {
   DLDataType dtype;
   dtype.lanes = 1;
-  dtype.bits = t.element_size() * 8;
-  switch (t.scalar_type()) {
+  dtype.bits = static_cast<uint8_t>(element_bits);
+  switch (scalar_type) {
     case torch::ScalarType::UInt1:
     case torch::ScalarType::UInt2:
     case torch::ScalarType::UInt3:
@@ -176,10 +184,15 @@ DLDataType get_data_type_for_dlpack_v1(const torch::Tensor& t) {
       break;
 #endif
     default:
-      LOG(FATAL) << "Unsupported scalar type: ";
+      LOG(FATAL) << "Unsupported scalar type: " << torch::toString(scalar_type);
       break;
   }
   return dtype;
+}
+
+DLDataType get_data_type_for_dlpack_v1(const torch::Tensor& t) {
+  const int64_t element_bits = static_cast<int64_t>(t.element_size() * 8);
+  return torch_scalar_type_to_dl_data_type_impl(t.scalar_type(), element_bits);
 }
 
 DLDevice torch_device_to_dl_device_for_dlpack_v1(torch::Device device) {
@@ -222,6 +235,24 @@ DLDevice torch_device_to_dl_device_for_dlpack_v1(torch::Device device) {
   }
 
   return ctx;
+}
+
+torch::Device dl_device_to_torch_device_for_dlpack_v1(DLDevice device) {
+  switch (device.device_type) {
+    case DLDeviceType::kDLCPU:
+    case DLDeviceType::kDLCUDAHost:
+      return torch::Device(torch::kCPU);
+    case DLDeviceType::kDLCUDA:
+      return torch::Device(torch::kCUDA,
+                           static_cast<c10::DeviceIndex>(device.device_id));
+    case DLDeviceType::kDLROCM:
+      return torch::Device(torch::kHIP,
+                           static_cast<c10::DeviceIndex>(device.device_id));
+    default:
+      LOG(FATAL) << "Unsupported DLPack device type: "
+                 << std::to_string(device.device_type);
+      return torch::Device(torch::kCPU);
+  }
 }
 
 template <class T>
@@ -268,6 +299,49 @@ T* to_dlpack_impl(const torch::Tensor& src) {
   fill_version(&atDLMTensor->tensor);
   return &(atDLMTensor->tensor);
 }
+
+int32_t torch_dlpack_managed_tensor_allocator(
+    DLTensor* prototype,
+    DLManagedTensorVersioned** out,
+    void* error_ctx,
+    void (*set_error)(void* error_ctx, const char* kind, const char* message)) {
+  try {
+    if (prototype == nullptr || out == nullptr) {
+      LOG(FATAL) << "prototype and out must not be null";
+      return -1;
+    }
+
+    std::vector<int64_t> shape(prototype->shape,
+                               prototype->shape + prototype->ndim);
+    torch::TensorOptions options =
+        torch::TensorOptions()
+            .dtype(at::toScalarType(prototype->dtype))
+            .device(dl_device_to_torch_device_for_dlpack_v1(prototype->device));
+    torch::Tensor tensor = torch::empty(shape, options);
+    *out = to_dlpack_impl<DLManagedTensorVersioned>(tensor);
+    return 0;
+  } catch (const std::exception& e) {
+    if (set_error != nullptr) {
+      set_error(error_ctx, "MemoryError", e.what());
+    }
+    return -1;
+  }
+}
+
+void ensure_tvm_ffi_tensor_allocator() {
+  static std::once_flag once;
+  std::call_once(once, []() {
+    DLPackManagedTensorAllocator previous_allocator = nullptr;
+    const int32_t rc = TVMFFIEnvSetDLPackManagedTensorAllocator(
+        torch_dlpack_managed_tensor_allocator,
+        /*write_to_global_context=*/1,
+        &previous_allocator);
+    if (rc != 0) {
+      LOG(FATAL) << "[tvmffi] failed to register Torch DLPack allocator, rc="
+                 << rc;
+    }
+  });
+}
 }  // namespace
 
 namespace xllm::kernel::cuda {
@@ -292,7 +366,7 @@ bool should_use_tensor_core(torch::ScalarType kv_cache_dtype,
   return false;
 }
 
-bool support_pdl() { return Device::is_enable_pdl(); }
+bool support_pdl() { return Platform::is_enable_pdl(); }
 
 std::string path_to_uri_so_lib(const std::string& uri) {
   return util::get_string_env("FLASHINFER_OPS_PATH") + "/" + uri + "/" + uri +
@@ -305,7 +379,7 @@ std::string determine_attention_backend(int64_t pos_encoding_mode,
   bool support_fa3_backend =
       (pos_encoding_mode == 0) && !use_fp16_qk_reduction && !use_custom_mask;
 
-  if (Device::is_support_sm90a() && support_fa3_backend) {
+  if (Platform::is_support_sm90a() && support_fa3_backend) {
     return "fa3";
   }
   return "fa2";
@@ -323,7 +397,12 @@ std::string get_batch_prefill_uri(const std::string& backend,
                                   bool use_logits_soft_cap,
                                   bool use_fp16_qk_reduction) {
   std::ostringstream oss;
+#if defined(USE_MACA)
+  // use batch_prefill_tvm_ffi_with_kv_cache api for maca
+  oss << "batch_prefill_tvm_ffi_with_kv_cache_"
+#else
   oss << "batch_prefill_with_kv_cache_"
+#endif
       << "dtype_q_" << filename_safe_dtype_map.at(dtype_q) << "_"
       << "dtype_kv_" << filename_safe_dtype_map.at(dtype_kv) << "_"
       << "dtype_o_" << filename_safe_dtype_map.at(dtype_o) << "_"
@@ -350,7 +429,13 @@ std::string get_batch_decode_uri(torch::ScalarType dtype_q,
                                  bool use_sliding_window,
                                  bool use_logits_soft_cap) {
   std::ostringstream oss;
+
+#if defined(USE_MACA)
+  // use batch_decode_tvm_ffi_with_kv_cache api for maca
+  oss << "batch_decode_tvm_ffi_with_kv_cache_"
+#else
   oss << "batch_decode_with_kv_cache_"
+#endif
       << "dtype_q_" << filename_safe_dtype_map.at(dtype_q) << "_"
       << "dtype_kv_" << filename_safe_dtype_map.at(dtype_kv) << "_"
       << "dtype_o_" << filename_safe_dtype_map.at(dtype_o) << "_"
@@ -395,6 +480,13 @@ std::tuple<torch::Tensor, double> split_scale_param(
   return std::make_tuple(scale, 1.0);
 }
 
+DLDataType to_dl_data_type(torch::ScalarType scalar_type) {
+  const int64_t element_bits =
+      static_cast<int64_t>(torch::elementSize(scalar_type) * 8);
+  return torch_scalar_type_to_dl_data_type_impl(scalar_type, element_bits);
+}
+
+// below are tvm-ffi related functions
 ffi::Tensor to_ffi_tensor(const torch::Tensor& torch_tensor) {
   if (!torch_tensor.defined()) {
     LOG(FATAL) << "torch_tensor is not defined";
@@ -402,6 +494,33 @@ ffi::Tensor to_ffi_tensor(const torch::Tensor& torch_tensor) {
 
   auto dlpack = to_dlpack_impl<DLManagedTensorVersioned>(torch_tensor);
   return ffi::Tensor::FromDLPackVersioned(dlpack);
+}
+
+ffi::Optional<ffi::Tensor> to_ffi_optional_tensor(
+    const std::optional<torch::Tensor>& optional) {
+  if (!optional.has_value()) {
+    return ffi::Optional<ffi::Tensor>();
+  }
+  return ffi::Optional<ffi::Tensor>(to_ffi_tensor(optional.value()));
+}
+
+ffi::Array<ffi::Tensor> to_ffi_array_tensors(
+    const std::vector<torch::Tensor>& torch_tensors) {
+  std::vector<ffi::Tensor> ffi_tensors;
+  ffi_tensors.reserve(torch_tensors.size());
+  for (const auto& torch_tensor : torch_tensors) {
+    ffi_tensors.emplace_back(to_ffi_tensor(torch_tensor));
+  }
+  return ffi::Array<ffi::Tensor>(ffi_tensors);
+}
+
+ffi::Optional<ffi::Array<ffi::Tensor>> to_ffi_optional_array_tensors(
+    const std::optional<std::vector<torch::Tensor>>& optional) {
+  if (!optional.has_value()) {
+    return ffi::Optional<ffi::Array<ffi::Tensor>>();
+  }
+  return ffi::Optional<ffi::Array<ffi::Tensor>>(
+      to_ffi_array_tensors(optional.value()));
 }
 
 ffi::Module get_module(const std::string& uri) {
@@ -413,6 +532,7 @@ ffi::Module get_module(const std::string& uri) {
   }
 
   ensure_tvm_ffi_global_symbols();
+  ensure_tvm_ffi_tensor_allocator();
   std::string so_file_path = path_to_uri_so_lib(uri);
   auto mod = ffi::Module::LoadFromFile(so_file_path);
   module_cache.emplace(uri, mod);
@@ -442,4 +562,5 @@ ffi::Function get_function(const std::string& uri,
   func_cache.emplace(key, func);
   return func;
 }
+#endif  // !USE_DCU
 }  // namespace xllm::kernel::cuda

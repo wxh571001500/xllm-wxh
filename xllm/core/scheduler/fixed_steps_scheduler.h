@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -49,9 +49,7 @@ struct ScheduleResult {
 class FixedStepsScheduler final : public ContinuousScheduler {
  public:
   FixedStepsScheduler(Engine* engine, const Options& options);
-  virtual ~FixedStepsScheduler() = default;
-
-  bool add_request(std::shared_ptr<Request>& request) override;
+  ~FixedStepsScheduler() override = default;
 
   // step the scheduler forward by one step
   // may get blocked if there are no requests to process
@@ -90,6 +88,15 @@ class FixedStepsScheduler final : public ContinuousScheduler {
     }
   };
 
+  class OneRecXAttentionSchedulerPipeline final : public SchedulerPipeline {
+   public:
+    std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
+                                      BatchFactory* batch_factory) override;
+    bool requires_kv_cache() const override { return true; }
+    bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
+                           Sequence* sequence) override;
+  };
+
   class RecMultiRoundSchedulerPipeline final : public SchedulerPipeline {
    public:
     std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
@@ -109,7 +116,7 @@ class FixedStepsScheduler final : public ContinuousScheduler {
   ScheduleResult schedule_request(const absl::Duration& timeout);
 
   // build a batch of requests from the priority queue
-  virtual std::vector<Batch> prepare_batch();
+  std::vector<Batch> prepare_batch() override;
 
   void handle_prefill_requests(
       size_t& remaining_token_budget,
@@ -118,6 +125,11 @@ class FixedStepsScheduler final : public ContinuousScheduler {
 
   // Lazy-initialized pipeline
   std::unique_ptr<SchedulerPipeline> scheduler_pipeline_;
+
+  // Holds a request consumed by the blocking wait in schedule_request() while
+  // the queue was empty. prepare_batch() drains it first, through the same path
+  // as request_queue_, so the blocking wait does not lose requests.
+  std::shared_ptr<Request> prefetched_request_;
 
   // Scheduler thread pool for parallel execution of step()
   std::unique_ptr<ThreadPool> step_threadpool_;

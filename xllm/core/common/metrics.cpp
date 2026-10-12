@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,6 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #include "common/metrics.h"
+
+#include <algorithm>
+#include <mutex>
 
 // llm server impl metrics
 DEFINE_COUNTER(request_status_total_ok, "Total number of request status OK");
@@ -44,6 +47,16 @@ DEFINE_COUNTER(tokenization_latency_seconds,
 DEFINE_COUNTER(chat_template_latency_seconds,
                "Chat template latency in seconds");
 
+// multimodal preprocessing metrics
+DEFINE_HISTOGRAM(mm_input_loading_latency_milliseconds,
+                 "Latency of multimodal input loading and decoding in "
+                 "milliseconds");
+DEFINE_HISTOGRAM(mm_preprocess_latency_milliseconds,
+                 "Latency of multimodal input preprocessing in milliseconds");
+
+DEFINE_HISTOGRAM(encoder_cache_hit_rate,
+                 "Histogram of encoder cache hit rate in percent");
+
 // block manager metrics
 DEFINE_COUNTER(prefix_cache_latency_seconds_insert,
                "Latency of prefix cache insert in seconds");
@@ -52,17 +65,39 @@ DEFINE_COUNTER(prefix_cache_latency_seconds_match,
 DEFINE_COUNTER(prefix_cache_latency_seconds_evict,
                "Latency of prefix cache evict in seconds");
 
-DEFINE_COUNTER(prefix_cache_match_length_total,
-               "Length of matched prefix in tokens");
+DEFINE_COUNTER(prefix_cache_prompt_tokens_total,
+               "Process-cumulative prompt tokens for admitted requests");
+DEFINE_COUNTER(prefix_cache_hit_tokens_total,
+               "Process-cumulative prefix-cache hit tokens");
+DEFINE_GAUGE(prefix_cache_token_hit_rate_perc,
+             "Process-cumulative prefix-cache token hit rate in percent");
 
 DEFINE_COUNTER(allocate_blocks_latency_seconds,
                "Latency of blocks allocation in seconds");
 
-DEFINE_HISTOGRAM(prefix_cache_block_matched_rate,
-                 "Histogram of prefix cache block match rate");
+namespace {
 
-DEFINE_HISTOGRAM(prefix_cache_block_matched_num,
-                 "Histogram of prefix cache block matched number");
+std::mutex prefix_cache_hit_metrics_mutex;
+
+}  // namespace
+
+namespace xllm {
+
+void record_prefix_cache_hit_metrics(size_t prompt_tokens, size_t hit_tokens) {
+  if (prompt_tokens == 0) {
+    return;
+  }
+
+  hit_tokens = std::min(hit_tokens, prompt_tokens);
+  const std::lock_guard<std::mutex> lock(prefix_cache_hit_metrics_mutex);
+  COUNTER_ADD(prefix_cache_prompt_tokens_total, prompt_tokens);
+  COUNTER_ADD(prefix_cache_hit_tokens_total, hit_tokens);
+  const double prompt_total = COUNTER_VALUE(prefix_cache_prompt_tokens_total);
+  const double hit_total = COUNTER_VALUE(prefix_cache_hit_tokens_total);
+  GAUGE_SET(prefix_cache_token_hit_rate_perc, hit_total * 100.0 / prompt_total);
+}
+
+}  // namespace xllm
 
 // sequence metrics
 DEFINE_COUNTER(detokenization_latency_seconds_stream,
@@ -74,6 +109,21 @@ DEFINE_COUNTER(detokenization_latency_seconds_non_stream,
 DEFINE_COUNTER(num_model_execution_total_eager,
                "Total number of model execution");
 
+DEFINE_COUNTER(mooncake_transfer_completed_total_read,
+               "Total number of completed MoonCake READ transfers");
+DEFINE_COUNTER(mooncake_transfer_completed_total_write,
+               "Total number of completed MoonCake WRITE transfers");
+DEFINE_COUNTER(mooncake_transfer_bytes_total_read,
+               "Total bytes completed by MoonCake READ transfers");
+DEFINE_COUNTER(mooncake_transfer_bytes_total_write,
+               "Total bytes completed by MoonCake WRITE transfers");
+DEFINE_COUNTER(mooncake_transfer_failed_total,
+               "Total number of failed MoonCake transfers");
+DEFINE_HISTOGRAM(mooncake_transfer_latency_microseconds_read,
+                 "MoonCake READ transfer latency in microseconds");
+DEFINE_HISTOGRAM(mooncake_transfer_latency_microseconds_write,
+                 "MoonCake WRITE transfer latency in microseconds");
+
 // worker metrics
 DEFINE_COUNTER(execution_latency_seconds_model,
                "Latency of model execution in seconds");
@@ -81,6 +131,40 @@ DEFINE_COUNTER(execution_latency_seconds_logits_processing,
                "Latency of logits processing in seconds");
 DEFINE_COUNTER(execution_latency_seconds_sampling,
                "Latency of sampling in seconds");
+
+DEFINE_COUNTER(json_object_mask_cache_hits_total,
+               "JSON object mask cache hit count");
+DEFINE_COUNTER(json_object_mask_cache_misses_total,
+               "JSON object mask cache miss count");
+DEFINE_HISTOGRAM(json_object_mask_vocab_scan_latency_microseconds,
+                 "JSON object mask vocabulary scan latency in microseconds");
+DEFINE_HISTOGRAM(json_object_mask_row_build_latency_microseconds,
+                 "JSON object CPU mask row build latency in microseconds");
+DEFINE_HISTOGRAM(json_object_mask_batch_build_latency_microseconds,
+                 "JSON object CPU mask batch build latency in microseconds");
+DEFINE_HISTOGRAM(json_object_mask_device_copy_latency_microseconds,
+                 "JSON object blocking device copy latency in microseconds");
+DEFINE_HISTOGRAM(
+    json_object_mask_transfer_submission_latency_microseconds,
+    "JSON object non-blocking device copy submission latency in microseconds");
+DEFINE_COUNTER(json_object_mask_build_calls_normal_total,
+               "JSON object normal mask build calls");
+DEFINE_COUNTER(json_object_mask_build_calls_draft_total,
+               "JSON object draft mask build calls");
+DEFINE_COUNTER(json_object_mask_build_calls_target_total,
+               "JSON object target mask build calls");
+DEFINE_COUNTER(json_object_mask_build_rows_normal_total,
+               "JSON object normal mask build rows");
+DEFINE_COUNTER(json_object_mask_build_rows_draft_total,
+               "JSON object draft mask build rows");
+DEFINE_COUNTER(json_object_mask_build_rows_target_total,
+               "JSON object target mask build rows");
+DEFINE_COUNTER(json_object_mask_build_constrained_rows_normal_total,
+               "JSON object constrained rows in normal mask builds");
+DEFINE_COUNTER(json_object_mask_build_constrained_rows_draft_total,
+               "JSON object constrained rows in draft mask builds");
+DEFINE_COUNTER(json_object_mask_build_constrained_rows_target_total,
+               "JSON object constrained rows in target mask builds");
 
 // scheduler metrics
 DEFINE_GAUGE(num_pending_requests, "Number of pending requests in scheduler");
@@ -125,6 +209,8 @@ DEFINE_HISTOGRAM(time_to_first_token_latency_milliseconds,
 // inter token latency histogram
 DEFINE_HISTOGRAM(inter_token_latency_milliseconds,
                  "Histogram of inter token latency in milliseconds");
+DEFINE_HISTOGRAM(inter_token_latency_microseconds,
+                 "Histogram of inter token latency in microseconds");
 
 // response metrics
 DEFINE_COUNTER(responsing_latency_seconds_stream,
@@ -162,10 +248,53 @@ DEFINE_COUNTER(speculative_execution_latency_seconds_target,
 DEFINE_COUNTER(speculative_execution_latency_seconds_validation,
                "Latency of validation in seconds");
 
+DEFINE_COUNTER(speculative_num_drafts_total,
+               "Total number of speculative proposal sequences");
 DEFINE_COUNTER(speculative_num_accepted_tokens_total,
                "Total number of accepted tokens in validation");
 DEFINE_COUNTER(speculative_num_draft_tokens_total,
                "Total number of draft tokens");
+DEFINE_COUNTER(speculative_num_committed_tokens_total,
+               "Total number of tokens committed by speculative decode");
+DEFINE_MULTI_COUNTER(speculative_num_accepted_tokens_per_pos,
+                     "position",
+                     "Accepted speculative tokens by zero-based draft "
+                     "position");
+DEFINE_GAUGE(speculative_mean_acceptance_length,
+             "Cumulative acceptance length: mean tokens committed per "
+             "speculative proposal sequence, including the target bonus "
+             "token (1.0 without accepted draft tokens)");
+DEFINE_MULTI_GAUGE(speculative_conditional_acceptance_rate_per_pos,
+                   "position",
+                   "Per-position conditional draft acceptance rate: P(accept "
+                   "position i | position i-1 accepted)");
+DEFINE_HISTOGRAM(speculative_draft_token_d2h_latency_microseconds,
+                 "Latency of draft token host copies in microseconds");
+DEFINE_MULTI_HISTOGRAM(
+    speculative_draft_token_copy_submission_latency_microseconds,
+    "draft_index",
+    "Latency of draft token asynchronous host-copy submission in microseconds");
+DEFINE_MULTI_HISTOGRAM(
+    speculative_draft_token_ready_wait_latency_microseconds,
+    "draft_index",
+    "Latency of draft token host event wait in microseconds");
+DEFINE_MULTI_HISTOGRAM(speculative_draft_token_bulk_read_latency_microseconds,
+                       "draft_index",
+                       "Latency of draft token bulk host read in microseconds");
+DEFINE_MULTI_HISTOGRAM(
+    speculative_draft_token_handoff_latency_microseconds,
+    "draft_index",
+    "Total latency of draft token host handoff in microseconds");
+DEFINE_COUNTER(speculative_draft_token_handoff_fallback_total,
+               "Draft token host handoff fallback count");
+DEFINE_COUNTER(speculative_num_accepted_tokens_constrained_total,
+               "Accepted speculative tokens from constrained rows");
+DEFINE_COUNTER(speculative_num_accepted_tokens_plain_total,
+               "Accepted speculative tokens from plain rows");
+DEFINE_COUNTER(speculative_num_draft_tokens_constrained_total,
+               "Draft speculative tokens from constrained rows");
+DEFINE_COUNTER(speculative_num_draft_tokens_plain_total,
+               "Draft speculative tokens from plain rows");
 
 // proto metrics
 DEFINE_COUNTER(proto_latency_seconds_proto2i,
@@ -182,18 +311,23 @@ DEFINE_COUNTER(prepare_input_latency_seconds,
                "Latency of preparing input in seconds");
 
 // rec engine metrics
-DEFINE_COUNTER(prepare_input_latency_microseconds,
-               "Latency of preparing input in microseconds");
-DEFINE_COUNTER(rec_first_token_latency_microseconds,
-               "Latency of rec first token generation in microseconds");
-DEFINE_COUNTER(rec_second_token_latency_microseconds,
-               "Latency of rec second token generation in microseconds");
-DEFINE_COUNTER(rec_third_token_latency_microseconds,
-               "Latency of rec third token generation in microseconds");
-DEFINE_COUNTER(rec_sampling_latency_microseconds,
-               "Latency of rec sampling in microseconds");
-DEFINE_HISTOGRAM(expand_beam_latency_microseconds,
-                 "Histogram of expand beam latency in microseconds");
+DEFINE_HISTOGRAM(rec_total_latency_microseconds,
+                 "Latency of rec engine in microseconds");
+DEFINE_HISTOGRAM(prepare_input_latency_microseconds,
+                 "Latency of preparing input in microseconds");
+DEFINE_HISTOGRAM(rec_first_token_latency_microseconds,
+                 "Latency of rec first token generation in microseconds");
+DEFINE_HISTOGRAM(rec_second_token_latency_microseconds,
+                 "Latency of rec second token generation in microseconds");
+DEFINE_HISTOGRAM(rec_third_token_latency_microseconds,
+                 "Latency of rec third token generation in microseconds");
+DEFINE_HISTOGRAM(rec_sampling_latency_microseconds,
+                 "Latency of rec sampling in microseconds");
+
+DEFINE_GAUGE(rec_beam_search_width, "rec beam search width");
+
+DEFINE_HISTOGRAM(rec_input_token_num_per_request,
+                 "Histogram of input token number per request in rec engine");
 
 // multi node metrics
 DEFINE_COUNTER(worker_service_latency_seconds,

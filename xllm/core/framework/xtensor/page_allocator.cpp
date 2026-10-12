@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/distributed_runtime/master.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "xtensor_allocator.h"
 
 namespace xllm {
@@ -42,7 +43,8 @@ void PageAllocator::init(size_t num_phy_pages,
 
   dp_size_ = dp_size;
   max_world_size_ = max_world_size > 0 ? max_world_size : 1;
-  page_size_ = FLAGS_phy_page_granularity_size;
+  page_size_ =
+      ::xllm::KVCacheConfig::get_instance().phy_page_granularity_size();
   enable_page_prealloc_ = enable_page_prealloc;
 
   // Set total physical pages from parameter (same for all workers)
@@ -282,7 +284,7 @@ bool PageAllocator::wakeup_model(const std::string& model_id) {
         size_t pages_needed = virt_page_ids.size() * phy_pages_per_virt;
         auto [start_w, end_w] = get_dp_group_worker_range(model_id, dp_rank);
         total_phy_pages_needed += pages_needed;
-        groups_to_map.push_back({dp_rank, std::move(virt_page_ids)});
+        groups_to_map.emplace_back(dp_rank, std::move(virt_page_ids));
         for (int32_t w = start_w; w < end_w && w < max_world_size_; ++w) {
           pages_to_consume_per_worker[w] += pages_needed;
         }

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,14 +15,21 @@ limitations under the License.
 
 #pragma once
 
+#include <c10/core/DeviceGuard.h>
 #include <torch/nn/functional/normalization.h>
 
+#include <filesystem>
 #include <optional>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
 #include "core/common/global_flags.h"
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_output.h"
+#include "core/framework/state_dict/state_dict.h"
 #include "core/layers/npu/npu_qwen3_decoder_layer_impl.h"
 #include "llm_model_base.h"
 
@@ -40,7 +47,11 @@ TORCH_MODULE(QWen3DecoderLayer);
 class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
  public:
   QWen3ModelImpl(const ModelContext& context)
-      : LlmModelImplBase<QWen3DecoderLayer>("qwen3", context.get_model_args()) {
+      : LlmModelImplBase<QWen3DecoderLayer>("qwen3", context.get_model_args()),
+        aux_capture_(
+            context.get_model_args(),
+            context.get_tensor_options(),
+            ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch()) {
     // register submodules
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
@@ -54,13 +65,17 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
     norm_ = register_module("norm", layer::NpuRMSNorm(context));
     npu_embed_tokens_ =
         register_module("npu_embed_tokens", layer::NpuWordEmbedding(context));
+    restored_embed_tokens_ = register_module("restored_embed_tokens",
+                                             layer::NpuWordEmbedding(context));
     atb_pos_emb_ = layer::NpuPosEmbedding(context);
     cos_sin_ = layer::rotary::get_concat_rotary_embedding(
         128,
         model_args.max_position_embeddings(),
         model_args.rope_theta(),
         options);
-    int32_t mask_value = FLAGS_enable_chunked_prefill ? -9984 : 1;
+    int32_t mask_value =
+        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill() ? -9984
+                                                                         : 1;
     // encode_attn_mask_ =
     //   layer::AttentionMask(options.device(),
     //   options.dtype()).get_attn_mask(2048, options.device(),
@@ -74,75 +89,112 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
       layers_.push_back(block);
       blocks_->push_back(block);
     }
+  }
 
-    // Eagle3: layer ids to capture (can be read from layers_to_capture in
-    // config.json)
-    if (FLAGS_speculative_algorithm == "Eagle3") {
-      const auto& layer_ids_from_config = model_args.layers_to_capture();
-      if (!layer_ids_from_config.empty()) {
-        set_eagle3_layers_to_capture(
-            std::make_optional<std::vector<int32_t>>(layer_ids_from_config));
-      } else {
-        set_eagle3_layers_to_capture();
-      }
-      // Pre-allocate aux output buffer [max_tokens_per_batch, hidden_size *
-      // num_captured]
-      const int64_t num_captured = layers_to_capture_set_.size();
-      const int64_t aux_dim = model_args.hidden_size() * num_captured;
-      aux_output_buffer_ =
-          torch::empty({FLAGS_max_tokens_per_batch, aux_dim}, options);
+  void load_restored_embed_tokens(const StateDict& state_dict,
+                                  torch::Tensor global_rotation,
+                                  const torch::Device& device) {
+    auto embed_weight = state_dict.get_tensor("embed_tokens.weight");
+    if (!embed_weight.defined()) {
+      return;
+    }
+
+    CHECK_EQ(embed_weight.dim(), 2) << "Embedding weight must be a 2D tensor";
+    CHECK_EQ(global_rotation.dim(), 2)
+        << "QuaRot global_rotation must be a 2D tensor";
+    CHECK_EQ(global_rotation.size(0), global_rotation.size(1))
+        << "QuaRot global_rotation must be square";
+    CHECK_EQ(embed_weight.size(1), global_rotation.size(0))
+        << "QuaRot global_rotation hidden size mismatch, expected "
+        << embed_weight.size(1) << ", got " << global_rotation.size(0);
+
+    torch::Tensor restored;
+    {
+      torch::DeviceGuard device_guard(device);
+      auto npu_options =
+          torch::TensorOptions().dtype(torch::kFloat32).device(device);
+      auto cpu_options = torch::TensorOptions()
+                             .dtype(embed_weight.scalar_type())
+                             .device(torch::kCPU);
+      auto embed_weight_npu =
+          embed_weight.to(npu_options, /*non_blocking=*/false, /*copy=*/true)
+              .contiguous();
+      auto rotation_t_npu =
+          global_rotation.to(npu_options, /*non_blocking=*/false, /*copy=*/true)
+              .transpose(0, 1)
+              .contiguous();
+      restored = torch::matmul(embed_weight_npu, rotation_t_npu)
+                     .to(cpu_options, /*non_blocking=*/false, /*copy=*/true)
+                     .contiguous();
+    }
+    StateDict embed_state_dict({{"weight", restored}});
+    restored_embed_tokens_->load_state_dict(embed_state_dict);
+    has_restored_embed_tokens_ = true;
+  }
+
+  bool has_restored_embed_tokens() const { return has_restored_embed_tokens_; }
+
+  bool has_restored_npu_word_embedding() const {
+    return has_restored_embed_tokens_;
+  }
+
+  void verify_restored_embed_tokens(const std::string& prefix) const {
+    if (has_restored_embed_tokens_) {
+      restored_embed_tokens_->verify_loaded_weights(prefix + "embed_tokens.");
     }
   }
 
-  torch::Tensor deepstack_process(torch::Tensor hidden_states,
-                                  torch::Tensor visual_pos_masks,
-                                  torch::Tensor visual_embeds) {
-    visual_pos_masks = visual_pos_masks.to(hidden_states.device());
-    auto selected = hidden_states.index({visual_pos_masks});
-    auto local_this = selected + visual_embeds;
-    hidden_states.index_put_({visual_pos_masks}, local_this);
-    return hidden_states;
+  void merge_restored_embed_tokens() {
+    if (has_restored_embed_tokens_) {
+      restored_embed_tokens_->merge_loaded_weights();
+    }
   }
 
-  void set_eagle3_layers_to_capture(
-      const std::optional<std::vector<int32_t>>& layer_ids = std::nullopt) {
-    capture_aux_hidden_states_ = true;
-    layers_to_capture_set_.clear();
-    if (!layer_ids.has_value()) {
-      int32_t num_layers = layers_.size();
-      layers_to_capture_set_.insert(2);
-      layers_to_capture_set_.insert(num_layers / 2);
-      layers_to_capture_set_.insert(num_layers - 3);
-    } else {
-      // Config uses 0-based layer indices, same as default {2, n/2, n-3}
-      for (int32_t val : layer_ids.value()) {
-        layers_to_capture_set_.insert(val);
-      }
+  void merge_and_move_restored_embed_tokens() {
+    if (has_restored_embed_tokens_) {
+      restored_embed_tokens_->merge_and_move_pinned_host();
     }
-    LOG(INFO) << "layers_to_capture_set_ size: "
-              << layers_to_capture_set_.size();
+  }
+
+  layer::NpuWordEmbedding get_npu_word_embedding() override {
+    if (has_restored_embed_tokens_) {
+      return restored_embed_tokens_;
+    }
+    return LlmModelImplBase<QWen3DecoderLayer>::get_npu_word_embedding();
   }
 
   virtual ModelOutput forward(torch::Tensor tokens,
                               torch::Tensor positions,
                               std::vector<KVCache>& kv_caches,
                               const ModelInputParams& input_params) {
-    bool use_deepstack = input_params.deep_stacks.size() > 0;
+    bool use_deepstack = input_params.multimodal.deep_stacks.size() > 0;
     std::vector<torch::Tensor> deep_stacks;
 
     if (tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
       positions = torch::tensor({0}).to(torch::kInt32).to(tokens.device());
     }
-    auto inputs_embeds = input_params.input_embedding;
+    auto inputs_embeds = input_params.embedding.input_embedding;
     torch::Tensor h;
     if (inputs_embeds.defined()) {
       h = inputs_embeds;
     } else {
       h = npu_embed_tokens_(tokens, 0);
     }
+
+    // This residual tensor would be shared by all the layers, as the
+    // current layer would use the output residual from previous layer,
+    // the layer could use the residual through local variable
+    // without passing the residual tensor to the layer.
+    torch::Tensor residual;
+    if (::xllm::KernelConfig::get_instance().enable_interlayer_addnorm()) {
+      residual = torch::zeros_like(h, h.options());
+      set_residual(residual);
+    }
+
     if (use_deepstack) {
-      deep_stacks = input_params.deep_stacks;  // [num_deepstack, hidden_size]
+      deep_stacks =
+          input_params.multimodal.deep_stacks;  // [num_deepstack, hidden_size]
     }
     auto target_cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
@@ -184,21 +236,21 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
 
     torch::Tensor attn_mask;
     // for chunked prefill, generate the attn mask.
-    if (!input_params.batch_forward_type.is_decode()) {
-      if (FLAGS_enable_chunked_prefill) {
-        int max_kv_seq = input_params.kv_max_seq_len;
-        int num_sequences = input_params.num_sequences;
+    if (!input_params.meta.batch_forward_type.is_decode()) {
+      if (::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
+        int32_t max_kv_seq = input_params.meta.kv_max_seq_len;
+        int32_t num_sequences = input_params.meta.num_sequences;
         if (num_sequences > 0) {
           std::vector<torch::Tensor> req_mask_vec;
           req_mask_vec.reserve(num_sequences);
 
-          for (int j = 0; j < num_sequences; j++) {
-            auto mask =
-                attn_mask_.gen_append_mask(input_params.q_seq_lens_vec[j],
-                                           input_params.kv_seq_lens_vec[j],
-                                           max_kv_seq,
-                                           cos_pos.dtype().toScalarType(),
-                                           cos_pos.device());
+          for (int32_t j = 0; j < num_sequences; j++) {
+            torch::Tensor mask =
+                gen_append_attn_mask(input_params.attention.host.q_seq_lens[j],
+                                     input_params.attention.host.kv_seq_lens[j],
+                                     max_kv_seq,
+                                     cos_pos.dtype().toScalarType(),
+                                     cos_pos.device());
             req_mask_vec.emplace_back(mask);
           }
           attn_mask = torch::cat(req_mask_vec, 0);
@@ -211,17 +263,15 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
 
     ModelInputParams& input_params_new =
         const_cast<ModelInputParams&>(input_params);
-    const int64_t num_tokens = h.size(0);
-    const int64_t hidden_size = h.size(-1);
-    int64_t capture_idx = 0;
     RollingLayerGuard rolling_guard(rolling_mgr_);
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event{nullptr};
       std::atomic<bool>* event_flag{nullptr};
 
-      if (input_params.layer_synchronizer != nullptr) {
-        event = input_params.layer_synchronizer->get_event(i);
-        event_flag = input_params.layer_synchronizer->get_event_flag(i);
+      if (input_params.parallel.layer_synchronizer != nullptr) {
+        event = input_params.parallel.layer_synchronizer->get_event(i);
+        event_flag =
+            input_params.parallel.layer_synchronizer->get_event_flag(i);
       }
       if (!input_params.synchronize_layer(i)) {
         return ModelOutput();
@@ -229,15 +279,6 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
 
       auto& layer = layers_[i];
       const int32_t layer_index = i;
-      if (capture_aux_hidden_states_ &&
-          layers_to_capture_set_.count(layer_index) != 0) {
-        aux_output_buffer_.slice(0, 0, num_tokens)
-            .slice(
-                1, capture_idx * hidden_size, (capture_idx + 1) * hidden_size)
-            .copy_(h.reshape({num_tokens, hidden_size}));
-        capture_idx++;
-      }
-
       if (layer_forward_interrupted_) {
         LOG(INFO) << "Forward interrupted at layer: " << i;
         return ModelOutput();
@@ -256,32 +297,38 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
       rolling_guard.after_layer(layer_index);
       if (use_deepstack) {
         if (deep_stacks.size() > 0 && i < deep_stacks.size()) {
-          h = deepstack_process(
-              h, input_params.visual_pos_masks, deep_stacks[i]);
+          h = h + deep_stacks[i];
         }
       }
+      // ATB keeps `h` as the full residual stream, so no separate residual.
+      aux_capture_.capture_layer(layer_index, h, std::nullopt);
     }
     auto hidden_states = norm_(h, 0);
-    if (capture_aux_hidden_states_) {
-      torch::Tensor aux_hidden_states =
-          aux_output_buffer_.slice(0, 0, num_tokens);
-      return ModelOutput(hidden_states, torch::Tensor(), aux_hidden_states);
-    }
-    return ModelOutput(hidden_states);
+    return aux_capture_.finalize(hidden_states);
+  }
+
+ protected:
+  virtual torch::Tensor gen_append_attn_mask(int32_t q_len,
+                                             int32_t kv_len,
+                                             int32_t max_kv_len,
+                                             torch::Dtype dtype,
+                                             torch::Device device) {
+    return attn_mask_.gen_append_mask(q_len, kv_len, max_kv_len, dtype, device);
   }
 
  private:
   torch::Tensor viusal_pos_mask_;
-  std::unordered_set<int32_t> layers_to_capture_set_;
-  bool capture_aux_hidden_states_ = false;
-  torch::Tensor aux_output_buffer_;
+  AuxHiddenCapture aux_capture_;
+  bool has_restored_embed_tokens_ = false;
+  layer::NpuWordEmbedding restored_embed_tokens_{nullptr};
 };
 TORCH_MODULE(QWen3Model);
 
 class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
  public:
   QWen3ForCausalLMImpl(const ModelContext& context)
-      : LlmForCausalLMImplBase<QWen3Model>(context) {}
+      : LlmForCausalLMImplBase<QWen3Model>(context),
+        device_(context.get_tensor_options().device()) {}
 
   torch::Tensor pooler(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) {
@@ -292,6 +339,142 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
     return torch::nn::functional::normalize(
         h, torch::nn::functional::NormalizeFuncOptions().p(2).dim(1));
   }
+
+  bool has_restored_npu_word_embedding() const {
+    return model_->has_restored_npu_word_embedding();
+  }
+
+  void load_model(std::unique_ptr<ModelLoader> loader,
+                  std::string prefix = "model.") override {
+    torch::Tensor global_rotation =
+        load_optional_quarot_rotation(loader->model_weights_path());
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      auto model_state_dict = state_dict->get_dict_with_prefix(
+          std::vector<std::string>{"model.language_model.",
+                                   "language_model.model.",
+                                   prefix,
+                                   "model.",
+                                   ""});
+      model_->load_state_dict(model_state_dict);
+      if (global_rotation.defined()) {
+        model_->load_restored_embed_tokens(
+            model_state_dict, global_rotation, device_);
+      }
+      if (!embedding_mode_) {
+        if (tie_word_embeddings) {
+          npu_lm_head_->load_state_dict(
+              state_dict->get_dict_with_prefix(std::vector<std::string>{
+                  prefix + "embed_tokens.", "embed_tokens."}));
+        } else {
+          npu_lm_head_->load_state_dict(
+              state_dict->get_dict_with_prefix("lm_head."));
+        }
+      }
+    }
+
+    model_->verify_loaded_weights(prefix);
+    model_->verify_restored_embed_tokens(prefix);
+    if (!embedding_mode_) {
+      if (tie_word_embeddings) {
+        npu_lm_head_->verify_loaded_weights("embed_tokens.");
+      } else {
+        npu_lm_head_->verify_loaded_weights("lm_head.");
+      }
+    }
+
+    model_->merge_loaded_weights();
+    model_->merge_restored_embed_tokens();
+    if (!embedding_mode_) {
+      npu_lm_head_->merge_loaded_weights();
+    }
+  }
+
+  void lazy_load_model(std::unique_ptr<ModelLoader> loader,
+                       std::string prefix = "model.") override {
+    if (keep_host_weights) {
+      LOG(INFO) << "Model weights are already kept on host.";
+      return;
+    }
+    torch::Tensor global_rotation =
+        load_optional_quarot_rotation(loader->model_weights_path());
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      auto model_state_dict = state_dict->get_dict_with_prefix(
+          std::vector<std::string>{"model.language_model.",
+                                   "language_model.model.",
+                                   prefix,
+                                   "model.",
+                                   ""});
+      model_->load_state_dict(model_state_dict);
+      if (global_rotation.defined()) {
+        model_->load_restored_embed_tokens(
+            model_state_dict, global_rotation, device_);
+      }
+      if (!embedding_mode_) {
+        if (tie_word_embeddings) {
+          npu_lm_head_->load_state_dict(
+              state_dict->get_dict_with_prefix(prefix + "embed_tokens."));
+        } else {
+          npu_lm_head_->load_state_dict(
+              state_dict->get_dict_with_prefix("lm_head."));
+        }
+      }
+    }
+
+    model_->verify_loaded_weights(prefix);
+    model_->verify_restored_embed_tokens(prefix);
+    if (!embedding_mode_) {
+      if (tie_word_embeddings) {
+        npu_lm_head_->verify_loaded_weights(prefix + "embed_tokens.");
+      } else {
+        npu_lm_head_->verify_loaded_weights("lm_head.");
+      }
+    }
+
+    model_->merge_and_move_pinned_host();
+    model_->merge_and_move_restored_embed_tokens();
+    if (!embedding_mode_) {
+      npu_lm_head_->merge_and_move_pinned_host();
+    }
+
+    keep_host_weights = true;
+  }
+
+ private:
+  torch::Tensor load_optional_quarot_rotation(
+      const std::filesystem::path& model_path) {
+    const std::filesystem::path quarot_path =
+        model_path / "optional" / "quarot.safetensors";
+    if (!std::filesystem::exists(quarot_path)) {
+      return torch::Tensor();
+    }
+
+    auto state_dict = StateDictFromSafeTensor::load(quarot_path.string());
+    torch::Tensor global_rotation = state_dict->get_tensor("global_rotation");
+    if (!global_rotation.defined()) {
+      LOG(WARNING) << "Optional QuaRot file exists but global_rotation is "
+                      "missing: "
+                   << quarot_path.string();
+      return torch::Tensor();
+    }
+    CHECK_EQ(global_rotation.dim(), 2)
+        << "QuaRot global_rotation must be a 2D tensor";
+    CHECK_EQ(global_rotation.size(0), global_rotation.size(1))
+        << "QuaRot global_rotation must be square";
+
+    auto global_rotation_cpu = global_rotation
+                                   .to(torch::TensorOptions()
+                                           .dtype(torch::kFloat32)
+                                           .device(torch::kCPU),
+                                       /*non_blocking=*/false,
+                                       /*copy=*/true)
+                                   .contiguous();
+    LOG(INFO) << "Loaded optional QuaRot global_rotation from "
+              << quarot_path.string()
+              << ", shape=" << global_rotation_cpu.sizes();
+    return global_rotation_cpu;
+  }
+
+  torch::Device device_;
 };
 TORCH_MODULE(QWen3ForCausalLM);
 
@@ -321,9 +504,12 @@ REGISTER_MODEL_ARGS_WITH_VARNAME(qwen3_atb, qwen3_atb, [&] {
   LOAD_ARG_OR(use_sliding_window, "use_sliding_window", false);
   LOAD_ARG_OR(max_window_layers, "max_window_layers", 28);
 
-  // Eagle3: layer ids (0-based) to capture from config, e.g.
-  // "layers_to_capture": [2, 14, 25]; defaults to empty if missing
-  LOAD_ARG_OR(layers_to_capture, "layers_to_capture", std::vector<int32_t>{});
+  // DSpark: low-rank dim of the Markov head (top-level config key, like vLLM's
+  // config.markov_rank). 0 = disabled (plain DFlash / non-DSpark models).
+  LOAD_ARG_OR(markov_rank, "markov_rank", 0);
+  LOAD_ARG_OR(enable_confidence_head, "enable_confidence_head", false);
+  LOAD_ARG_OR(
+      confidence_head_with_markov, "confidence_head_with_markov", false);
 
   LOAD_ARG_OR_FUNC(head_dim, "head_dim", [&] {
     return args->hidden_size() / args->n_heads();

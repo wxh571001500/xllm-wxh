@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,16 +18,21 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
-#include "framework/request/mm_data.h"
+#include "core/framework/multimodal/mm_data.h"
 #include "framework/request/sequence.h"
 #include "runtime/forward_params.h"
 #include "util/threadpool.h"
 
 namespace xllm {
 
+class BatchInputBuilderTestPeer;
 struct ModelArgs;
 
 class BatchInputBuilder {
@@ -48,18 +53,23 @@ class BatchInputBuilder {
   ForwardInput build_forward_input(uint32_t num_decoding_tokens,
                                    uint32_t min_decoding_batch_size);
 
-  RawForwardInput build_raw_forward_input();
-
  private:
+  friend class BatchInputBuilderTestPeer;
+
   // Core building methods
   void process_sequences();
   void process_sequences_multithreaded();
+  ForwardInput state_to_forward_input();
   void padding_decode_batch_size(uint32_t num_decoding_tokens,
                                  uint32_t min_decoding_batch_size);
-  ForwardInput state_to_forward_input();
-  RawForwardInput state_to_raw_forward_input();
 
-  void process_swap_block_infos(RawForwardInput& raw_forward_input);
+  static TransferKVInfo build_step_transfer_info(
+      const TransferKVInfo& full_info,
+      Sequence* sequence,
+      uint32_t seq_len,
+      uint32_t kv_split_size);
+
+  void process_swap_block_infos(ForwardInput& forward_input);
 
   // State management
   struct BuilderState {
@@ -70,6 +80,9 @@ class BatchInputBuilder {
 
     // Sampling data
     std::vector<const RequestSamplingParam*> sampling_params;
+    std::vector<JsonObjectGrammarState> json_object_states;
+    std::vector<std::string> sample_sequence_ids;
+    std::vector<int32_t> sample_prior_output_rows;
     std::vector<int32_t> selected_token_idxes;
     std::vector<int32_t> sample_idxes;
 
@@ -82,13 +95,18 @@ class BatchInputBuilder {
     BatchForwardType batch_forward_type;
     uint32_t max_seq_len = 0;
     uint32_t q_max_seq_len = 0;
-    // Tracking token counts in KV cache，only used for deepseek chunked prefill
-    // ops on npu device
+    // Authoritative request-scoped execution counts. Keep these independent
+    // from backend-specific attention layouts such as q_seq_lens.
+    std::vector<int32_t> num_scheduled_tokens;
+    std::vector<int32_t> num_computed_tokens;
+    std::vector<uint8_t> is_prefilling;
+    // Tracking token counts in KV cache for linear-attention state setup.
     std::vector<int32_t> kv_cache_tokens_nums;
-#if defined(USE_NPU) || defined(USE_MUSA)
+#if defined(USE_NPU)
     std::vector<int32_t> seq_lens;
     std::vector<int32_t> q_seq_lens;
-#elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU)
+#elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU) || \
+    defined(USE_DCU) || defined(USE_MUSA)
     std::vector<int32_t> seq_lens = {0};    // cu_seq_lens
     std::vector<int32_t> q_seq_lens = {0};  // q_cu_seq_len
 #endif
@@ -96,15 +114,25 @@ class BatchInputBuilder {
     // Cache and block data
     std::vector<int32_t> new_token_slot_ids;
     std::vector<std::vector<int32_t>> block_tables_vec;
+    // Grouped cache block tables.
+    // [manager_num][batch_size][block_ids]
+    std::vector<std::vector<std::vector<int32_t>>> multi_block_tables;
 
     // beam search kernel input
     std::vector<float> acc_logprob_vec;
 
     // Additional data
     std::vector<int32_t> embedding_ids;
+    std::vector<int32_t> linear_state_ids;
+    std::vector<int32_t> linear_state_read_ids;
     std::vector<std::string> request_ids;
     std::vector<int32_t> extra_token_ids;
+    std::vector<int32_t> mtp_shifted_token_ids;
+    std::vector<int32_t> eplb_decode_token_mask;
+    std::vector<int32_t> mtp_bootstrap_row_idxes;
+    std::vector<torch::Tensor> mtp_bootstrap_embeddings;
     std::vector<TransferKVInfo> transfer_kv_infos;
+    std::vector<MMData> scheduled_mm_data_vec;
 
     // for continuous kvcache
     std::vector<int64_t> new_cache_slot_offsets;  //[n_tokens]
@@ -121,11 +149,20 @@ class BatchInputBuilder {
       int32_t seq_index,
       BuilderState* state_ptr = nullptr,
       std::unordered_set<int32_t>* write_block_ids_ptr = nullptr);
+  void process_multi_modal_inputs(Sequence* sequence,
+                                  uint32_t n_kv_cache_tokens,
+                                  uint32_t q_seq_len,
+                                  int32_t seq_index,
+                                  BuilderState* state_ptr = nullptr);
   void extract_tokens_and_positions(Sequence* sequence,
                                     uint32_t n_kv_cache_tokens,
                                     uint32_t seq_len,
-                                    uint32_t padded_seq_len,
                                     BuilderState* state_ptr = nullptr);
+  void append_linear_state_row(Sequence* sequence, BuilderState& state);
+  torch::Tensor get_mrope_positions(Sequence* sequence,
+                                    uint32_t start,
+                                    uint32_t end);
+
   void handle_sampling_parameters(Sequence* sequence,
                                   BuilderState* state_ptr = nullptr);
   void setup_kv_cache_info(
@@ -140,16 +177,19 @@ class BatchInputBuilder {
   const std::vector<Sequence*>& sequences_;
   const std::vector<uint32_t>& allowed_max_tokens_;
   const std::vector<torch::Tensor>& input_embeddings_vec_;
-  const std::vector<MMData>& mm_data_vec_;
+  std::vector<MMData> mm_data_vec_;
   const ModelArgs* args_;
 
   // Builder state
   BuilderState state_;
 
   // Configuration
+  bool enable_json_object_output_ = true;
   bool use_mrope_ = false;
   uint32_t num_sequences_ = 0;
   bool need_unique_tokens_ = true;
+  bool build_eplb_decode_token_mask_ = false;
+  bool is_graph_warmup_ = false;
   int32_t cp_size_ = 1;
 
   // copy in and out cache contents

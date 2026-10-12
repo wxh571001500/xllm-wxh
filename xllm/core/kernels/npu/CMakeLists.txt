@@ -1,5 +1,7 @@
 include(cc_library)
 
+add_subdirectory(tilelang)
+
 add_subdirectory(xllm_ops)
 
 cc_library(
@@ -7,16 +9,39 @@ cc_library(
     npu_kernels
   HDRS
     npu_ops_api.h
+    aclnn/pytorch_npu_helper.hpp
   SRCS
     active.cpp
     attention.cpp
     fused_layernorm.cpp
+    npu_adalayernorm.cpp
     matmul.cpp
+    matmul_reduce_scatter.cpp
+    npu_causal_conv1d.cpp
+    npu_fused_infer_attention.cpp
+    npu_gemma_rms_norm.cpp
+    npu_block_sparse_attention.cpp
+    npu_rain_fusion_attention.cpp
     npu_grouped_matmul.cpp
     npu_moe_gating_topk_softmax.cpp
+    npu_mega_moe.cpp
+    npu_dispatch_ffn_combine.cpp
+    npu_dispatch_gmm_combine_decode.cpp
+    npu_moe_distribute_combine_v2.cpp
+    npu_moe_distribute_dispatch_v2.cpp
     npu_moe_init_routing_v2.cpp
     npu_moe_token_unpermute.cpp
     rope.cpp
+    npu_recurrent_gated_delta_rule.cpp
+    utils.cpp
+    w4a8_dynamic_moe_preprocess.cpp
+    rec_constrained_topk.cpp
+    npu_ops_library.cpp
   DEPS
     :torch_npu_kernels
+    :tilelang_kernels
+    xllm_ops
+    nnopbase
+    opapi
+    platform_npu
 )

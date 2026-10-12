@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "deepseek_v2.h"
 
 namespace xllm {
@@ -24,14 +26,17 @@ class DeepseekV3ForCausalLMImpl
  public:
   DeepseekV3ForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekV2Model>(context) {
+#if !defined(USE_DCU)
     // Check if prefix cache or chunked prefill is enabled for unsupported
-    // models
-    CHECK(!FLAGS_enable_prefix_cache)
+    // models. DCU DeepSeek context prefill is handled by the DCU
+    // attention implementation.
+    CHECK(!::xllm::KVCacheConfig::get_instance().enable_prefix_cache())
         << "deepseek_v3 have not supported "
            "enable_prefix_cache yet. Please disable it.";
-    CHECK(!FLAGS_enable_chunked_prefill)
+    CHECK(!::xllm::SchedulerConfig::get_instance().enable_chunked_prefill())
         << "deepseek_v3 have not supported "
            "enable_chunked_prefill yet. Please disable it.";
+#endif
   }
 };
 TORCH_MODULE(DeepseekV3ForCausalLM);

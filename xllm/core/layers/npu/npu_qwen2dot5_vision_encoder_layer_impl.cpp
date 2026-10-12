@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,6 +21,8 @@ limitations under the License.
 #include <iostream>
 #include <map>
 
+#include "common/global_flags.h"
+#include "core/framework/config/load_config.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUException.h"
 
@@ -61,7 +63,12 @@ NpuQwen2dot5VisionEncoderLayerImpl::NpuQwen2dot5VisionEncoderLayerImpl(
   placeholder_ = atb_speed::Utils::AtTensor2Tensor(
       torch::zeros({1}).to(device_).to(dtype_));
   loader_ = std::make_unique<Qwen2dot5VisionEncoderLoader>(
-      WEIGHT_COUNT_PER_LAYER, context, encode_param_.numAttentionHeadsPerRank);
+      WEIGHT_COUNT_PER_LAYER,
+      context,
+      encode_param_.numAttentionHeadsPerRank,
+      ::xllm::LoadConfig::get_instance().enable_manual_loader()
+          ? LoadMode::kManual
+          : LoadMode::kEager);
 }
 
 void NpuQwen2dot5VisionEncoderLayerImpl::merge_loaded_weights() {
@@ -119,24 +126,17 @@ torch::Tensor NpuQwen2dot5VisionEncoderLayerImpl::forward(
     torch::Tensor& sin_pos,
     torch::Tensor& cu_seqlen,
     std::vector<int>& cu_seqlen_vec,
-    ModelInputParams& input_params,
     int node_id,
     aclrtEvent* event,
     std::atomic<bool>* event_flag) {
   atb::Status st;
 
-  build_node_variant_pack(encode_node_,
-                          x,
-                          cos_pos,
-                          sin_pos,
-                          cu_seqlen,
-                          cu_seqlen_vec,
-                          input_params,
-                          true);
+  build_node_variant_pack(
+      encode_node_, x, cos_pos, sin_pos, cu_seqlen, cu_seqlen_vec, true);
   // mstxRangeEnd(id);
   st = execute_node(encode_node_, node_id);
   LOG_IF(FATAL, st != 0) << model_name_
-                         << "excute encode layer fail, error code: " << st;
+                         << "execute encode layer fail, error code: " << st;
   return x;
 }
 
@@ -147,7 +147,6 @@ void NpuQwen2dot5VisionEncoderLayerImpl::build_node_variant_pack(
     torch::Tensor& sin_pos,
     torch::Tensor& cu_seqlen,
     std::vector<int>& cu_seqlen_vec,
-    ModelInputParams& input_params,
     bool is_prefill) {
   internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(x);
 

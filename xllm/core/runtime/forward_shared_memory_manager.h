@@ -1,9 +1,9 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <memory>
 
+#include "dit_forward_params.h"
 #include "forward_params.h"
 #include "params_utils.h"
 #include "util/shared_memory_manager.h"
@@ -40,6 +41,11 @@ enum class ForwardType : int8_t {
   PB_OUTPUT = 2,
   RAW_INPUT = 3,
   RAW_OUTPUT = 4,
+};
+
+enum class InputDeviceMaterializationPolicy : int8_t {
+  MATERIALIZE_ON_READ = 0,
+  DEFER_TO_WORKER_PREPARE,
 };
 
 class ForwardSharedMemoryManager : public SharedMemoryManager {
@@ -102,19 +108,29 @@ class ForwardSharedMemoryManager : public SharedMemoryManager {
     return true;
   };
 
-  bool raw_input_write(const RawForwardInput& input);
-  void raw_input_read(ForwardInput& input, const torch::Device& device);
-  bool raw_output_write(const torch::Tensor& next_tokens,
-                        const torch::Tensor& logprobs,
-                        const torch::Tensor& top_tokens,
-                        const torch::Tensor& top_logprobs,
-                        const torch::Tensor& embeddings,
-                        const std::vector<torch::Tensor>& mm_embeddings,
-                        const torch::Tensor& expert_load_data,
-                        int32_t prepared_layer_id,
-                        const torch::Tensor& src_seq_idxes,
-                        const torch::Tensor& out_tokens,
-                        const torch::Tensor& out_logprobs);
+  bool input_write(const ForwardInput& input);
+  void input_read(ForwardInput& input,
+                  const torch::Device& device,
+                  InputDeviceMaterializationPolicy policy =
+                      InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ);
+  bool raw_output_write(
+      const torch::Tensor& next_tokens,
+      const torch::Tensor& logprobs,
+      const torch::Tensor& top_tokens,
+      const torch::Tensor& top_logprobs,
+      const torch::Tensor& embeddings,
+      const std::vector<std::vector<torch::Tensor>>& mm_embeddings,
+      const std::vector<SpeculativeTokenStats>& speculative_token_stats,
+      const std::vector<torch::Tensor>& dit_images,
+      const std::vector<std::string>& dit_text_output,
+      const std::vector<torch::Tensor>& dit_audio,
+      const torch::Tensor& expert_load_data,
+      int64_t prepared_token,
+      const torch::Tensor& src_seq_idxes,
+      const torch::Tensor& out_tokens,
+      const torch::Tensor& out_logprobs,
+      const std::vector<JsonObjectOutputError>& json_object_errors,
+      const std::vector<std::string>& failed_request_ids);
   void raw_output_read(RawForwardOutput& outputs);
 
   void clear();

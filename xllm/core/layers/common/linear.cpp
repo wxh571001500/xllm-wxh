@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,10 +14,17 @@ limitations under the License.
 ==============================================================================*/
 
 #include "linear.h"
+#if defined(USE_MUSA)
+#include "layers/musa/linear_block_fp8.h"
+#endif
 
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <cctype>
+
+#include "core/layers/common/quant_utils.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
@@ -56,6 +63,10 @@ inline float compute_max_scale(const std::vector<float>& scales) {
 inline bool is_unfused_checkpoint(const std::vector<float>& scales) {
   return scales.size() > 1 &&
          scales.back() > std::numeric_limits<float>::lowest();
+}
+
+bool is_fp8_dtype(torch::ScalarType dtype) {
+  return dtype == torch::kFloat8_e4m3fn || dtype == torch::kFloat8_e5m2;
 }
 
 // Realigns FP8 partitions to a unified global scale to enable fusion.
@@ -178,6 +189,317 @@ torch::Tensor fp8_linear_forward(
   return xllm::kernel::fp8_scaled_matmul(matmul_params);
 }
 
+std::string to_lower_copy(std::string value) {
+  std::transform(
+      value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+  return value;
+}
+
+bool is_w8a8_dynamic_quant(
+    const std::optional<std::string>& resolved_weight_quant_method) {
+  return resolved_weight_quant_method.has_value() &&
+         resolved_weight_quant_method.value() == "w8a8_dynamic";
+}
+
+bool is_w8a8_quant(
+    const std::optional<std::string>& resolved_weight_quant_method) {
+  return resolved_weight_quant_method.has_value() &&
+         resolved_weight_quant_method.value() == "w8a8";
+}
+
+bool wants_mmrs(RowParallelReduceMode reduce_mode) {
+  return reduce_mode == RowParallelReduceMode::MATMUL_REDUCE_SCATTER;
+}
+
+void log_mmrs_quant_skip(RowParallelReduceMode reduce_mode,
+                         const FlashComm1Context* fc1_ctx,
+                         const char* quant_path,
+                         const torch::Tensor& input) {
+  if (!wants_mmrs(reduce_mode)) {
+    return;
+  }
+  LOG_FIRST_N(WARNING, 16)
+      << "FC1 MMRS skipped in row-parallel " << quant_path
+      << " path: fused matmul_reduce_scatter is currently wired only for "
+         "non-quant linear. input="
+      << input.sizes() << ", sequence_sharded="
+      << (fc1_ctx != nullptr && is_sequence_sharded(*fc1_ctx))
+      << ", enable_mmrs_fusion="
+      << (fc1_ctx != nullptr && fc1_ctx->enable_mmrs_fusion);
+}
+
+bool is_fp8_channelwise_w8a8(const QuantArgs& quant_args) {
+#if defined(USE_DCU)
+  // Compressed-tensors FP8 W8A8 currently pairs dynamic activations with
+  // per-output-channel weight scales on DCU.
+  return quant_args.quant_method() == kQuantMethodFp8 &&
+         quant_args.activation_dynamic();
+#else
+  (void)quant_args;
+  return false;
+#endif
+}
+
+void check_fp8_activation_dynamic_supported(const QuantArgs& quant_args) {
+  if (!quant_args.activation_dynamic()) {
+    return;
+  }
+  CHECK(is_fp8_channelwise_w8a8(quant_args))
+      << "DCU FP8 currently supports only compressed-tensors dynamic "
+         "channelwise W8A8.";
+}
+
+torch::Dtype get_w8a8_deq_scale_dtype(const torch::TensorOptions& options) {
+  const torch::Dtype dtype = c10::typeMetaToScalarType(options.dtype());
+  if (dtype == torch::kFloat16) {
+    return torch::kInt64;
+  }
+  if (dtype == torch::kBFloat16) {
+    return torch::kFloat32;
+  }
+  LOG(WARNING) << "W8A8 deq_scale defaults to float32 for dtype " << dtype;
+  return torch::kFloat32;
+}
+
+struct W8A8LinearParamRefs {
+  torch::Tensor& weight;
+  bool& weight_is_loaded;
+  torch::Tensor& input_scale;
+  bool& input_scale_is_loaded;
+  torch::Tensor& input_offset;
+  bool& input_offset_is_loaded;
+  torch::Tensor& deq_scale;
+  bool& deq_scale_is_loaded;
+  torch::Tensor& quant_bias;
+  bool& quant_bias_is_loaded;
+  torch::Tensor& weight_scale;
+  bool& weight_scale_is_loaded;
+  torch::Tensor& weight_offset;
+  bool& weight_offset_is_loaded;
+  torch::Tensor& smooth;
+  bool& smooth_is_loaded;
+};
+
+void ensure_w8a8_params_for_linear_load(
+    torch::nn::Module* module,
+    const QuantArgs& quant_args,
+    const torch::TensorOptions& options,
+    const std::optional<std::string>& resolved_weight_quant_method,
+    int64_t shared_input_param_size,
+    W8A8LinearParamRefs refs) {
+#if defined(USE_MUSA)
+  musa::check_quantization_supported(quant_args, resolved_weight_quant_method);
+#endif
+#if !defined(USE_NPU) && !defined(USE_MLU) && !defined(USE_DCU)
+  CHECK(!is_w8a8_dynamic_quant(resolved_weight_quant_method))
+      << "Dynamic W8A8 Linear is unsupported on this backend";
+#endif
+  std::vector<weight::LazyParameterSpec> specs;
+  auto push = [&](torch::Tensor& tensor,
+                  bool& tensor_is_loaded,
+                  const char* name,
+                  std::vector<int64_t> sizes,
+                  const torch::TensorOptions& tensor_options) {
+    specs.push_back(weight::LazyParameterSpec{
+        &tensor, &tensor_is_loaded, name, std::move(sizes), tensor_options});
+  };
+
+  if (!is_w8a8_quant(resolved_weight_quant_method) &&
+      !is_w8a8_dynamic_quant(resolved_weight_quant_method)) {
+    if (!quant_args.quant_descs().empty() ||
+        quant_args.is_compressed_tensors_w8a8_dynamic()) {
+      // Quant args indicated a checkpoint that may be quantized, so the
+      // constructor initialized weights as kInt8. If the actual checkpoint is
+      // not resolved to a W8A8 method, re-register the weight in the original
+      // dtype so the subsequent load can copy checkpoint weights correctly.
+      CHECK(refs.weight.defined())
+          << "weight must be registered before lazy quant fallback";
+      const int64_t out_features = refs.weight.size(0);
+      const int64_t in_features = refs.weight.size(1);
+      specs.reserve(1);
+      push(refs.weight,
+           refs.weight_is_loaded,
+           "weight",
+           {out_features, in_features},
+           options);
+      weight::ensure_parameter_storage(module, specs);
+    }
+    return;
+  }
+
+  CHECK(refs.weight.defined())
+      << "weight must be registered before lazy quant init";
+  const int64_t out_features = refs.weight.size(0);
+  const int64_t in_features = refs.weight.size(1);
+
+  specs.reserve(5);
+  if (is_w8a8_quant(resolved_weight_quant_method)) {
+    push(refs.input_scale,
+         refs.input_scale_is_loaded,
+         "input_scale",
+         {shared_input_param_size},
+         options.dtype(torch::kFloat32));
+    push(refs.input_offset,
+         refs.input_offset_is_loaded,
+         "input_offset",
+         {shared_input_param_size},
+         options.dtype(torch::kInt8));
+    push(refs.deq_scale,
+         refs.deq_scale_is_loaded,
+         "deq_scale",
+         {out_features},
+         options.dtype(get_w8a8_deq_scale_dtype(options)));
+    push(refs.quant_bias,
+         refs.quant_bias_is_loaded,
+         "quant_bias",
+         {out_features},
+         options.dtype(torch::kInt32));
+  } else {
+    push(refs.weight_scale,
+         refs.weight_scale_is_loaded,
+         "weight_scale",
+         {out_features},
+         options.dtype(torch::kFloat32));
+    push(refs.weight_offset,
+         refs.weight_offset_is_loaded,
+         "weight_offset",
+         {out_features},
+         options.dtype(torch::kFloat32));
+  }
+  if (quant_args.is_compressed_tensors_w8a8_dynamic() &&
+      quant_args.preserve_smooth()) {
+#if !defined(USE_MLU) && !defined(USE_DCU)
+    LOG(FATAL)
+        << "Preserved compressed-tensors smooth is unsupported on this backend";
+#endif
+    push(refs.smooth,
+         refs.smooth_is_loaded,
+         "smooth",
+         {in_features},
+         options.dtype(torch::kFloat32));
+  }
+  weight::ensure_parameter_storage(module, specs);
+}
+
+bool tensors_allclose_as_fp32(const torch::Tensor& lhs,
+                              const torch::Tensor& rhs) {
+  return torch::allclose(lhs.to(torch::kFloat32), rhs.to(torch::kFloat32));
+}
+
+bool load_shared_tensor_from_prefixes_or_fail(
+    const StateDict& state_dict,
+    const std::vector<std::string>& prefixes,
+    const std::string& name,
+    torch::Tensor& tensor,
+    bool& tensor_is_loaded) {
+  // W8A8 fused input_scale/offset should be same
+  if (tensor_is_loaded || !tensor.defined()) {
+    return tensor_is_loaded;
+  }
+  torch::Tensor first_candidate;
+  std::string first_prefix;
+  for (const auto& prefix : prefixes) {
+    auto candidate = state_dict.get_tensor(prefix + name);
+    if (!candidate.defined()) {
+      continue;
+    }
+    auto flattened = candidate.flatten();
+    if (!first_candidate.defined()) {
+      first_candidate = flattened;
+      first_prefix = prefix;
+      continue;
+    }
+    CHECK_EQ(flattened.sizes(), first_candidate.sizes())
+        << "Shared tensor size for " << name << ": prefix '" << prefix
+        << "' has shape " << flattened.sizes() << ", but prefix '"
+        << first_prefix << "' has shape " << first_candidate.sizes() << ".";
+    CHECK(tensors_allclose_as_fp32(flattened, first_candidate))
+        << "Shared tensor value for " << name << ": prefix '" << prefix
+        << "' differs from prefix '" << first_prefix << "'.";
+  }
+  if (!first_candidate.defined()) {
+    return false;
+  }
+  CHECK_EQ(first_candidate.numel(), tensor.numel())
+      << "Tensor size mismatch for shared: " << state_dict.prefix() << name;
+  tensor.copy_(first_candidate.view(tensor.sizes()));
+  tensor_is_loaded = true;
+  return true;
+}
+
+void collapse_shared_tensor_to_scalar_or_fail(torch::Tensor& tensor,
+                                              const char* name) {
+  // W8A8 fused input_scale/offset should be same
+  CHECK(tensor.defined()) << name << " must be defined.";
+  CHECK_GT(tensor.numel(), 0) << name << " must contain at least one element.";
+  if (tensor.numel() <= 1) {
+    return;
+  }
+  auto flattened = tensor.flatten();
+  auto first = flattened.slice(0, 0, 1).expand_as(flattened);
+  CHECK(tensors_allclose_as_fp32(flattened, first))
+      << "Shared tensor value for " << name
+      << " in fused static W8A8 should be same.";
+  tensor = tensor.flatten().slice(0, 0, 1);
+}
+
+torch::Tensor npu_w8a8_linear_forward(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& input_scale,
+    const torch::Tensor& input_offset,
+    const torch::Tensor& deq_scale,
+    const std::optional<torch::Tensor>& quant_bias,
+    at::ScalarType output_dtype) {
+  xllm::kernel::NpuQuantizeParams quant_params;
+  quant_params.input = input;
+  quant_params.scale = input_scale;
+  quant_params.zero_point = input_offset;
+  // quant_params.output_dtype = at::ScalarType::QInt8;
+  quant_params.axis = -1;
+
+  auto quantized_input = xllm::kernel::quantize(quant_params);
+
+  xllm::kernel::QuantMatmulParams quant_matmul_params;
+  quant_matmul_params.x1 = quantized_input;
+  quant_matmul_params.x2 = weight;
+  quant_matmul_params.transpose2 = true;
+  quant_matmul_params.scale = deq_scale;
+  quant_matmul_params.bias = quant_bias;
+  quant_matmul_params.output_dtype = output_dtype;
+
+  return xllm::kernel::quant_matmul(quant_matmul_params);
+}
+
+torch::Tensor scaled_w8a8_linear(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& scale,
+    const torch::Tensor& smooth,
+    const std::optional<torch::Tensor>& bias,
+    torch::ScalarType output_dtype,
+    const LinearExtraArgs& extra = LinearExtraArgs()) {
+  kernel::ScaledQuantizeParams quantize;
+  quantize.x = input.reshape({-1, input.size(-1)});
+  quantize.smooth = smooth;
+  quantize.act_mode = extra.act_mode;
+  quantize.is_gated = extra.is_gated;
+  auto [quantized, token_scale] = kernel::scaled_quantize(quantize);
+  kernel::ScaledMatmulParams matmul;
+  matmul.a = quantized;
+  matmul.b = weight;
+  matmul.a_scale = token_scale;
+  matmul.b_scale = scale;
+  matmul.bias = bias;
+  matmul.output_dtype = output_dtype;
+  matmul.a_quant_bit_size = 8;
+  matmul.beta = 0.0;
+  std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
+  shape.back() = weight.size(0);
+  return kernel::scaled_matmul(matmul).reshape(shape);
+}
 }  // namespace
 
 ColumnParallelLinearImpl::ColumnParallelLinearImpl(const ModelContext& context)
@@ -187,7 +509,9 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(const ModelContext& context)
           /*bias=*/false,
           /*gather_output=*/true,
           QuantArgs{},  // do not use quantization for lm_head
-          context.get_parallel_args().tp_group_,
+          context.get_parallel_args().lm_head_group_ != nullptr
+              ? context.get_parallel_args().lm_head_group_
+              : context.get_parallel_args().tp_group_,
           context.get_tensor_options()) {}
 
 // Linear layer with column parallelism.
@@ -199,18 +523,31 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(
     const QuantArgs& quant_args,
     ProcessGroup* process_group,
     const torch::TensorOptions& options,
-    const LinearExtraArgs& linear_extra_args)
+    const LinearExtraArgs& linear_extra_args,
+    int32_t output_replicas)
     : gather_output_(gather_output),
-      quant_args_(quant_args),
-      process_group_(process_group),
       device_(options.device()),
-      linear_extra_args_(linear_extra_args) {
+      process_group_(process_group),
+      quant_args_(quant_args),
+      options_(options),
+      linear_extra_args_(linear_extra_args),
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
+#if defined(USE_MUSA)
+  musa::check_quantization_supported(quant_args_);
+#endif
   rank_ = process_group_->rank();
   world_size_ = process_group_->world_size();
-  CHECK(out_features % world_size_ == 0)
-      << "out_features " << out_features << " not divisible by world_size "
-      << world_size_;
-  const int64_t out_features_per_partition = out_features / world_size_;
+  int32_t valid_output_replicas = output_replicas;
+  if (valid_output_replicas <= 0 || world_size_ % valid_output_replicas != 0 ||
+      (valid_output_replicas != 1 && gather_output)) {
+    valid_output_replicas = 1;
+  }
+  weight_rank_ = rank_ / valid_output_replicas;
+  weight_world_size_ = world_size_ / valid_output_replicas;
+  CHECK(out_features % weight_world_size_ == 0)
+      << "out_features " << out_features
+      << " not divisible by weight_world_size " << weight_world_size_;
+  const int64_t out_features_per_partition = out_features / weight_world_size_;
   // Note: torch.nn.functional.linear performs XA^T + b and as a result
   // we allocate the transpose.
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
@@ -230,6 +567,15 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(
         /*requires_grad=*/false);
     // output dtype for scaled_matmul
     output_dtype_ = c10::typeMetaToScalarType(options.dtype());
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    musa::register_block_fp8_parameters(*this,
+                                        out_features_per_partition,
+                                        in_features,
+                                        options,
+                                        weight_,
+                                        weight_scale_inv_);
+#endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 W8A8 quantization - weight is stored as FP8 (float8_e4m3fn)
     weight_ = register_parameter(
@@ -237,11 +583,12 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(
         torch::empty({out_features_per_partition, in_features},
                      options.dtype(torch::kFloat8_e4m3fn)),
         /*requires_grad=*/false);
-    // Weight scale is per-tensor (scalar)
-    weight_scale_ =
-        register_parameter("weight_scale",
-                           torch::empty({1}, options.dtype(torch::kFloat32)),
-                           /*requires_grad=*/false);
+    const int64_t weight_scale_size =
+        is_fp8_channelwise_w8a8(quant_args_) ? out_features_per_partition : 1;
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({weight_scale_size}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
     // For static activation quantization, input_scale is pre-computed
     if (!quant_args_.activation_dynamic()) {
       input_scale_ =
@@ -249,8 +596,16 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(
                              torch::empty({1}, options.dtype(torch::kFloat32)),
                              /*requires_grad=*/false);
     }
-    // output dtype for scaled matmul
-    output_dtype_ = c10::typeMetaToScalarType(options.dtype());
+  } else if (!quant_args_.quant_descs().empty() ||
+             quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features_per_partition, in_features},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
   } else {
     weight_ = register_parameter(
         "weight",
@@ -277,59 +632,74 @@ torch::Tensor ColumnParallelLinearImpl::forward(torch::Tensor input) {
     CHECK(per_channel_scale_.defined())
         << "per_channel_scale is required for smoothquant.";
 
-    torch::Tensor quantized_input;
-    torch::Tensor input_scale;
-
-    xllm::kernel::ScaledQuantizeParams quantize_params;
-    quantize_params.x = input;
-    quantize_params.smooth = smooth_;
-    quantize_params.zero = std::nullopt;
-    quantize_params.token_count = std::nullopt;
-    quantize_params.gather_index = std::nullopt;
-    quantize_params.gather_index_start_position = std::nullopt;
-    quantize_params.output = std::nullopt;
-    quantize_params.output_scale = std::nullopt;
-    quantize_params.act_mode = linear_extra_args_.act_mode;
-    quantize_params.active_coef = 1.0;
-    quantize_params.is_gated = linear_extra_args_.is_gated;
-
-    std::tie(quantized_input, input_scale) =
-        xllm::kernel::scaled_quantize(quantize_params);
-
-    xllm::kernel::ScaledMatmulParams matmul_params;
-    matmul_params.a = quantized_input;
-    matmul_params.b = qweight_;
-    matmul_params.a_scale = input_scale;
-    matmul_params.b_scale = per_channel_scale_;
-    matmul_params.output_dtype = output_dtype_;
-    matmul_params.bias = bias;
-    matmul_params.c = std::nullopt;
-    matmul_params.act_mode = "none";
-    matmul_params.quant_bit_size = 8;
-    matmul_params.alpha = 1.0;
-    matmul_params.beta = 0.0;
-    matmul_params.use_hp_active = false;
-    matmul_params.a_quant_bit_size = 8;
-    matmul_params.a_calib = std::nullopt;
-    matmul_params.b_calib = std::nullopt;
-    matmul_params.output = std::nullopt;
-
-    output = xllm::kernel::scaled_matmul(matmul_params);
+    output = scaled_w8a8_linear(input,
+                                qweight_,
+                                per_channel_scale_,
+                                smooth_,
+                                bias,
+                                output_dtype_,
+                                linear_extra_args_);
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    output = musa::block_fp8_or_bf16_forward(
+        input, weight_, weight_scale_inv_, bias, matmul_output_buffer_);
+#endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
-    CHECK(!quant_args_.activation_dynamic())
-        << "FP8 quantization does not support activation_dynamic yet";
-
+    check_fp8_activation_dynamic_supported(quant_args_);
     auto scale = input_scale_.defined()
                      ? std::optional<torch::Tensor>(input_scale_)
                      : std::nullopt;
     output = fp8_linear_forward(
         input, weight_, weight_scale_, scale, bias, output_dtype_);
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    CHECK(input_scale_is_loaded_ && input_scale_.defined())
+        << "input_scale is required for w8a8 quant matmul.";
+    CHECK(input_offset_is_loaded_ && input_offset_.defined())
+        << "input_offset is required for w8a8 quant matmul.";
+    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
+        << "deq_scale is required for w8a8 quant matmul.";
+    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
+                          ? std::optional<torch::Tensor>(quant_bias_)
+                          : std::nullopt;
+    output = npu_w8a8_linear_forward(input,
+                                     weight_,
+                                     input_scale_,
+                                     input_offset_,
+                                     deq_scale_,
+                                     quant_bias,
+                                     output_dtype_);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    auto weight_scale = weight_scale_is_loaded_
+                            ? std::optional<torch::Tensor>(weight_scale_)
+                            : std::nullopt;
+    CHECK(weight_scale.has_value() && weight_scale.value().defined())
+        << "weight_scale is required for w8a8_dynamic quant matmul.";
+#if defined(USE_MLU) || defined(USE_DCU)
+    CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    output = scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        output_dtype_,
+        linear_extra_args_);
+#elif defined(USE_NPU)
+    output = npu_w8a8_dynamic_linear_forward(
+        input, weight_, weight_scale.value(), bias, output_dtype_);
+#endif
   } else {
+#if defined(USE_MUSA)
+    output = musa::matmul_forward(input, weight_, bias, matmul_output_buffer_);
+#else
     xllm::kernel::MatmulParams matmul_params;
     matmul_params.a = input;
     matmul_params.b = weight_;
     matmul_params.bias = bias;
     output = xllm::kernel::matmul(matmul_params);
+#endif
   }
 
   if (world_size_ > 1 && gather_output_) {
@@ -338,10 +708,87 @@ torch::Tensor ColumnParallelLinearImpl::forward(torch::Tensor input) {
   return output;
 }
 
+torch::Tensor ColumnParallelLinearImpl::forward_quantized(
+    const W8A8DynamicInput& input) {
+  CHECK(uses_w8a8_dynamic_quant())
+      << "forward_quantized requires w8a8_dynamic quant method.";
+  CHECK(input.activation.defined())
+      << "forward_quantized requires a quantized activation.";
+  CHECK(input.per_token_scale.defined())
+      << "forward_quantized requires a per-token scale.";
+  CHECK_EQ(input.activation.dim(), 2)
+      << "forward_quantized requires a 2D activation.";
+  CHECK_EQ(input.activation.size(0), input.per_token_scale.numel())
+      << "forward_quantized requires one scale per activation row.";
+
+#if defined(USE_NPU)
+  torch::Tensor output = npu_w8a8_dynamic_quantized_linear_forward(
+      input.activation.to(device_),
+      input.per_token_scale.to(device_),
+      weight_,
+      w8a8_dynamic_weight_scale(),
+      bias(),
+      output_dtype_);
+  if (world_size_ > 1 && gather_output_) {
+    output = xllm::parallel_state::gather(output, process_group_);
+  }
+  return output;
+#else
+  LOG(FATAL) << "forward_quantized is only supported on NPU.";
+  return torch::Tensor();
+#endif
+}
+
+bool ColumnParallelLinearImpl::uses_w8a8_dynamic_quant() const {
+  return is_w8a8_dynamic_quant(resolved_weight_quant_method_);
+}
+
+torch::Tensor ColumnParallelLinearImpl::w8a8_dynamic_weight_scale() const {
+  CHECK(uses_w8a8_dynamic_quant())
+      << "w8a8_dynamic_weight_scale requires w8a8_dynamic quant method.";
+  CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
+      << "weight_scale is required for w8a8_dynamic quant matmul.";
+  return weight_scale_;
+}
+
+std::optional<torch::Tensor> ColumnParallelLinearImpl::bias() const {
+  if (bias_.defined()) {
+    return bias_;
+  }
+  return std::nullopt;
+}
+
 // load the weight from the checkpoint
 void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
-  const int64_t rank = world_size_ == 1 ? 0 : rank_;
-  const int64_t world_size = world_size_;
+  if (state_dict.size() == 0) {
+    return;
+  }
+  const int64_t rank = weight_world_size_ == 1 ? 0 : weight_rank_;
+  const int64_t world_size = weight_world_size_;
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // load and merge the weights on dim 0
   // If quant_args_ indicates SmoothQuant, load qweight; otherwise, load
@@ -351,13 +798,46 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     LOAD_SHARDED_WEIGHT(per_channel_scale, 0);
     // for input, there is one smooth value
     LOAD_WEIGHT(smooth);
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    musa::maybe_resolve_block_fp8_unquantized(state_dict,
+                                              /*prefixes=*/nullptr,
+                                              options_,
+                                              weight_,
+                                              weight_is_loaded_,
+                                              weight_scale_inv_is_loaded_,
+                                              block_fp8_resolved_unquantized_);
+    if (!block_fp8_resolved_unquantized_) {
+      LOAD_SHARDED_WEIGHT(weight_scale_inv, 0);
+    }
+    LOAD_SHARDED_WEIGHT(weight, 0);
+#endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 quantization: load FP8 weight and scales
     LOAD_SHARDED_WEIGHT(weight, 0);
-    LOAD_WEIGHT(weight_scale);
+    if (is_fp8_channelwise_w8a8(quant_args_)) {
+      LOAD_SHARDED_WEIGHT(weight_scale, 0);
+    } else {
+      LOAD_WEIGHT(weight_scale);
+    }
     // For static activation quantization, load input_scale
     if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
       LOAD_WEIGHT(input_scale);
+    }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    LOAD_SHARDED_WEIGHT(weight, 0);
+    LOAD_WEIGHT(input_scale);
+    LOAD_WEIGHT(input_offset);
+    LOAD_SHARDED_WEIGHT(deq_scale, 0);
+    LOAD_SHARDED_WEIGHT(quant_bias, 0);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOAD_SHARDED_WEIGHT(weight, 0);
+    LOAD_SHARDED_WEIGHT(weight_scale, 0);
+    if (smooth_.defined()) {
+      LOAD_WEIGHT(smooth);
+    }
+    if (weight_offset_.defined()) {
+      LOAD_SHARDED_WEIGHT(weight_offset, 0);
     }
   } else {
     LOAD_SHARDED_WEIGHT(weight, 0);
@@ -372,8 +852,35 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
 void ColumnParallelLinearImpl::load_state_dict(
     const StateDict& state_dict,
     const std::vector<std::string>& prefixes) {
-  const int64_t rank = world_size_ == 1 ? 0 : rank_;
-  const int64_t world_size = world_size_;
+  if (state_dict.size() == 0) {
+    return;
+  }
+  const int64_t rank = weight_world_size_ == 1 ? 0 : weight_rank_;
+  const int64_t world_size = weight_world_size_;
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, &prefixes, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // load and merge the weights on dim 0
   // If quant_args_ indicates SmoothQuant, load qweight
@@ -394,54 +901,100 @@ void ColumnParallelLinearImpl::load_state_dict(
     }
     LOAD_FUSED_WEIGHT(qweight, 0);
     LOAD_FUSED_WEIGHT(per_channel_scale, 0);
-  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
-    // FP8 fused layer loading: each partition may have its own per-tensor scale
-    // (unfused checkpoint). We must requantize all partitions with max_scale.
-
-    // Step 1: Collect partition info BEFORE LOAD_FUSED_WEIGHT (clears list)
-    Fp8PartitionInfo partition_info;
-    if (!weight_scale_is_loaded_) {
-      for (const auto& prefix : prefixes) {
-        auto scale_tensor = state_dict.get_tensor(prefix + "weight_scale");
-        if (scale_tensor.defined()) {
-          partition_info.scales.push_back(scale_tensor.flatten().item<float>());
-        }
-        auto weight_tensor = state_dict.get_sharded_tensor(
-            prefix + "weight", 0, rank, world_size);
-        if (weight_tensor.defined()) {
-          partition_info.logical_widths.push_back(weight_tensor.size(0));
-        }
-      }
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    musa::maybe_resolve_block_fp8_unquantized(state_dict,
+                                              /*prefixes=*/&prefixes,
+                                              options_,
+                                              weight_,
+                                              weight_is_loaded_,
+                                              weight_scale_inv_is_loaded_,
+                                              block_fp8_resolved_unquantized_);
+    if (!block_fp8_resolved_unquantized_) {
+      LOAD_FUSED_WEIGHT(weight_scale_inv, 0);
     }
-
-    // Step 2: Load fused weight
     LOAD_FUSED_WEIGHT(weight, 0);
+#endif
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    if (is_fp8_channelwise_w8a8(quant_args_)) {
+      LOAD_FUSED_WEIGHT(weight, 0);
+      LOAD_FUSED_WEIGHT(weight_scale, 0);
+    } else {
+      // FP8 fused layer loading: each partition may have its own per-tensor
+      // scale (unfused checkpoint). We must requantize all partitions with
+      // max_scale.
 
-    // Step 3: Requantize if needed (unfused checkpoint case)
-    if (!weight_scale_is_loaded_ && !partition_info.empty()) {
-      float max_scale = compute_max_scale(partition_info.scales);
-
-      if (is_unfused_checkpoint(partition_info.scales) && weight_.defined() &&
-          partition_info.logical_widths.size() ==
-              partition_info.scales.size()) {
-        requantize_fp8_weight(weight_,
-                              partition_info.scales,
-                              partition_info.logical_widths,
-                              max_scale);
+      // Step 1: Collect partition info BEFORE LOAD_FUSED_WEIGHT (clears list)
+      Fp8PartitionInfo partition_info;
+      if (!weight_scale_is_loaded_) {
+        for (const auto& prefix : prefixes) {
+          auto scale_tensor = state_dict.get_tensor(prefix + "weight_scale");
+          if (scale_tensor.defined()) {
+            partition_info.scales.push_back(
+                scale_tensor.flatten().item<float>());
+          }
+          auto weight_tensor = state_dict.get_sharded_tensor(
+              prefix + "weight", 0, rank, world_size);
+          if (weight_tensor.defined()) {
+            partition_info.logical_widths.push_back(weight_tensor.size(0));
+          }
+        }
       }
 
-      weight_scale_.fill_(max_scale);
-      weight_scale_is_loaded_ = true;
+      // Step 2: Load fused weight
+      LOAD_FUSED_WEIGHT(weight, 0);
+
+      // Step 3: Requantize if needed (unfused checkpoint case)
+      if (!weight_scale_is_loaded_ && !partition_info.empty()) {
+        float max_scale = compute_max_scale(partition_info.scales);
+
+        if (is_unfused_checkpoint(partition_info.scales) && weight_.defined() &&
+            partition_info.logical_widths.size() ==
+                partition_info.scales.size()) {
+          requantize_fp8_weight(weight_,
+                                partition_info.scales,
+                                partition_info.logical_widths,
+                                max_scale);
+        }
+
+        weight_scale_.fill_(max_scale);
+        weight_scale_is_loaded_ = true;
+      }
+
+      // Step 4: Load input_scale for static activation quantization
+      if (input_scale_.defined() && !input_scale_is_loaded_) {
+        auto max_input_scale = load_max_input_scale(state_dict, prefixes);
+        if (max_input_scale.defined()) {
+          input_scale_.copy_(max_input_scale.view({1}));
+          input_scale_is_loaded_ = true;
+        }
+      }
     }
-
-    // Step 4: Load input_scale for static activation quantization
-    if (!quant_args_.activation_dynamic() && input_scale_.defined() &&
-        !input_scale_is_loaded_) {
-      auto max_input_scale = load_max_input_scale(state_dict, prefixes);
-      if (max_input_scale.defined()) {
-        input_scale_.copy_(max_input_scale.view({1}));
-        input_scale_is_loaded_ = true;
-      }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    LOAD_FUSED_WEIGHT(weight, 0);
+    // Fused static W8A8 quantizes the shared input only once, so keep a single
+    // input_scale/input_offset slot and pull the first available tensor.
+    load_shared_tensor_from_prefixes_or_fail(state_dict,
+                                             prefixes,
+                                             "input_scale",
+                                             input_scale_,
+                                             input_scale_is_loaded_);
+    load_shared_tensor_from_prefixes_or_fail(state_dict,
+                                             prefixes,
+                                             "input_offset",
+                                             input_offset_,
+                                             input_offset_is_loaded_);
+    LOAD_FUSED_WEIGHT(deq_scale, 0);
+    LOAD_FUSED_WEIGHT(quant_bias, 0);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOAD_FUSED_WEIGHT(weight, 0);
+    LOAD_FUSED_WEIGHT(weight_scale, 0);
+    if (smooth_.defined()) {
+      load_smooth_from_prefixes(
+          state_dict, prefixes, smooth_, smooth_list_, smooth_is_loaded_);
+    }
+    if (weight_offset_.defined()) {
+      LOAD_FUSED_WEIGHT(weight_offset, 0);
     }
   } else {
     LOAD_FUSED_WEIGHT(weight, 0);
@@ -465,18 +1018,80 @@ void ColumnParallelLinearImpl::load_state_dict(
     const StateDict& state_dict,
     int32_t shard_tensor_count,
     const std::vector<int64_t>& shard_sizes) {
-  const int64_t rank = rank_;
-  const int64_t world_size = world_size_;
+  if (state_dict.size() == 0) {
+    return;
+  }
+  const int64_t rank = weight_rank_;
+  const int64_t world_size = weight_world_size_;
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // load and merge the weights on dim 0 with variable shard sizes
   if (quant_args_.quant_method() == "smoothquant") {
     // For smoothquant, load quantized weights with variable shard sizes
     LOAD_MERGED_WEIGHT_V2(qweight, 0);
     LOAD_MERGED_WEIGHT_V2(per_channel_scale, 0);
-  } else {
-    // For regular weights, use the new merged weight loading with variable
-    // shard sizes
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    musa::maybe_resolve_block_fp8_unquantized(state_dict,
+                                              /*prefixes=*/nullptr,
+                                              options_,
+                                              weight_,
+                                              weight_is_loaded_,
+                                              weight_scale_inv_is_loaded_,
+                                              block_fp8_resolved_unquantized_);
+    if (!block_fp8_resolved_unquantized_) {
+      LOAD_WEIGHT(weight_scale_inv);
+      if (weight_scale_inv_is_loaded_) {
+        CHECK_EQ(world_size, 1)
+            << "block-fp8 merged-variable-shard scale loading requires TP=1";
+      }
+    }
     LOAD_MERGED_WEIGHT_V2(weight, 0);
+#endif
+  } else {
+    if (is_w8a8_quant(resolved_weight_quant_method_)) {
+      LOAD_MERGED_WEIGHT_V2(weight, 0);
+      LOAD_WEIGHT(input_scale);
+      LOAD_WEIGHT(input_offset);
+      LOAD_MERGED_WEIGHT_V2(deq_scale, 0);
+      LOAD_MERGED_WEIGHT_V2(quant_bias, 0);
+    } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+      LOAD_MERGED_WEIGHT_V2(weight, 0);
+      LOAD_MERGED_WEIGHT_V2(weight_scale, 0);
+      if (smooth_.defined()) {
+        LOAD_WEIGHT(smooth);
+      }
+      if (weight_offset_.defined()) {
+        LOAD_MERGED_WEIGHT_V2(weight_offset, 0);
+      }
+    } else {
+      // For regular weights, use the new merged weight loading with variable
+      // shard sizes
+      LOAD_MERGED_WEIGHT_V2(weight, 0);
+    }
   }
 
   if (bias_.defined()) {
@@ -496,7 +1111,8 @@ QKVParallelLinearImpl::QKVParallelLinearImpl(
     bool gather_output,
     const ParallelArgs& parallel_args,
     const torch::TensorOptions& options,
-    const QuantArgs& quant_args)
+    const QuantArgs& quant_args,
+    const LinearExtraArgs& linear_extra_args)
     : hidden_size_(hidden_size),
       num_heads_(num_heads),
       num_kv_heads_(num_kv_heads),
@@ -506,26 +1122,55 @@ QKVParallelLinearImpl::QKVParallelLinearImpl(
       parallel_args_(parallel_args),
       options_(options),
       device_(options.device()),
-      quant_args_(quant_args) {
+      quant_args_(quant_args),
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
   rank_ = parallel_args_.tp_group_->rank();
   world_size_ = parallel_args_.tp_group_->world_size();
   const int64_t out_features_per_partition =
       (num_heads + 2 * num_kv_heads) * head_size;
+  (void)linear_extra_args;
+#if defined(USE_MUSA)
+  musa::check_quantization_supported(quant_args_);
+#endif
   // Note: torch.nn.functional.linear performs XA^T + b and as a result
   // we allocate the transpose.
-  if (quant_args_.quant_method() == kQuantMethodFp8) {
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    qweight_ = register_parameter(
+        "qweight",
+        torch::empty({out_features_per_partition, hidden_size},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+    per_channel_scale_ =
+        register_parameter("per_channel_scale",
+                           torch::empty({out_features_per_partition},
+                                        options.dtype(torch::kFloat32)),
+                           /*requires_grad=*/false);
+    smooth_ = register_parameter(
+        "smooth",
+        torch::empty({hidden_size}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    musa::register_block_fp8_parameters(*this,
+                                        out_features_per_partition,
+                                        hidden_size,
+                                        options,
+                                        weight_,
+                                        weight_scale_inv_);
+#endif
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 W8A8 quantization - weight is stored as FP8 (float8_e4m3fn)
     weight_ = register_parameter(
         "weight",
         torch::empty({out_features_per_partition, hidden_size},
                      options.dtype(torch::kFloat8_e4m3fn)),
         /*requires_grad=*/false);
-    // Weight scale: create {3} for Q/K/V, will use max() after loading
-    // load separate scales then merge with max
-    weight_scale_ =
-        register_parameter("weight_scale",
-                           torch::empty({3}, options.dtype(torch::kFloat32)),
-                           /*requires_grad=*/false);
+    const int64_t weight_scale_size =
+        is_fp8_channelwise_w8a8(quant_args_) ? out_features_per_partition : 3;
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({weight_scale_size}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
     // For static activation quantization, input_scale is pre-computed
     // Also create {3} for Q/K/V, will use max() after loading
     if (!quant_args_.activation_dynamic()) {
@@ -534,8 +1179,16 @@ QKVParallelLinearImpl::QKVParallelLinearImpl(
                              torch::empty({3}, options.dtype(torch::kFloat32)),
                              /*requires_grad=*/false);
     }
-    // output dtype for scaled matmul
-    output_dtype_ = c10::typeMetaToScalarType(options.dtype());
+  } else if (!quant_args_.quant_descs().empty() ||
+             quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features_per_partition, hidden_size},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
   } else {
     weight_ = register_parameter(
         "weight",
@@ -557,26 +1210,75 @@ torch::Tensor QKVParallelLinearImpl::forward(torch::Tensor input) {
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
 
   torch::Tensor output;
-  if (quant_args_.quant_method() == kQuantMethodFp8) {
-    // FP8 W8A8 quantization
-    CHECK(!quant_args_.activation_dynamic())
-        << "FP8 quantization does not support activation_dynamic yet";
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    CHECK(qweight_.defined()) << "qweight is required for smoothquant.";
+    CHECK(per_channel_scale_.defined())
+        << "per_channel_scale is required for smoothquant.";
+    CHECK(smooth_.defined()) << "smooth is required for smoothquant.";
 
-    // Use max of Q/K/V scales as unified scale for fused projection
-    // Note: weight_scale_ and input_scale_ are already scalar tensors
-    // (replaced with max values in load_state_dict)
+    output = scaled_w8a8_linear(
+        input, qweight_, per_channel_scale_, smooth_, bias, output_dtype_);
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    output = musa::block_fp8_or_bf16_forward(
+        input, weight_, weight_scale_inv_, bias, matmul_output_buffer_);
+#endif
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+    check_fp8_activation_dynamic_supported(quant_args_);
     auto a_scale = input_scale_.defined()
                        ? std::optional<torch::Tensor>(input_scale_)
                        : std::nullopt;
     output = fp8_linear_forward(
         input, weight_, weight_scale_, a_scale, bias, output_dtype_);
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    CHECK(input_scale_is_loaded_ && input_scale_.defined())
+        << "input_scale is required for w8a8 quant matmul.";
+    CHECK(input_offset_is_loaded_ && input_offset_.defined())
+        << "input_offset is required for w8a8 quant matmul.";
+    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
+        << "deq_scale is required for w8a8 quant matmul.";
+    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
+                          ? std::optional<torch::Tensor>(quant_bias_)
+                          : std::nullopt;
+    output = npu_w8a8_linear_forward(input,
+                                     weight_,
+                                     input_scale_,
+                                     input_offset_,
+                                     deq_scale_,
+                                     quant_bias,
+                                     output_dtype_);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    auto weight_scale = weight_scale_is_loaded_
+                            ? std::optional<torch::Tensor>(weight_scale_)
+                            : std::nullopt;
+    CHECK(weight_scale.has_value() && weight_scale.value().defined())
+        << "weight_scale is required for w8a8_dynamic quant matmul.";
+#if defined(USE_MLU) || defined(USE_DCU)
+    CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    output = scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        output_dtype_);
+#elif defined(USE_NPU)
+    output = npu_w8a8_dynamic_linear_forward(
+        input, weight_, weight_scale.value(), bias, output_dtype_);
+#endif
   } else {
+#if defined(USE_MUSA)
+    output = musa::matmul_forward(input, weight_, bias, matmul_output_buffer_);
+#else
     xllm::kernel::MatmulParams matmul_params;
     matmul_params.a = input;
     matmul_params.b = weight_;
     matmul_params.bias = bias;
 
     output = xllm::kernel::matmul(matmul_params);
+#endif
   }
 
   if (world_size_ > 1 && gather_output_) {
@@ -588,14 +1290,73 @@ torch::Tensor QKVParallelLinearImpl::forward(torch::Tensor input) {
 void QKVParallelLinearImpl::load_state_dict(
     const StateDict& state_dict,
     const std::vector<std::string>& prefixes) {
+  if (state_dict.size() == 0) {
+    return;
+  }
   const int64_t rank = rank_;
   const int64_t world_size = world_size_;
-  LOAD_QKV_WEIGHT(weight, 0, num_kv_head_replicas_);
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, &prefixes, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
+#if defined(USE_MUSA)
+  const bool is_block_fp8 = musa::is_block_fp8_quant(quant_args_);
+  if (is_block_fp8) {
+    musa::maybe_resolve_block_fp8_unquantized(state_dict,
+                                              /*prefixes=*/&prefixes,
+                                              options_,
+                                              weight_,
+                                              weight_is_loaded_,
+                                              weight_scale_inv_is_loaded_,
+                                              block_fp8_resolved_unquantized_);
+  }
+#endif
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    LOAD_QKV_WEIGHT(qweight, 0, num_kv_head_replicas_);
+    LOAD_QKV_WEIGHT(per_channel_scale, 0, num_kv_head_replicas_);
+    load_shared_tensor_from_prefixes_or_fail(
+        state_dict, prefixes, "smooth", smooth_, smooth_is_loaded_);
+  } else {
+    LOAD_QKV_WEIGHT(weight, 0, num_kv_head_replicas_);
+  }
   if (bias_.defined()) {
     LOAD_QKV_WEIGHT(bias, 0, num_kv_head_replicas_);
   }
+#if defined(USE_MUSA)
+  if (is_block_fp8) {
+    if (!block_fp8_resolved_unquantized_) {
+      LOAD_QKV_WEIGHT(weight_scale_inv, 0, num_kv_head_replicas_);
+    }
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
+#else
   // FP8: load weight_scale and input_scale, requantize if needed
   if (quant_args_.quant_method() == kQuantMethodFp8) {
+#endif
+    if (is_fp8_channelwise_w8a8(quant_args_)) {
+      LOAD_QKV_WEIGHT(weight_scale, 0, num_kv_head_replicas_);
+      return;
+    }
+
     // Build partition info for Q/K/V
     Fp8PartitionInfo partition_info;
     int64_t num_heads_per_partition = num_heads_ / world_size_;
@@ -643,19 +1404,121 @@ void QKVParallelLinearImpl::load_state_dict(
     if (input_scale_.defined() && input_scale_.numel() > 1) {
       input_scale_ = input_scale_.max();
     }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    // input_scale/input_offset are shared activation-quant params and should
+    // not inherit the KV-head replication logic used by output-channel tensors.
+    load_shared_tensor_from_prefixes_or_fail(state_dict,
+                                             prefixes,
+                                             "input_scale",
+                                             input_scale_,
+                                             input_scale_is_loaded_);
+    load_shared_tensor_from_prefixes_or_fail(state_dict,
+                                             prefixes,
+                                             "input_offset",
+                                             input_offset_,
+                                             input_offset_is_loaded_);
+    LOAD_QKV_WEIGHT(deq_scale, 0, num_kv_head_replicas_);
+    LOAD_QKV_WEIGHT(quant_bias, 0, num_kv_head_replicas_);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOAD_QKV_WEIGHT(weight_scale, 0, num_kv_head_replicas_);
+    if (smooth_.defined()) {
+      load_smooth_from_prefixes(
+          state_dict, prefixes, smooth_, smooth_list_, smooth_is_loaded_);
+    }
+    if (weight_offset_.defined()) {
+      LOAD_QKV_WEIGHT(weight_offset, 0, num_kv_head_replicas_);
+    }
   }
 }
 
 void QKVParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
+  if (state_dict.size() == 0) {
+    return;
+  }
   const int64_t rank = rank_;
   const int64_t world_size = world_size_;
   const int32_t shard_tensor_count = 3;
   const int64_t shard_size = num_heads_ * head_size_;
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
+#if defined(USE_MUSA)
+  const bool is_block_fp8 = musa::is_block_fp8_quant(quant_args_);
+  if (is_block_fp8) {
+    musa::maybe_resolve_block_fp8_unquantized(state_dict,
+                                              /*prefixes=*/nullptr,
+                                              options_,
+                                              weight_,
+                                              weight_is_loaded_,
+                                              weight_scale_inv_is_loaded_,
+                                              block_fp8_resolved_unquantized_);
+  }
+#endif
   CHECK_EQ(num_heads_, num_kv_heads_);
-  LOAD_MERGED_WEIGHT(weight, 0);
+  if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    LOAD_MERGED_WEIGHT(qweight, 0);
+    LOAD_MERGED_WEIGHT(per_channel_scale, 0);
+    LOAD_WEIGHT(smooth);
+  } else {
+    LOAD_MERGED_WEIGHT(weight, 0);
+  }
 
   if (bias_.defined()) {
     LOAD_MERGED_WEIGHT(bias, 0);
+  }
+#if defined(USE_MUSA)
+  if (is_block_fp8) {
+    if (!block_fp8_resolved_unquantized_) {
+      CHECK_EQ(world_size, 1)
+          << "block-fp8 merged QKV scale loading requires TP=1";
+      LOAD_WEIGHT(weight_scale_inv);
+    }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+#else
+  if (is_w8a8_quant(resolved_weight_quant_method_)) {
+#endif
+    const std::vector<std::string> shared_input_prefixes{""};
+    load_shared_tensor_from_prefixes_or_fail(state_dict,
+                                             shared_input_prefixes,
+                                             "input_scale",
+                                             input_scale_,
+                                             input_scale_is_loaded_);
+    load_shared_tensor_from_prefixes_or_fail(state_dict,
+                                             shared_input_prefixes,
+                                             "input_offset",
+                                             input_offset_,
+                                             input_offset_is_loaded_);
+    LOAD_SHARDED_WEIGHT(deq_scale, 0);
+    LOAD_SHARDED_WEIGHT(quant_bias, 0);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOAD_SHARDED_WEIGHT(weight_scale, 0);
+    if (smooth_.defined()) {
+      LOAD_WEIGHT(smooth);
+    }
+    if (weight_offset_.defined()) {
+      LOAD_SHARDED_WEIGHT(weight_offset, 0);
+    }
   }
 }
 
@@ -682,8 +1545,13 @@ RowParallelLinearImpl::RowParallelLinearImpl(
     : input_is_parallelized_(input_is_parallelized),
       enable_result_reduction_(enable_result_reduction),
       quant_args_(quant_args),
+      options_(options),
       process_group_(process_group),
-      linear_extra_args_(linear_extra_args) {
+      linear_extra_args_(linear_extra_args),
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
+#if defined(USE_MUSA)
+  musa::check_quantization_supported(quant_args_);
+#endif
   rank_ = process_group_->rank();
   world_size_ = process_group_->world_size();
   CHECK(in_features % world_size_ == 0)
@@ -707,6 +1575,15 @@ RowParallelLinearImpl::RowParallelLinearImpl(
                                  /*requires_grad=*/false);
     // Output dtype for scaled_matmul
     output_dtype_ = c10::typeMetaToScalarType(options.dtype());
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    musa::register_block_fp8_parameters(*this,
+                                        out_features,
+                                        in_features_per_partition,
+                                        options,
+                                        weight_,
+                                        weight_scale_inv_);
+#endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 W8A8 quantization - weight is stored as FP8 (float8_e4m3fn)
     weight_ = register_parameter(
@@ -714,11 +1591,12 @@ RowParallelLinearImpl::RowParallelLinearImpl(
         torch::empty({out_features, in_features_per_partition},
                      options.dtype(torch::kFloat8_e4m3fn)),
         /*requires_grad=*/false);
-    // Weight scale is per-tensor (scalar)
-    weight_scale_ =
-        register_parameter("weight_scale",
-                           torch::empty({1}, options.dtype(torch::kFloat32)),
-                           /*requires_grad=*/false);
+    const int64_t weight_scale_size =
+        is_fp8_channelwise_w8a8(quant_args_) ? out_features : 1;
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({weight_scale_size}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
     // For static activation quantization, input_scale is pre-computed
     if (!quant_args_.activation_dynamic()) {
       input_scale_ =
@@ -726,8 +1604,16 @@ RowParallelLinearImpl::RowParallelLinearImpl(
                              torch::empty({1}, options.dtype(torch::kFloat32)),
                              /*requires_grad=*/false);
     }
-    // output dtype for scaled matmul
-    output_dtype_ = c10::typeMetaToScalarType(options.dtype());
+  } else if (!quant_args_.quant_descs().empty() ||
+             quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features, in_features_per_partition},
+                     options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
   } else {
     weight_ = register_parameter(
         "weight",
@@ -743,64 +1629,86 @@ RowParallelLinearImpl::RowParallelLinearImpl(
 }
 
 torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
+  const RowParallelReduceMode reduce_mode =
+      enable_result_reduction_ ? RowParallelReduceMode::ALL_REDUCE
+                               : RowParallelReduceMode::NONE;
+  return forward_impl(input, reduce_mode);
+}
+
+torch::Tensor RowParallelLinearImpl::mmrs_weight_transposed() const {
+  CHECK(weight_.defined()) << "weight is required for MMRS.";
+  const bool valid = mmrs_weight_t_.defined() &&
+                     mmrs_weight_t_.device() == weight_.device() &&
+                     mmrs_weight_t_.scalar_type() == weight_.scalar_type() &&
+                     mmrs_weight_t_.size(0) == weight_.size(1) &&
+                     mmrs_weight_t_.size(1) == weight_.size(0);
+  if (!valid) {
+    mmrs_weight_t_ = weight_.transpose(0, 1).contiguous();
+  }
+  return mmrs_weight_t_;
+}
+
+torch::Tensor RowParallelLinearImpl::forward(
+    torch::Tensor input,
+    RowParallelReduceMode reduce_mode) {
+#if !defined(USE_NPU)
+  reduce_mode = enable_result_reduction_ ? RowParallelReduceMode::ALL_REDUCE
+                                         : RowParallelReduceMode::NONE;
+#endif
+  return forward_impl(input, reduce_mode);
+}
+
+torch::Tensor RowParallelLinearImpl::forward_impl(
+    torch::Tensor input,
+    RowParallelReduceMode reduce_mode) {
+#if defined(USE_NPU)
+  const bool use_fc1_reduce =
+      reduce_mode == RowParallelReduceMode::REDUCE_SCATTER ||
+      reduce_mode == RowParallelReduceMode::MATMUL_REDUCE_SCATTER;
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+#else
+  const bool use_fc1_reduce = false;
+  const FlashComm1Context* fc1_ctx = nullptr;
+#endif
   auto bias = bias_.defined() && rank_ == 0
                   ? std::optional<torch::Tensor>(bias_)
                   : std::nullopt;
+
+  const bool skip_scatter =
+      use_fc1_reduce && fc1_ctx && is_sequence_sharded(*fc1_ctx);
+
   torch::Tensor output;
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "smoothquant", input);
     CHECK(smooth_.defined()) << "smooth is required for smoothquant.";
     CHECK(qweight_.defined()) << "qweight is required for smoothquant.";
     CHECK(per_channel_scale_.defined())
         << "per_channel_scale is required for smoothquant.";
 
-    torch::Tensor quantized_input;
-    torch::Tensor input_scale;
-
-    if (!input_is_parallelized_) {
+    if (!input_is_parallelized_ && !skip_scatter) {
       input = xllm::parallel_state::scatter(input, process_group_);
     }
-
-    xllm::kernel::ScaledQuantizeParams quantize_params;
-    quantize_params.x = input;
-    quantize_params.smooth = smooth_;
-    quantize_params.zero = std::nullopt;
-    quantize_params.token_count = std::nullopt;
-    quantize_params.gather_index = std::nullopt;
-    quantize_params.gather_index_start_position = std::nullopt;
-    quantize_params.output = std::nullopt;
-    quantize_params.output_scale = std::nullopt;
-    quantize_params.act_mode = linear_extra_args_.act_mode;
-    quantize_params.active_coef = 1.0;
-    quantize_params.is_gated = linear_extra_args_.is_gated;
-
-    std::tie(quantized_input, input_scale) =
-        xllm::kernel::scaled_quantize(quantize_params);
-
-    xllm::kernel::ScaledMatmulParams matmul_params;
-    matmul_params.a = quantized_input;
-    matmul_params.b = qweight_;
-    matmul_params.a_scale = input_scale;
-    matmul_params.b_scale = per_channel_scale_;
-    matmul_params.output_dtype = output_dtype_;
-    matmul_params.bias = bias;
-    matmul_params.c = std::nullopt;
-    matmul_params.act_mode = "none";
-    matmul_params.quant_bit_size = 8;
-    matmul_params.alpha = 1.0;
-    matmul_params.beta = 0.0;
-    matmul_params.use_hp_active = false;
-    matmul_params.a_quant_bit_size = 8;
-    matmul_params.a_calib = std::nullopt;
-    matmul_params.b_calib = std::nullopt;
-    matmul_params.output = std::nullopt;
-
-    output = xllm::kernel::scaled_matmul(matmul_params);
+    output = scaled_w8a8_linear(input,
+                                qweight_,
+                                per_channel_scale_,
+                                smooth_,
+                                bias,
+                                output_dtype_,
+                                linear_extra_args_);
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "block_fp8", input);
+    if (!input_is_parallelized_ && !skip_scatter) {
+      input = xllm::parallel_state::scatter(input, process_group_);
+    }
+    output = musa::block_fp8_or_bf16_forward(
+        input, weight_, weight_scale_inv_, bias, matmul_output_buffer_);
+#endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
-    // FP8 W8A8 quantization
-    CHECK(!quant_args_.activation_dynamic())
-        << "FP8 quantization does not support activation_dynamic yet";
+    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "fp8", input);
+    check_fp8_activation_dynamic_supported(quant_args_);
 
-    if (!input_is_parallelized_) {
+    if (!input_is_parallelized_ && !skip_scatter) {
       input = xllm::parallel_state::scatter(input, process_group_);
     }
 
@@ -809,16 +1717,215 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
                      : std::nullopt;
     output = fp8_linear_forward(
         input, weight_, weight_scale_, scale, bias, output_dtype_);
-  } else {
-    if (!input_is_parallelized_) {
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "w8a8", input);
+    CHECK(input_scale_is_loaded_ && input_scale_.defined())
+        << "input_scale is required for w8a8 quant matmul.";
+    CHECK(input_offset_is_loaded_ && input_offset_.defined())
+        << "input_offset is required for w8a8 quant matmul.";
+    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
+        << "deq_scale is required for w8a8 quant matmul.";
+    if (!input_is_parallelized_ && !skip_scatter) {
       input = xllm::parallel_state::scatter(input, process_group_);
     }
+    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
+                          ? std::optional<torch::Tensor>(quant_bias_)
+                          : std::nullopt;
+    output = npu_w8a8_linear_forward(input,
+                                     weight_,
+                                     input_scale_,
+                                     input_offset_,
+                                     deq_scale_,
+                                     quant_bias,
+                                     output_dtype_);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    if (!input_is_parallelized_ && !skip_scatter) {
+      input = xllm::parallel_state::scatter(input, process_group_);
+    }
+    auto weight_scale = weight_scale_is_loaded_
+                            ? std::optional<torch::Tensor>(weight_scale_)
+                            : std::nullopt;
+    CHECK(weight_scale.has_value() && weight_scale.value().defined())
+        << "weight_scale is required for w8a8_dynamic quant matmul.";
+#if defined(USE_MLU) || defined(USE_DCU)
+    CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    output = scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        output_dtype_,
+        linear_extra_args_);
+#elif defined(USE_NPU)
+    // FC1 fused int8 MMRS: per-token quantize the (padded) activation, then let
+    // torch_npu fuse matmul + reduce_scatter. Numerically equivalent to the
+    // symmetric w8a8_dynamic path (per-channel weight scale, no weight offset).
+    if (wants_mmrs(reduce_mode) && fc1_ctx && is_sequence_sharded(*fc1_ctx) &&
+        fc1_ctx->enable_mmrs_fusion && !bias.has_value() && input.defined() &&
+        input.dim() == 2 && input.size(0) == fc1_ctx->original_num_tokens) {
+      torch::Tensor mmrs_input = input;
+      if (fc1_ctx->pad_size > 0) {
+        mmrs_input = pad_rows_by_copy(input, fc1_ctx->padded_num_tokens);
+      }
+      xllm::kernel::NpuQuantizeParams q_params;
+      q_params.input = mmrs_input;
+      torch::Tensor q_input;
+      std::optional<torch::Tensor> pertoken_scale;
+      std::tie(q_input, pertoken_scale) = xllm::kernel::dynamic_quant(q_params);
+      if (pertoken_scale.has_value() && pertoken_scale->defined()) {
+        const std::vector<int64_t> output_shape = {
+            fc1_ctx->padded_local_num_tokens, weight_.size(0)};
+        xllm::kernel::MatmulReduceScatterParams mmrs_params;
+        mmrs_params.a = q_input;
+        mmrs_params.b = mmrs_weight_transposed();
+        mmrs_params.bias = std::nullopt;
+        mmrs_params.process_group = process_group_;
+        mmrs_params.comm_mode = fc1_ctx->mmrs_comm_mode;
+        mmrs_params.x1_scale = pertoken_scale->reshape({-1, 1}).to(at::kFloat);
+        mmrs_params.x2_scale =
+            weight_scale.value().reshape({1, -1}).to(at::kFloat);
+        mmrs_params.output_dtype = output_dtype_;
+        try {
+          output = xllm::kernel::matmul_reduce_scatter(mmrs_params);
+        } catch (const c10::Error& error) {
+          LOG_FIRST_N(WARNING, 8)
+              << "FC1 w8a8 MMRS call failed; fallback reduction will run: "
+              << error.what_without_backtrace();
+          output = torch::Tensor();
+        }
+        if (output.defined() &&
+            output.sizes() == torch::IntArrayRef(output_shape)) {
+          retain_quantized_mmrs_launch_tensors(q_input,
+                                               mmrs_params.x1_scale.value(),
+                                               mmrs_params.x2_scale.value());
+          return output;
+        }
+        if (output.defined()) {
+          LOG_FIRST_N(WARNING, 8)
+              << "FC1 w8a8 MMRS returned unexpected shape; fallback reduction "
+                 "will run. returned="
+              << output.sizes() << ", expected_local=" << output_shape;
+          output = torch::Tensor();
+        }
+      }
+    }
+    if (!output.defined()) {
+      log_mmrs_quant_skip(reduce_mode, fc1_ctx, "w8a8_dynamic", input);
+      output = npu_w8a8_dynamic_linear_forward(
+          input, weight_, weight_scale.value(), bias, output_dtype_);
+    }
+#endif
+  } else {
+    if (!input_is_parallelized_ && !skip_scatter) {
+      input = xllm::parallel_state::scatter(input, process_group_);
+    }
+#if defined(USE_NPU)
+    if (wants_mmrs(reduce_mode) && fc1_ctx && is_sequence_sharded(*fc1_ctx) &&
+        fc1_ctx->enable_mmrs_fusion) {
+      bool can_try_mmrs = input.defined() && weight_.defined() &&
+                          input.dim() == 2 &&
+                          input.size(0) == fc1_ctx->original_num_tokens &&
+                          (!bias.has_value() || fc1_ctx->pad_size == 0);
+      if (can_try_mmrs) {
+        torch::Tensor mmrs_input = input;
+        if (fc1_ctx->pad_size > 0) {
+          mmrs_input = pad_rows_by_copy(input, fc1_ctx->padded_num_tokens);
+        }
+
+        auto output_shape = mmrs_input.sizes().vec();
+        output_shape[0] = fc1_ctx->padded_local_num_tokens;
+        output_shape[1] = weight_.size(0);
+
+        xllm::kernel::MatmulReduceScatterParams mmrs_params;
+        mmrs_params.a = mmrs_input;
+        mmrs_params.b = mmrs_weight_transposed();
+        mmrs_params.bias = bias;
+        mmrs_params.process_group = process_group_;
+        mmrs_params.comm_mode = fc1_ctx->mmrs_comm_mode;
+        try {
+          output = xllm::kernel::matmul_reduce_scatter(mmrs_params);
+        } catch (const c10::Error& error) {
+          LOG_FIRST_N(WARNING, 8)
+              << "FC1 MMRS call failed; fallback reduction will run: "
+              << error.what_without_backtrace();
+          output = torch::Tensor();
+        }
+        if (output.defined() &&
+            output.sizes() == torch::IntArrayRef(output_shape)) {
+          return output;
+        }
+        if (output.defined()) {
+          LOG_FIRST_N(WARNING, 8)
+              << "FC1 MMRS returned non-local shape; fallback reduction will "
+                 "run. input="
+              << input.sizes() << ", weight=" << weight_.sizes()
+              << ", returned_output=" << output.sizes()
+              << ", expected_local_output=" << output_shape;
+          output = torch::Tensor();
+        }
+      } else {
+        LOG_FIRST_N(WARNING, 8)
+            << "FC1 MMRS skipped for unsupported row-parallel shape; fallback "
+               "to matmul + reduce_scatter. input="
+            << input.sizes() << ", weight=" << weight_.sizes()
+            << ", original_num_tokens=" << fc1_ctx->original_num_tokens
+            << ", pad_size=" << fc1_ctx->pad_size
+            << ", has_bias=" << bias.has_value()
+            << ", input_dim=" << input.dim();
+      }
+
+      if (!output.defined()) {
+        xllm::kernel::MatmulParams matmul_params;
+        matmul_params.a = input;
+        matmul_params.b = weight_;
+        matmul_params.bias = bias;
+        output = xllm::kernel::matmul(matmul_params);
+      }
+    } else {
+      if (wants_mmrs(reduce_mode)) {
+        LOG_FIRST_N(WARNING, 16)
+            << "FC1 MMRS skipped before row-parallel matmul: fc1_ctx="
+            << (fc1_ctx != nullptr) << ", sequence_sharded="
+            << (fc1_ctx != nullptr && is_sequence_sharded(*fc1_ctx))
+            << ", enable_mmrs_fusion="
+            << (fc1_ctx != nullptr && fc1_ctx->enable_mmrs_fusion)
+            << ", reduce_mode=" << static_cast<int>(reduce_mode)
+            << ", input=" << input.sizes();
+      }
+      xllm::kernel::MatmulParams matmul_params;
+      matmul_params.a = input;
+      matmul_params.b = weight_;
+      matmul_params.bias = bias;
+      output = xllm::kernel::matmul(matmul_params);
+    }
+#else
+#if defined(USE_MUSA)
+    output = musa::matmul_forward(input, weight_, bias, matmul_output_buffer_);
+#else
     xllm::kernel::MatmulParams matmul_params;
     matmul_params.a = input;
     matmul_params.b = weight_;
     matmul_params.bias = bias;
     output = xllm::kernel::matmul(matmul_params);
+#endif
+#endif
   }
+
+  if (reduce_mode == RowParallelReduceMode::NONE) {
+    return output;
+  }
+
+  if ((reduce_mode == RowParallelReduceMode::REDUCE_SCATTER ||
+       reduce_mode == RowParallelReduceMode::MATMUL_REDUCE_SCATTER) &&
+      fc1_ctx) {
+    FlashComm1Context ctx_copy = *fc1_ctx;
+    ctx_copy.tp_group = process_group_;
+    return maybe_pad_and_reduce(output, ctx_copy, reduce_mode);
+  }
+
   if (enable_result_reduction_ && world_size_ > 1) {
     output = xllm::parallel_state::reduce(output, process_group_);
   }
@@ -827,8 +1934,37 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
 
 // load the weight from the checkpoint
 void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
+  if (state_dict.size() == 0) {
+    return;
+  }
+  // The transposed weight is derived state and must be rebuilt after reload.
+  mmrs_weight_t_ = torch::Tensor();
   const int64_t rank = world_size_ == 1 ? 0 : rank_;
   const int64_t world_size = world_size_;
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
 
   // If quant_args_ indicates SmoothQuant, load qweight; otherwise, load
   // normal weight.
@@ -836,6 +1972,20 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     LOAD_SHARDED_WEIGHT(qweight, 1);
     LOAD_WEIGHT(per_channel_scale);
     LOAD_SHARDED_WEIGHT(smooth, 0);
+#if defined(USE_MUSA)
+  } else if (musa::is_block_fp8_quant(quant_args_)) {
+    musa::maybe_resolve_block_fp8_unquantized(state_dict,
+                                              /*prefixes=*/nullptr,
+                                              options_,
+                                              weight_,
+                                              weight_is_loaded_,
+                                              weight_scale_inv_is_loaded_,
+                                              block_fp8_resolved_unquantized_);
+    if (!block_fp8_resolved_unquantized_) {
+      LOAD_SHARDED_WEIGHT(weight_scale_inv, 1);
+    }
+    LOAD_SHARDED_WEIGHT(weight, 1);
+#endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 quantization: load FP8 weight and scales
     LOAD_SHARDED_WEIGHT(weight, 1);
@@ -843,6 +1993,26 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     // For static activation quantization, load input_scale
     if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
       LOAD_WEIGHT(input_scale);
+    }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    LOAD_SHARDED_WEIGHT(weight, 1);
+    LOAD_WEIGHT(input_scale);
+    LOAD_WEIGHT(input_offset);
+    LOAD_WEIGHT(deq_scale);
+    if (rank_ == 0) {
+      LOAD_WEIGHT(quant_bias);
+    } else if (quant_bias_.defined()) {
+      quant_bias_.zero_();
+      quant_bias_is_loaded_ = true;
+    }
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOAD_SHARDED_WEIGHT(weight, 1);
+    LOAD_WEIGHT(weight_scale);
+    if (smooth_.defined()) {
+      LOAD_SHARDED_WEIGHT(smooth, 0);
+    }
+    if (weight_offset_.defined()) {
+      LOAD_WEIGHT(weight_offset);
     }
   } else {
     LOAD_SHARDED_WEIGHT(weight, 1);
@@ -859,11 +2029,39 @@ ReplicatedLinearImpl::ReplicatedLinearImpl(
     int64_t out_features,
     bool bias,
     const QuantArgs& quant_args,
-    const torch::TensorOptions& options) {
-  weight_ =
-      register_parameter("weight",
-                         torch::empty({out_features, in_features}, options),
-                         /*requires_grad=*/false);
+    const torch::TensorOptions& options,
+    const LinearExtraArgs& linear_extra_args)
+    : quant_args_(quant_args),
+      options_(options),
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
+  (void)linear_extra_args;
+#if defined(USE_MUSA)
+  musa::check_quantization_supported(quant_args_);
+#endif
+  if (quant_args_.quant_method() == kQuantMethodFp8) {
+    // Replicated projections are mixed in DeepSeek checkpoints: attention
+    // low-rank projections can be FP8, while router gates remain BF16. Keep the
+    // storage in runtime dtype initially and switch to FP8 lazily after seeing
+    // the checkpoint tensor dtype in load_state_dict().
+    weight_ =
+        register_parameter("weight",
+                           torch::empty({out_features, in_features}, options),
+                           /*requires_grad=*/false);
+  } else if (!quant_args_.quant_descs().empty() ||
+             quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    // quant_descs is not empty: default initialize weight as kInt8.
+    // During load_state_dict, the weight will be lazily re-registered to the
+    // appropriate dtype based on the resolved quant method.
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features, in_features}, options.dtype(torch::kInt8)),
+        /*requires_grad=*/false);
+  } else {
+    weight_ =
+        register_parameter("weight",
+                           torch::empty({out_features, in_features}, options),
+                           /*requires_grad=*/false);
+  }
 
   if (bias) {
     bias_ = register_parameter("bias",
@@ -875,6 +2073,59 @@ ReplicatedLinearImpl::ReplicatedLinearImpl(
 torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input) {
   auto bias =
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+  if (is_fp8_dtype(weight_.scalar_type())) {
+    check_fp8_activation_dynamic_supported(quant_args_);
+    CHECK(weight_scale_.defined())
+        << "weight_scale is required for FP8 replicated linear.";
+    auto scale = input_scale_.defined()
+                     ? std::optional<torch::Tensor>(input_scale_)
+                     : std::nullopt;
+    return fp8_linear_forward(
+        input, weight_, weight_scale_, scale, bias, output_dtype_);
+  }
+  if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    CHECK(input_scale_is_loaded_ && input_scale_.defined())
+        << "input_scale is required for w8a8 quant matmul.";
+    CHECK(input_offset_is_loaded_ && input_offset_.defined())
+        << "input_offset is required for w8a8 quant matmul.";
+    CHECK(deq_scale_is_loaded_ && deq_scale_.defined())
+        << "deq_scale is required for w8a8 quant matmul.";
+    auto quant_bias = quant_bias_is_loaded_ && quant_bias_.defined()
+                          ? std::optional<torch::Tensor>(quant_bias_)
+                          : std::nullopt;
+    return npu_w8a8_linear_forward(input,
+                                   weight_,
+                                   input_scale_,
+                                   input_offset_,
+                                   deq_scale_,
+                                   quant_bias,
+                                   input.scalar_type());
+  }
+  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    auto weight_scale = weight_scale_is_loaded_
+                            ? std::optional<torch::Tensor>(weight_scale_)
+                            : std::nullopt;
+    CHECK(weight_scale.has_value() && weight_scale.value().defined())
+        << "weight_scale is required for w8a8_dynamic quant matmul.";
+#if defined(USE_MLU) || defined(USE_DCU)
+    CHECK(weight_is_loaded_) << "Missing compressed-tensors weight";
+    CHECK(!quant_args_.preserve_smooth() || smooth_is_loaded_)
+        << "Missing compressed-tensors smooth";
+    return scaled_w8a8_linear(
+        input,
+        weight_,
+        weight_scale.value(),
+        smooth_.defined() && smooth_is_loaded_ ? smooth_ : torch::Tensor(),
+        bias,
+        output_dtype_);
+#elif defined(USE_NPU)
+    return npu_w8a8_dynamic_linear_forward(
+        input, weight_, weight_scale.value(), bias, input.scalar_type());
+#endif
+  }
+#if defined(USE_MUSA)
+  return musa::matmul_forward(input, weight_, bias, matmul_output_buffer_);
+#else
   xllm::kernel::MatmulParams matmul_params;
   matmul_params.a = input;
   matmul_params.b = weight_;
@@ -882,11 +2133,120 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input) {
 
   auto output = xllm::kernel::matmul(matmul_params);
   return output;
+#endif
+}
+
+bool ReplicatedLinearImpl::uses_w8a8_dynamic_quant() const {
+  return is_w8a8_dynamic_quant(resolved_weight_quant_method_);
+}
+
+torch::Tensor ReplicatedLinearImpl::w8a8_dynamic_weight_scale() const {
+  CHECK(uses_w8a8_dynamic_quant())
+      << "w8a8_dynamic_weight_scale requires w8a8_dynamic quant method.";
+  CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
+      << "weight_scale is required for w8a8_dynamic quant matmul.";
+  return weight_scale_;
+}
+
+at::ScalarType ReplicatedLinearImpl::output_dtype() const {
+  return output_dtype_;
+}
+
+std::optional<torch::Tensor> ReplicatedLinearImpl::bias() const {
+  if (bias_.defined()) {
+    return bias_;
+  }
+  return std::nullopt;
 }
 
 // load the weight from the checkpoint
 void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
+  if (state_dict.size() == 0) {
+    return;
+  }
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+  ensure_w8a8_params_for_linear_load(
+      this,
+      quant_args_,
+      options_,
+      resolved_weight_quant_method_,
+      /*shared_input_param_size=*/1,
+      W8A8LinearParamRefs{weight_,
+                          weight_is_loaded_,
+                          input_scale_,
+                          input_scale_is_loaded_,
+                          input_offset_,
+                          input_offset_is_loaded_,
+                          deq_scale_,
+                          deq_scale_is_loaded_,
+                          quant_bias_,
+                          quant_bias_is_loaded_,
+                          weight_scale_,
+                          weight_scale_is_loaded_,
+                          weight_offset_,
+                          weight_offset_is_loaded_,
+                          smooth_,
+                          smooth_is_loaded_});
+
+#if defined(USE_MUSA)
+  musa::check_replicated_weight_supported(state_dict);
+#else
+  if (quant_args_.quant_method() == kQuantMethodFp8) {
+    torch::Tensor checkpoint_weight = state_dict.get_tensor("weight");
+    if (checkpoint_weight.defined() &&
+        is_fp8_dtype(checkpoint_weight.scalar_type())) {
+      const int64_t out_features = weight_.size(0);
+      const int64_t in_features = weight_.size(1);
+      const int64_t weight_scale_size =
+          is_fp8_channelwise_w8a8(quant_args_) ? out_features : 1;
+      std::vector<weight::LazyParameterSpec> specs;
+      specs.reserve(quant_args_.activation_dynamic() ? 2 : 3);
+      specs.push_back(weight::LazyParameterSpec{
+          &weight_,
+          &weight_is_loaded_,
+          "weight",
+          {out_features, in_features},
+          options_.dtype(checkpoint_weight.scalar_type())});
+      specs.push_back(
+          weight::LazyParameterSpec{&weight_scale_,
+                                    &weight_scale_is_loaded_,
+                                    "weight_scale",
+                                    {weight_scale_size},
+                                    options_.dtype(torch::kFloat32)});
+      if (!quant_args_.activation_dynamic()) {
+        specs.push_back(
+            weight::LazyParameterSpec{&input_scale_,
+                                      &input_scale_is_loaded_,
+                                      "input_scale",
+                                      {1},
+                                      options_.dtype(torch::kFloat32)});
+      }
+      weight::ensure_parameter_storage(this, specs);
+    }
+  }
+#endif
+
   LOAD_WEIGHT(weight);
+  if (is_fp8_dtype(weight_.scalar_type())) {
+    LOAD_WEIGHT(weight_scale);
+    if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
+      LOAD_WEIGHT(input_scale);
+    }
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    LOAD_WEIGHT(input_scale);
+    LOAD_WEIGHT(input_offset);
+    LOAD_WEIGHT(deq_scale);
+    LOAD_WEIGHT(quant_bias);
+  } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    LOAD_WEIGHT(weight_scale);
+    if (smooth_.defined()) {
+      LOAD_WEIGHT(smooth);
+    }
+    if (weight_offset_.defined()) {
+      LOAD_WEIGHT(weight_offset);
+    }
+  }
   if (bias_.defined()) {
     LOAD_WEIGHT(bias);
   }

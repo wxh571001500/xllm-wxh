@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,20 +17,82 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <optional>
+#include <string>
+#include <vector>
+
 #include "common/global_flags.h"
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/model_context.h"
+#include "core/layers/common/quant_utils.h"
+#include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
 #include "layers/common/dp_utils.h"
+#include "platform/model_stream_registry.h"
 #include "util/tensor_helper.h"
 #include "util/utils.h"
 
 namespace xllm {
 namespace layer {
 
+namespace {
+
+QuantArgs resolve_expert_args(const QuantArgs& args,
+                              const std::string& prefix,
+                              int64_t num_experts) {
+  if (args.compressed_groups().empty()) {
+    return args;
+  }
+  CHECK(!prefix.empty() ||
+        std::all_of(args.compressed_groups().begin(),
+                    args.compressed_groups().end(),
+                    [](const CompressedQuantGroup& group) {
+                      return group.targets ==
+                             std::vector<std::string>{"Linear"};
+                    }))
+      << "Compressed-tensors MoE requires a module prefix";
+  const auto resolved = args.for_module(prefix + ".experts.0.gate_proj");
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    for (const std::string& projection :
+         {"gate_proj", "up_proj", "down_proj"}) {
+      const std::string module =
+          prefix + ".experts." + std::to_string(expert) + "." + projection;
+      const auto local = args.for_module(module);
+      CHECK(local.quant_method() == resolved.quant_method() &&
+            local.bits() == resolved.bits() &&
+            local.group_size() == resolved.group_size() &&
+            local.preserve_smooth() == resolved.preserve_smooth())
+          << "Incompatible compressed-tensors schemes within fused MoE: "
+          << module;
+    }
+  }
+  return resolved;
+}
+
+}  // namespace
+
+FusedMoEImpl::FusedMoEImpl(const ModelContext& context,
+                           const FusedMoEArgs& moe_args)
+    : FusedMoEImpl(
+          context.get_model_args(),
+          moe_args,
+          context.get_quant_args(),
+          context.get_parallel_args(),
+          context.get_tensor_options(),
+          context.stream_registry()->get(ExecutionStreamRole::COMMUNICATION),
+          context.stream_registry()->get(
+              ExecutionStreamRole::AUXILIARY_COMPUTE)) {}
+
 FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
                            const FusedMoEArgs& moe_args,
                            const QuantArgs& quant_args,
                            const ParallelArgs& parallel_args,
-                           const torch::TensorOptions& options)
+                           const torch::TensorOptions& options,
+                           const std::shared_ptr<Stream>& routed_comm_stream,
+                           const std::shared_ptr<Stream>& shared_compute_stream)
     : num_total_experts_(model_args.n_routed_experts()),
       topk_(model_args.num_experts_per_tok()),
       hidden_size_(model_args.hidden_size()),
@@ -38,10 +100,24 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
       is_gated_(moe_args.is_gated),
       enable_result_reduction_(moe_args.enable_result_reduction),
       hidden_act_(model_args.hidden_act()),
-      quant_args_(quant_args),
+      swiglu_limit_(model_args.model_type() == "deepseek_v4" ||
+                            model_args.model_type() == "glm5_next"
+                        ? std::make_optional(model_args.swiglu_limit())
+                        : std::nullopt),
+      use_hash_(moe_args.use_hash),
+      quant_args_(resolve_expert_args(quant_args,
+                                      moe_args.module_prefix,
+                                      model_args.n_routed_experts())),
       parallel_args_(parallel_args),
       options_(options),
       device_(options.device()) {
+  CHECK(routed_comm_stream != nullptr)
+      << "FusedMoE requires a model-scoped communication stream";
+  CHECK(shared_compute_stream != nullptr)
+      << "FusedMoE requires a model-scoped auxiliary compute stream";
+  routed_stream_ = routed_comm_stream;
+  shared_stream_ = shared_compute_stream;
+
   const int64_t num_experts = num_total_experts_;
   const int64_t intermediate_size =
       static_cast<int64_t>(model_args.moe_intermediate_size());
@@ -53,37 +129,35 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     tp_pg_ = parallel_args.moe_tp_group_;
   }
 
-  moe_weight_bits_ = quant_args.moe_weight_bits();
+  moe_weight_bits_ = quant_args_.moe_weight_bits();
   weight_pack_factor_ = (moe_weight_bits_ == 4 ? 2 : 1);
 
-  // smoothquant check: if quant_method is not empty, only smoothquant with
-  // A8 and expert W8/W4 is supported.
-  if (!quant_args.quant_method().empty()) {
-    if (quant_args.quant_method() != kQuantMethodSmoothquant ||
-        quant_args.bits() != 8 || !quant_args.activation_dynamic() ||
-        (moe_weight_bits_ != 8 && moe_weight_bits_ != 4)) {
-      LOG(FATAL)
-          << "FusedMoE only supports the current SmoothQuant MoE path with "
-             "non-expert bits=8, dynamic activation, and expert weight bits "
-             "in {4,8}. "
-          << "Got quant_method=" << quant_args.quant_method()
-          << ", bits=" << quant_args.bits()
-          << ", moe_weight_bits=" << moe_weight_bits_
-          << ", activation_dynamic=" << quant_args.activation_dynamic();
-    }
-    is_smoothquant_ = true;
+  // A8 quantization supports SmoothQuant and compressed-tensors with
+  // dynamic A8 activations and expert W8/W4 weights.
+  if (!quant_args_.quant_method().empty()) {
+    const bool compressed_quant =
+        quant_args_.is_compressed_tensors_w8a8_dynamic();
+    CHECK((quant_args_.quant_method() == kQuantMethodSmoothquant ||
+           compressed_quant) &&
+          (compressed_quant || quant_args_.bits() == 8) &&
+          quant_args_.activation_dynamic() &&
+          (moe_weight_bits_ == 8 || moe_weight_bits_ == 4))
+        << "FusedMoE requires dynamic A8 with W8 or W4 weights";
+    use_a8_quant_ = true;
   } else {
-    is_smoothquant_ = false;
+    use_a8_quant_ = false;
   }
 
   // Deep EP initialization check
-  enable_deep_ep_ = FLAGS_expert_parallel_degree == 2 && ep_size > 1;
+  enable_deep_ep_ =
+      ::xllm::EPLBConfig::get_instance().expert_parallel_degree() == 2 &&
+      ep_size > 1;
   if (enable_deep_ep_) {
     // for now, we only implement the deep ep for decode stage.
     // so we will assume the max_token_num is limited to max_batch_size * (1+K)
     // K is the number of speculative tokens.
     int64_t dispatch_token_size;
-    if (quant_args.quant_method() == kQuantMethodSmoothquant) {
+    if (use_a8_quant_) {
       // float32 is for the scale of the quantized input
       dispatch_token_size = hidden_size_ * get_dtype_size(torch::kInt8) +
                             get_dtype_size(torch::kFloat32);
@@ -94,16 +168,20 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     torch::ScalarType combine_dtype = options_.dtype().toScalarType();
     int64_t combine_token_size = hidden_size_ * get_dtype_size(combine_dtype);
     // Ensure calculation base is at least ep_size
-    int64_t effective_seqs =
-        std::max((int64_t)FLAGS_max_seqs_per_batch, (int64_t)ep_size);
-    // NOTE: FLAGS_max_seqs_per_batch represents the maximum total batch size,
-    // regardless of the dp size. To ensure robust scheduling and account
-    // for the worst-case scenario, we must guarantee that each rank is capable
-    // of handling the maximum possible number of tokens. Therefore, we define
-    // max_num_tokens_per_rank as the full maximum value, without dividing by
-    // either the rank count or the dp size.
+    int64_t effective_seqs = std::max(
+        (int64_t)::xllm::SchedulerConfig::get_instance().max_seqs_per_batch(),
+        (int64_t)ep_size);
+    // NOTE: ::xllm::SchedulerConfig::get_instance().max_seqs_per_batch()
+    // represents the maximum total batch size, regardless of the dp size. To
+    // ensure robust scheduling and account for the worst-case scenario, we must
+    // guarantee that each rank is capable of handling the maximum possible
+    // number of tokens. Therefore, we define max_num_tokens_per_rank as the
+    // full maximum value, without dividing by either the rank count or the dp
+    // size.
     int64_t max_num_tokens_per_rank =
-        (1 + FLAGS_num_speculative_tokens) * effective_seqs * topk_;
+        (1 +
+         ::xllm::SpeculativeConfig::get_instance().num_speculative_tokens()) *
+        effective_seqs * topk_;
 
     // make sure that all layers share the same deep ep instance
     //  so that the memory footprint is minimized
@@ -121,7 +199,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     // intermediate buffer that can be initialized once
     // we place these tensor here in order to speed up forward pass
     int64_t n_tokens_recv = deep_ep_params_.max_num_tokens_recv;
-    int64_t token_bytes = is_smoothquant_
+    int64_t token_bytes = use_a8_quant_
                               ? get_dtype_size(torch::kInt8)
                               : get_dtype_size(options_.dtype().toScalarType());
     token_bytes = token_bytes * hidden_size_;
@@ -130,7 +208,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
         deep_ep_buffer_.combine_send_token_tensor.narrow(0, 0, head_size)
             .view({n_tokens_recv, token_bytes});
     // input scale in smoothquant
-    if (is_smoothquant_) {
+    if (use_a8_quant_) {
       int64_t tail_size = n_tokens_recv * get_dtype_size(torch::kFloat32);
       dispatch_recv_token_tensor_tail_ =
           deep_ep_buffer_.combine_send_token_tensor
@@ -143,35 +221,27 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
   num_experts_per_rank_ = num_experts / ep_size;
   start_expert_id_ = ep_rank * num_experts_per_rank_;
 
-  gate_ = register_module("gate", MoEGate(model_args, quant_args, options));
+  gate_ = register_module("gate",
+                          MoEGate(model_args, quant_args, options, use_hash_));
   if (n_shared_experts_ > 0) {
-    ProcessGroup* shared_expert_pg;
-    if (parallel_args_.ep_size() > 1) {
-      // we use tp=1 for shared experts computation in deep ep mode
-      CHECK(parallel_args_.ep_size() == parallel_args_.world_size())
-          << "Models with shared experts only support ep_size equal to "
-             "world size for now.";
-      shared_expert_pg = parallel_args.moe_tp_group_;
-    } else {
-      shared_expert_pg = parallel_args.process_group_;
-    }
-    // The shared experts computation can proceed in parallel with the
-    // final communication step during the MoE computation, as long as it
-    // remains independent of any communication operations. For optimal
-    // performance, ensure that the shared experts layer on each rank always
-    // maintains its own unique weights.
-    shared_pg_ = shared_expert_pg;
-    shared_experts_ =
-        register_module("shared_experts",
-                        DenseMLP(hidden_size_,
-                                 intermediate_size * n_shared_experts_,
-                                 is_gated_,
-                                 false,
-                                 hidden_act_,
-                                 enable_result_reduction_,
-                                 quant_args,
-                                 shared_expert_pg,
-                                 options));
+    CHECK(parallel_args.single_rank_group_ != nullptr)
+        << "shared experts require single_rank_group_";
+    // Shared experts always run with full weights on the local rank. This
+    // keeps the shared path independent from TP/EP sharding.
+    shared_pg_ = parallel_args.single_rank_group_;
+    shared_experts_ = register_module(
+        "shared_experts",
+        DenseMLP(hidden_size_,
+                 intermediate_size * n_shared_experts_,
+                 is_gated_,
+                 false,
+                 hidden_act_,
+                 enable_result_reduction_,
+                 quant_args,
+                 shared_pg_,
+                 options,
+                 "",
+                 static_cast<double>(swiglu_limit_.value_or(0.0f))));
   }
 
   // create weight buffer
@@ -180,7 +250,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
   const bool is_groupwise_scale = quant_args_.group_size() > 0;
   int64_t w13_scale_group_cols = 0;
   int64_t w2_scale_group_cols = 0;
-  if (is_smoothquant_ && weight_pack_factor_ > 1) {
+  if (use_a8_quant_ && weight_pack_factor_ > 1) {
     CHECK_EQ(hidden_size_ % weight_pack_factor_, 0)
         << "hidden_size must be divisible by weight_pack_factor for W4 MoE. "
         << "hidden_size=" << hidden_size_
@@ -191,7 +261,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
         << local_intermediate_size
         << ", weight_pack_factor=" << weight_pack_factor_;
   }
-  if (is_smoothquant_ && is_groupwise_scale) {
+  if (use_a8_quant_ && is_groupwise_scale) {
     CHECK_GT(quant_args_.group_size(), 0)
         << "group_size must be positive for group-wise smoothquant.";
     CHECK_EQ(hidden_size_ % quant_args_.group_size(), 0)
@@ -206,7 +276,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     w13_scale_group_cols = hidden_size_ / quant_args_.group_size();
     w2_scale_group_cols = local_intermediate_size / quant_args_.group_size();
   }
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     // W4 expert qweight is stored as packed int4 in an int8 tensor container.
     auto quant_option = options_.dtype(torch::kInt8);
     auto fp_option = options_.dtype(torch::kFloat32);
@@ -229,10 +299,13 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     // Note: We do not check enable_deep_ep_ here, since smooth quantization
     // information may be needed even when deep EP mode is disabled. This allows
     // retrieving quantization parameters for any subset of experts as required.
-    input_smooth_ = register_parameter(
-        "input_smooth",
-        torch::empty({num_total_experts_, hidden_size_}, fp_option),
-        false);
+    if (!quant_args_.is_compressed_tensors_w8a8_dynamic() ||
+        quant_args_.preserve_smooth()) {
+      input_smooth_ = register_parameter(
+          "input_smooth",
+          torch::empty({num_total_experts_, hidden_size_}, fp_option),
+          false);
+    }
     w2_ = register_parameter(
         "w2",
         torch::empty({num_experts_per_rank_,
@@ -248,11 +321,14 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
                   fp_option)
             : torch::empty({num_experts_per_rank_, hidden_size_}, fp_option),
         false);
-    act_smooth_ = register_parameter(
-        "act_smooth",
-        torch::empty({num_experts_per_rank_, local_intermediate_size},
-                     fp_option),
-        false);
+    if (!quant_args_.is_compressed_tensors_w8a8_dynamic() ||
+        quant_args_.preserve_smooth()) {
+      act_smooth_ = register_parameter(
+          "act_smooth",
+          torch::empty({num_experts_per_rank_, local_intermediate_size},
+                       fp_option),
+          false);
+    }
 
   } else {
     w13_ = register_parameter(
@@ -270,24 +346,39 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
   }
 }
 
-std::pair<torch::Tensor, std::optional<torch::List<int64_t>>>
-FusedMoEImpl::prepare_group_gemm_weight_scale(
-    const torch::Tensor& b_scale) const {
-  if (moe_weight_bits_ != 4 || b_scale.dim() != 3) {
-    return {b_scale, std::nullopt};
+void FusedMoEImpl::prepare_scale_layout() {
+  if (scale_layout_prepared_) {
+    return;
+  }
+  scale_layout_prepared_ = true;
+
+  // Only the groupwise W4 path carries a 3D scale; the per-channel path keeps
+  // a 2D scale with no per-group quant_flag, so it needs no permute.
+  const bool needs_layout = use_a8_quant_ && moe_weight_bits_ == 4 &&
+                            w13_scale_.defined() && w13_scale_.dim() == 3;
+  if (!needs_layout) {
+    return;
   }
 
-  torch::List<int64_t> quant_flag;
-  const int64_t num_k_groups = b_scale.size(2);
-  const int64_t num_experts = b_scale.size(0);
+  auto permute_in_place = [](torch::Tensor& scale) {
+    scale.set_data(scale.permute({2, 0, 1}).contiguous());
+  };
+  permute_in_place(w13_scale_);
+  permute_in_place(w2_scale_);
+
+  const int64_t num_experts = w13_scale_.size(1);
+  const int64_t num_w13_groups = w13_scale_.size(0);
+  const int64_t num_w2_groups = w2_scale_.size(0);
+  w13_scale_quant_flag_ = torch::List<int64_t>();
+  w2_scale_quant_flag_ = torch::List<int64_t>();
   for (int64_t expert_id = 0; expert_id < num_experts; ++expert_id) {
-    for (int64_t group_id = 0; group_id < num_k_groups; ++group_id) {
-      quant_flag.emplace_back(4);
+    for (int64_t group_id = 0; group_id < num_w13_groups; ++group_id) {
+      w13_scale_quant_flag_.emplace_back(4);
+    }
+    for (int64_t group_id = 0; group_id < num_w2_groups; ++group_id) {
+      w2_scale_quant_flag_.emplace_back(4);
     }
   }
-
-  // torch_mlu_ops quant_flag path expects b_scale as [group_cols, experts, n].
-  return {b_scale.permute({2, 0, 1}).contiguous(), quant_flag};
 }
 
 torch::Tensor FusedMoEImpl::create_group_gemm_output(
@@ -313,12 +404,12 @@ torch::Tensor FusedMoEImpl::create_group_gemm_output(
 
   auto options = a.options().dtype(dtype);
 
-  // non-smoothquant: direct allocation
-  if (!is_smoothquant_) {
+  // Without A8 quantization: direct allocation
+  if (!use_a8_quant_) {
     return torch::empty(output_shape, options);
   }
 
-  // smoothquant: managed workspace logic
+  // A8 quantization: managed workspace logic
   if (!workspace.defined()) {
     // Lazy initialization: allocate max buffer for the lifecycle
     // Note: accessing class members w13_ and w2_ directly for context
@@ -333,17 +424,6 @@ torch::Tensor FusedMoEImpl::create_group_gemm_output(
 
   // utilize the pre-calculated output_shape
   return workspace.slice(0, 0, required_elements).view(output_shape);
-}
-
-void FusedMoEImpl::init_streams(const torch::Tensor& hidden_states) {
-  if (stream_initialized_) {
-    return;
-  }
-
-  device_ = xllm::Device(hidden_states.device());
-  routed_stream_ = device_.get_stream_from_pool();
-  shared_stream_ = device_.get_stream_from_pool();
-  stream_initialized_ = true;
 }
 
 torch::Tensor FusedMoEImpl::compute_routed_experts(
@@ -363,32 +443,37 @@ torch::Tensor FusedMoEImpl::compute_routed_experts(
   {
     xllm::kernel::GroupGemmParams group_gemm_params;
     torch::ScalarType a_dtype =
-        is_smoothquant_ ? torch::kInt8 : hidden_states_dtype;
+        use_a8_quant_ ? torch::kInt8 : hidden_states_dtype;
     group_gemm_params.a =
         view_as_dtype(expand_hidden_states, a_dtype).view({-1, hidden_size_});
     group_gemm_params.b = w13_;
     group_gemm_params.token_count = selected_expert_info.token_count_slice;
-    if (is_smoothquant_) {
-      auto [b_scale, quant_flag] = prepare_group_gemm_weight_scale(w13_scale_);
+    if (use_a8_quant_) {
       torch::Tensor a_scale =
           selected_expert_info.input_scale.value().flatten();
       selected_expert_info.input_scale =
           view_as_dtype(a_scale, torch::kFloat32);
       group_gemm_params.a_scale = selected_expert_info.input_scale;
-      group_gemm_params.b_scale = b_scale;
-      group_gemm_params.quant_flag = quant_flag;
+      group_gemm_params.b_scale = w13_scale_;
+      if (!w13_scale_quant_flag_.empty()) {
+        group_gemm_params.quant_flag = w13_scale_quant_flag_;
+      }
     }
     group_gemm_params.max_dim = group_gemm_max_dim;
     group_gemm_params.trans_a = false;
     group_gemm_params.trans_b = true;
-    group_gemm_params.a_quant_bit = is_smoothquant_ ? 8 : -1;
+    group_gemm_params.a_quant_bit = use_a8_quant_ ? 8 : -1;
     group_gemm_params.output = gemm1_out;
     gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
   }
 
+  if (swiglu_limit_.has_value()) {
+    gemm1_out = kernel::mlu::fused_moe_clamp(gemm1_out, swiglu_limit_.value());
+  }
+
   torch::Tensor act_out;
   torch::Tensor act_out_scale;
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     int64_t slice_dim = gemm1_out.size(1);
     if (is_gated_) {
       slice_dim /= 2;
@@ -434,16 +519,17 @@ torch::Tensor FusedMoEImpl::compute_routed_experts(
     group_gemm_params.a = act_out;
     group_gemm_params.b = w2_;
     group_gemm_params.token_count = selected_expert_info.token_count_slice;
-    if (is_smoothquant_) {
-      auto [b_scale, quant_flag] = prepare_group_gemm_weight_scale(w2_scale_);
+    if (use_a8_quant_) {
       group_gemm_params.a_scale = act_out_scale;
-      group_gemm_params.b_scale = b_scale;
-      group_gemm_params.quant_flag = quant_flag;
+      group_gemm_params.b_scale = w2_scale_;
+      if (!w2_scale_quant_flag_.empty()) {
+        group_gemm_params.quant_flag = w2_scale_quant_flag_;
+      }
     }
     group_gemm_params.max_dim = group_gemm_max_dim;
     group_gemm_params.trans_a = false;
     group_gemm_params.trans_b = true;
-    group_gemm_params.a_quant_bit = is_smoothquant_ ? 8 : -1;
+    group_gemm_params.a_quant_bit = use_a8_quant_ ? 8 : -1;
     group_gemm_params.output = gemm2_out;
     gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
   }
@@ -454,13 +540,15 @@ torch::Tensor FusedMoEImpl::compute_routed_experts(
   return gemm2_out;
 }
 
-FusedMoEImpl::RouteInfo FusedMoEImpl::prep_route(torch::Tensor& hidden_states) {
+FusedMoEImpl::RouteInfo FusedMoEImpl::prep_route(
+    torch::Tensor& hidden_states,
+    const std::optional<torch::Tensor>& input_ids) {
   torch::Tensor hidden_states_2d =
       hidden_states.reshape({-1, hidden_states.size(-1)});
 
   RouteInfo route_info;
   std::tie(route_info.reduce_weight, route_info.expert_id) =
-      gate_->forward(hidden_states_2d);
+      gate_->forward(hidden_states_2d, input_ids);
   return route_info;
 }
 
@@ -499,27 +587,35 @@ void FusedMoEImpl::check_route(const torch::Tensor& hidden_states_2d,
 
 FusedMoEImpl::RouteInfo FusedMoEImpl::get_route(
     torch::Tensor& hidden_states_2d,
-    bool enable_all2all_communication,
-    const std::optional<RouteInfo>& route_info) {
+    bool /*enable_all2all_communication*/,
+    const std::optional<RouteInfo>& route_info,
+    const std::optional<torch::Tensor>& input_ids) {
   if (!route_info.has_value()) {
-    return prep_route(hidden_states_2d);
+    return prep_route(hidden_states_2d, input_ids);
   }
 
-  CHECK(!enable_all2all_communication)
-      << "all2all path does not support external route_info";
   check_route(hidden_states_2d, route_info.value());
-  return route_info.value();
+  RouteInfo route = route_info.value();
+  if (route.expert_id.scalar_type() != torch::kInt) {
+    route.expert_id = route.expert_id.to(torch::kInt);
+  }
+  return route;
 }
 
 torch::Tensor FusedMoEImpl::forward_experts(
     const torch::Tensor& hidden_states,
     bool enable_all2all_communication,
-    const std::optional<RouteInfo>& route_info) {
+    const std::optional<RouteInfo>& route_info,
+    const std::optional<torch::Tensor>& input_ids) {
+  if (quant_args_.is_compressed_tensors_w8a8_dynamic() && !ct_verified_) {
+    verify_loaded_weights();
+    ct_verified_ = true;
+  }
   // Dispatcher: route to the appropriate path based on communication mode
   if (enable_all2all_communication) {
-    return forward_experts_all2all(hidden_states, route_info);
+    return forward_experts_all2all(hidden_states, route_info, input_ids);
   } else {
-    return forward_experts_base(hidden_states, route_info);
+    return forward_experts_base(hidden_states, route_info, input_ids);
   }
 }
 
@@ -532,14 +628,136 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
       hidden_states, enable_all2all_communication, std::nullopt);
 }
 
+namespace {
+
+void check_ct_expert(const StateDict& projection_dict,
+                     int64_t in_features,
+                     int64_t out_features,
+                     int64_t group_size) {
+  const std::string module(projection_dict.prefix());
+  torch::Tensor weight = projection_dict.get_tensor("weight");
+  CHECK(!weight.defined() || weight.dim() == 2)
+      << "W4A8 expert packed weight must be 2D: " << module;
+  torch::Tensor scale = projection_dict.get_tensor("weight_scale");
+  if (scale.defined()) {
+    CHECK(scale.sizes() ==
+          torch::IntArrayRef({out_features, in_features / group_size}))
+        << "W4A8 expert group scale shape mismatch: " << module;
+    CHECK(scale.is_floating_point())
+        << "W4A8 scale must be floating point: " << module;
+  }
+}
+
+// Keep both projections on CPU until all shards arrive and fusion is validated.
+void load_ct_smooth(const StateDict& state_dict,
+                    torch::Tensor& smooth,
+                    std::vector<torch::Tensor>& tensors,
+                    bool& is_loaded) {
+  if (is_loaded) {
+    return;
+  }
+  const int64_t num_experts = smooth.size(0);
+  std::vector<std::string> prefixes;
+  prefixes.reserve(num_experts * 2);
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    prefixes.emplace_back(std::to_string(expert) + ".gate_proj.");
+    prefixes.emplace_back(std::to_string(expert) + ".up_proj.");
+  }
+  if (!weight::load_tensor_list(state_dict,
+                                prefixes,
+                                "smooth",
+                                /*dim=*/-1,
+                                /*rank=*/0,
+                                /*world_size=*/1,
+                                tensors)) {
+    return;
+  }
+  const auto paired =
+      torch::stack(tensors).view({num_experts, 2, smooth.size(1)});
+  const auto gate_smooth = paired.select(/*dim=*/1, /*index=*/0);
+  CHECK(torch::allclose(
+      gate_smooth.to(torch::kFloat32),
+      paired.select(/*dim=*/1, /*index=*/1).to(torch::kFloat32)))
+      << "gate_proj and up_proj smooth must match: " << state_dict.prefix();
+  smooth.copy_(gate_smooth);
+  is_loaded = true;
+  tensors.clear();
+}
+
+}  // namespace
+
+void FusedMoEImpl::load_ct_experts(const StateDict& state_dict) {
+  if (state_dict.size() == 0) {
+    return;
+  }
+
+  const int64_t rank = tp_pg_->rank();
+  const int64_t world_size = tp_pg_->world_size();
+  const int64_t start_expert_id = start_expert_id_;
+  const int64_t num_experts_per_rank = num_experts_per_rank_;
+  const bool w4 = moe_weight_bits_ == 4;
+  const int64_t intermediate_size =
+      w2_.size(2) * weight_pack_factor_ * world_size;
+  std::vector<std::string> prefixes = {"gate_proj.", "up_proj."};
+  for (int64_t expert = 0; expert < num_total_experts_; ++expert) {
+    const std::string prefix = std::to_string(expert) + ".";
+    auto expert_dict = state_dict.get_dict_with_prefix(prefix);
+    if (expert_dict.size() == 0) {
+      continue;
+    }
+
+    for (const std::string& projection :
+         {"gate_proj.", "up_proj.", "down_proj."}) {
+      std::string module =
+          std::string(state_dict.prefix()) + prefix + projection;
+      module.pop_back();
+      torch::Tensor weight = expert_dict.get_tensor(projection + "weight");
+      CHECK(!weight.defined() || weight.scalar_type() == torch::kInt8)
+          << "Compressed-tensors expert weight must be INT8: " << module;
+      const bool down = projection == "down_proj.";
+      if (w4) {
+        check_ct_expert(expert_dict.get_dict_with_prefix(projection),
+                        down ? intermediate_size : hidden_size_,
+                        down ? hidden_size_ : intermediate_size,
+                        quant_args_.group_size());
+      } else {
+        check_ct_scale(expert_dict.get_tensor(projection + "weight_scale"),
+                       module);
+      }
+      if (quant_args_.preserve_smooth()) {
+        const auto smooth = expert_dict.get_tensor(projection + "smooth");
+        CHECK(!smooth.defined() ||
+              (smooth.is_floating_point() && smooth.dim() == 1 &&
+               smooth.numel() == (down ? intermediate_size : hidden_size_)))
+            << "Compressed-tensors expert smooth shape or dtype mismatch: "
+            << module;
+      }
+    }
+  }
+
+  LOAD_MOE_FUSED_WEIGHT("weight", w1, w3, w13);
+  LOAD_MOE_FUSED_WEIGHT("weight_scale", w1_scale, w3_scale, w13_scale);
+  LOAD_MOE_WEIGHT("down_proj.", "weight", w2, 1);
+  LOAD_MOE_WEIGHT("down_proj.", "weight_scale", w2_scale, w4 ? 1 : -1);
+  if (quant_args_.preserve_smooth()) {
+    load_ct_smooth(
+        state_dict, input_smooth_, input_smooth_list_, input_smooth_is_loaded_);
+    LOAD_MOE_WEIGHT("down_proj.", "smooth", act_smooth, 0);
+  }
+}
+
 void FusedMoEImpl::load_experts(const StateDict& state_dict) {
+  if (quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    load_ct_experts(state_dict);
+    return;
+  }
   const int64_t rank = tp_pg_->rank();
   const int64_t world_size = tp_pg_->world_size();
   const int64_t start_expert_id = start_expert_id_;
   const int64_t num_experts_per_rank = num_experts_per_rank_;
   const int64_t num_total_experts = num_total_experts_;
   std::vector<std::string> prefixes = {"gate_proj.", "up_proj."};
-  if (is_smoothquant_) {
+  if (use_a8_quant_) {
     LOAD_MOE_FUSED_WEIGHT("qweight", w1, w3, w13);
     LOAD_MOE_FUSED_WEIGHT("per_channel_scale", w1_scale, w3_scale, w13_scale);
     // When supporting DeepEP All2All mode,
@@ -550,7 +768,12 @@ void FusedMoEImpl::load_experts(const StateDict& state_dict) {
     // deep_ep_ is enabled in this case.
     LOAD_MOE_ALL_EXPERT_WEIGHT("up_proj.", "smooth", input_smooth, -1);
     LOAD_MOE_WEIGHT("down_proj.", "qweight", w2, 1);
-    LOAD_MOE_WEIGHT("down_proj.", "per_channel_scale", w2_scale, -1);
+    // Group-wise down-projection scales follow the TP-sharded intermediate
+    // dimension, unlike per-channel scales which remain [experts, hidden].
+    LOAD_MOE_WEIGHT("down_proj.",
+                    "per_channel_scale",
+                    w2_scale,
+                    quant_args_.group_size() > 0 ? 1 : -1);
     LOAD_MOE_WEIGHT("down_proj.", "smooth", act_smooth, 0);
   } else {
     LOAD_MOE_FUSED_WEIGHT("weight", w1, w3, w13);
@@ -559,7 +782,21 @@ void FusedMoEImpl::load_experts(const StateDict& state_dict) {
 }
 
 void FusedMoEImpl::verify_loaded_weights() const {
-  if (!is_smoothquant_) {
+  if (!use_a8_quant_) {
+    return;
+  }
+  if (quant_args_.is_compressed_tensors_w8a8_dynamic()) {
+    CHECK(w13_scale_is_loaded_ && w2_scale_is_loaded_)
+        << "Missing compressed-tensors expert weight scales";
+    if (quant_args_.preserve_smooth()) {
+      CHECK(input_smooth_is_loaded_ && act_smooth_is_loaded_)
+          << "Missing compressed-tensors expert smooth tensors";
+    }
+    CHECK(w13_is_loaded_)
+        << "Compressed-tensors expert gate_proj/up_proj weight was not "
+           "fully loaded.";
+    CHECK(w2_is_loaded_)
+        << "Compressed-tensors expert down_proj weight was not fully loaded.";
     return;
   }
   CHECK(w13_is_loaded_)
@@ -583,6 +820,11 @@ void FusedMoEImpl::load_state_dict(const StateDict& state_dict) {
   }
   gate_->load_state_dict(state_dict.get_dict_with_prefix("gate."));
   load_experts(state_dict.get_dict_with_prefix("experts."));
+  if (use_a8_quant_ && w13_scale_is_loaded_ && w2_scale_is_loaded_) {
+    // This conversion reallocates registered scale tensors, so do it before
+    // MLU graph capture begins and owns its temporary allocation pool.
+    prepare_scale_layout();
+  }
 }
 
 }  // namespace layer

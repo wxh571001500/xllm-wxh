@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,14 +20,21 @@ limitations under the License.
 
 namespace xllm::kernel::npu {
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-apply_moe_gating_topk_softmax(const torch::Tensor& x,
-                              const std::optional<torch::Tensor>& finished,
-                              int k) {
+std::tuple<torch::Tensor, torch::Tensor> apply_moe_gating_topk_softmax(
+    const torch::Tensor& x,
+    const std::optional<torch::Tensor>& finished,
+    int k,
+    bool normalize) {
   const torch::Tensor finished_tensor =
       finished.has_value() ? finished.value() : torch::Tensor();
-  return at_npu::native::custom_ops::npu_moe_gating_top_k_softmax(
-      x, finished_tensor, k);
+  auto [topk_weights, topk_ids, row_ids] =
+      at_npu::native::custom_ops::npu_moe_gating_top_k_softmax(
+          x, finished_tensor, k);
+  (void)row_ids;
+  if (normalize) {
+    topk_weights = topk_weights / topk_weights.sum(-1, true);
+  }
+  return std::make_tuple(topk_weights, topk_ids);
 }
 
 }  // namespace xllm::kernel::npu

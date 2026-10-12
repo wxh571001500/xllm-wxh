@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,6 +23,15 @@ namespace xllm {
 DisaggPDService::DisaggPDService(DisaggPDScheduler* scheduler, Engine* engine) {
   disagg_pd_service_impl_ =
       std::make_unique<DisaggPDServiceImpl>(scheduler, engine);
+}
+
+void DisaggPDService::ReleaseReservation(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::ReleaseReservationRequest* request,
+    proto::ReleaseReservationResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  disagg_pd_service_impl_->release_reservation(request, response);
 }
 
 void DisaggPDService::AddNewRequests(

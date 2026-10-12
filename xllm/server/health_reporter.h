@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,8 @@ limitations under the License.
 #pragma once
 
 #include <brpc/health_reporter.h>
+
+#include <nlohmann/json.hpp>
 
 #include "core/common/health_check_manager.h"
 
@@ -36,13 +38,20 @@ class HealthReporter : public brpc::HealthReporter {
 
     bool is_healthy = HealthCheckManager::instance().is_healthy();
 
+    nlohmann::ordered_json report;
     if (!is_healthy) {
       std::string reason = HealthCheckManager::instance().unhealthy_reason();
       LOG(ERROR) << "HealthReporter: cluster is unhealthy, reason: " << reason;
+      report["status"] = "unhealthy";
+      report["reason"] = reason;
       cntl->http_response().set_status_code(503);  // Service Unavailable
     } else {
+      report["status"] = "healthy";
       cntl->http_response().set_status_code(200);  // OK
     }
+
+    cntl->http_response().set_content_type("application/json");
+    cntl->response_attachment().append(report.dump());
   }
 };
 

@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -30,6 +30,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/types.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "virt_page.h"
 #include "xtensor.h"  // For offset_t type definition
 
@@ -283,7 +284,9 @@ class PageAllocator {
 
   // Configuration
   int32_t dp_size_ = 1;
-  size_t page_size_ = 0;  // Page size (from FLAGS_phy_page_granularity_size)
+  size_t page_size_ =
+      0;  // Page size (from
+          // ::xllm::KVCacheConfig::get_instance().phy_page_granularity_size())
   bool enable_page_prealloc_ = PAGE_PREALLOC_ENABLED;
 
   // Physical page tracking (shared across all models)

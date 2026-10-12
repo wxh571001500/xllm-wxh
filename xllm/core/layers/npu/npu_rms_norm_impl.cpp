@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,8 @@ limitations under the License.
 #include "npu_rms_norm_impl.h"
 
 #include <glog/logging.h>
+
+#include "core/framework/config/load_config.h"
 
 namespace xllm {
 namespace layer {
@@ -32,11 +34,12 @@ NpuRMSNormImpl::NpuRMSNormImpl(const ModelContext& context)
 
   atb_weight_tensors_.resize(1);
 
-  if (FLAGS_enable_manual_loader) {
-    loader_ = std::make_unique<RMSNormManualLoader>(1, context);
-  } else {
-    loader_ = std::make_unique<RMSNormLoader>(1, context);
-  }
+  loader_ = std::make_unique<RMSNormLoader>(
+      1,
+      context,
+      ::xllm::LoadConfig::get_instance().enable_manual_loader()
+          ? LoadMode::kManual
+          : LoadMode::kEager);
 }
 
 int64_t NpuRMSNormImpl::init_layer() {

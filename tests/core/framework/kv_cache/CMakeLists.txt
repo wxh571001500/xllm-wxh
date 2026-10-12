@@ -1,0 +1,72 @@
+include(cc_test)
+
+set(cache_layout_builder_test_sources cache_layout_builder_test.cpp)
+if(USE_NPU OR USE_MLU)
+  list(APPEND cache_layout_builder_test_sources
+    cache_layout_builder_hybrid_mla_test.cpp)
+endif()
+
+cc_test(
+  NAME
+    cache_layout_builder_test
+  CPU_ONLY
+  SRCS
+    ${cache_layout_builder_test_sources}
+  DEPS
+    :kv_cache
+    GTest::gtest_main
+)
+target_link_libraries(cache_layout_builder_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME
+    kv_cache_estimation_test
+  CPU_ONLY
+  SRCS
+    kv_cache_estimation_test.cpp
+  DEPS
+    :kv_cache_estimation
+    GTest::gtest_main
+)
+target_link_libraries(kv_cache_estimation_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME
+    kv_cache_test
+  SRCS
+    kv_cache_test.cpp
+  DEPS
+    :kv_cache
+    GTest::gtest_main
+)
+target_link_libraries(kv_cache_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME
+    linear_state_restore_test
+  CPU_ONLY
+  SRCS
+    linear_state_restore_test.cpp
+  DEPS
+    :linear_state_restore
+    GTest::gtest_main
+)
+target_link_libraries(linear_state_restore_test PUBLIC Python::Python)

@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,21 +19,31 @@ limitations under the License.
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
-#include "core/common/global_flags.h"
+#include "core/common/flash_comm1_context.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
 #include "core/framework/model_loader.h"
+#include "core/framework/parallel_state/parallel_args.h"
 #include "core/layers/common/attention_mask.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/common/qwen3_next_rms_norm.h"
 #include "core/layers/common/word_embedding.h"
+#if defined(USE_NPU)
 #include "core/layers/npu_torch/qwen3_next_hybrid_decoder_layer_base.h"
+#elif defined(USE_MLU)
+#include "core/layers/mlu/qwen3_5/qwen3_5_hybrid_decoder_layer_base.h"
+#elif defined(USE_MUSA)
+#include "core/layers/musa/qwen3_next_hybrid_decoder_layer_base.h"
+#endif
 
 namespace xllm {
 
@@ -55,7 +65,17 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
  public:
   explicit Qwen3HybridModelImplBase(const ModelContext& context)
       : device_(context.get_tensor_options().device()),
-        model_args_(context.get_model_args()) {
+        model_args_(context.get_model_args()),
+        parallel_args_(context.get_parallel_args()),
+        flash_comm1_options_(context.get_flash_comm1_options()),
+        aux_capture_(context.get_model_args(),
+                     context.get_tensor_options(),
+                     SchedulerConfig::get_instance().max_tokens_per_batch()) {
+    if (model_args_.n_routed_experts() > 0) {
+      flash_comm1_options_.enable_flashcomm1 = false;
+      flash_comm1_options_.enable_mmrs_fusion = false;
+    }
+
     auto options = context.get_tensor_options();
     auto parallel_args = context.get_parallel_args();
 
@@ -69,10 +89,12 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
             model_args_.hidden_size(), model_args_.rms_norm_eps(), options));
     embed_tokens_ =
         register_module("embed_tokens", layer::WordEmbedding(context));
-    int32_t mask_value = FLAGS_enable_chunked_prefill ? -9984 : 1;
     attn_mask_ = layer::AttentionMask(options.device(),
                                       options.dtype().toScalarType(),
-                                      /*mask_value=*/mask_value);
+                                      /*mask_value=*/-9984);
+    dense_attn_mask_ = layer::AttentionMask(options.device(),
+                                            options.dtype().toScalarType(),
+                                            /*mask_value=*/1);
     dp_size_ = parallel_args.dp_size();
   }
 
@@ -91,17 +113,114 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
       }
     }
 
+    const ModelInputParams* attention_input = &input_params;
+    layer::AttentionMetadataBuildOptions metadata_build_options;
+#if defined(USE_NPU)
+    std::optional<ModelInputParams> dummy_attention_input;
+    if (dp_size_ > 1 &&
+        is_qwen3_5_target_model_type(model_args_.model_type()) &&
+        input_params.is_spec_verify &&
+        input_params.meta.batch_forward_type.is_chunked_prefill() &&
+        input_params.meta.num_sequences == 0 &&
+        input_params.meta.q_max_seq_len > 0 &&
+        input_params.attention.host.q_seq_lens.empty() &&
+        input_params.attention.host.kv_seq_lens.empty()) {
+      dummy_attention_input = input_params;
+      dummy_attention_input->meta.q_max_seq_len = 0;
+      attention_input = &dummy_attention_input.value();
+    }
+    // Native NPU GDN consumes the canonical host mask directly. Avoid
+    // materializing the unused device bool tensor inside ACL graph capture.
+    metadata_build_options.materialize_linear_state_validity =
+        !input_params.enable_graph;
+#endif
+#if defined(USE_MUSA)
+    layer::AttentionMetadata attn_metadata =
+        layer::AttentionMetadataBuilder::build(*attention_input,
+                                               model_args_.enable_mla(),
+                                               /*attn_mask=*/std::nullopt,
+                                               /*device=*/device_,
+                                               metadata_build_options);
+    attn_metadata.fa3_metadata.share_fa3_scheduler_metadata = true;
+#else
     layer::AttentionMetadata attn_metadata =
         layer::AttentionMetadataBuilder::build(
-            input_params, model_args_, build_attention_mask(input_params));
-    torch::Tensor h = embed_tokens_(tokens);
-    for (size_t i = 0; i < layers_.size(); i++) {
-      auto& layer = layers_[i];
-      h = layer->forward(
-          h, positions, attn_metadata, kv_caches[i], input_params);
+            *attention_input,
+            model_args_.enable_mla(),
+            build_attention_mask(input_params),
+            /*device=*/device_,
+            metadata_build_options);
+#endif
+    const int32_t num_tokens = static_cast<int32_t>(tokens.size(0));
+    const auto& batch_forward_type = input_params.meta.batch_forward_type;
+    const bool is_prefill_side = batch_forward_type.no_decode();
+    FlashComm1Context fc1_ctx;
+    // Sequence sharding changes the token-row layout. Per-layer auxiliary
+    // capture must keep the full DP-local token set so every capture slot and
+    // the final hidden states have identical row ordering.
+    if (!aux_capture_.enabled()) {
+      fc1_ctx = build_flash_comm1_context(
+          num_tokens, is_prefill_side, parallel_args_, flash_comm1_options_);
     }
-    h = norm_(h);
-    return ModelOutput(h);
+    FlashComm1ContextScope fc1_scope(&fc1_ctx);
+
+    torch::Tensor h;
+    if (input_params.embedding.input_embedding.defined()) {
+      h = input_params.embedding.input_embedding;
+    } else {
+      h = embed_tokens_(tokens);
+    }
+
+    if (is_sequence_sharded(fc1_ctx)) {
+      h = shard_sequence(h, fc1_ctx);
+    }
+
+    torch::Tensor mrope_cos_sin;
+    for (const auto& layer : layers_) {
+      mrope_cos_sin = layer->build_mrope_cos_sin(positions);
+      if (mrope_cos_sin.defined()) break;
+    }
+
+    std::optional<torch::Tensor> residual = std::nullopt;
+    for (size_t i = 0; i < layers_.size(); i++) {
+#if defined(USE_MUSA)
+      if (attn_metadata.plan_info != nullptr) {
+        attn_metadata.plan_info->layer_id = static_cast<int32_t>(i);
+      }
+      if (attn_metadata.shared_plan_info != nullptr) {
+        attn_metadata.shared_plan_info->layer_id = static_cast<int32_t>(i);
+      }
+      if (attn_metadata.unshared_plan_info != nullptr) {
+        attn_metadata.unshared_plan_info->layer_id = static_cast<int32_t>(i);
+      }
+#endif
+      // Capture hooks run before a layer. Worker-side draft config loading
+      // converts target output layer L to capture index L + 1, matching the
+      // established Qwen3 DFlash convention. Hybrid layers keep the residual
+      // stream split between h and residual, so capture their sum.
+      aux_capture_.capture_layer(static_cast<int32_t>(i), h, residual);
+      auto& layer = layers_[i];
+      h = layer->forward(h,
+                         residual,
+                         positions,
+                         attn_metadata,
+                         kv_caches[i],
+                         input_params,
+                         mrope_cos_sin);
+#if defined(USE_NPU)
+      if (input_params.parallel.layer_synchronizer != nullptr &&
+          !input_params.parallel.layer_synchronizer->record_event(
+              static_cast<int64_t>(i), device_.index())) {
+        return ModelOutput();
+      }
+#endif
+    }
+    auto [hidden_states, residual_out] = norm_->forward(h, residual);
+    h = hidden_states;
+    if (is_sequence_sharded(fc1_ctx)) {
+      h = gather_sequence(h, fc1_ctx);
+    }
+    return aux_capture_.finalize(h);
   }
 
   // load the weight from the checkpoint
@@ -139,27 +258,45 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
 
  protected:
   torch::Tensor build_attention_mask(const ModelInputParams& input_params) {
-    max_seq_len_ = std::max(input_params.kv_max_seq_len, max_seq_len_);
-    if (!FLAGS_enable_chunked_prefill) {
-      return attn_mask_.get_attn_mask(max_seq_len_, dtype_, device_);
+#if defined(USE_NPU) || defined(USE_MLU)
+    // NPU and MLU hybrid attention do not consume attn_metadata.attn_mask:
+    // their full-attention kernels handle causality internally, and linear
+    // attention needs no mask. Avoid quadratic allocations for long contexts,
+    // including MTP decode graph capture. Preserve an explicit graph buffer.
+    if (input_params.graph.attn_mask.defined()) {
+      return input_params.graph.attn_mask;
+    }
+    return torch::Tensor();
+#else
+    if (input_params.graph.attn_mask.defined()) {
+      return input_params.graph.attn_mask;
+    }
+    max_seq_len_ = std::max(input_params.meta.kv_max_seq_len, max_seq_len_);
+    const bool use_append_mask =
+        input_params.is_spec_verify ||
+        input_params.meta.batch_forward_type.is_mixed() ||
+        input_params.meta.batch_forward_type.is_chunked_prefill();
+    if (!use_append_mask) {
+      return dense_attn_mask_.get_attn_mask(max_seq_len_, dtype_, device_);
     }
 
-    const int32_t num_sequences = input_params.num_sequences;
+    const int32_t num_sequences = input_params.meta.num_sequences;
     if (num_sequences <= 0) {
-      return attn_mask_.get_attn_mask(max_seq_len_, dtype_, device_);
+      return dense_attn_mask_.get_attn_mask(max_seq_len_, dtype_, device_);
     }
 
     std::vector<torch::Tensor> req_mask_vec;
     req_mask_vec.reserve(num_sequences);
     for (int32_t j = 0; j < num_sequences; ++j) {
       req_mask_vec.emplace_back(
-          attn_mask_.gen_append_mask(input_params.q_seq_lens_vec[j],
-                                     input_params.kv_seq_lens_vec[j],
+          attn_mask_.gen_append_mask(input_params.attention.host.q_seq_lens[j],
+                                     input_params.attention.host.kv_seq_lens[j],
                                      max_seq_len_,
                                      dtype_,
                                      device_));
     }
     return torch::cat(req_mask_vec, 0);
+#endif
   }
 
   ModelArgs model_args_;
@@ -167,11 +304,15 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
   std::vector<layer::Qwen3HybridDecoderLayerModulePtr> layers_;
   int32_t max_seq_len_ = 0;
   int32_t dp_size_ = 1;
+  ParallelArgs parallel_args_;
+  FlashComm1Options flash_comm1_options_;
   torch::Device device_;
   torch::ScalarType dtype_ = torch::kFloat;
   layer::Qwen3NextRMSNorm norm_{nullptr};
   layer::AttentionMask attn_mask_;
+  layer::AttentionMask dense_attn_mask_;
   layer::WordEmbedding embed_tokens_{nullptr};
+  AuxHiddenCapture aux_capture_;
 };
 
 class Qwen3HybridForCausalLMImplBase : public torch::nn::Module {
@@ -216,53 +357,28 @@ class Qwen3HybridForCausalLMImplBase : public torch::nn::Module {
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
-    auto has_model_weights = [](const StateDict& dict) {
-      return dict.get_tensor("embed_tokens.weight").defined() ||
-             dict.get_dict_with_prefix("layers.").size() > 0 ||
-             dict.get_tensor("norm.weight").defined();
-    };
+    load_model(std::move(loader), "model.", "lm_head.");
+  }
+
+  void load_model(std::unique_ptr<ModelLoader> loader,
+                  const std::string& model_prefix) {
+    load_model(std::move(loader), model_prefix, "lm_head.");
+  }
+
+  void load_model(std::unique_ptr<ModelLoader> loader,
+                  const std::string& model_prefix,
+                  const std::string& lm_head_prefix) {
     auto has_lm_head_weights = [](const StateDict& dict) {
       return dict.get_tensor("weight").defined() ||
              dict.get_tensor("qweight").defined();
     };
 
     for (const auto& state_dict : loader->get_state_dicts()) {
-      auto model_state_dict = state_dict->get_dict_with_prefix("model.");
-      if (!has_model_weights(model_state_dict)) {
-        auto language_model_state_dict =
-            state_dict->get_dict_with_prefix("language_model.model.");
-        if (has_model_weights(language_model_state_dict)) {
-          model_state_dict = language_model_state_dict;
-        } else {
-          auto wrapped_language_model_state_dict =
-              state_dict->get_dict_with_prefix("model.language_model.");
-          if (has_model_weights(wrapped_language_model_state_dict)) {
-            model_state_dict = wrapped_language_model_state_dict;
-          }
-        }
-      }
+      auto model_state_dict = state_dict->get_dict_with_prefix(model_prefix);
       model_->load_state_dict(model_state_dict);
 
-      auto lm_head_state_dict = state_dict->get_dict_with_prefix("lm_head.");
-      if (!has_lm_head_weights(lm_head_state_dict)) {
-        auto language_model_lm_head_state_dict =
-            state_dict->get_dict_with_prefix("language_model.lm_head.");
-        if (has_lm_head_weights(language_model_lm_head_state_dict)) {
-          lm_head_state_dict = language_model_lm_head_state_dict;
-        } else {
-          auto wrapped_language_model_lm_head_state_dict =
-              state_dict->get_dict_with_prefix("model.language_model.lm_head.");
-          if (has_lm_head_weights(wrapped_language_model_lm_head_state_dict)) {
-            lm_head_state_dict = wrapped_language_model_lm_head_state_dict;
-          } else {
-            auto wrapped_lm_head_state_dict =
-                state_dict->get_dict_with_prefix("model.lm_head.");
-            if (has_lm_head_weights(wrapped_lm_head_state_dict)) {
-              lm_head_state_dict = wrapped_lm_head_state_dict;
-            }
-          }
-        }
-      }
+      auto lm_head_state_dict =
+          state_dict->get_dict_with_prefix(lm_head_prefix);
       if (!has_lm_head_weights(lm_head_state_dict) && tie_word_embeddings_) {
         auto tied_lm_head_state_dict =
             model_state_dict.get_dict_with_prefix("embed_tokens.");
@@ -272,8 +388,7 @@ class Qwen3HybridForCausalLMImplBase : public torch::nn::Module {
       }
       lm_head_->load_state_dict(lm_head_state_dict);
     }
-
-    model_->verify_loaded_weights("model.");
+    model_->verify_loaded_weights(model_prefix);
   }
 
   virtual void prepare_expert_weight(int32_t layer_id,
@@ -281,6 +396,8 @@ class Qwen3HybridForCausalLMImplBase : public torch::nn::Module {
     return;
   }
   virtual void update_expert_weight(int32_t layer_id) { return; }
+
+  bool is_hybrid_linear_attention() { return true; }
 
   layer::LmHead get_lm_head() { return lm_head_; }
 

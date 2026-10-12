@@ -15,21 +15,25 @@ limitations under the License. -->
 [English](./README.md) | [中文](./README_zh.md)
 
 <div align="center">
-<img src="docs/assets/logo_with_llm.png" alt="xLLM" style="width:50%; height:auto;">
+<img src="assets/logo_with_llm.png" alt="xLLM" style="width:50%; height:auto;">
     
-[![Document](https://img.shields.io/badge/Document-black?logo=html5&labelColor=grey&color=red)](https://xllm.readthedocs.io/zh-cn/latest/) [![Docker](https://img.shields.io/badge/Docker-black?logo=docker&labelColor=grey&color=%231E90FF)](https://hub.docker.com/r/xllm/xllm-ai) [![License](https://img.shields.io/badge/license-Apache%202.0-brightgreen?labelColor=grey)](https://opensource.org/licenses/Apache-2.0) [![report](https://img.shields.io/badge/Technical%20Report-red?logo=arxiv&logoColor=%23B31B1B&labelColor=%23F0EBEB&color=%23D42626)](https://arxiv.org/abs/2510.14686) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jd-opensource/xllm) 
+[![Document](https://img.shields.io/badge/Document-black?logo=html5&labelColor=grey&color=red)](https://docs.xllm-ai.com/) [![Docker](https://img.shields.io/badge/Docker-black?logo=docker&labelColor=grey&color=%231E90FF)](https://quay.io/repository/jd_xllm/xllm-ai?tab=tags) [![License](https://img.shields.io/badge/license-Apache%202.0-brightgreen?labelColor=grey)](https://opensource.org/licenses/Apache-2.0) [![report](https://img.shields.io/badge/Technical%20Report-red?logo=arxiv&logoColor=%23B31B1B&labelColor=%23F0EBEB&color=%23D42626)](https://arxiv.org/abs/2510.14686) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xLLM-AI/xllm)
     
 </div>
 
 ---------------------
 
-<p align="center">
-| <a href="https://xllm.readthedocs.io/zh-cn/latest/"><b>Documentation</b></a> | <a href="https://arxiv.org/abs/2510.14686"><b>Technical Report</b></a> |
-</p>
-
 
 ### 📢 News
+<!-- only keep the latest 3 news, others should be folded -->
+- 2026-08-27: 🎉  We day-0 support the [GLM-5.3-Flash](https://modelscope.cn/models/ZhipuAI/GLM-5.3-Flash) model, please refer to the [Deployment  Document](https://github.com/xLLM-AI/xllm/blob/preview/glm-5.3-flash/testspace/run_glm_53_flash.sh) for deployment.
+- 2026-07-06: 🎉 xLLM is officially donated to the OpenAtom Foundation!
+- 2026-06-13: 🎉 We day-0 support the [MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) model, please refer to the [Deployment Document](https://github.com/xLLM-AI/xllm/blob/preview/minimax-m3/testspace/run_minimax_m3.sh) for deployment.
 
+<details>
+<summary>More News</summary>
+
+- 2026-04-24: 🎉  We day-0 support the [DeepSeek-V4](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) model, please refer to the [Deployment Document](https://github.com/xLLM-AI/xllm/blob/preview/deepseek-v4-mlu/testspace/run_deepseek_v4.sh) for deployment.
 - 2026-02-12: 🎉 We day-0 support high-performance inference for the [GLM-5](https://github.com/zai-org/GLM-5) model, please refer to the [Deployment Document](https://github.com/zai-org/GLM-5/blob/main/example/ascend.md) for deployment.
 - 2025-12-21: 🎉 We day-0 support high-performance inference for the [GLM-4.7](https://github.com/zai-org) model.
 - 2025-12-08: 🎉 We day-0 support high-performance inference for the [GLM-4.6V](https://github.com/zai-org/GLM-V) model.
@@ -38,91 +42,46 @@ limitations under the License. -->
 - 2025-12-05: 🎉 We build hybrid KV cache management based on [Mooncake](https://github.com/kvcache-ai/Mooncake), supporting global KV cache management with intelligent offloading and prefetching.
 - 2025-10-16: 🎉 We recently have released our [xLLM Technical Report](https://arxiv.org/abs/2510.14686) on arXiv, providing comprehensive technical blueprints and implementation insights.
 
-## Project Overview
+</details>
 
-**xLLM** is an **efficient LLM inference framework**, specifically optimized for **Chinese AI accelerators**, enabling enterprise-grade deployment with enhanced efficiency and reduced cost. The framework adopts a **service-engine decoupled** inference architecture, achieving breakthrough efficiency through several  technologies: at the service layer, including elastic scheduling of online/offline requests, dynamic PD disaggregation, a hybrid EPD mechanism for multimodal and high-availability fault tolerance; and at the engine layer, combined with technologies such as multi-stream parallel computing, graph fusion optimization, speculative inference, dynamic load balancing and global KV cache management. The overall architecture is shown below:
+## Overview
 
+**xLLM** is an **efficient LLM inference framework**, specifically optimized for **Chinese AI accelerators**, enabling enterprise-grade deployment with enhanced efficiency and reduced cost.
 <div align="center">
-<img src="docs/assets/xllm_arch.png" alt="xllm_arch" style="width:90%; height:auto;">
+<img src="assets/xllm_arch.png" alt="xllm_arch" style="width:90%; height:auto;">
 </div>
 
-**xLLM** already supports efficient deployment of mainstream large models (such as *DeepSeek-V3.1*, *Qwen2/3*, etc.) on Chinese AI accelerators, empowering enterprises to implement high-performance, low-cost AI large model applications. xLLM has been fully deployed in JD.com’s real core retail businesses, covering a variety of scenarios including intelligent customer service, risk control, supply chain optimization, ad recommendation, and more.
+## Highlights
 
+* **Top-tier Performance**: Delivers high-throughput, low-latency inference through many advanced features.
+* **Mainstream Hardware Support**: Purpose-built and deeply optimized for Chinese AI accelerators.
+* **Service-Engine Decoupled Architecture**: Service layer handles scheduling and availability; engine layer handles computation.
+* **Enterprise-grade Deployment**: Battle-tested at scale across JD.com's core retail business.
 
-## Core Features
-
-**xLLM** delivers robust intelligent computing capabilities. By leveraging hardware system optimization and algorithm-driven decision control, it jointly accelerates the inference process, enabling high-throughput, low-latency distributed inference services.
-
-**Full Graph Pipeline Execution Orchestration**
-- Asynchronous decoupled scheduling at the requests scheduling layer, to reduce computational bubbles.
-- Asynchronous parallelism of computation and communication at the model graph layer, overlapping computation and communication.
-- Pipelining of heterogeneous computing units at the operator kernel layer, overlapping computation and memory access.
-
-**Graph Optimization for Dynamic Shapes**
-- Dynamic shape adaptation based on parameterization and multi-graph caching methods to enhance the flexibility of static graph.
-- Controlled tensor memory pool to ensure address security and reusability.
-- Integration and adaptation of performance-critical custom operators (e.g., *PageAttention*, *AllReduce*).
-
-**Efficient Memory Optimization**
-- Mapping management between discrete physical memory and continuous virtual memory.
-- On-demand memory allocation to reduce memory fragmentation.
-- Intelligent scheduling of memory pages to increase memory reusability.
-- Adaptation of corresponding operators for domestic accelerators.
-
-**Global KV Cache Management**
-- Intelligent offloading and prefetching of KV in hierarchical caches.
-- KV cache-centric distributed storage architecture.
-- Intelligent KV routing among computing nodes.
-
-**Algorithm-driven Acceleration**
-- Speculative decoding optimization to improve efficiency through multi-core parallelism.
-- Dynamic load balancing of MoE experts to achieve efficient adjustment of expert distribution.
-
----
 ## Hardware Support
 
-| Hardware | Example | Remark          |
-| -------- | ------- | --------------- |
-| NPU      | A2, A3  | HDK Driver 25.2.0 + |
-| MLU      |         |                 |
-| ILU      | BI150   |                 |
-| MUSA     | S5000   |                 |
+| Hardware           | Abbreviation | Example | Remark              |
+| ------------------ | ------------ | ------- | ------------------- |
+| Ascend NPU         | NPU          | A2, A3  | HDK Driver 25.2.0 + |
+| Cambricon MLU      | MLU          | MLU     |                     |
+| Moore Threads GPU  | MUSA         | S5000   |                     |
+| Hygon DCU          | DCU          | BW1000  |                     |
+| MetaX MACA         | MACA         | MXC500  |                     |
+| Iluvatar CoreX GPU | ILU          | BI150   |                     |
 
-Besides, please check the supported models on different hardwares at [Supported Models List](docs/en/supported_models.md).
 
----
+## Getting Started
 
-## Quick Start
-
-Please refer to [Quick Start](docs/en/getting_started/quick_start.md) for more details.
-
---- 
-
-## Contributing
-There are several ways you can contribute to xLLM:
-
-1. Reporting Issues (Bugs & Errors)
-2. Suggesting Enhancements
-3. Improving Documentation
-    + Fork the repository
-    + Add your view in document
-    + Send your pull request
-4. Writing Code
-    + Fork the repository
-    + Create a new branch
-    + Add your feature or improvement
-    + Send your pull request
-
-We appreciate all kinds of contributions! 🎉🎉🎉
-If you have problems about development, please check our document: **[Document](https://xllm.readthedocs.io/zh-cn/latest)**
-
----
+* [Quick Start](https://docs.xllm-ai.com/en/getting_started/quick_start/)
+* [Launch xLLM](https://docs.xllm-ai.com/en/getting_started/launch_xllm/)
+* [Online Service](https://docs.xllm-ai.com/en/getting_started/online_service/)
+* [Offline Inference](https://docs.xllm-ai.com/en/getting_started/offline_service/)
+* [Supported Models](https://docs.xllm-ai.com/en/supported_models/)
 
 ## Community & Support
-If you encounter any issues along the way, you are welcomed to submit reproducible steps and log snippets in the project's Issues area, or contact the xLLM Core team directly via your internal Slack. In addition, we have established official WeChat groups. You can access the following QR code to join. Welcome to contact us!
 
 <div align="center">
-  <img src="docs/assets/wechat_qrcode.png" alt="qrcode3" width="50%" />
+  <img src="assets/wechat_qrcode.png" alt="qrcode3" width="50%" />
 </div>
 
 ## Acknowledgment
@@ -146,19 +105,12 @@ Thanks to the following collaborating university laboratories:
 - PKU-NetSys-LAB (NetSys Lab, Peking University)
 - [TJU-TANKLab](https://flashserve.org/) (TANK Lab, Tianjin University)
 
-Thanks to all the following [developers](https://github.com/jd-opensource/xllm/graphs/contributors) who have contributed to xLLM.
+Thanks to all the following [developers](https://github.com/xLLM-AI/xllm/graphs/contributors) who have contributed to xLLM.
 
-<a href="https://github.com/jd-opensource/xllm/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=jd-opensource/xllm" />
+<a href="https://github.com/xLLM-AI/xllm/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=xLLM-AI/xllm" />
 </a>
 
----
-
-## License
-[Apache License](LICENSE)
-
-#### xLLM is provided by JD.com 
-#### Thanks for your Contributions!
 
 ## Citation
 
@@ -166,7 +118,7 @@ If you think this repository is helpful to you, welcome to cite us:
 ```
 @article{liu2025xllm,
   title={xLLM Technical Report},
-  author={Liu, Tongxuan and Peng, Tao and Yang, Peijun and Zhao, Xiaoyang and Lu, Xiusheng and Huang, Weizhe and Liu, Zirui and Chen, Xiaoyu and Liang, Zhiwei and Xiong, Jun and others},
+  author={xLLM team},
   journal={arXiv preprint arXiv:2510.14686},
   year={2025}
 }

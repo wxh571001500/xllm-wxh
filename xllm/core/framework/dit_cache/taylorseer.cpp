@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,7 +21,9 @@ namespace {
 double factorial(int k) { return std::tgamma(static_cast<double>(k) + 1.0); }
 }  // namespace
 
-void TaylorSeer::init(const DiTCacheConfig& cfg) {
+void TaylorSeer::init(const DiTCacheConfig& cfg,
+                      const ParallelArgs& parallel_args) {
+  parallel_args_ = &parallel_args;
   CHECK_GE(cfg.taylorseer.warmup_steps, 0) << "warmup_steps must be >= 0";
   CHECK_GE(cfg.taylorseer.skip_interval_steps, 0)
       << "skip_interval_steps must be >= 0";
@@ -104,12 +106,12 @@ void TaylorSeer::update(const torch::Tensor& Y) {
 
 bool TaylorSeer::on_before_block(const CacheBlockIn&) { return false; }
 
-CacheBlockOut TaylorSeer::on_after_block(const CacheBlockIn& blockin) {
+CacheBlockOut TaylorSeer::on_after_block(const CacheBlockIn& block_input) {
   TensorMap out_map;
   out_map["hidden_states"] =
-      get_tensor_or_empty(blockin.tensors, "hidden_states");
+      get_tensor_or_empty(block_input.tensors, "hidden_states");
   out_map["encoder_hidden_states"] =
-      get_tensor_or_empty(blockin.tensors, "encoder_hidden_states");
+      get_tensor_or_empty(block_input.tensors, "encoder_hidden_states");
   return CacheBlockOut(out_map);
 }
 

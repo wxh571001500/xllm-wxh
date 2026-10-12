@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,157 +15,19 @@ limitations under the License.
 
 #pragma once
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/qwen2_5_vision_layer.h"
 #include "core/layers/qwen2_decoder_layer.h"
 #include "models/llm/qwen2.h"
 #include "models/model_registry.h"
-#include "processors/input_processor.h"
+#include "models/vlm/mposition/mposition.h"
 #include "processors/qwen2_vl_image_processor.h"
+#include "processors/qwen2_vl_prompt_processor.h"
+#include "processors/qwen2_vl_video_processor.h"
 
 namespace xllm {
-
-class Qwen2_5_VLInputProcessor : public InputProcessor {
-  enum class TokenType {
-    INVALID,
-    IMAGE,
-    VIDEO,
-  };
-
- public:
-  Qwen2_5_VLInputProcessor(const ModelArgs& args) {
-    merge_size_ = args.mm_image_merge_size();
-    vision_start_token_id_ = args.vision_start_token_id();
-    vision_end_token_id_ = args.vision_end_token_id();
-    image_token_id_ = args.image_token_id();
-    video_token_id_ = args.video_token_id();
-  }
-
-  void process(std::string& prompt, const MMData& mm_data) override {
-    torch::Tensor image_grid_thw;
-    if (auto res = mm_data.get<torch::Tensor>("image_grid_thw"))
-      image_grid_thw = res.value();
-
-    torch::Tensor video_grid_thw;
-    if (auto res = mm_data.get<torch::Tensor>("video_grid_thw"))
-      video_grid_thw = res.value();
-
-    if (!image_grid_thw.defined() && !video_grid_thw.defined()) return;
-
-    auto merge_length = merge_size_ * merge_size_;
-    int total_image_token = 0;
-    if (image_grid_thw.defined()) {
-      auto count = image_grid_thw.sizes()[0];
-      for (int idx = 0; idx < count; ++idx)
-        total_image_token +=
-            image_grid_thw[idx].prod().item<int>() / merge_length;
-    }
-
-    int total_video_token = 0;
-    if (video_grid_thw.defined()) {
-      auto count = video_grid_thw.sizes()[0];
-      for (int idx = 0; idx < count; ++idx)
-        total_video_token +=
-            video_grid_thw[idx].prod().item<int>() / merge_length;
-    }
-
-    size_t total_token_len = total_image_token * image_token_.size() +
-                             total_video_token * video_token_.size();
-    std::string data;
-    data.reserve(prompt.size() + total_token_len);
-
-    int image_index = 0;
-    int video_index = 0;
-
-    const torch::Tensor* grid_thw = nullptr;
-    const std::string* token = nullptr;
-    int* index = 0;
-
-    size_t begin = 0;
-    auto pair = find_vision_token(prompt, begin);
-
-    while (pair.second != std::string::npos) {
-      data.append(prompt, begin, pair.second - begin);
-
-      if (pair.first == TokenType::IMAGE) {
-        grid_thw = &image_grid_thw;
-        token = &image_token_;
-        index = &image_index;
-      } else if (pair.first == TokenType::VIDEO) {
-        grid_thw = &video_grid_thw;
-        token = &video_token_;
-        index = &video_index;
-      } else {
-        assert(false);
-      }
-
-      auto token_num = (*grid_thw)[(*index)].prod().item<int>() / merge_length;
-      while (token_num--) data.append(*token);
-
-      ++(*index);
-      begin = pair.second + token->size();
-      pair = find_vision_token(prompt, begin);
-    }
-
-    if (begin < prompt.size()) data.append(prompt, begin, std::string::npos);
-
-    prompt = std::move(data);
-  }
-
-  void find_mm_spans(const std::vector<int>& prompt, MMData& mm_data) {
-    auto start = prompt.begin();
-    uint32_t global_mm_index = 0;
-    uint32_t offset = 0;
-    uint32_t length = 0;
-    auto& mm_items = mm_data.items<MMItemVec>();
-    while (true) {
-      auto vision_start_it =
-          std::find(start, prompt.end(), vision_start_token_id_);
-      auto vision_end_it = std::find(start, prompt.end(), vision_end_token_id_);
-      if (vision_start_it == prompt.end()) {
-        break;
-      }
-      offset = std::distance(prompt.begin(), vision_start_it);
-      length = std::distance(vision_start_it + 1, vision_end_it);
-
-      auto& item = mm_items[global_mm_index];
-      if (*(vision_start_it + 1) == image_token_id_) {
-        item.mutable_state().mutable_token_pos() = {offset + 1, length};
-      } else if (*(vision_start_it + 1) == video_token_id_) {
-        item.mutable_state().mutable_token_pos() = {offset + 1, length};
-      }
-      global_mm_index++;
-      start = std::next(vision_end_it);
-    }
-  }
-
- private:
-  std::pair<TokenType, size_t> find_vision_token(const std::string& prompt,
-                                                 size_t begin) {
-    auto img_pos = prompt.find(image_token_, begin);
-    auto vid_pos = prompt.find(video_token_, begin);
-
-    if (img_pos == std::string::npos && vid_pos == std::string::npos)
-      return {TokenType::INVALID, std::string::npos};
-    else if (vid_pos == std::string::npos)
-      return {TokenType::IMAGE, img_pos};
-    else if (img_pos == std::string::npos)
-      return {TokenType::VIDEO, vid_pos};
-    else
-      return img_pos < vid_pos ? std::make_pair(TokenType::IMAGE, img_pos)
-                               : std::make_pair(TokenType::VIDEO, vid_pos);
-  }
-
- private:
-  const std::string image_token_ = "<|image_pad|>";
-  const std::string video_token_ = "<|video_pad|>";
-  int32_t vision_start_token_id_;
-  int32_t vision_end_token_id_;
-  int32_t image_token_id_;
-  int32_t video_token_id_;
-  int32_t merge_size_ = 0;
-};
 
 class Qwen2_5_VisionPatchEmbedImpl : public torch::nn::Module {
  public:
@@ -496,8 +358,7 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
   }
 
   torch::Tensor forward(torch::Tensor hidden_states,
-                        torch::Tensor grid_thw,  // [batch,thw]
-                        const ModelInputParams& input_params) {
+                        torch::Tensor grid_thw) {  // [batch,thw]
     // patchify
     // hidden_states = x.to(device=self.device, dtype=self.dtype);
     hidden_states = patch_embed_(hidden_states);
@@ -541,8 +402,6 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
 
     m_cos = m_cos.repeat({1, 2});
     m_sin = m_sin.repeat({1, 2});
-    ModelInputParams& input_params_new =
-        const_cast<ModelInputParams&>(input_params);
     torch::Tensor cu_seqlens_cpu = cu_seqlens.cpu();
     torch::Tensor cu_window_seqlens_cpu = cu_window_seqlens.cpu();
     std::vector<int> cu_seqlens_vec(
@@ -561,13 +420,8 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
         cu_seqlens_now = cu_window_seqlens;
         cu_seqlens_now_vec = cu_w_seqlens_vec;
       }
-      hidden_states = layers_[idx](hidden_states,
-                                   m_cos,
-                                   m_sin,
-                                   cu_seqlens_now,
-                                   cu_seqlens_now_vec,
-                                   input_params_new,
-                                   idx);
+      hidden_states = layers_[idx](
+          hidden_states, m_cos, m_sin, cu_seqlens_now, cu_seqlens_now_vec, idx);
     }
     // adapter
     hidden_states = merger_(hidden_states);
@@ -635,7 +489,7 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       const ModelInputParams& input_params,
       std::optional<Qwen2_5_VLImageInputs>& image_inputs,
       std::optional<Qwen2_5_VLVideoInputs>& video_inputs) {
-    const auto& mm_data = input_params.mm_data;
+    const auto& mm_data = input_params.multimodal.mm_data;
     torch::Tensor pixel_values;
     if (const auto& res = mm_data.get<torch::Tensor>("pixel_values"))
       pixel_values = res.value();
@@ -674,8 +528,7 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     if (image_input) {
       // visual
       auto image_embeds = visual_(image_input->pixel_values.to(options_),
-                                  image_input->image_grid_thw,
-                                  input_params);
+                                  image_input->image_grid_thw);
       auto image_tokens =
           (image_input->image_grid_thw.prod(-1) / merge_size / merge_size)
               .cpu()
@@ -686,13 +539,12 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
           image_tokens.data_ptr<int64_t>(),
           image_tokens.data_ptr<int64_t>() + image_tokens.numel());
       multimodal_embeds["image|embedding"] =
-          image_embeds.split(image_tokens_vec, 0 /*dim*/);
+          image_embeds.split(image_tokens_vec, /*dim=*/0);
     }
     if (video_input) {
       // visual
       auto video_embeds = visual_(video_input->pixel_values_videos.to(options_),
-                                  video_input->video_grid_thw,
-                                  input_params);
+                                  video_input->video_grid_thw);
       auto video_tokens =
           (video_input->video_grid_thw.prod(-1) / merge_size / merge_size)
               .cpu()
@@ -703,17 +555,9 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
           video_tokens.data_ptr<int64_t>() + video_tokens.numel());
 
       multimodal_embeds["video|embedding"] =
-          video_embeds.split(video_tokens_vec, 0 /*dim*/);
+          video_embeds.split(video_tokens_vec, /*dim=*/0);
     }
     return multimodal_embeds;
-  }
-
-  torch::Tensor generate_multimodal_mask(torch::Tensor input_ids) {
-    auto special_token_ids = torch::tensor(
-        {model_args_.image_token_id(), model_args_.video_token_id()},
-        input_ids.options().dtype(torch::kInt64));
-    auto is_multimodal = torch::isin(input_ids, special_token_ids);
-    return is_multimodal;
   }
 
   torch::Tensor merge_multimodal_embeddings(
@@ -726,36 +570,21 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
 
   torch::Tensor get_input_embeddings(const torch::Tensor input_ids,
                                      const ModelInputParams& input_params) {
-    const auto& mm_data = input_params.mm_data;
-    torch::Tensor multimodal_embeds;
-    if (const auto& emb = mm_data.get<torch::Tensor>("embedding")) {
-      multimodal_embeds = emb.value();
-    } else if (mm_data.get<torch::Tensor>("pixel_values").has_value() &&
-               mm_data.get<torch::Tensor>("image_grid_thw").has_value()) {
-      // Compute vision embeddings from pixel_values and merge with text
-      auto mm_dict = get_multimodal_embeddings(input_params);
-      if (mm_dict.count("image|embedding")) {
-        const auto& image_embeds_list =
-            std::get<std::vector<torch::Tensor>>(mm_dict["image|embedding"]);
-        multimodal_embeds = torch::cat(image_embeds_list, 0);
-      }
-      if (mm_dict.count("video|embedding")) {
-        const auto& video_embeds_list =
-            std::get<std::vector<torch::Tensor>>(mm_dict["video|embedding"]);
-        auto video_embeds = torch::cat(video_embeds_list, 0);
-        multimodal_embeds =
-            multimodal_embeds.defined()
-                ? torch::cat({multimodal_embeds, video_embeds}, 0)
-                : video_embeds;
-      }
-    }
+    const auto& mm_data = input_params.multimodal.mm_data;
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
-    if (!multimodal_embeds.defined()) {
-      return inputs_embeds;
-    }
-    auto is_multimodal = generate_multimodal_mask(input_ids);
-    inputs_embeds = merge_multimodal_embeddings(
-        inputs_embeds, multimodal_embeds, is_multimodal);
+    auto merge_modality = [&](const std::string& embed_key,
+                              const std::string& mask_key) {
+      auto emb = mm_data.get<torch::Tensor>(embed_key);
+      if (!emb.has_value()) return;
+      auto mask = mm_data.get<torch::Tensor>(mask_key);
+      if (!mask.has_value()) return;
+      inputs_embeds =
+          merge_multimodal_embeddings(inputs_embeds, emb.value(), mask.value());
+    };
+
+    merge_modality("image|embedding", "image|mask");
+    merge_modality("video|embedding", "video|mask");
+
     return inputs_embeds;
   }
 
@@ -766,6 +595,23 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     return language_model_(tokens, positions, kv_caches, input_params);
   }
 
+  torch::Tensor pooler(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes) {
+    auto h = hidden_states;
+    // return full embeddings if set flag
+    if (::xllm::ModelConfig::get_instance()
+            .enable_return_mm_full_embeddings()) {
+      return h;
+    }
+
+    if (seleted_idxes.defined()) {
+      h = h.index_select(/*dim=*/0, seleted_idxes);
+    }
+    auto pooler_output = torch::nn::functional::normalize(
+        h, torch::nn::functional::NormalizeFuncOptions().p(2).dim(1));
+    return pooler_output;
+  }
+
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) {
     return language_model_->logits(hidden_states, seleted_idxes);
@@ -773,10 +619,11 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
     for (const auto& state_dict : loader->get_state_dicts()) {
-      visual_->load_state_dict(state_dict->get_dict_with_prefix("visual."));
+      visual_->load_state_dict(state_dict->get_dict_with_prefix(
+          std::vector<std::string>{"visual.", "model.visual."}));
     }
 
-    if (!model_args_.image_embedding_mode()) {
+    if (!model_args_.encoder_embedding_mode()) {
       language_model_->load_model(std::move(loader));
     }
   }
@@ -801,9 +648,12 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
 };
 TORCH_MODULE(Qwen2_5_VLForConditionalGeneration);
 
-REGISTER_INPUT_PROCESSOR(qwen2_5_vl, Qwen2_5_VLInputProcessor);
+using Qwen25VLMultimodalProcessor = MultimodalProcessor<Qwen2VLPromptProcessor,
+                                                        Qwen2VLImageProcessor,
+                                                        Qwen2VLVideoProcessor>;
+REGISTER_MULTIMODAL_PROCESSOR(qwen2_5_vl, Qwen25VLMultimodalProcessor);
 REGISTER_CAUSAL_VLM_MODEL(qwen2_5_vl, Qwen2_5_VLForConditionalGeneration);
-REGISTER_IMAGE_PROCESSOR(qwen2_5_vl, Qwen2VLImageProcessor);
+REGISTER_MPOSITION_GENERATOR(qwen2_5_vl, QwenVLMPositionGenerator);
 
 // Macro to load Qwen2.5-VL model arguments (shared between qwen2_5_vl and
 // Qwen2_5_VLForConditionalGeneration)
@@ -852,6 +702,9 @@ REGISTER_IMAGE_PROCESSOR(qwen2_5_vl, Qwen2VLImageProcessor);
     LOAD_ARG_OR(mm_projection_dim, "vision_config.out_hidden_size", 3584);     \
     LOAD_ARG_OR(mm_patch_size, "vision_config.patch_size", 14);                \
     LOAD_ARG_OR(mm_spatial_merge_size, "vision_config.spatial_merge_size", 2); \
+    LOAD_ARG_OR_FUNC(mm_image_merge_size,                                      \
+                     "vision_config.image_merge_size",                         \
+                     [&] { return args->mm_spatial_merge_size(); });           \
     LOAD_ARG_OR(                                                               \
         mm_spatial_patch_size, "vision_config.spatial_patch_size", 14);        \
     LOAD_ARG_OR(mm_window_size, "vision_config.window_size", 112);             \
@@ -870,6 +723,9 @@ REGISTER_IMAGE_PROCESSOR(qwen2_5_vl, Qwen2VLImageProcessor);
                 "rope_scaling.mrope_section",                                  \
                 std::vector<int64_t>({16, 24, 24}));                           \
     LOAD_ARG_OR(vocab_size, "vocab_size", 152064);                             \
+    if (args->rope_scaling_rope_type() == "default") {                         \
+      args->rope_scaling_rope_type() = "mrope";                                \
+    }                                                                          \
   } while (0)
 
 REGISTER_MODEL_ARGS(qwen2_5_vl, [&] { LOAD_QWEN2_5_VL_MODEL_ARGS(); });

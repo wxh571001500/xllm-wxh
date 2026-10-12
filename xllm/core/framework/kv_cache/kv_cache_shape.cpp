@@ -1,0 +1,603 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "framework/kv_cache/kv_cache_shape.h"
+
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <utility>
+
+#include "core/platform/platform.h"
+#include "framework/kv_cache/cache_layout_builder.h"
+#include "framework/kv_cache/kv_cache_utils.h"
+#include "util/utils.h"
+#include "worker.pb.h"
+
+namespace xllm {
+
+KVCacheCreateOptions get_kv_cache_create_options(const ModelArgs& model_args,
+                                                 const KVCacheShape& shape,
+                                                 bool is_spec_draft) {
+  KVCacheCreateOptions options;
+  const bool kpool_draft = shape.has_kpool_tail_shape() && is_spec_draft;
+  options.enable_linear_attention(has_linear_attention_layers(model_args) &&
+                                  !kpool_draft);
+  options.full_attention_interval(
+      kpool_draft ? 1 : model_args.full_attention_interval());
+  options.layer_types(
+      kpool_draft
+          ? std::vector<std::string>(static_cast<size_t>(model_args.n_layers()),
+                                     "full_attention")
+          : model_args.layer_types());
+  return options;
+}
+
+namespace {
+constexpr int32_t kNzAlignment = 16;
+
+int64_t get_local_head_count(int64_t total_head_count, int64_t world_size) {
+  CHECK_GT(world_size, 0) << "world_size must be positive.";
+  return std::max<int64_t>(1, total_head_count / world_size);
+}
+
+std::vector<int64_t> repeated_field_to_vector(
+    const google::protobuf::RepeatedField<int64_t>& field) {
+  return std::vector<int64_t>(field.begin(), field.end());
+}
+
+void add_shape_to_proto(const std::vector<int64_t>& shape,
+                        google::protobuf::RepeatedField<int64_t>* proto_shape) {
+  CHECK(proto_shape != nullptr) << "proto_shape must not be nullptr.";
+  proto_shape->Reserve(static_cast<int32_t>(shape.size()));
+  for (const int64_t dim : shape) {
+    proto_shape->Add(dim);
+  }
+}
+
+void transpose_dim_1_and_2(std::vector<int64_t>* shape) {
+  CHECK(shape != nullptr) << "shape must not be nullptr.";
+  if (shape->size() <= 2) {
+    return;
+  }
+  std::swap((*shape)[1], (*shape)[2]);
+}
+
+}  // namespace
+
+KVCacheShape::KVCacheShape(const KVCacheCapacity& kv_cache_cap,
+                           const ModelArgs& model_args,
+                           int64_t world_size) {
+  CHECK_GT(world_size, 0) << "world_size must be positive.";
+  CHECK_GT(kv_cache_cap.block_size(), 0) << "block_size must be positive.";
+  replicated_block_pages_ =
+      std::max<int64_t>(kv_cache_cap.replicated_block_pages(), 1);
+  if (replicated_block_pages_ > 1) {
+    CHECK_EQ(kv_cache_cap.n_blocks() % replicated_block_pages_, 0)
+        << "A replicated cache pool must own a whole number of logical "
+           "blocks: n_blocks="
+        << kv_cache_cap.n_blocks()
+        << ", replicated_block_pages=" << replicated_block_pages_;
+  }
+
+  if (util::is_deepseek_v4_model_type(model_args.model_type())) {
+    init_dsv4_pool_shape(kv_cache_cap, model_args);
+    return;
+  }
+
+  kpool_layout_ = model_args.index_kpool_compress()
+                      ? kv_cache_cap.kpool_layout()
+                      : KPoolCacheLayout::PACKED;
+  const bool enable_lighting_indexer = model_args.index_n_heads() > 0;
+  const bool enable_linear_attention = has_linear_attention_layers(model_args);
+  // A model may be BOTH linear-attention (KDA layers need conv/ssm caches)
+  // AND have a lighting indexer (DSA layers need an index cache) — e.g.
+  // glm5_next. The three shape members are independent optionals, and
+  // create_kv_cache_impl dispatches ONE impl per layer (LinearAttention /
+  // Indexed / base), each reading only its own shape, so coexistence here
+  // is harmless. The prior exclusivity CHECK guarded a non-problem.
+
+  // The build gate lives in util::enable_mla_packed_c8(); the packed C8 bit on
+  // KVCacheCapacity is force-false on non-NPU builds, so the shape here stays
+  // in lockstep with the estimator's slot sizing without a second #ifdef.
+  const bool mla_packed_c8 = kv_cache_cap.enable_mla_kv_cache_quant();
+  if (mla_packed_c8) {
+    init_mla_packed_c8_shape(kv_cache_cap, model_args);
+  } else {
+    init_key_cache_shape(kv_cache_cap, model_args, world_size);
+    init_value_cache_shape(kv_cache_cap, model_args, world_size);
+  }
+
+  if (enable_lighting_indexer) {
+    init_index_cache_shape(kv_cache_cap, model_args);
+    if (model_args.index_kpool_compress() &&
+        kpool_layout_ == KPoolCacheLayout::COMPRESSED_WITH_TAIL) {
+      CHECK_GT(kv_cache_cap.num_linear_state_blocks(), 0);
+      kpool_tail_shape_ =
+          std::vector<int64_t>{kv_cache_cap.num_linear_state_blocks(),
+                               2,
+                               std::max<int64_t>(model_args.index_kpool(),
+                                                 kv_cache_cap.kpool_tail_len()),
+                               model_args.index_head_dim()};
+    }
+  }
+
+  if (enable_linear_attention) {
+    init_conv_cache_shape(kv_cache_cap, model_args, world_size);
+    init_ssm_cache_shape(kv_cache_cap, model_args, world_size);
+  }
+
+  // apply_device_layout() is an MLU/ILU/DCU dim1<->2 swap and is a no-op on
+  // every other backend. Packed C8 only fires on NPU (gated by
+  // util::enable_mla_packed_c8), so calling unconditionally is safe today. If
+  // SFA C8 ever extends to a backend whose apply_device_layout() actually
+  // rewrites the main-KV shape, revisit this and skip the packed rows so they
+  // do not disagree with the indexer cache layout below.
+  apply_device_layout(model_args);
+
+  if (enable_lighting_indexer && kv_cache_cap.enable_indexer_cache_quant()) {
+    init_index_cache_scale_shape();
+  }
+}
+
+const std::vector<int64_t>& KVCacheShape::key_cache_shape() const {
+  CHECK(key_cache_shape_.has_value()) << "key_cache_shape is not initialized.";
+  return *key_cache_shape_;
+}
+
+const std::vector<int64_t>& KVCacheShape::value_cache_shape() const {
+  if (!value_cache_shape_.has_value()) {
+    return empty_shape();
+  }
+  return *value_cache_shape_;
+}
+
+const std::vector<int64_t>& KVCacheShape::index_cache_shape() const {
+  if (!index_cache_shape_.has_value()) {
+    return empty_shape();
+  }
+  return *index_cache_shape_;
+}
+
+const std::vector<int64_t>& KVCacheShape::index_cache_scale_shape() const {
+  if (!index_cache_scale_shape_.has_value()) {
+    return empty_shape();
+  }
+  return *index_cache_scale_shape_;
+}
+
+const std::vector<int64_t>& KVCacheShape::kpool_tail_shape() const {
+  return kpool_tail_shape_.has_value() ? *kpool_tail_shape_ : empty_shape();
+}
+
+bool KVCacheShape::has_kpool_tail_shape() const {
+  return kpool_tail_shape_.has_value();
+}
+
+const std::vector<int64_t>& KVCacheShape::conv_cache_shape() const {
+  if (!conv_cache_shape_.has_value()) {
+    return empty_shape();
+  }
+  return *conv_cache_shape_;
+}
+
+const std::vector<int64_t>& KVCacheShape::ssm_cache_shape() const {
+  if (!ssm_cache_shape_.has_value()) {
+    return empty_shape();
+  }
+  return *ssm_cache_shape_;
+}
+
+bool KVCacheShape::has_key_cache_shape() const {
+  return key_cache_shape_.has_value();
+}
+
+bool KVCacheShape::has_value_cache_shape() const {
+  return value_cache_shape_.has_value();
+}
+
+bool KVCacheShape::has_index_cache_shape() const {
+  return index_cache_shape_.has_value();
+}
+
+bool KVCacheShape::has_index_cache_scale_shape() const {
+  return index_cache_scale_shape_.has_value();
+}
+
+bool KVCacheShape::has_conv_cache_shape() const {
+  return conv_cache_shape_.has_value();
+}
+
+bool KVCacheShape::has_ssm_cache_shape() const {
+  return ssm_cache_shape_.has_value();
+}
+
+int64_t KVCacheShape::linear_ssm_checkpoint_stride() const {
+  if (!has_conv_cache_shape() || !has_ssm_cache_shape()) {
+    return 1;
+  }
+  CHECK(!conv_cache_shape().empty() && !ssm_cache_shape().empty());
+  CHECK_GT(conv_cache_shape()[0], 0);
+  CHECK_EQ(ssm_cache_shape()[0] % conv_cache_shape()[0], 0)
+      << "SSM physical rows must be divisible by logical sequence slots.";
+  const int64_t checkpoint_stride =
+      ssm_cache_shape()[0] / conv_cache_shape()[0];
+  CHECK_GT(checkpoint_stride, 0);
+  return checkpoint_stride;
+}
+
+void KVCacheShape::print_shapes() const {
+  if (shape_kind_ == ShapeKind::GROUPED_POOL) {
+    print_dsv4_pool_shape();
+    return;
+  }
+
+  if (has_key_cache_shape()) {
+    LOG(INFO) << "Initializing k cache with shape: [" << key_cache_shape()
+              << "]";
+  }
+  if (has_value_cache_shape()) {
+    LOG(INFO) << "Initializing v cache with shape: [" << value_cache_shape()
+              << "]";
+  }
+  if (has_index_cache_shape()) {
+    LOG(INFO) << "Initializing indexer cache with shape: ["
+              << index_cache_shape() << "]";
+  }
+  if (has_kpool_tail_shape()) {
+    LOG(INFO) << "Initializing KPool tail with shape: [" << kpool_tail_shape()
+              << "]";
+  }
+  if (has_index_cache_scale_shape()) {
+    LOG(INFO) << "Initializing indexer cache scale with shape: ["
+              << index_cache_scale_shape() << "]";
+  }
+  if (has_conv_cache_shape()) {
+    LOG(INFO) << "Initializing conv cache with shape: [" << conv_cache_shape()
+              << "]";
+  }
+  if (has_ssm_cache_shape()) {
+    LOG(INFO) << "Initializing ssm cache with shape: [" << ssm_cache_shape()
+              << "]";
+  }
+}
+
+void KVCacheShape::init_dsv4_pool_shape(const KVCacheCapacity& kv_cache_cap,
+                                        const ModelArgs& model_args) {
+  shape_kind_ = ShapeKind::GROUPED_POOL;
+  // V4 pool is positional [swa_count, c4_count, c128_count]; V4.1 reuses the
+  // slots as [swa_count, c2_count, c1_count] (contract §2), disambiguated by
+  // model_type.
+  dsv41_pool_ = util::is_deepseek_v41_model_type(model_args.model_type());
+  if (dsv41_pool_) {
+    key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.swa_count(),
+                                            kv_cache_cap.c2_count(),
+                                            kv_cache_cap.c1_count()};
+    return;
+  }
+  key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.swa_count(),
+                                          kv_cache_cap.c4_count(),
+                                          kv_cache_cap.c128_count()};
+}
+
+void KVCacheShape::print_dsv4_pool_shape() const {
+  CHECK(has_key_cache_shape())
+      << "DeepSeek V4 cache shape must contain cache pool counts.";
+  const std::vector<int64_t>& pool_counts = key_cache_shape();
+  CHECK_GE(pool_counts.size(), 3)
+      << "DeepSeek V4/V4.1 cache shape must be [swa_count, c4_count, "
+         "c128_count] (V4) or [swa_count, c2_count, c1_count] (V4.1).";
+  if (dsv41_pool_) {
+    LOG(INFO) << "Initializing DSV4.1 kv cache with shape: [swa_count="
+              << pool_counts[0] << ", c2_count=" << pool_counts[1]
+              << ", c1_count=" << pool_counts[2] << "]";
+    return;
+  }
+  LOG(INFO) << "Initializing DSV4 kv cache with shape: [swa_count="
+            << pool_counts[0] << ", c4_count=" << pool_counts[1]
+            << ", c128_count=" << pool_counts[2] << "]";
+}
+
+void KVCacheShape::to_proto(proto::KVCacheShape* proto_shape) const {
+  CHECK(proto_shape != nullptr) << "proto_shape must not be nullptr.";
+  proto_shape->Clear();
+  proto_shape->set_grouped_cache_layout(has_grouped_cache_layout());
+  proto_shape->set_kpool_layout(static_cast<int32_t>(kpool_layout_));
+  if (has_kpool_tail_shape()) {
+    add_shape_to_proto(kpool_tail_shape(),
+                       proto_shape->mutable_kpool_tail_shape());
+  }
+  add_shape_to_proto(key_cache_shape(), proto_shape->mutable_key_cache_shape());
+  if (has_value_cache_shape()) {
+    add_shape_to_proto(value_cache_shape(),
+                       proto_shape->mutable_value_cache_shape());
+  }
+  if (has_index_cache_shape()) {
+    add_shape_to_proto(index_cache_shape(),
+                       proto_shape->mutable_index_cache_shape());
+  }
+  if (has_index_cache_scale_shape()) {
+    add_shape_to_proto(index_cache_scale_shape(),
+                       proto_shape->mutable_index_cache_scale_shape());
+  }
+  if (has_conv_cache_shape()) {
+    add_shape_to_proto(conv_cache_shape(),
+                       proto_shape->mutable_conv_cache_shape());
+    add_shape_to_proto(ssm_cache_shape(),
+                       proto_shape->mutable_ssm_cache_shape());
+  }
+}
+
+KVCacheShape KVCacheShape::from_proto(const proto::KVCacheShape& proto_shape) {
+  KVCacheShape kv_cache_shape;
+  CHECK(proto_shape.kpool_layout() ==
+            static_cast<int32_t>(KPoolCacheLayout::PACKED) ||
+        proto_shape.kpool_layout() ==
+            static_cast<int32_t>(KPoolCacheLayout::COMPRESSED_WITH_TAIL))
+      << "unknown kpool_layout=" << proto_shape.kpool_layout();
+  kv_cache_shape.kpool_layout_ =
+      static_cast<KPoolCacheLayout>(proto_shape.kpool_layout());
+  if (proto_shape.kpool_tail_shape_size() > 0) {
+    kv_cache_shape.kpool_tail_shape_ =
+        repeated_field_to_vector(proto_shape.kpool_tail_shape());
+  }
+  if (proto_shape.grouped_cache_layout()) {
+    kv_cache_shape.shape_kind_ = ShapeKind::GROUPED_POOL;
+  }
+  kv_cache_shape.key_cache_shape_ =
+      repeated_field_to_vector(proto_shape.key_cache_shape());
+  if (proto_shape.value_cache_shape_size() > 0) {
+    kv_cache_shape.value_cache_shape_ =
+        repeated_field_to_vector(proto_shape.value_cache_shape());
+  }
+  if (proto_shape.index_cache_shape_size() > 0) {
+    kv_cache_shape.index_cache_shape_ =
+        repeated_field_to_vector(proto_shape.index_cache_shape());
+  }
+  if (proto_shape.index_cache_scale_shape_size() > 0) {
+    kv_cache_shape.index_cache_scale_shape_ =
+        repeated_field_to_vector(proto_shape.index_cache_scale_shape());
+  }
+  if (proto_shape.conv_cache_shape_size() > 0) {
+    kv_cache_shape.conv_cache_shape_ =
+        repeated_field_to_vector(proto_shape.conv_cache_shape());
+  }
+  if (proto_shape.ssm_cache_shape_size() > 0) {
+    kv_cache_shape.ssm_cache_shape_ =
+        repeated_field_to_vector(proto_shape.ssm_cache_shape());
+  }
+  return kv_cache_shape;
+}
+
+void KVCacheShape::init_key_cache_shape(const KVCacheCapacity& kv_cache_cap,
+                                        const ModelArgs& model_args,
+                                        int64_t world_size) {
+  if (model_args.enable_mla()) {
+#if defined(USE_NPU)
+    if (use_npu_nz_kv_cache_layout(model_args.model_type())) {
+      key_cache_shape_ = std::vector<int64_t>{
+          kv_cache_cap.n_blocks(),
+          util::ceil_div(model_args.kv_lora_rank(), kNzAlignment),
+          kv_cache_cap.block_size(),
+          kNzAlignment};
+      return;
+    }
+#endif
+    key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.n_blocks(),
+                                            kv_cache_cap.block_size(),
+                                            1,
+                                            model_args.kv_lora_rank()};
+    return;
+  }
+
+  const int64_t total_kv_head_count =
+      model_args.n_kv_heads().value_or(model_args.n_heads());
+  const int64_t local_kv_head_count =
+      get_local_head_count(total_kv_head_count, world_size);
+  key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.n_blocks(),
+                                          kv_cache_cap.block_size(),
+                                          local_kv_head_count,
+                                          model_args.head_dim()};
+}
+
+void KVCacheShape::init_value_cache_shape(const KVCacheCapacity& kv_cache_cap,
+                                          const ModelArgs& model_args,
+                                          int64_t world_size) {
+  if (model_args.enable_mla()) {
+    // GLM5 uses MLA without a separate value cache.  Represent that layout as
+    // an absent shape so device/host cache allocation and transfer registration
+    // never create or publish a zero-sized VALUE tensor.
+    if (model_args.qk_rope_head_dim() == 0) {
+      value_cache_shape_.reset();
+      return;
+    }
+#if defined(USE_NPU)
+    if (use_npu_nz_kv_cache_layout(model_args.model_type())) {
+      value_cache_shape_ = std::vector<int64_t>{
+          kv_cache_cap.n_blocks(),
+          util::ceil_div(model_args.qk_rope_head_dim(), kNzAlignment),
+          kv_cache_cap.block_size(),
+          kNzAlignment};
+      return;
+    }
+#endif
+    value_cache_shape_ = std::vector<int64_t>{kv_cache_cap.n_blocks(),
+                                              kv_cache_cap.block_size(),
+                                              1,
+                                              model_args.qk_rope_head_dim()};
+    return;
+  }
+
+  const int64_t total_kv_head_count =
+      model_args.n_kv_heads().value_or(model_args.n_heads());
+  const int64_t local_kv_head_count =
+      get_local_head_count(total_kv_head_count, world_size);
+  value_cache_shape_ = std::vector<int64_t>{kv_cache_cap.n_blocks(),
+                                            kv_cache_cap.block_size(),
+                                            local_kv_head_count,
+                                            model_args.head_dim()};
+}
+
+void KVCacheShape::init_mla_packed_c8_shape(const KVCacheCapacity& kv_cache_cap,
+                                            const ModelArgs& model_args) {
+  // SFA C8 packed layout, per token: [int8 nope (kv_lora_rank bytes)] ++
+  // [bf16 rope (2 * qk_rope_head_dim bytes)] ++
+  // [fp32 tile scales (kv_lora_rank / tile_size * 4 bytes)].
+  // GLM-5.2: 512 + 2*64 + 4*4 = 656. The whole cache is stored as a single
+  // int8 byte tensor; K==V, so value_cache_shape mirrors key_cache_shape and
+  // gets aliased at the Python layer.
+  const int64_t nope_bytes = model_args.kv_lora_rank();
+  const int64_t rope_bytes =
+      MlaPackedC8Layout::kRopeElementBytes * model_args.qk_rope_head_dim();
+  static_assert(MlaPackedC8Layout::kTileSize > 0);
+  CHECK_EQ(nope_bytes % MlaPackedC8Layout::kTileSize, 0)
+      << "kv_lora_rank must be a multiple of the SFA C8 tile size ("
+      << MlaPackedC8Layout::kTileSize << ").";
+  const int64_t scale_bytes = MlaPackedC8Layout::kScaleElementBytes *
+                              (nope_bytes / MlaPackedC8Layout::kTileSize);
+  const int64_t packed_head_dim = nope_bytes + rope_bytes + scale_bytes;
+  LOG(INFO) << "SFA C8 packed head_dim=" << packed_head_dim
+            << " (nope=" << nope_bytes << ", rope=" << rope_bytes
+            << ", scale=" << scale_bytes << ")";
+  key_cache_shape_ = std::vector<int64_t>{
+      kv_cache_cap.n_blocks(), kv_cache_cap.block_size(), 1, packed_head_dim};
+  value_cache_shape_ = *key_cache_shape_;
+}
+
+void KVCacheShape::init_index_cache_shape(const KVCacheCapacity& kv_cache_cap,
+                                          const ModelArgs& model_args) {
+  const int64_t replication_factor = indexer_pages_per_block();
+  const int64_t index_block_count =
+      kv_cache_cap.n_blocks() * replication_factor;
+  if (kpool_layout_ == KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
+      model_args.index_kpool_compress()) {
+    CHECK_EQ(kv_cache_cap.block_size() % model_args.index_kpool(), 0)
+        << "KPool cache block_size must be divisible by index_kpool.";
+    index_cache_shape_ = std::vector<int64_t>{
+        index_block_count,
+        kv_cache_cap.block_size() / model_args.index_kpool(),
+        1,
+        model_args.index_head_dim()};
+    return;
+  }
+  // GLM-next kPool packs [k, gate, valid] = index_head_dim*2+1 per token into
+  // the index cache (its Python select_topk reads historical gate/valid from
+  // the cache). Models using the lightning_indexer op (DS V3.2 / glm5.2) keep
+  // only k, so index_kpool_compress (false by default) gates the packed
+  // width without affecting them.
+  const int64_t head_dim = model_args.index_head_dim();
+  const int64_t cache_head_dim =
+      model_args.index_kpool_compress() ? head_dim * 2 + 1 : head_dim;
+  index_cache_shape_ = std::vector<int64_t>{
+      index_block_count, kv_cache_cap.block_size(), 1, cache_head_dim};
+}
+
+void KVCacheShape::init_index_cache_scale_shape() {
+  CHECK(index_cache_shape_.has_value())
+      << "index_cache_shape must be initialized before index cache scale.";
+  CHECK_EQ(index_cache_shape_->size(), 4)
+      << "index_cache_shape must be [blocks, heads, block_size, head_dim].";
+  index_cache_scale_shape_ = std::vector<int64_t>{(*index_cache_shape_)[0],
+                                                  (*index_cache_shape_)[1],
+                                                  (*index_cache_shape_)[2]};
+}
+
+void KVCacheShape::init_conv_cache_shape(const KVCacheCapacity& kv_cache_cap,
+                                         const ModelArgs& model_args,
+                                         int64_t world_size) {
+  const int64_t local_linear_k_head_count =
+      get_local_head_count(model_args.linear_num_key_heads(), world_size);
+  const int64_t local_linear_v_head_count =
+      get_local_head_count(model_args.linear_num_value_heads(), world_size);
+  const int64_t conv_state_len = kv_cache_cap.linear_conv_state_len() > 0
+                                     ? kv_cache_cap.linear_conv_state_len()
+                                     : model_args.linear_conv_kernel_dim() - 1;
+
+#if defined(USE_MUSA)
+  // MUSA causal-conv kernels consume [num_blocks, dim, state_len]. Keep the
+  // framework cache layout identical to the kernel contract.
+  conv_cache_shape_ = std::vector<int64_t>{
+      kv_cache_cap.num_linear_state_blocks(),
+      model_args.linear_key_head_dim() * local_linear_k_head_count * 2 +
+          model_args.linear_value_head_dim() * local_linear_v_head_count,
+      conv_state_len};
+#else
+  conv_cache_shape_ = std::vector<int64_t>{
+      kv_cache_cap.num_linear_state_blocks(),
+      conv_state_len,
+      model_args.linear_key_head_dim() * local_linear_k_head_count * 2 +
+          model_args.linear_key_head_dim() * local_linear_v_head_count};
+#endif
+}
+
+void KVCacheShape::init_ssm_cache_shape(const KVCacheCapacity& kv_cache_cap,
+                                        const ModelArgs& model_args,
+                                        int64_t world_size) {
+  const int64_t local_linear_v_head_count =
+      get_local_head_count(model_args.linear_num_value_heads(), world_size);
+  const int64_t checkpoint_stride =
+      std::max<int64_t>(kv_cache_cap.linear_ssm_checkpoint_stride(), 1);
+#if defined(USE_MUSA)
+  // Mate prefill and fused decode persist MUSA SSM states as [V, K].
+  ssm_cache_shape_ = std::vector<int64_t>{
+      kv_cache_cap.num_linear_state_blocks() * checkpoint_stride,
+      local_linear_v_head_count,
+      model_args.linear_value_head_dim(),
+      model_args.linear_key_head_dim()};
+#else
+  ssm_cache_shape_ = std::vector<int64_t>{
+      kv_cache_cap.num_linear_state_blocks() * checkpoint_stride,
+      local_linear_v_head_count,
+      model_args.linear_key_head_dim(),
+      model_args.linear_value_head_dim()};
+#endif
+}
+
+void KVCacheShape::apply_device_layout(const ModelArgs& model_args) {
+  // default k/v cache layout: [n_blocks, block_size, n_head, head_dim]
+  // => mlu/ilu k/v cache layout: [n_blocks, n_head, block_size, head_dim]
+#if defined(USE_MLU) || defined(USE_ILU)
+  if (key_cache_shape_.has_value()) {
+    transpose_dim_1_and_2(&*key_cache_shape_);
+  }
+  if (value_cache_shape_.has_value()) {
+    transpose_dim_1_and_2(&*value_cache_shape_);
+  }
+  if (index_cache_shape_.has_value()) {
+    transpose_dim_1_and_2(&*index_cache_shape_);
+  }
+#endif
+
+#if defined(USE_MLU) || defined(USE_DCU)
+  if (model_args.enable_mla()) {
+    CHECK(key_cache_shape_.has_value())
+        << "key_cache_shape is not initialized.";
+    CHECK_GE(key_cache_shape_->size(), 4) << "invalid mla key_cache_shape.";
+    (*key_cache_shape_)[3] =
+        model_args.kv_lora_rank() + model_args.qk_rope_head_dim();
+    value_cache_shape_.reset();
+  }
+#else
+  static_cast<void>(model_args);
+#endif
+}
+
+const std::vector<int64_t>& KVCacheShape::empty_shape() {
+  static const std::vector<int64_t> kEmptyShape;
+  return kEmptyShape;
+}
+
+}  // namespace xllm

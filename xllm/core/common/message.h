@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -29,14 +30,17 @@ using Embedding = xllm::proto::Embedding;
 
 struct ImageURL {
   std::string url;
+  std::unordered_map<std::string, std::string> headers;
 };
 
 struct VideoURL {
   std::string url;
+  std::unordered_map<std::string, std::string> headers;
 };
 
 struct AudioURL {
   std::string url;
+  std::unordered_map<std::string, std::string> headers;
 };
 
 struct MMContent {
@@ -100,6 +104,18 @@ struct Message {
     }
 
     return count;
+  }
+
+  bool has_mm_content() const {
+    if (std::holds_alternative<std::string>(content)) {
+      return false;
+    }
+    for (const auto& item : std::get<MMContentVec>(content)) {
+      if (item.type != "text") {
+        return true;
+      }
+    }
+    return false;
   }
 
   std::string role;

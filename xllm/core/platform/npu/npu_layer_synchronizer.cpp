@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,7 @@ limitations under the License.
 #include "npu_layer_synchronizer.h"
 
 #include <glog/logging.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 
 namespace xllm {
 
@@ -29,6 +30,8 @@ NPULayerSynchronizerImpl::NPULayerSynchronizerImpl(const int64_t num_layers,
     auto ret = aclrtCreateEventWithFlag(&events_[i], flags);
     CHECK(ret == ACL_SUCCESS) << "Create event failed:" << ret;
   }
+  aclError ctx_ret = aclrtGetCurrentContext(&context_);
+  CHECK(ctx_ret == ACL_SUCCESS) << "Get current context failed:" << ctx_ret;
 }
 
 NPULayerSynchronizerImpl::~NPULayerSynchronizerImpl() {
@@ -46,14 +49,66 @@ std::atomic<bool>* NPULayerSynchronizerImpl::get_event_flag(
   return &event_record_flags_[layer_index];
 }
 
+namespace {
+aclrtStream get_push_wait_stream() {
+  static thread_local aclrtStream wait_stream = nullptr;
+  if (wait_stream == nullptr) {
+    auto ret = aclrtCreateStream(&wait_stream);
+    CHECK(ret == ACL_SUCCESS) << "Create wait stream failed:" << ret;
+  }
+  return wait_stream;
+}
+}  // namespace
+
 bool NPULayerSynchronizerImpl::synchronize_layer(const int64_t layer_index) {
-  while (!event_record_flags_[layer_index].load(std::memory_order_acquire));
-  auto ret = aclrtSynchronizeEventWithTimeout(events_[layer_index], timeout_);
+  while (!event_record_flags_[layer_index].load(std::memory_order_acquire)) {
+    if (aborted_.load(std::memory_order_acquire)) {
+      return false;
+    }
+  }
+  if (aborted_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (context_ != nullptr) {
+    auto ctx_ret = aclrtSetCurrentContext(context_);
+    if (ctx_ret != ACL_SUCCESS) {
+      LOG(ERROR) << "Set current context failed: " << ctx_ret;
+      return false;
+    }
+  }
+  aclrtStream wait_stream = get_push_wait_stream();
+  auto ret = aclrtStreamWaitEvent(wait_stream, events_[layer_index]);
   if (ret != ACL_SUCCESS) {
-    LOG(ERROR) << "Synchronize event failed: " << ret;
+    LOG(ERROR) << "Stream wait event failed: " << ret;
+    return false;
+  }
+  ret = aclrtSynchronizeStreamWithTimeout(wait_stream, timeout_);
+  if (ret != ACL_SUCCESS) {
+    LOG(ERROR) << "Synchronize wait stream failed: " << ret;
     return false;
   }
   return true;
+}
+
+bool NPULayerSynchronizerImpl::record_event(const int64_t layer_index,
+                                            const int32_t device_index) {
+  aclrtStream stream = c10_npu::getCurrentNPUStream(device_index).stream();
+  auto ret = aclrtRecordEvent(events_[layer_index], stream);
+  if (ret != ACL_SUCCESS) {
+    LOG(ERROR) << "Record event failed: " << ret;
+    return false;
+  }
+  event_record_flags_[layer_index].store(true, std::memory_order_release);
+  return true;
+}
+
+void NPULayerSynchronizerImpl::abort() {
+  // Set aborted_ before raising the flags so any thread released from the spin
+  // observes the abort and reports failure rather than syncing a stale event.
+  aborted_.store(true, std::memory_order_release);
+  for (size_t i = 0; i < event_record_flags_.size(); ++i) {
+    event_record_flags_[i].store(true, std::memory_order_release);
+  }
 }
 
 }  // namespace xllm

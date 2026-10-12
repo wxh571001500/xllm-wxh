@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <optional>
+
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v2_decoder_layer_impl.h"
 #include "llm_model_base.h"
@@ -76,9 +81,7 @@ class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
     decoder_layer_->reload_weights_from_device();
   }
 
-  layer::BaseManualLoader* get_manual_loader() {
-    return decoder_layer_->get_manual_loader();
-  }
+  layer::BaseLoader* get_loader() { return decoder_layer_->get_loader(); }
 
   void refresh_rolling_weights() { decoder_layer_->refresh_rolling_weights(); }
 
@@ -96,7 +99,11 @@ TORCH_MODULE(DeepseekV2DecoderLayer);
 class DeepseekV2ModelImpl : public torch::nn::Module {
  public:
   DeepseekV2ModelImpl(const ModelContext& context)
-      : device_(context.get_tensor_options().device()) {
+      : aux_capture_(
+            context.get_model_args(),
+            context.get_tensor_options(),
+            ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch()),
+        device_(context.get_tensor_options().device()) {
     auto options = context.get_tensor_options();
     auto model_args = context.get_model_args();
     auto parallel_args = context.get_parallel_args();
@@ -153,24 +160,29 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
                       torch::Tensor positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) {
-    if (dp_size_ > 1) {
-      if (tokens.sizes() == 0) {
-        tokens = torch::tensor({1}).to(torch::kInt32).to(device_);
-        positions = torch::tensor({0}).to(torch::kInt32).to(device_);
-      }
+    if (dp_size_ > 1 && (!tokens.defined() || tokens.numel() == 0)) {
+      tokens = torch::tensor({1}).to(torch::kInt32).to(device_);
+      positions = torch::tensor({0}).to(torch::kInt32).to(device_);
     }
 
-    auto h = npu_embed_tokens_(tokens, 0);
+    auto inputs_embeds = input_params.embedding.input_embedding;
+    torch::Tensor h;
+    if (inputs_embeds.defined()) {
+      h = inputs_embeds;
+    } else {
+      h = npu_embed_tokens_(tokens, 0);
+    }
     auto cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto cos_sin_chunks = cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
     auto cos_pos = cos_sin_chunks[0].contiguous();
     auto sin_pos = cos_sin_chunks[1].contiguous();
 
     torch::Tensor attn_mask;
-    if (FLAGS_enable_prefix_cache &&
-        !input_params.batch_forward_type.is_decode()) {
+    if (::xllm::KVCacheConfig::get_instance().enable_prefix_cache() &&
+        !input_params.meta.batch_forward_type.is_decode()) {
       attn_mask = attn_mask_.get_attn_mask(512, dtype_, device_);
-    } else if (input_params.batch_forward_type.is_prefill()) {
+    } else if (input_params.meta.batch_forward_type.is_prefill() ||
+               input_params.meta.batch_forward_type.is_chunked_prefill()) {
       attn_mask = attn_mask_.get_attn_mask(128, dtype_, device_);
     } else if (num_speculative_tokens_ > 0) {
       // TODO :the judgement of gen_free_mask need more check
@@ -182,16 +194,18 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event = nullptr;
       std::atomic<bool>* event_flag = nullptr;
-      if (input_params.layer_synchronizer != nullptr) {
-        event = input_params.layer_synchronizer->get_event(i);
-        event_flag = input_params.layer_synchronizer->get_event_flag(i);
+      if (input_params.parallel.layer_synchronizer != nullptr) {
+        event = input_params.parallel.layer_synchronizer->get_event(i);
+        event_flag =
+            input_params.parallel.layer_synchronizer->get_event_flag(i);
       }
       if (!input_params.synchronize_layer(i)) {
         return ModelOutput();
       }
 
       auto& layer = layers_[i];
-      const int32_t layer_index = i;
+      const int32_t layer_index = static_cast<int32_t>(i);
+      aux_capture_.capture_layer(layer_index, h, std::nullopt);
       rolling_guard.before_layer(layer_index);
       layer(h,
             cos_pos,
@@ -204,7 +218,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       rolling_guard.after_layer(layer_index);
     }
     auto hidden_states = norm_(h, 0);
-    return ModelOutput(hidden_states);
+    return aux_capture_.finalize(hidden_states);
   }
 
   // load the weight from the checkpoint
@@ -279,11 +293,11 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     }
   }
 
-  std::vector<layer::BaseManualLoader*> get_decoder_loaders() {
-    std::vector<layer::BaseManualLoader*> loaders;
+  std::vector<layer::BaseLoader*> get_decoder_loaders() {
+    std::vector<layer::BaseLoader*> loaders;
     loaders.reserve(layers_.size());
     for (auto& layer : layers_) {
-      loaders.push_back(layer->get_manual_loader());
+      loaders.push_back(layer->get_loader());
     }
     return loaders;
   }
@@ -315,6 +329,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
   int32_t dp_local_tp_size_;
   int32_t num_experts_per_tok_;
   int32_t num_speculative_tokens_ = 0;
+  AuxHiddenCapture aux_capture_;
   at::Device device_;
   torch::Dtype dtype_;
   layer::NpuWordEmbedding npu_embed_tokens_{nullptr};
@@ -342,6 +357,55 @@ class DeepseekV2ForCausalLMImpl
 
   void update_expert_weight(int32_t layer_id) override {
     model_->update_expert_weight(layer_id + first_k_dense_replace_);
+  }
+
+  // Keep default load_model() behavior unchanged.
+  // This helper is for VLM wrappers whose HF checkpoints place language model
+  // tensors under custom prefixes, e.g.:
+  // - language_model.model.*
+  // - language_model.lm_head.*
+  void load_model_with_prefixes(std::unique_ptr<ModelLoader> loader,
+                                const std::string& model_prefix,
+                                const std::string& lm_head_prefix) {
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      auto sub_dict = state_dict->get_dict_with_prefix(model_prefix);
+      if (sub_dict.size() == 0) {
+        sub_dict = state_dict->get_dict_with_prefix("model.");
+        if (sub_dict.size() == 0) {
+          sub_dict = state_dict->get_dict_with_prefix("");
+        }
+      }
+      model_->load_state_dict(sub_dict);
+
+      if (tie_word_embeddings) {
+        auto embed_dict =
+            state_dict->get_dict_with_prefix(model_prefix + "embed_tokens.");
+        if (embed_dict.size() == 0) {
+          embed_dict = state_dict->get_dict_with_prefix("model.embed_tokens.");
+          if (embed_dict.size() == 0) {
+            embed_dict = state_dict->get_dict_with_prefix("embed_tokens.");
+          }
+        }
+        npu_lm_head_->load_state_dict(embed_dict);
+      } else {
+        auto lm_dict = state_dict->get_dict_with_prefix(lm_head_prefix);
+        if (lm_dict.size() == 0) {
+          lm_dict = state_dict->get_dict_with_prefix("lm_head.");
+        }
+        npu_lm_head_->load_state_dict(lm_dict);
+      }
+    }
+
+    // verify
+    model_->verify_loaded_weights(model_prefix);
+    if (tie_word_embeddings) {
+      npu_lm_head_->verify_loaded_weights(model_prefix + "embed_tokens.");
+    } else {
+      npu_lm_head_->verify_loaded_weights(lm_head_prefix);
+    }
+
+    model_->merge_loaded_weights();
+    npu_lm_head_->merge_loaded_weights();
   }
 
  private:

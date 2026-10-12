@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +20,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common.pb.h"
@@ -36,20 +37,23 @@ class EngineType {
     VLM = 2,
     DIT = 3,
     REC = 4,
+    VLMSSM = 5,
     INVALID = -1,
   };
 
   constexpr EngineType(Value v) : value_(v) {}
   EngineType(const std::string& str) {
-    if (str == "LLM") {
+    if (str == "LLM" || str == "llm") {
       value_ = LLM;
-    } else if (str == "SSM") {
+    } else if (str == "SSM" || str == "ssm") {
       value_ = SSM;
-    } else if (str == "VLM") {
+    } else if (str == "VLM" || str == "vlm") {
       value_ = VLM;
-    } else if (str == "DIT") {
+    } else if (str == "VLMSSM" || str == "vlmssm") {
+      value_ = VLMSSM;
+    } else if (str == "DIT" || str == "dit") {
       value_ = DIT;
-    } else if (str == "REC") {
+    } else if (str == "REC" || str == "rec") {
       value_ = REC;
     } else {
       value_ = INVALID;
@@ -73,6 +77,8 @@ class EngineType {
       return "SSM";
     } else if (this->value_ == VLM) {
       return "VLM";
+    } else if (this->value_ == VLMSSM) {
+      return "VLMSSM";
     } else if (this->value_ == DIT) {
       return "DIT";
     } else if (this->value_ == REC) {
@@ -198,12 +204,31 @@ struct RawToken {
   std::vector<float> embeddings;  // hidden states
 };
 
-// Weight segment info for D2D transfer (supports non-contiguous allocation)
+struct RecItemInfo {
+  // The decoded recommendation item id.
+  int64_t item_id = 0;
+  // The DID associated with the recommendation item.
+  std::string did;
+  // The business type associated with the recommendation item.
+  std::string type;
+};
+
+// Weight segment info for P2P transfer (supports non-contiguous allocation)
 // Forward declaration needed by InstanceInfo
 struct WeightSegment {
   uint64_t offset;  // Offset from GlobalXTensor base address
   uint64_t size;    // Segment size in bytes
 };
+
+// Values of InstanceInfo.cp_index_write_mode (InstanceMetaInfo.
+// cp_index_write_mode on the wire): which pages of each INDEX resource a
+// CP/KV-split instance actually writes. Mirrors XLLM_CP_INDEX_WRITE_MODE
+// (xllm/python/model_executor/cp_utils.py) -- the mode decides INDEX page
+// validity semantics, so it is declared at registration and consulted by
+// plan_kv_split_widths before a PD link is admitted.
+inline constexpr int32_t kCpIndexWriteModeUnspecified = 0;
+inline constexpr int32_t kCpIndexWriteModeReplicated = 1;
+inline constexpr int32_t kCpIndexWriteModeSharded = 2;
 
 struct InstanceInfo {
   std::string name = "";
@@ -215,11 +240,21 @@ struct InstanceInfo {
   // remote kv cache info
   std::vector<uint64_t> cluster_ids;
   std::vector<std::string> addrs;
-  std::vector<int64_t> k_cache_ids;
-  std::vector<int64_t> v_cache_ids;
-  int32_t dp_size;
-  // device network info
-  std::vector<std::string> device_ips;
+  int32_t dp_size = 1;
+  // Direct construction defaults this to 1, but instance_info_from_proto
+  // copies the wire value verbatim: a peer registered before the field
+  // existed (or served by a service that never carried it) arrives as the
+  // proto3 zero, which means "width never declared" -- a state the KV-split
+  // width gate treats differently from an explicit 1 (see
+  // plan_kv_split_widths: an undeclared destination width refuses a split
+  // source). Do not "normalize" the zero here; the distinction is load-bearing.
+  int32_t kv_split_size = 1;
+  // Which pages of each INDEX resource this instance writes; see the
+  // kCpIndexWriteMode* constants above. 0 (the default) means the instance
+  // predates the field or never declared a mode, in which case link
+  // admission keeps the legacy behavior.
+  int32_t cp_index_write_mode = kCpIndexWriteModeUnspecified;
+  // transfer listen ports
   std::vector<uint16_t> ports;
   // ttft profiling data
   std::vector<std::pair<int32_t, double>> ttft_profiling_data;
@@ -256,10 +291,9 @@ struct InstanceInfo {
     }
     json_val["cluster_ids"] = cluster_ids;
     json_val["addrs"] = addrs;
-    json_val["k_cache_ids"] = k_cache_ids;
-    json_val["v_cache_ids"] = v_cache_ids;
     json_val["dp_size"] = dp_size;
-    json_val["device_ips"] = device_ips;
+    json_val["kv_split_size"] = kv_split_size;
+    json_val["cp_index_write_mode"] = cp_index_write_mode;
     json_val["ports"] = ports;
     json_val["ttft_profiling_data"] = ttft_profiling_data;
     json_val["tpot_profiling_data"] = tpot_profiling_data;
@@ -286,17 +320,48 @@ struct XTensorLayerOffsets {
   std::vector<uint64_t> v_offsets;  // V cache offsets in GlobalXTensor
 };
 
+// Transfer mapping for one cache group. group_id is an opaque, stable
+// identifier shared by the P/D cache layouts; transfer code does not interpret
+// model semantics such as compression ratios.
+struct KVTransferMapping {
+  int32_t group_id = 0;
+  std::vector<uint64_t> local_ids;
+  std::vector<uint64_t> remote_ids;
+  // Number of leading blocks D already has from its own device-side prefix
+  // cache under this group. P uses this to compress its per-group transfer
+  // cursor to the first block D actually needs (no shared -> zero, no-op).
+  uint32_t remote_shared_num = 0;
+};
+
 struct TransferKVInfo {
   std::string request_id;
-  std::vector<uint64_t> local_blocks_ids;
-  std::vector<uint64_t> remote_blocks_ids;
-  int32_t dp_rank;
+  // True when mappings are scoped to the current KV rank and remote_ids maps
+  // one-to-one to local_ids. False means remote_ids is expanded across all
+  // KV-split ranks and must be filtered before transfer.
+  bool rank_local_mapping = false;
+  int32_t dp_rank = 0;
   InstanceInfo remote_instance_info;
 
   // XTensor mode: destination offsets from D-node (per-layer)
-  // Only populated when FLAGS_enable_xtensor is true
+  // Only populated when KVCacheConfig::enable_xtensor is true.
   std::vector<XTensorLayerOffsets> dst_xtensor_layer_offsets;
+
+  // One entry per cache id space. group_id is unique within one request.
+  std::vector<KVTransferMapping> mappings;
 };
+
+inline std::vector<std::string> unique_transfer_request_ids(
+    const std::vector<TransferKVInfo>& transfer_kv_infos) {
+  std::unordered_set<std::string> seen_request_ids;
+  std::vector<std::string> request_ids;
+  request_ids.reserve(transfer_kv_infos.size());
+  for (const TransferKVInfo& info : transfer_kv_infos) {
+    if (seen_request_ids.emplace(info.request_id).second) {
+      request_ids.emplace_back(info.request_id);
+    }
+  }
+  return request_ids;
+}
 
 // in bytes
 struct DeviceStats {
@@ -329,21 +394,6 @@ struct JsonTool {
   JsonTool(const std::string& tool_type, const JsonFunction& func)
       : type(tool_type), function(func) {}
 };
-// Experts update the required information
-struct EplbInfo {
-  // Target layer ID for new expert weight pre-loading (-1 = no pending load)
-  // Values >=0 indicate the layer ID that should start loading new expert
-  // weights
-  int32_t prepare_layer_id = -1;
-  // Expert IDs requiring updates, ordered by device shard assignment
-  // Contains per-device expert indices for distributed weight updates
-  std::vector<int32_t> expert_ids;
-  // Layer ID ready for expert weight activation (-1 = no pending update)
-  // Values >=0 indicate the layer ID whose pre-loaded weights are ready for
-  // deployment
-  int32_t update_layer_id = -1;
-};
-
 class MasterStatus {
  public:
   enum Value : int32_t {
@@ -353,7 +403,9 @@ class MasterStatus {
   };
 
   constexpr MasterStatus(Value v) : value_(v) {}
-  constexpr MasterStatus(const xllm::proto::MasterStatus& status) {
+
+  explicit MasterStatus(const xllm::proto::MasterStatus& status)
+      : value_(WAKEUP) {
     switch (status) {
       case xllm::proto::MasterStatus::WAKEUP:
         value_ = WAKEUP;
@@ -366,7 +418,6 @@ class MasterStatus {
         break;
       default:
         LOG(FATAL) << "Unsupported master status: " << status;
-        value_ = WAKEUP;  // unreachable, suppress warning
         break;
     }
   }
@@ -381,7 +432,7 @@ class MasterStatus {
   bool operator==(Value rhs) const { return value_ == rhs; }
   bool operator!=(Value rhs) const { return value_ != rhs; }
 
-  constexpr xllm::proto::MasterStatus to_proto() const {
+  xllm::proto::MasterStatus to_proto() const {
     switch (value_) {
       case WAKEUP:
         return xllm::proto::MasterStatus::WAKEUP;
@@ -415,4 +466,5 @@ inline constexpr const char* LLM_REC_INPUT_TOKENS = "llm_rec_input_tokens";
 inline constexpr const char* LLM_REC_INPUT_INDICES = "llm_rec_input_indices";
 inline constexpr const char* LLM_REC_INPUT_EMBEDDING =
     "llm_rec_input_embedding";
+
 }  // namespace xllm

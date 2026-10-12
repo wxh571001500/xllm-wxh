@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -40,25 +40,30 @@ class DisaggPDService : public proto::DisaggPDService {
                        ::google::protobuf::Closure* done) override;
 
   // for decode recv multiple tokens from prefill
-  virtual void MultiGenerations(::google::protobuf::RpcController* controller,
-                                const proto::DisaggGenerationsRequests* request,
-                                proto::Status* response,
-                                ::google::protobuf::Closure* done) override;
+  void MultiGenerations(::google::protobuf::RpcController* controller,
+                        const proto::DisaggGenerationsRequests* request,
+                        proto::Status* response,
+                        ::google::protobuf::Closure* done) override;
 
-  virtual void SendPullSignal(::google::protobuf::RpcController* controller,
-                              const proto::PullSignal* request,
-                              proto::Status* response,
-                              ::google::protobuf::Closure* done) override;
+  void SendPullSignal(::google::protobuf::RpcController* controller,
+                      const proto::PullSignal* request,
+                      proto::Status* response,
+                      ::google::protobuf::Closure* done) override;
 
-  virtual void LinkInstance(::google::protobuf::RpcController* controller,
-                            const proto::InstanceClusterInfo* request,
-                            proto::Status* response,
-                            ::google::protobuf::Closure* done) override;
+  void LinkInstance(::google::protobuf::RpcController* controller,
+                    const proto::InstanceClusterInfo* request,
+                    proto::Status* response,
+                    ::google::protobuf::Closure* done) override;
 
-  virtual void UnlinkInstance(::google::protobuf::RpcController* controller,
-                              const proto::InstanceClusterInfo* request,
-                              proto::Status* response,
-                              ::google::protobuf::Closure* done) override;
+  void UnlinkInstance(::google::protobuf::RpcController* controller,
+                      const proto::InstanceClusterInfo* request,
+                      proto::Status* response,
+                      ::google::protobuf::Closure* done) override;
+
+  void ReleaseReservation(::google::protobuf::RpcController* controller,
+                          const proto::ReleaseReservationRequest* request,
+                          proto::ReleaseReservationResponse* response,
+                          ::google::protobuf::Closure* done) override;
 
  protected:
   std::unique_ptr<DisaggPDServiceImpl> disagg_pd_service_impl_;

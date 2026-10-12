@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,17 +19,18 @@ limitations under the License.
 
 #include <tuple>
 
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_DCU)
 #include "kernels/cuda/cuda_ops_api.h"
 #endif
 namespace {
 inline bool is_qwen3_model(const std::string& model_type) {
   static const std::unordered_set<std::string> qwen3_type_set = {
-      "qwen3", "qwen3_vl", "qwen3_moe", "qwen3_vl_moe"};
-  return qwen3_type_set.contains(model_type);
+      "qwen3", "qwen3_vl", "qwen3_moe", "qwen3_vl_moe", "oxygenvlm"};
+  return qwen3_type_set.contains(model_type) ||
+         xllm::is_dflash2_draft_model_type(model_type);
 }
 
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_DCU)
 inline bool supports_fused_qk_norm_rope_head_dim(int64_t head_dim) {
   return head_dim == 64 || head_dim == 128 || head_dim == 256;
 }
@@ -68,7 +69,7 @@ Qwen2AttentionImpl::Qwen2AttentionImpl(const ModelContext& context) {
   q_size_ = num_heads_ * head_dim_;
   kv_size_ = num_kv_heads_ * head_dim_;
   scaling_ = std::sqrt(1.0f / head_dim_);
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_DCU)
   // Fused QKNorm+RoPE currently only supports:
   // 1) non-MRoPE models (positions must be 1D),
   // 2) head_dim in {64, 128, 256}.
@@ -144,7 +145,7 @@ torch::Tensor Qwen2AttentionImpl::forward(
   const int64_t T = q.size(0);
   bool fused_qk_norm_rope_applied = false;
 
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_DCU)
   // Runtime guard: fused QKNorm+RoPE only accepts 1D position_ids.
   // MRoPE provides 2D positions, so it must fall back to the unfused path.
   if (can_use_fused_qk_norm_rope_ && positions.dim() == 1) {
@@ -193,11 +194,34 @@ torch::Tensor Qwen2AttentionImpl::forward(
 }
 
 void Qwen2AttentionImpl::load_state_dict(const StateDict& state_dict) {
+  q_proj_weight_seen_ = q_proj_weight_seen_ || state_dict.has("q_proj.weight");
+  k_proj_weight_seen_ = k_proj_weight_seen_ || state_dict.has("k_proj.weight");
+  v_proj_weight_seen_ = v_proj_weight_seen_ || state_dict.has("v_proj.weight");
   qkv_proj_->load_state_dict(state_dict, {"q_proj.", "k_proj.", "v_proj."});
   o_proj_->load_state_dict(state_dict.get_dict_with_prefix("o_proj."));
   if (is_qwen3_style_) {
     q_norm_->load_state_dict(state_dict.get_dict_with_prefix("q_norm."));
     k_norm_->load_state_dict(state_dict.get_dict_with_prefix("k_norm."));
+  }
+}
+
+void Qwen2AttentionImpl::verify_loaded_weights(
+    const std::string& prefix) const {
+  if (!qkv_proj_->is_weight_loaded()) {
+    CHECK(q_proj_weight_seen_)
+        << "weight is not loaded for " << prefix + "q_proj.weight";
+    CHECK(k_proj_weight_seen_)
+        << "weight is not loaded for " << prefix + "k_proj.weight";
+    CHECK(v_proj_weight_seen_)
+        << "weight is not loaded for " << prefix + "v_proj.weight";
+  }
+  CHECK(qkv_proj_->is_weight_loaded()) << "weight is not loaded for " << prefix
+                                       << "{q_proj,k_proj,v_proj}.weight";
+  CHECK(o_proj_->is_weight_loaded())
+      << "weight is not loaded for " << prefix + "o_proj.weight";
+  if (is_qwen3_style_) {
+    q_norm_->verify_loaded_weights(prefix + "q_norm.");
+    k_norm_->verify_loaded_weights(prefix + "k_norm.");
   }
 }
 

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,9 +19,11 @@ limitations under the License.
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "common/global_flags.h"
 #include "common/macros.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "phy_page.h"  // Includes page_id_t definition
 #include "platform/vmm_api.h"
 
@@ -33,10 +35,7 @@ using offset_t = page_id_t;
 /* NOTE: XTensorAllocator is thread-safe but XTensor is not. */
 class XTensor {
  public:
-  XTensor(size_t size,
-          torch::Dtype dtype,
-          torch::Device dev,
-          PhyPage* zero_page);
+  XTensor(size_t size, torch::Dtype dtype, torch::Device dev);
 
   // Constructor for weight tensor using pre-allocated page_ids (non-contiguous)
   // page_ids: physical page IDs from PhyPagePool (allocated via
@@ -105,14 +104,14 @@ class XTensor {
  private:
   // Map a single physical page at the given offset
   bool map_phy_page_(PhyPage* page, offset_t offset);
-  bool init_with_zero_();
 
   VirPtr vaddr_;
   size_t size_;
-  size_t page_size_;  // Page size (FLAGS_phy_page_granularity_size)
+  size_t
+      page_size_;  // Page size
+                   // (::xllm::KVCacheConfig::get_instance().phy_page_granularity_size())
   torch::Dtype dtype_;
   torch::Device dev_;
-  PhyPage* zero_page_;  // Not owned, managed by PhyPagePool
 
   // Maps page id -> PhyPage (page id = offset / page_size_)
   std::unordered_map<page_id_t, std::unique_ptr<PhyPage>> mapping_;

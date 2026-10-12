@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <vector>
+
 #if defined(USE_CUDA) || defined(USE_MUSA)
 #include <tvm/ffi/container/array.h>
 namespace ffi = tvm::ffi;
@@ -26,8 +28,59 @@ namespace ffi = tvm::ffi;
 #include <optional>
 #include <string>
 
+#include "dsa_metadata.h"
+#include "layers/common/kv_shard_batch_metadata.h"
+
+#if defined(USE_NPU)
+namespace xllm::npu {
+class AclGraphTaskUpdateContext;
+}
+#endif
+
 namespace xllm::layer {
 
+struct ExpandedDecodeMetadata {
+  bool enabled = false;
+  torch::Tensor kv_seq_lens;
+  torch::Tensor block_table;
+  torch::Tensor paged_kv_indptr;
+  torch::Tensor paged_kv_indices;
+  torch::Tensor paged_kv_last_page_len;
+  torch::Tensor paged_attention_tiling_data;
+  torch::Tensor kv_seq_lens_host;
+  std::vector<int32_t> kv_seq_lens_host_vec;
+};
+
+struct KPoolBatchMetadata {
+  std::vector<int32_t> q_seq_lens;
+  std::vector<int32_t> kv_seq_lens;
+  torch::Tensor row_batch;
+  torch::Tensor query_starts;
+  torch::Tensor block_table;
+  torch::Tensor tail_indices;
+  int64_t max_kv_len = 0;
+};
+
+#if defined(USE_NPU)
+struct MegaGdnPrefillIndicesKey {
+  torch::Device device;
+  int64_t batch_size;
+  int64_t num_slots;
+  int64_t checkpoint_stride;
+  std::vector<int32_t> linear_state_ids;
+  std::vector<int64_t> linear_state_validity_mask;
+  std::vector<int32_t> linear_state_read_ids;
+};
+
+struct MegaGdnPrefillIndicesCache {
+  torch::Tensor conv_read;
+  torch::Tensor conv_write;
+  torch::Tensor ssm_read;
+  torch::Tensor ssm_write;
+  MegaGdnPrefillIndicesKey key;
+  int64_t device_tensor_materializations;
+};
+#endif
 #if defined(USE_CUDA) || defined(USE_MUSA)
 struct PlanInfo {
   int32_t layer_id = -1;
@@ -45,6 +98,7 @@ struct XAttentionTwoStageDecodeCache {
 
   // Fixed tensors (values don't change for the same batch/shape)
   torch::Tensor q_cu_seq_lens_shared;             // [batch_size + 1], int32
+  torch::Tensor qo_indptr_expanded;               // [total_beam + 1], int32
   torch::Tensor paged_kv_indptr_expanded;         // [total_beam + 1], int32
   torch::Tensor paged_kv_indices_expanded;        // [total_beam], int32
   torch::Tensor paged_kv_last_page_len_expanded;  // [total_beam], int32
@@ -59,6 +113,19 @@ struct XAttentionTwoStageDecodeCache {
 };
 #endif
 
+#if defined(USE_MUSA)
+// FA3 / FlashInfer extras used by MUSA attention and graph replay:
+// CPU host mirrors for plan updates (avoid D2H during capture) and optional
+// shared FA3 scheduler metadata across layers.
+struct Fa3AttentionMetadata {
+  torch::Tensor paged_kv_indptr_host;
+  torch::Tensor paged_kv_indices_host;
+  torch::Tensor paged_kv_last_page_len_host;
+  bool share_fa3_scheduler_metadata = false;
+  mutable torch::Tensor fa3_scheduler_metadata;
+};
+#endif
+
 // AttentionMetadata contains batch-level information shared across all
 // attention layers. It is built once at the beginning of model forward pass and
 // reused by all layers. This avoids redundant computation and memory allocation
@@ -70,17 +137,42 @@ struct AttentionMetadata {
   torch::Tensor kv_cu_seq_lens;
   torch::Tensor kv_seq_lens;
   torch::Tensor q_seq_lens;
+  std::vector<int32_t> kv_seq_lens_vec;
+  std::vector<int32_t> q_seq_lens_vec;
   torch::Tensor block_table;
   torch::Tensor slot_mapping;
+  // Stable per-sequence slot ids for model-owned recurrent state.
+  torch::Tensor linear_state_indices;
+  std::vector<int32_t> kpool_query_lens;
+  std::shared_ptr<const KPoolBatchMetadata> kpool_batch_metadata;
+  // Cache-shard derivations are immutable batch data shared by all layers.
+  std::shared_ptr<const KVShardBatchMetadata> kv_shard_batch_metadata;
   int64_t max_query_len;
   int64_t max_seq_len;
   int64_t total_kv_len = 0;
   std::string compute_dtype;
   bool is_prefill;
   bool is_chunked_prefill;
+  bool is_mixed = false;
+  // Run prefill attention without writing key/value tensors to paged cache.
+  bool prefill_without_cache = false;
   bool is_dummy;
   // Whether to apply causal mask. Default: true.
   bool is_causal = true;
+  // Optional non-causal prefill window for backends that consume it.
+  // An absent window preserves the backend's existing masking behavior.
+  std::optional<int32_t> non_causal_window_right;
+#if defined(USE_DCU)
+  bool use_dense_flash_attention = false;
+#endif
+
+  // Spec-verify ACL graph can run full attention as expanded decode while GDN
+  // layers keep the original spec-verify metadata.
+  ExpandedDecodeMetadata expanded_decode;
+  // Shared by NPU ACL graph and MUSA FlashInfer expanded-decode routing.
+  bool is_spec_verify = false;
+  // DFlash2 proposal block. Distinct from target spec-verify.
+  bool is_dflash_proposal = false;
 
   // for mrope
   torch::Tensor mrope_cos;
@@ -139,16 +231,50 @@ struct AttentionMetadata {
   torch::Tensor unshared_v_cache;
   torch::Tensor step_tensor;
 
+  // for GDN attention
+  torch::Tensor chunk_indices;
+  torch::Tensor batch;
+  torch::Tensor token_block_offset;
+  // Per-sequence recurrent-state validity for prefill/chunked-prefill only.
+  // Decode advances already-initialized states selected by linear state ids.
+  torch::Tensor has_initial_states;
+  int32_t tot = 0;
+
   // custom attention mask
   torch::Tensor attn_mask;
 
+  // DeepSeek V4 sparse attention metadata (optional).
+  // Built by DSAMetadataBuilder and shared across all layers.
+  std::shared_ptr<DSAMetadata> dsa_metadata;
+
+#if defined(USE_MUSA)
+  Fa3AttentionMetadata fa3_metadata;
+#endif
+
 #if defined(USE_NPU)
+  // Lazily materialized by the first Qwen3.5 GDN Prefill layer and shared by
+  // subsequent GDN layers within this model forward.
+  mutable std::optional<MegaGdnPrefillIndicesCache> mega_gdn_prefill_indices;
+
   // for npu
+  std::shared_ptr<npu::AclGraphTaskUpdateContext> acl_graph_task_update_context;
+  torch::Tensor q_seq_lens_host;
   torch::Tensor kv_seq_lens_host;
-  // For ACL graph execution - tiling data for CustomPagedAttention.
-  // If defined, use this instead of kv_seq_lens_host to avoid .to(kCPU)
-  // operations that break ACL graph capture.
+  // For ACL graph execution - fixed-address device tiling data for
+  // CustomPagedAttention replay.
   torch::Tensor paged_attention_tiling_data;
+  // Pre-computed attention mask for npu_fused_infer_attention.
+  torch::Tensor fia_attn_mask;
+  // Optional FIA band-mode overrides. Negative values retain the default
+  // causal/full-attention behavior selected by AttentionImpl.
+  int64_t fia_sparse_mode = -1;
+  int64_t fia_pre_tokens = -1;
+  int64_t fia_next_tokens = -1;
+  // Host vectors for npu_fused_infer_attention (kernel requires host memory).
+  std::vector<int64_t> q_cu_seq_lens_host_vec;
+  std::vector<int64_t> kv_cu_seq_lens_host_vec;
+  // Non-cumulative per-sequence lengths for chunked_prefill mode.
+  std::vector<int64_t> kv_seq_lens_host_vec;
 #endif
 };
 

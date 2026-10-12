@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -36,9 +36,24 @@ bool TokenizerProxy::encode(const std::string_view& text,
   return get_tls_tokenizer()->encode(text, ids, add_special_tokens);
 }
 
+bool TokenizerProxy::encode(int64_t item_id,
+                            std::vector<int32_t>* token_ids) const {
+  return get_tls_tokenizer()->encode(item_id, token_ids);
+}
+
 std::string TokenizerProxy::decode(const Slice<int32_t>& ids,
                                    bool skip_special_tokens) const {
   return get_tls_tokenizer()->decode(ids, skip_special_tokens);
+}
+
+std::string TokenizerProxy::decode_token(int32_t id) const {
+  return get_tls_tokenizer()->decode_token(id);
+}
+
+bool TokenizerProxy::decode(const Slice<int32_t>& token_ids,
+                            bool skip_special_tokens,
+                            std::vector<int64_t>* item_ids) const {
+  return get_tls_tokenizer()->decode(token_ids, skip_special_tokens, item_ids);
 }
 
 std::optional<int32_t> TokenizerProxy::token_to_id(

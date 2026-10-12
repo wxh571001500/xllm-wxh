@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,38 +15,24 @@ limitations under the License.
 
 #pragma once
 
-#include "api_service/api_service_impl.h"
+#include <string>
+#include <vector>
 
 namespace xllm {
 
-template <typename T>
+class APIService;
+class Master;
+
+// Creates all service-impl instances that an APIService needs for the active
+// engine type.  Adding a new engine type only requires one new entry in the
+// registry defined in service_impl_factory.cpp.
 class ServiceImplFactory {
  public:
-  static std::unique_ptr<T> create_service_impl(
-      LLMMaster* master,
-      const std::vector<std::string>& model_names) {
-    auto service_impl = std::make_unique<T>(master, model_names);
-    if (!service_impl) {
-      LOG(ERROR) << "handler is nullptr";
-    }
-    return service_impl;
-  }
-
-  static std::unique_ptr<T> create_service_impl(
-      const std::vector<std::string>& model_names,
-      const std::vector<std::string>& model_versions) {
-    if (model_names.size() != model_versions.size()) {
-      LOG(ERROR)
-          << "Models and model_versions size mismatch: model_names.size()="
-          << model_names.size()
-          << ", model_versions.size()=" << model_versions.size();
-    }
-    auto service_impl = std::make_unique<T>(model_names, model_versions);
-    if (!service_impl) {
-      LOG(ERROR) << "handler is nullptr";
-    }
-    return service_impl;
-  }
+  static void create(APIService* service,
+                     Master* master,
+                     const std::vector<std::string>& model_names,
+                     const std::vector<std::string>& model_repository_names,
+                     const std::vector<std::string>& model_versions);
 };
 
 }  // namespace xllm

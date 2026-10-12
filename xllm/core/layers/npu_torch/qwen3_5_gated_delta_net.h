@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,10 +17,13 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 
-#include "qwen3_next_gated_delta_net.h"
+#include "core/layers/npu_torch/qwen3_5_gdn_indices.h"
+#include "core/layers/npu_torch/qwen3_next_gated_delta_net.h"
 
 namespace xllm {
 namespace layer {
@@ -33,10 +36,17 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
                            const ParallelArgs& parallel_args,
                            const torch::TensorOptions& options);
 
+  torch::Tensor forward(const torch::Tensor& hidden_states,
+                        const AttentionMetadata& attn_metadata,
+                        KVCache& kv_cache,
+                        const ModelInputParams& input_params) override;
+
  protected:
-  std::pair<torch::Tensor, torch::Tensor> project_padded_inputs(
-      const torch::Tensor& hidden_states,
-      const AttentionMetadata& attn_metadata) override;
+  std::optional<
+      std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
+  project_split_inputs(const torch::Tensor& hidden_states,
+                       const AttentionMetadata& attn_metadata) override;
+  bool use_fla_ssm_state_layout() const override { return true; }
 
   void load_projection_state_dict(const StateDict& state_dict) override;
   void verify_projection_weights(const std::string& prefix) const override;

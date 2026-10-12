@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,6 +28,8 @@ namespace function_call {
 class DeepSeekV32Detector : public BaseFormatDetector {
  public:
   DeepSeekV32Detector();
+  DeepSeekV32Detector(const std::string& tool_calls_start_token,
+                      const std::string& tool_calls_end_token);
 
   virtual ~DeepSeekV32Detector() = default;
 
@@ -66,6 +68,11 @@ class DeepSeekV32Detector : public BaseFormatDetector {
   std::vector<ToolCallItem> parse_json_tool_calls(
       const std::string& text,
       const std::vector<JsonTool>& tools);
+};
+
+class DeepSeekV4Detector final : public DeepSeekV32Detector {
+ public:
+  DeepSeekV4Detector();
 };
 
 }  // namespace function_call

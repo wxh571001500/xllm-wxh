@@ -1,0 +1,295 @@
+include(cc_test)
+
+cc_test(
+  NAME
+    vlm_request_factory_test
+  CPU_ONLY
+  SRCS
+    vlm_request_factory_test.cpp
+  DEPS
+    :common
+    :config
+    :request
+    :processors
+    :jinja_chat_template
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(vlm_request_factory_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(vlm_request_factory_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    rec_request_factory_test
+  CPU_ONLY
+  SRCS
+    rec_request_factory_test.cpp
+  DEPS
+    :common
+    :config
+    :request
+    :util
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(rec_request_factory_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(rec_request_factory_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sample_slot_test
+  CPU_ONLY
+  SRCS
+    sample_slot_test.cpp
+  DEPS
+    :config
+    :request
+    GTest::gtest
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    request_params_test
+  CPU_ONLY
+  SRCS
+    request_params_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    llm_request_factory_test
+  CPU_ONLY
+  SRCS
+    llm_request_factory_test.cpp
+  DEPS
+    :common
+    :config
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(llm_request_factory_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(llm_request_factory_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    dit_media_sources_test
+  CPU_ONLY
+  SRCS
+    dit_media_sources_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    dit_tensor_sources_test
+  SRCS
+    dit_tensor_sources_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    dit_request_params_test
+  CPU_ONLY
+  SRCS
+    dit_request_params_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    dit_request_test
+  CPU_ONLY
+  SRCS
+    dit_request_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    stopping_checker_test
+  CPU_ONLY
+  SRCS
+    stopping_checker_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    request_prefix_cache_tokens_test
+  CPU_ONLY
+  SRCS
+    request_prefix_cache_tokens_test.cpp
+  DEPS
+    :block
+    :config
+    :request
+    GTest::gtest_main
+)
+target_link_libraries(request_prefix_cache_tokens_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(request_prefix_cache_tokens_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sequence_kv_state_test
+  CPU_ONLY
+  SRCS
+    sequence_kv_state_test.cpp
+  DEPS
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(sequence_kv_state_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(sequence_kv_state_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sequence_mtp_bootstrap_test
+  CPU_ONLY
+  SRCS
+    sequence_mtp_bootstrap_test.cpp
+  DEPS
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(sequence_mtp_bootstrap_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(sequence_mtp_bootstrap_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sequence_generated_tokens_test
+  CPU_ONLY
+  SRCS
+    sequence_generated_tokens_test.cpp
+  DEPS
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(sequence_generated_tokens_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(sequence_generated_tokens_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sequence_stop_output_test
+  CPU_ONLY
+  SRCS
+    sequence_stop_output_test.cpp
+  DEPS
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(sequence_stop_output_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(sequence_stop_output_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sequence_mrope_positions_test
+  CPU_ONLY
+  SRCS
+    sequence_mrope_positions_test.cpp
+  DEPS
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(sequence_mrope_positions_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(sequence_mrope_positions_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)

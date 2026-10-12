@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,8 +24,8 @@ limitations under the License.
 #include <vector>
 
 #include "common.pb.h"
+#include "core/framework/multimodal/mm_data.h"
 #include "core/framework/sampling/sampling_params.h"
-#include "mm_data.h"
 #include "sequence.h"
 #include "stopping_checker.h"
 #include "util/threadpool.h"
@@ -38,7 +38,7 @@ class SequencesGroup {
                  const std::vector<int32_t>& prompt_tokens,
                  const torch::Tensor& input_embedding,
                  const MMData& mm_data,
-                 const SequenceParams& sequence_params);
+                 SequenceParams sequence_params);
 
   bool finished() const;
 
@@ -48,7 +48,7 @@ class SequencesGroup {
                         const Tokenizer& tokenizer,
                         ThreadPool* thread_pool = nullptr);
 
-  void process_beam_search();
+  void process_beam_search(bool force_requested_result_size = false);
 
   bool check_beam_search() {
     return sequence_params_.sampling_param->beam_width > 1;

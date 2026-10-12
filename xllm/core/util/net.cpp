@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,17 +19,35 @@ limitations under the License.
 #include <glog/logging.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <unordered_set>
 
 namespace xllm {
 namespace net {
 
-static std::mutex g_port_mutex;
-static std::unordered_set<int> g_allocated_port_map;
+namespace {
+
+std::mutex g_port_mutex;
+std::unordered_set<int> g_allocated_port_map;
+
+std::string to_ip_addr(const sockaddr_in& addr) {
+  char ip[INET_ADDRSTRLEN]{'\0'};
+  const char* result =
+      inet_ntop(addr.sin_family, &addr.sin_addr, ip, sizeof(ip));
+  if (result == nullptr) {
+    return "";
+  }
+  return std::string(ip);
+}
+
+}  // namespace
 
 // TODO: return private ip
 std::string get_local_ip_addr() {
@@ -50,21 +68,77 @@ std::string get_local_ip_addr() {
     LOG(ERROR) << "getaddrinfo failed";
     return "";
   }
-  auto guard = std::unique_ptr<struct addrinfo, decltype(&freeaddrinfo)>(
-      info, freeaddrinfo);
-  auto* addr = (struct sockaddr_in*)info->ai_addr;
-  auto* result = inet_ntop(addr->sin_family, &addr->sin_addr, ip, sizeof(ip));
+  std::unique_ptr<struct addrinfo, decltype(&freeaddrinfo)> guard(info,
+                                                                  freeaddrinfo);
+  const sockaddr_in* addr = reinterpret_cast<const sockaddr_in*>(info->ai_addr);
+  const char* result =
+      inet_ntop(addr->sin_family, &addr->sin_addr, ip, sizeof(ip));
+  if (result == nullptr) {
+    LOG(ERROR) << "inet_ntop failed";
+    return "";
+  }
 
   return std::string(ip);
 }
 
+std::string get_route_ip(const std::string& remote_addr) {
+  std::string remote_host;
+  int remote_port = 0;
+  parse_host_port_from_addr(remote_addr, remote_host, remote_port);
+
+  struct addrinfo* info = nullptr;
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  std::string port = std::to_string(remote_port);
+  int ret = getaddrinfo(remote_host.c_str(), port.c_str(), &hints, &info);
+  if (ret != 0) {
+    LOG(ERROR) << "Failed to resolve remote address " << remote_addr << ": "
+               << gai_strerror(ret);
+    return "";
+  }
+  std::unique_ptr<struct addrinfo, decltype(&freeaddrinfo)> guard(info,
+                                                                  freeaddrinfo);
+
+  for (const struct addrinfo* current = info; current != nullptr;
+       current = current->ai_next) {
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+      continue;
+    }
+    ret = connect(fd, current->ai_addr, current->ai_addrlen);
+    if (ret != 0) {
+      ::close(fd);
+      continue;
+    }
+
+    sockaddr_in local{};
+    socklen_t local_len = sizeof(local);
+    ret =
+        getsockname(fd, reinterpret_cast<struct sockaddr*>(&local), &local_len);
+    ::close(fd);
+    if (ret != 0) {
+      continue;
+    }
+
+    std::string local_ip = to_ip_addr(local);
+    if (!local_ip.empty()) {
+      return local_ip;
+    }
+  }
+
+  LOG(ERROR) << "No local route found for remote address " << remote_addr;
+  return "";
+}
+
 int get_local_free_port() {
   std::lock_guard<std::mutex> lock(g_port_mutex);
-  int port;
+  int port = 0;
   do {
     port = 0;
     struct sockaddr_in addr;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
       return -1;
     }
@@ -72,11 +146,14 @@ int get_local_free_port() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+      ::close(fd);
       return -1;
     }
     socklen_t len = sizeof(addr);
-    if (getsockname(fd, (struct sockaddr*)&addr, &len) == -1) {
+    if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len) ==
+        -1) {
+      ::close(fd);
       return -1;
     }
     port = ntohs(addr.sin_port);
@@ -119,7 +196,7 @@ std::string extract_ip(const std::string& input) {
   std::string ip;
 
   std::getline(stream, ip, ':');
-  if (ip == "127.0.0.1") {
+  if (ip == "127.0.0.1" || ip == "0.0.0.0" || ip == "localhost") {
     ip = get_local_ip_addr();
   }
   return ip;
@@ -141,7 +218,7 @@ void parse_host_port_from_addr(const std::string& addr,
                                int& port) {
   CHECK(!addr.empty()) << "Address is empty";
 
-  auto colon_pos = addr.find(':');
+  const std::size_t colon_pos = addr.find(':');
   CHECK_NE(colon_pos, std::string::npos) << "Invalid address format: " << addr;
 
   host = addr.substr(0, colon_pos);

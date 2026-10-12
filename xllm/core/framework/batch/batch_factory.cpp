@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -67,12 +67,14 @@ std::vector<Batch> BatchFactory::create_batches(
   }
 
   for (int i = 0; i < dp_size_; i++) {
-    if (!batches[i].empty()) {
-      if (swap_block_transfer_infos != nullptr &&
-          swap_block_transfer_infos->size() == dp_size_) {
-        batches[i].set_swap_block_transfer_infos(
-            &(swap_block_transfer_infos->at(i)));
-      }
+    if (batches[i].empty()) {
+      continue;
+    }
+    if (swap_block_transfer_infos != nullptr &&
+        swap_block_transfer_infos->size() == dp_size_) {
+      batches[i].set_swap_block_transfer_infos(
+          std::move(swap_block_transfer_infos->at(i)));
+      swap_block_transfer_infos->at(i).clear();
     }
   }
 
@@ -125,12 +127,14 @@ std::vector<Batch> BatchFactory::create_rec_batches(
   }
 
   for (int i = 0; i < dp_size_; i++) {
-    if (!batches[i].empty()) {
-      if (swap_block_transfer_infos != nullptr &&
-          swap_block_transfer_infos->size() == dp_size_) {
-        batches[i].set_swap_block_transfer_infos(
-            &(swap_block_transfer_infos->at(i)));
-      }
+    if (batches[i].empty()) {
+      continue;
+    }
+    if (swap_block_transfer_infos != nullptr &&
+        swap_block_transfer_infos->size() == dp_size_) {
+      batches[i].set_swap_block_transfer_infos(
+          std::move(swap_block_transfer_infos->at(i)));
+      swap_block_transfer_infos->at(i).clear();
     }
   }
 

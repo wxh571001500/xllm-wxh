@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,8 @@ limitations under the License.
 #pragma once
 
 #include <torch/torch.h>
+
+#include <optional>
 
 #include "activation.h"
 #include "framework/model/model_args.h"
@@ -38,7 +40,10 @@ class DenseMLPImpl : public torch::nn::Module {
                bool enable_result_reduction,
                const QuantArgs& quant_args,
                ProcessGroup* process_group,
-               const torch::TensorOptions& options);
+               const torch::TensorOptions& options,
+               const std::string& module_prefix = "",
+               double swiglu_limit = 0.0,
+               bool apply_fc1_sequence_parallel = true);
 
   torch::Tensor forward(const torch::Tensor& hidden_states);
 
@@ -46,6 +51,8 @@ class DenseMLPImpl : public torch::nn::Module {
   void load_state_dict(const StateDict& state_dict,
                        const std::vector<std::string>& gate_up_name,
                        const std::string& down_name);
+
+  void verify_loaded_weights(const std::string& prefix) const;
 
   // Get FP8 input scale from gate_up_proj for fused RMSNorm+FP8 quantization
   std::optional<torch::Tensor> get_fp8_input_scale() const;
@@ -59,6 +66,12 @@ class DenseMLPImpl : public torch::nn::Module {
   Activation act_{nullptr};
   bool is_smoothquant_;
   std::string hidden_act_;
+  double swiglu_limit_ = 0.0;
+  bool apply_fc1_sequence_parallel_ = true;
+  // gate/up are fused at runtime; retain their logical checkpoint presence so
+  // a partial fused load reports the exact missing projection.
+  bool gate_proj_weight_seen_ = false;
+  bool up_proj_weight_seen_ = false;
 };
 TORCH_MODULE(DenseMLP);
 

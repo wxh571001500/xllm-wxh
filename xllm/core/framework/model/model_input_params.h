@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,23 +18,41 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
 #include <variant>
 
+#include "common/types.h"
+#include "framework/block/block.h"
+#include "framework/eplb/eplb_info.h"
+#include "platform/layer_synchronizer.h"
 #if defined(USE_NPU)
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
+#if defined(USE_MLU)
+#include "platform/mlu/mlu_layer_synchronizer.h"
+#endif
+#if defined(USE_DCU)
+#include "platform/dcu/dcu_layer_synchronizer.h"
+#endif
+
+#include "core/framework/model/mtp_topk_state.h"
+#include "core/framework/multimodal/mm_batch_data.h"
 #include "framework/batch/batch_forward_type.h"
-#include "framework/request/mm_batch_data.h"
-#include "npu_cp_ep_padding.h"
-#include "npu_cp_prepare.h"
-#include "npu_dp_ep_padding.h"
+#include "framework/parallel_state/npu_cp_plan.h"
+#include "framework/parallel_state/npu_dp_ep_padding.h"
+#include "runtime/dit_forward_params.h"
 #include "util/hash_util.h"
 #include "util/tensor_helper.h"
 
 namespace xllm {
+namespace npu {
+struct AclGraphTaskUpdateContext;
+}  // namespace npu
 namespace layer {
 struct AttentionMetadata;
 }  // namespace layer
@@ -64,7 +82,7 @@ struct OneRecModelInputParams {
   torch::Tensor cross_attn_kv_cu_seq_lens;
   torch::Tensor cross_attn_new_cache_slots;
   torch::Tensor cross_attn_block_tables;
-  std::vector<int> cross_attn_kv_cu_seq_lens_vec;
+  std::vector<int32_t> cross_attn_kv_cu_seq_lens_vec;
 
   torch::Tensor encoder_token_ids;
   torch::Tensor encoder_positions;
@@ -147,6 +165,70 @@ struct OneRecModelInputParams {
   }
 };
 
+struct OneRecXAttentionParams : public OneRecModelInputParams {
+  std::vector<torch::Tensor> unshared_k_caches;
+  std::vector<torch::Tensor> unshared_v_caches;
+  std::vector<torch::Tensor> shared_k_caches;
+  std::vector<torch::Tensor> shared_v_caches;
+  torch::Tensor beam_width_tensor;
+  torch::Tensor current_round_tensor;
+  torch::Tensor debug_selected_token_idxes;
+  std::vector<int64_t> debug_selected_token_idxes_expected;
+
+  OneRecXAttentionParams to(const c10::Device& device) const {
+    OneRecXAttentionParams result = *this;
+    static_cast<OneRecModelInputParams&>(result) =
+        OneRecModelInputParams::to(device);
+    result.unshared_k_caches.clear();
+    result.unshared_v_caches.clear();
+    result.shared_k_caches.clear();
+    result.shared_v_caches.clear();
+    result.unshared_k_caches.reserve(unshared_k_caches.size());
+    result.unshared_v_caches.reserve(unshared_v_caches.size());
+    result.shared_k_caches.reserve(shared_k_caches.size());
+    result.shared_v_caches.reserve(shared_v_caches.size());
+    for (const auto& t : unshared_k_caches) {
+      result.unshared_k_caches.emplace_back(safe_to(t, device));
+    }
+    for (const auto& t : unshared_v_caches) {
+      result.unshared_v_caches.emplace_back(safe_to(t, device));
+    }
+    for (const auto& t : shared_k_caches) {
+      result.shared_k_caches.emplace_back(safe_to(t, device));
+    }
+    for (const auto& t : shared_v_caches) {
+      result.shared_v_caches.emplace_back(safe_to(t, device));
+    }
+    if (beam_width_tensor.defined()) {
+      result.beam_width_tensor = safe_to(beam_width_tensor, device, true);
+    }
+    if (current_round_tensor.defined()) {
+      result.current_round_tensor = safe_to(current_round_tensor, device, true);
+    }
+    if (debug_selected_token_idxes.defined()) {
+      result.debug_selected_token_idxes =
+          safe_to(debug_selected_token_idxes, device);
+    }
+    return result;
+  }
+
+  void print() const {
+    LOG(INFO) << "OneRecXAttentionParams:";
+    OneRecModelInputParams::print();
+    LOG(INFO) << " unshared_k_caches size: " << unshared_k_caches.size()
+              << " unshared_v_caches size: " << unshared_v_caches.size()
+              << " shared_k_caches size: " << shared_k_caches.size()
+              << " shared_v_caches size: " << shared_v_caches.size();
+    if (beam_width_tensor.defined()) {
+      LOG(INFO) << " beam_width_tensor shape: " << beam_width_tensor.sizes();
+    }
+    if (current_round_tensor.defined()) {
+      LOG(INFO) << " current_round_tensor shape: "
+                << current_round_tensor.sizes();
+    }
+  }
+};
+
 // Parameters for LLM Rec multi-round mode (device loop, beam search).
 struct LlmRecMultiRoundParams {
   // full kv caches provided by engine for step-level decode, per layer
@@ -171,6 +253,7 @@ struct LlmRecMultiRoundParams {
   torch::Tensor two_stage_unshared_lse;
   torch::Tensor two_stage_unshared_o;
   torch::Tensor two_stage_q_cu_seq_lens_shared;
+  torch::Tensor two_stage_qo_indptr_expanded;
   torch::Tensor two_stage_paged_kv_indptr_expanded;
   torch::Tensor two_stage_paged_kv_indices_expanded;
   torch::Tensor two_stage_paged_kv_last_page_len_expanded;
@@ -180,27 +263,33 @@ struct LlmRecMultiRoundParams {
 
     result.full_k_caches.clear();
     result.full_v_caches.clear();
+    result.full_k_caches.reserve(full_k_caches.size());
+    result.full_v_caches.reserve(full_v_caches.size());
     for (const auto& t : full_k_caches) {
-      result.full_k_caches.push_back(safe_to(t, device));
+      result.full_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : full_v_caches) {
-      result.full_v_caches.push_back(safe_to(t, device));
+      result.full_v_caches.emplace_back(safe_to(t, device));
     }
     result.unshared_k_caches.clear();
     result.unshared_v_caches.clear();
     result.shared_k_caches.clear();
     result.shared_v_caches.clear();
+    result.unshared_k_caches.reserve(unshared_k_caches.size());
+    result.unshared_v_caches.reserve(unshared_v_caches.size());
+    result.shared_k_caches.reserve(shared_k_caches.size());
+    result.shared_v_caches.reserve(shared_v_caches.size());
     for (const auto& t : unshared_k_caches) {
-      result.unshared_k_caches.push_back(safe_to(t, device));
+      result.unshared_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : unshared_v_caches) {
-      result.unshared_v_caches.push_back(safe_to(t, device));
+      result.unshared_v_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : shared_k_caches) {
-      result.shared_k_caches.push_back(safe_to(t, device));
+      result.shared_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : shared_v_caches) {
-      result.shared_v_caches.push_back(safe_to(t, device));
+      result.shared_v_caches.emplace_back(safe_to(t, device));
     }
 
     if (beam_width_tensor.defined()) {
@@ -226,6 +315,10 @@ struct LlmRecMultiRoundParams {
       result.two_stage_q_cu_seq_lens_shared =
           safe_to(two_stage_q_cu_seq_lens_shared, device);
     }
+    if (two_stage_qo_indptr_expanded.defined()) {
+      result.two_stage_qo_indptr_expanded =
+          safe_to(two_stage_qo_indptr_expanded, device);
+    }
     if (two_stage_paged_kv_indptr_expanded.defined()) {
       result.two_stage_paged_kv_indptr_expanded =
           safe_to(two_stage_paged_kv_indptr_expanded, device);
@@ -240,29 +333,371 @@ struct LlmRecMultiRoundParams {
     }
 
     result.decode_positions_tensor_list.clear();
+    result.decode_positions_tensor_list.reserve(
+        decode_positions_tensor_list.size());
     for (const auto& t : decode_positions_tensor_list) {
-      result.decode_positions_tensor_list.push_back(safe_to(t, device));
+      result.decode_positions_tensor_list.emplace_back(safe_to(t, device));
     }
 
     return result;
   }
 };
 
-using RecModelInputParams = std::
-    variant<std::monostate, OneRecModelInputParams, LlmRecMultiRoundParams>;
+using RecModelInputParams = std::variant<std::monostate,
+                                         OneRecModelInputParams,
+                                         OneRecXAttentionParams,
+                                         LlmRecMultiRoundParams>;
+
+struct AttentionHostInput {
+  // Worker-local request spans retained when MTP expands attention into token
+  // rows. Generated after transport; normal scheduler inputs leave this empty.
+  std::vector<int32_t> kpool_query_lens;
+  std::vector<int32_t> q_seq_lens;
+  std::vector<int32_t> q_cu_seq_lens;
+  std::vector<int32_t> kv_seq_lens;
+  std::vector<int32_t> kv_cu_seq_lens;
+  std::vector<int32_t> new_cache_slots;
+  std::vector<int32_t> kv_cache_tokens_nums;
+  std::vector<int32_t> ring_cur_seqlen;
+  std::vector<int32_t> ring_cache_seqlen;
+  torch::Tensor block_tables;
+
+  const int32_t* graph_q_seq_lens_data = nullptr;
+  const int32_t* graph_kv_seq_lens_data = nullptr;
+};
+
+struct AttentionDeviceInput {
+  torch::Tensor q_seq_lens;
+  torch::Tensor kv_seq_lens;
+  torch::Tensor q_cu_seq_lens;
+
+  torch::Tensor new_cache_slots;
+  torch::Tensor block_tables;
+
+  torch::Tensor paged_kv_indptr;
+  torch::Tensor paged_kv_indices;
+  torch::Tensor paged_kv_last_page_len;
+
+  torch::Tensor new_cache_slot_offsets;
+  torch::Tensor kv_cache_start_offsets;
+
+  torch::Tensor kv_cache_tokens_nums;
+  torch::Tensor history_compressed_kv;
+  torch::Tensor history_k_rope;
+  torch::Tensor ring_cur_seqlen;
+  torch::Tensor ring_cache_seqlen;
+
+  // Per-rank prefix slot indices for KV-split prefix AllGather. NpuCpPlan
+  // supplies this graph input with the rest of the CP attention metadata.
+  torch::Tensor in_prefix_slots;
+
+  AttentionDeviceInput to(const torch::Device& device) const {
+    AttentionDeviceInput out;
+    out.q_seq_lens = safe_to(q_seq_lens, device, true);
+    out.kv_seq_lens = safe_to(kv_seq_lens, device, true);
+#if !defined(USE_CUDA) && !defined(USE_MUSA)
+    out.q_cu_seq_lens = safe_to(q_cu_seq_lens, device, true);
+#else
+    out.q_cu_seq_lens = q_cu_seq_lens;
+#endif
+    out.new_cache_slots = safe_to(new_cache_slots, device, true);
+    out.block_tables = safe_to(block_tables, device, true);
+    out.paged_kv_indptr = safe_to(paged_kv_indptr, device);
+    out.paged_kv_indices = safe_to(paged_kv_indices, device);
+    out.paged_kv_last_page_len = safe_to(paged_kv_last_page_len, device);
+    out.new_cache_slot_offsets = safe_to(new_cache_slot_offsets, device);
+    out.kv_cache_start_offsets = safe_to(kv_cache_start_offsets, device);
+    out.kv_cache_tokens_nums = safe_to(kv_cache_tokens_nums, device);
+    out.history_compressed_kv = safe_to(history_compressed_kv, device);
+    out.history_k_rope = safe_to(history_k_rope, device);
+    out.ring_cur_seqlen = safe_to(ring_cur_seqlen, device);
+    out.ring_cache_seqlen = safe_to(ring_cache_seqlen, device);
+    out.in_prefix_slots = safe_to(in_prefix_slots, device, true);
+    return out;
+  }
+};
+
+struct AttentionInput {
+  enum class BufferReusePolicy {
+    COPY_ON_WRITE,
+    GROWABLE,
+    FIXED_CAPACITY,
+  };
+
+  struct PackedIntInput {
+    const std::vector<int32_t>* values = nullptr;
+    torch::Tensor* host_view = nullptr;
+    torch::Tensor* device_view = nullptr;
+  };
+
+  AttentionHostInput host;
+  AttentionDeviceInput device;
+  torch::Tensor attention_host_buffer;
+  torch::Tensor attention_device_buffer;
+  uint64_t attention_buffer_bytes = 0;
+  uint64_t attention_buffer_capacity = 0;
+  std::shared_ptr<int> attention_buffer_owner = std::make_shared<int>(0);
+
+  AttentionInput to(const torch::Device& target_device) const {
+    AttentionInput out;
+    out.host = host;
+    out.device = device.to(target_device);
+    out.attention_host_buffer = attention_host_buffer;
+    out.attention_device_buffer = attention_device_buffer;
+    out.attention_buffer_bytes = attention_buffer_bytes;
+    out.attention_buffer_capacity = attention_buffer_capacity;
+    out.attention_buffer_owner = attention_buffer_owner;
+    return out;
+  }
+
+  bool rebuild_device_buffer(
+      const torch::Device& target_device,
+      const std::vector<PackedIntInput>& extra_int_inputs = {},
+      BufferReusePolicy reuse_policy = BufferReusePolicy::COPY_ON_WRITE) {
+    struct Entry {
+      const void* source = nullptr;
+      std::vector<int64_t> sizes;
+      torch::ScalarType dtype = torch::kUInt8;
+      torch::Tensor* host_target = nullptr;
+      torch::Tensor* target = nullptr;
+      uint64_t offset = 0;
+      uint64_t bytes = 0;
+      uint64_t aligned_bytes = 0;
+    };
+
+    auto align_up = [](uint64_t value, uint64_t alignment) {
+      return ((value + alignment - 1) / alignment) * alignment;
+    };
+
+    CHECK_EQ(host.q_seq_lens.empty(), host.q_cu_seq_lens.empty())
+        << "q_seq_lens and q_cu_seq_lens must be provided together";
+
+    std::vector<Entry> entries;
+    std::vector<torch::Tensor> tensor_sources;
+    tensor_sources.reserve(16);
+
+    auto add_raw = [&entries](const void* source,
+                              std::vector<int64_t> sizes,
+                              torch::ScalarType dtype,
+                              uint64_t bytes,
+                              torch::Tensor* host_target,
+                              torch::Tensor* target) {
+      if (source == nullptr || bytes == 0) {
+        return;
+      }
+      entries.push_back(Entry{
+          source, std::move(sizes), dtype, host_target, target, 0, bytes, 0});
+    };
+
+    auto add_int_vector = [&add_raw](const std::vector<int32_t>& values,
+                                     torch::Tensor* host_target,
+                                     torch::Tensor* target) {
+      if (values.empty()) {
+        return;
+      }
+      add_raw(values.data(),
+              {static_cast<int64_t>(values.size())},
+              torch::kInt,
+              static_cast<uint64_t>(values.size() * sizeof(int32_t)),
+              host_target,
+              target);
+    };
+
+    auto add_cpu_tensor = [&entries, &tensor_sources](
+                              const torch::Tensor& tensor,
+                              torch::Tensor* target) {
+      if (!tensor.defined()) {
+        return;
+      }
+      if (!tensor.device().is_cpu()) {
+        return;
+      }
+      tensor_sources.emplace_back(tensor.contiguous());
+      const torch::Tensor& source = tensor_sources.back();
+      const uint64_t bytes =
+          static_cast<uint64_t>(source.numel() * source.element_size());
+      if (bytes == 0) {
+        return;
+      }
+      entries.push_back(Entry{source.data_ptr(),
+                              source.sizes().vec(),
+                              source.scalar_type(),
+                              nullptr,
+                              target,
+                              0,
+                              bytes,
+                              0});
+    };
+
+    for (const PackedIntInput& extra : extra_int_inputs) {
+      CHECK(extra.values != nullptr);
+      add_int_vector(*extra.values, extra.host_view, extra.device_view);
+    }
+    add_int_vector(host.q_seq_lens, nullptr, &device.q_seq_lens);
+    add_int_vector(host.kv_seq_lens, nullptr, &device.kv_seq_lens);
+    add_int_vector(host.q_cu_seq_lens, nullptr, &device.q_cu_seq_lens);
+    add_int_vector(host.new_cache_slots, nullptr, &device.new_cache_slots);
+    add_cpu_tensor(host.block_tables, &device.block_tables);
+    add_int_vector(
+        host.kv_cache_tokens_nums, nullptr, &device.kv_cache_tokens_nums);
+    add_int_vector(host.ring_cur_seqlen, nullptr, &device.ring_cur_seqlen);
+    add_int_vector(host.ring_cache_seqlen, nullptr, &device.ring_cache_seqlen);
+
+    add_cpu_tensor(device.paged_kv_indptr, &device.paged_kv_indptr);
+    add_cpu_tensor(device.paged_kv_indices, &device.paged_kv_indices);
+    add_cpu_tensor(device.paged_kv_last_page_len,
+                   &device.paged_kv_last_page_len);
+    add_cpu_tensor(device.new_cache_slot_offsets,
+                   &device.new_cache_slot_offsets);
+    add_cpu_tensor(device.kv_cache_start_offsets,
+                   &device.kv_cache_start_offsets);
+    add_cpu_tensor(device.history_compressed_kv, &device.history_compressed_kv);
+    add_cpu_tensor(device.history_k_rope, &device.history_k_rope);
+
+    if (entries.empty()) {
+      attention_buffer_bytes = 0;
+      return true;
+    }
+
+    constexpr uint64_t kAlignment = 16;
+    uint64_t total_bytes = 0;
+    for (auto& entry : entries) {
+      total_bytes = align_up(total_bytes, kAlignment);
+      entry.offset = total_bytes;
+      entry.aligned_bytes = align_up(entry.bytes, kAlignment);
+      total_bytes += entry.aligned_bytes;
+    }
+    if (total_bytes == 0) {
+      attention_buffer_bytes = 0;
+      return true;
+    }
+
+    if (reuse_policy == BufferReusePolicy::COPY_ON_WRITE) {
+      detach_attention_buffer_if_shared();
+    }
+    if (reuse_policy == BufferReusePolicy::FIXED_CAPACITY) {
+      CHECK(attention_host_buffer.defined() &&
+            attention_device_buffer.defined());
+      CHECK_GE(attention_buffer_capacity, total_bytes)
+          << "fixed attention buffer cannot grow after graph capture";
+    } else {
+      ensure_attention_buffer_capacity(total_bytes, target_device);
+    }
+    attention_buffer_bytes = total_bytes;
+
+    auto* host_base = static_cast<char*>(attention_host_buffer.data_ptr());
+    for (const auto& entry : entries) {
+      if (entry.bytes == 0) {
+        continue;
+      }
+      std::memcpy(host_base + entry.offset, entry.source, entry.bytes);
+      if (entry.aligned_bytes > entry.bytes) {
+        std::memset(host_base + entry.offset + entry.bytes,
+                    0,
+                    static_cast<size_t>(entry.aligned_bytes - entry.bytes));
+      }
+    }
+
+    attention_device_buffer.narrow(0, 0, static_cast<int64_t>(total_bytes))
+        .copy_(attention_host_buffer.narrow(
+                   0, 0, static_cast<int64_t>(total_bytes)),
+               /*non_blocking=*/true);
+    const char* device_base =
+        static_cast<const char*>(attention_device_buffer.data_ptr());
+    for (const auto& entry : entries) {
+      if (entry.host_target != nullptr) {
+        void* host_ptr = host_base + entry.offset;
+        *entry.host_target = torch::from_blob(
+            host_ptr,
+            entry.sizes,
+            torch::TensorOptions().dtype(entry.dtype).device(torch::kCPU));
+      }
+      if (entry.target == nullptr) {
+        continue;
+      }
+      const void* ptr = device_base + entry.offset;
+#if defined(USE_CUDA) || defined(USE_DCU)
+      if (target_device.type() == torch::kCUDA) {
+        *entry.target = get_tensor_from_blob(
+            entry.sizes, entry.dtype, ptr, attention_device_buffer);
+        continue;
+      }
+#endif
+#if defined(USE_MLU) || defined(USE_MUSA)
+      if (target_device.type() == torch::kPrivateUse1) {
+        *entry.target = get_tensor_from_blob(
+            entry.sizes, entry.dtype, ptr, attention_device_buffer);
+        continue;
+      }
+#endif
+#if defined(USE_NPU)
+      *entry.target = get_tensor_from_blob(entry.sizes, entry.dtype, ptr);
+#else
+      (void)ptr;
+#endif
+    }
+    return true;
+  }
+
+  void reserve_device_buffer_capacity(uint64_t capacity,
+                                      const torch::Device& target_device) {
+    ensure_attention_buffer_capacity(capacity, target_device);
+  }
+
+ private:
+  void detach_attention_buffer_if_shared() {
+    if (attention_buffer_owner == nullptr) {
+      attention_buffer_owner = std::make_shared<int>(0);
+    }
+    if (attention_buffer_owner.use_count() <= 1) {
+      return;
+    }
+    attention_buffer_owner = std::make_shared<int>(0);
+    attention_host_buffer = torch::Tensor();
+    attention_device_buffer = torch::Tensor();
+    attention_buffer_bytes = 0;
+    attention_buffer_capacity = 0;
+  }
+
+  void ensure_attention_buffer_capacity(uint64_t total_bytes,
+                                        const torch::Device& target_device) {
+    if (attention_host_buffer.defined() && attention_device_buffer.defined() &&
+        attention_host_buffer.device().is_cpu() &&
+        attention_device_buffer.device() == target_device &&
+        attention_buffer_capacity >= total_bytes) {
+      return;
+    }
+
+    const uint64_t new_capacity = std::max(
+        total_bytes, std::max<uint64_t>(attention_buffer_capacity * 2, 1024));
+    attention_host_buffer = torch::empty({static_cast<int64_t>(new_capacity)},
+                                         torch::TensorOptions()
+                                             .dtype(torch::kUInt8)
+                                             .device(torch::kCPU)
+                                             .pinned_memory(true));
+    attention_device_buffer = torch::empty(
+        {static_cast<int64_t>(new_capacity)},
+        torch::TensorOptions().dtype(torch::kUInt8).device(target_device));
+    attention_buffer_capacity = new_capacity;
+  }
+};
 
 enum class TransferType : uint8_t {
-  G2H = 0,  // global memory(KVCache store) to host memory(DRAM)
-  H2D = 1,  // host memory(DRAM) to device memory(HBM)
-  D2G = 2,  // host memory(DRAM) to global memory(KVCache store)
-  G2D = 3   // global memory(KVCache store) to device memory(HBM)
+  G2H = 0,    // global memory(KVCache store) to host memory(DRAM)
+  H2D = 1,    // host memory(DRAM) to device memory(HBM)
+  D2G = 2,    // device memory(HBM) to global memory(KVCache store)
+  G2D = 3,    // global memory(KVCache store) to device memory(HBM)
+  D2H2G = 4,  // device memory(HBM) to host memory(DRAM) to global
+              // memory(KVCache store)
 };
 
 struct BlockTransferInfo {
   int32_t src_block_id = -1;
   int32_t dst_block_id = -1;
   uint8_t hash_key[XXH3_128BITS_HASH_VALUE_LEN];
-  TransferType transfer_type;
+  BlockType block_type = BlockType::KV;
+  TransferType transfer_type = TransferType::G2H;
+  size_t checkpoint_row = 0;
 
   BlockTransferInfo(int32_t src_block_id, int32_t dst_block_id) {
     this->src_block_id = src_block_id;
@@ -272,22 +707,30 @@ struct BlockTransferInfo {
   BlockTransferInfo(int32_t src_id,
                     int32_t dst_id,
                     const uint8_t* key,
-                    TransferType type)
-      : src_block_id(src_id), dst_block_id(dst_id), transfer_type(type) {
+                    TransferType type,
+                    BlockType btype = BlockType::KV)
+      : src_block_id(src_id),
+        dst_block_id(dst_id),
+        block_type(btype),
+        transfer_type(type) {
     memcpy(hash_key, key, XXH3_128BITS_HASH_VALUE_LEN);
   }
 
   BlockTransferInfo(const BlockTransferInfo& other)
       : src_block_id(other.src_block_id),
         dst_block_id(other.dst_block_id),
-        transfer_type(other.transfer_type) {
+        block_type(other.block_type),
+        transfer_type(other.transfer_type),
+        checkpoint_row(other.checkpoint_row) {
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
   }
 
   BlockTransferInfo(BlockTransferInfo&& other)
       : src_block_id(other.src_block_id),
         dst_block_id(other.dst_block_id),
-        transfer_type(other.transfer_type) {
+        block_type(other.block_type),
+        transfer_type(other.transfer_type),
+        checkpoint_row(other.checkpoint_row) {
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
 
     other.src_block_id = -1;
@@ -297,7 +740,9 @@ struct BlockTransferInfo {
   BlockTransferInfo& operator=(const BlockTransferInfo& other) {
     src_block_id = other.src_block_id;
     dst_block_id = other.dst_block_id;
+    block_type = other.block_type;
     transfer_type = other.transfer_type;
+    checkpoint_row = other.checkpoint_row;
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
     return *this;
   }
@@ -305,7 +750,9 @@ struct BlockTransferInfo {
   BlockTransferInfo& operator=(BlockTransferInfo&& other) {
     src_block_id = other.src_block_id;
     dst_block_id = other.dst_block_id;
+    block_type = other.block_type;
     transfer_type = other.transfer_type;
+    checkpoint_row = other.checkpoint_row;
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
 
     other.src_block_id = -1;
@@ -323,119 +770,380 @@ struct BlockTransferInfo {
   }
 };
 
+struct BatchInputMeta {
+  BatchForwardType batch_forward_type;
+  int32_t num_sequences = 0;
+  int32_t actual_num_sequences = 0;
+  int32_t kv_max_seq_len = 0;
+  int32_t q_max_seq_len = 0;
+  uint64_t batch_id = 0;
+  bool requires_host_restore = false;
+  bool is_graph_warmup = false;
+};
+
+// Stable, model-execution view of the logical batch. Unlike
+// BatchInputMeta::num_sequences, these fields are never repurposed to describe
+// expanded attention rows or graph buckets.
+struct ExecutionBatchMetadata {
+  int32_t num_reqs = 0;
+  int64_t num_tokens = 0;
+  std::vector<int32_t> num_scheduled_tokens;
+  std::vector<int32_t> num_computed_tokens;
+  std::vector<int32_t> query_start_loc{0};
+  std::vector<uint8_t> is_prefilling;
+};
+
+struct ModelEmbeddingInput {
+  // input embedding
+  mutable torch::Tensor input_embedding;
+
+  // embedding ids of each sequence
+  std::vector<int32_t> embedding_ids;
+
+  // linear state ids of each sequence
+  std::vector<int32_t> linear_state_ids;
+
+  // IntTensor: [n_seq]
+  torch::Tensor linear_state_indices;
+  std::vector<int32_t> linear_state_read_ids;
+  torch::Tensor linear_state_read_indices;
+
+  // request ids of each sequence, used by suffix decoding request identity
+  std::vector<std::string> request_ids;
+
+  // chunked prefill case of speculative decoding
+  // extra token ids for each sequence, and -1 for last chunk
+  std::vector<int32_t> extra_token_ids;
+
+  // Precomputed shifted token ids for MTP prefill, aligned with tokens.
+  torch::Tensor mtp_shifted_token_ids;
+
+  // Pending PD handoff bootstrap rows for the first MTP decode step.
+  std::vector<int32_t> mtp_bootstrap_row_idxes;
+  torch::Tensor mtp_bootstrap_embeddings;
+
+  ModelEmbeddingInput to(const torch::Device& device) const {
+    ModelEmbeddingInput out;
+    out.input_embedding = safe_to(input_embedding, device);
+    out.embedding_ids = embedding_ids;
+    out.linear_state_ids = linear_state_ids;
+    out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_read_ids = linear_state_read_ids;
+    out.linear_state_read_indices =
+        safe_to(linear_state_read_indices, device, true);
+    out.request_ids = request_ids;
+    out.extra_token_ids = extra_token_ids;
+    out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
+    out.mtp_bootstrap_row_idxes = mtp_bootstrap_row_idxes;
+    out.mtp_bootstrap_embeddings =
+        safe_to(mtp_bootstrap_embeddings, device, true);
+    return out;
+  }
+};
+
+struct BlockCopyInput {
+  // swap
+  std::vector<BlockTransferInfo> swap_blocks;
+
+  // block copy kernel
+  torch::Tensor src_block_indices;
+  torch::Tensor dst_block_indices;
+  torch::Tensor cum_sum;
+
+  BlockCopyInput to(const torch::Device& device) const {
+    BlockCopyInput out;
+    out.swap_blocks = swap_blocks;
+    out.src_block_indices = safe_to(src_block_indices, device, true);
+    out.dst_block_indices = safe_to(dst_block_indices, device, true);
+    out.cum_sum = safe_to(cum_sum, device, true);
+    return out;
+  }
+};
+
+struct MultiModalInput {
+  // multimodal
+  mutable MMBatchData mm_data;
+
+  // deep_stack for Qwen3-VL
+  mutable std::vector<torch::Tensor> deep_stacks;
+
+  MultiModalInput to(const torch::Device& device) const {
+    MultiModalInput out;
+    out.mm_data = MMBatchData::to(mm_data, device);
+    out.deep_stacks = deep_stacks;
+    return out;
+  }
+};
+
+struct ParallelInput {
+  // num tokens of all workers, mainly used for dp case
+  std::vector<int32_t> dp_global_token_nums;
+  // Original DP token counts before empty ranks are padded to one fake token.
+  // Attention/FFN paths may need the padded counts, while lm_head output
+  // compaction must skip true empty DP ranks.
+  std::vector<int32_t> raw_dp_global_token_nums;
+  // Per-DP-shard generation derived from the local batch identity. Every shard
+  // receives the full vector so speculative prelaunch reuse decisions remain
+  // collective-order consistent when any shard changes its batch.
+  std::vector<uint64_t> dp_global_batch_generations;
+  // max kv seq len of all dp shards. Graph key generation uses this so empty
+  // DP decode ranks pick the same graph as ranks with real decode tokens.
+  std::vector<int32_t> dp_global_kv_max_seq_lens;
+  // Per-DP-shard json_object presence (0/1), replicated even to shards without
+  // constrained rows. The prelaunched first draft is submitted inside HCCL
+  // collectives, so the prelaunch decision must not read rank-local grammar
+  // state; only a complete all-zero vector permits a prelaunch. In-loop MTP
+  // drafting is unaffected.
+  std::vector<int32_t> dp_global_json_object_active;
+  std::vector<int32_t> dp_is_decode;
+
+  DpEpPaddingData dp_ep_padding_data;
+  NpuCpPlan cp_plan;
+  // int8 active-token mask for aclnnMegaMoe, length = padded token count.
+  // Only set by the ACL graph executor (persistent buffer) so captured
+  // mega graphs can replay with per-step real token counts; eager mode
+  // leaves it undefined and FusedMoE builds its own mask.
+  torch::Tensor mega_active_mask;
+
+#if defined(USE_MLU)
+  std::shared_ptr<MLULayerSynchronizerImpl> layer_synchronizer = nullptr;
+#elif defined(USE_DCU)
+  std::shared_ptr<DCULayerSynchronizerImpl> layer_synchronizer = nullptr;
+#elif defined(USE_NPU)
+  std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer = nullptr;
+#endif
+  uint32_t layers_per_event = std::numeric_limits<uint32_t>::max();
+  std::shared_ptr<LayerSynchronizer> layer_wise_load_synchronizer = nullptr;
+  std::optional<uint32_t> draft_load_event_index;
+#if defined(USE_NPU) || defined(USE_MUSA)
+  std::vector<int64_t> query_start_loc;
+#endif
+
+  ParallelInput to(const torch::Device& device) const {
+    ParallelInput out;
+    out.dp_global_token_nums = dp_global_token_nums;
+    out.raw_dp_global_token_nums = raw_dp_global_token_nums;
+    out.dp_global_batch_generations = dp_global_batch_generations;
+    out.dp_global_kv_max_seq_lens = dp_global_kv_max_seq_lens;
+    out.dp_global_json_object_active = dp_global_json_object_active;
+    out.dp_is_decode = dp_is_decode;
+    out.dp_ep_padding_data = dp_ep_padding_data;
+    out.mega_active_mask = mega_active_mask;
+    out.cp_plan = cp_plan.to(device);
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+    out.layer_synchronizer = layer_synchronizer;
+#endif
+    out.layers_per_event = layers_per_event;
+    out.layer_wise_load_synchronizer = layer_wise_load_synchronizer;
+    out.draft_load_event_index = draft_load_event_index;
+#if defined(USE_NPU) || defined(USE_MUSA)
+    out.query_start_loc = query_start_loc;
+#endif
+    return out;
+  }
+};
+
+using LinearStatePrefixHash = PrefixHash;
+using LinearStateValidityMask = std::vector<int64_t>;
+
+struct ExpertInput {
+  torch::Tensor expert_load_data;
+  torch::Tensor expert_array;
+  EplbInfo eplb_info;
+  torch::Tensor eplb_decode_token_mask;
+
+  ExpertInput to(const torch::Device& device) const {
+    ExpertInput out;
+    out.expert_load_data = expert_load_data;
+    out.expert_array = expert_array;
+    out.eplb_info = eplb_info;
+    out.eplb_decode_token_mask =
+        safe_to(eplb_decode_token_mask, device, /*non_blocking=*/true);
+    return out;
+  }
+};
+
+struct GraphInput {
+  torch::Tensor attn_mask;
+  torch::Tensor tiling_data;
+  torch::Tensor num_valid_token_rows;
+#if defined(USE_DCU)
+  bool use_dense_flash_attention = false;
+#endif
+  bool use_expanded_decode_for_spec_verify_attention = false;
+  torch::Tensor expanded_kv_seq_lens;
+  torch::Tensor expanded_block_tables;
+  torch::Tensor expanded_paged_kv_indptr;
+  torch::Tensor expanded_paged_kv_indices;
+  torch::Tensor expanded_paged_kv_last_page_len;
+  torch::Tensor expanded_tiling_data;
+  std::vector<int32_t> expanded_kv_seq_lens_vec;
+#if defined(USE_NPU)
+  std::shared_ptr<npu::AclGraphTaskUpdateContext> acl_graph_task_update_context;
+#endif
+  torch::Tensor input_tokens_override;
+  // Device token sources produced by a speculative proposer. A matching
+  // backend may fuse them into graph-owned target-verify storage.
+  std::vector<torch::Tensor> spec_verify_draft_token_sources;
+  // All dynamic target-verify source tensors retain their backing addresses
+  // across replay generations. When true, the ACL graph records those
+  // addresses separately from its graph key/task signature and validates them
+  // before each replay.
+  bool spec_verify_source_addresses_stable = false;
+  // All ready events for the current static causal-conv task signature have
+  // already been recorded on the signal stream. Replay can skip cold-path
+  // signaling on the final-draft-to-target critical path.
+  bool spec_verify_static_graph_tasks_prepared = false;
+
+  GraphInput to(const torch::Device& device) const {
+    GraphInput out;
+    out.attn_mask = safe_to(attn_mask, device, true);
+    out.tiling_data = safe_to(tiling_data, device, true);
+    out.num_valid_token_rows = safe_to(num_valid_token_rows, device, true);
+#if defined(USE_DCU)
+    out.use_dense_flash_attention = use_dense_flash_attention;
+#endif
+    out.use_expanded_decode_for_spec_verify_attention =
+        use_expanded_decode_for_spec_verify_attention;
+    out.expanded_kv_seq_lens = safe_to(expanded_kv_seq_lens, device, true);
+    out.expanded_block_tables = safe_to(expanded_block_tables, device, true);
+    out.expanded_paged_kv_indptr =
+        safe_to(expanded_paged_kv_indptr, device, true);
+    out.expanded_paged_kv_indices =
+        safe_to(expanded_paged_kv_indices, device, true);
+    out.expanded_paged_kv_last_page_len =
+        safe_to(expanded_paged_kv_last_page_len, device, true);
+    out.expanded_tiling_data = safe_to(expanded_tiling_data, device, true);
+    out.expanded_kv_seq_lens_vec = expanded_kv_seq_lens_vec;
+#if defined(USE_NPU)
+    out.acl_graph_task_update_context = acl_graph_task_update_context;
+#endif
+    out.input_tokens_override =
+        safe_to(input_tokens_override, device, /*non_blocking=*/true);
+    out.spec_verify_draft_token_sources.reserve(
+        spec_verify_draft_token_sources.size());
+    for (const auto& token : spec_verify_draft_token_sources) {
+      out.spec_verify_draft_token_sources.push_back(
+          safe_to(token, device, /*non_blocking=*/true));
+    }
+    out.spec_verify_source_addresses_stable =
+        spec_verify_source_addresses_stable;
+    out.spec_verify_static_graph_tasks_prepared =
+        spec_verify_static_graph_tasks_prepared;
+    return out;
+  }
+};
+
 struct ModelInputParams {
+  // Drops every recurrent (linear attention) state field. Pure full-attention
+  // drafts in the DFlash family and MTP reuse a hybrid target's ForwardInput
+  // and must call this so target-only slot ids do not classify their rows as
+  // recurrent, which would enter a stateful path the draft has no cache for.
+  void clear_linear_attention_state() {
+    embedding.linear_state_ids.clear();
+    embedding.linear_state_indices = torch::Tensor();
+    embedding.linear_state_read_ids.clear();
+    embedding.linear_state_read_indices = torch::Tensor();
+    linear_state_validity_mask.clear();
+    linear_state_validity_mask_tensor = torch::Tensor();
+  }
+
   ModelInputParams to(const torch::Device& device) const {
     ModelInputParams params;
-    params.batch_forward_type = batch_forward_type;
-    params.num_sequences = num_sequences;
-    params.kv_max_seq_len = kv_max_seq_len;
-    params.q_max_seq_len = q_max_seq_len;
-    params.enable_mla = enable_mla;
-
-    params.kv_seq_lens = safe_to(kv_seq_lens, device, true);
-    params.q_seq_lens = safe_to(q_seq_lens, device, true);
-    params.q_cu_seq_lens = safe_to(q_cu_seq_lens, device, true);
-
-    params.new_cache_slots = safe_to(new_cache_slots, device, true);
-    params.block_tables = safe_to(block_tables, device, true);
-    params.kv_seq_lens_vec = kv_seq_lens_vec;
-    params.q_seq_lens_vec = q_seq_lens_vec;
-
-    params.input_embedding = safe_to(input_embedding, device);
-
-    params.deep_stacks = deep_stacks;
-    params.visual_pos_masks = visual_pos_masks;
-    params.mm_data = MMBatchData::to(mm_data, device);
-    params.dp_global_token_nums = dp_global_token_nums;
-    params.dp_is_decode = dp_is_decode;
-    params.embedding_ids = std::move(embedding_ids);
-    params.request_ids = std::move(request_ids);
-    params.extra_token_ids = std::move(extra_token_ids);
-    params.dp_ep_padding_data = dp_ep_padding_data;
-    params.cp_ep_padding_data
-        .attn_padding_idx(
-            safe_to(cp_ep_padding_data.attn_padding_idx(), device, true))
-        .attn_unpadding_idx(
-            safe_to(cp_ep_padding_data.attn_unpadding_idx(), device, true))
-        .ffn_padding_idx(
-            safe_to(cp_ep_padding_data.ffn_padding_idx(), device, true))
-        .ffn_unpadding_idx(
-            safe_to(cp_ep_padding_data.ffn_unpadding_idx(), device, true))
-        .lm_head_skip_padding_token_indices(
-            safe_to(cp_ep_padding_data.lm_head_skip_padding_token_indices(),
-                    device,
-                    true))
-        .gather_prenorm_idx(
-            safe_to(cp_ep_padding_data.gather_prenorm_idx(), device, true));
-
-    params.kv_cache_tokens_nums_host = std::move(kv_cache_tokens_nums_host);
-    params.kv_cache_tokens_nums = safe_to(kv_cache_tokens_nums, device);
-    params.history_compressed_kv = safe_to(history_compressed_kv, device);
-    params.history_k_rope = safe_to(history_k_rope, device);
-    params.ring_cur_seqlen = safe_to(ring_cur_seqlen, device);
-    params.ring_cur_seqlen_host = ring_cur_seqlen_host;
-    params.ring_cache_seqlen = safe_to(ring_cache_seqlen, device);
-    params.ring_cache_seqlen_host = ring_cache_seqlen_host;
-#if defined(USE_NPU)
-    params.layer_synchronizer = layer_synchronizer;
+    params.meta = meta;
+    params.execution_batch = execution_batch;
+    params.attention = attention.to(device);
+    params.embedding = embedding.to(device);
+    params.block_copy = block_copy.to(device);
+    params.multimodal = multimodal.to(device);
+    params.parallel = parallel.to(device);
+    params.expert = expert.to(device);
+    params.graph = graph.to(device);
+    if (dit_forward_input.has_value()) {
+      params.dit_forward_input.emplace(dit_forward_input->to(device));
+    }
+    params.linear_state_validity_mask = linear_state_validity_mask;
+    params.linear_state_validity_mask_tensor =
+        safe_to(linear_state_validity_mask_tensor, device, true);
+    params.is_spec_verify = is_spec_verify;
+    params.is_dflash_proposal = is_dflash_proposal;
+    params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
+    params.num_accepted_tokens_host = num_accepted_tokens_host;
+#if defined(USE_MUSA)
+    params.attn_metadata = attn_metadata;
 #endif
-    params.expert_load_data = expert_load_data;
-    params.expert_array = expert_array;
-
-    params.swap_blocks = std::move(swap_blocks);
-
-    params.src_block_indices = safe_to(src_block_indices, device, true);
-    params.dst_block_indices = safe_to(dst_block_indices, device, true);
-    params.cum_sum = safe_to(cum_sum, device, true);
-
-    // params for continuous kvcache
-    params.new_cache_slot_offsets = safe_to(new_cache_slot_offsets, device);
-    params.kv_cache_start_offsets = safe_to(kv_cache_start_offsets, device);
-
-    // Copy graph_buffer to device
-    // params.graph_buffer = safe_to(graph_buffer, device, true);
-    params.graph_buffer.attn_mask =
-        safe_to(graph_buffer.attn_mask, device, true);
-    params.graph_buffer.tiling_data =
-        safe_to(graph_buffer.tiling_data, device, true);
-
-    // params for flashinfer
-    params.paged_kv_indptr = safe_to(paged_kv_indptr, device);
-    params.paged_kv_indices = safe_to(paged_kv_indices, device);
-    params.paged_kv_last_page_len = safe_to(paged_kv_last_page_len, device);
-
-    params.batch_id = batch_id;
+    params.mtp_topk_state =
+        mtp_topk_state == nullptr ? nullptr : mtp_topk_state->to(device);
+    for (const auto& table : multi_block_tables) {
+      params.multi_block_tables.push_back(
+          safe_to(table, table.options().device(torch::kCPU), true));
+    }
+    params.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
+    if (!params.embedding.linear_state_indices.defined() &&
+        !params.embedding.linear_state_ids.empty()) {
+      params.embedding.linear_state_indices =
+          torch::tensor(params.embedding.linear_state_ids, torch::kInt)
+              .to(device);
+    }
+    if (!params.embedding.linear_state_read_indices.defined() &&
+        !params.embedding.linear_state_ids.empty()) {
+      auto& read_ids = params.embedding.linear_state_read_ids;
+      if (read_ids.empty()) {
+        read_ids = params.embedding.linear_state_ids;
+      }
+      CHECK_EQ(read_ids.size(), params.embedding.linear_state_ids.size());
+      params.embedding.linear_state_read_indices =
+          torch::tensor(read_ids, torch::kInt).to(device);
+    }
 
     // rec_params device conversion for both OneRec and LLM-Rec variants
-    if (const auto* onerec = onerec_params()) {
+    if (const auto* onerec_xattn = onerec_xattention_params()) {
+      params.rec_params = onerec_xattn->to(device);
+    } else if (const auto* onerec = onerec_params()) {
       params.rec_params = onerec->to(device);
     } else if (const auto* llmrec = llmrec_params()) {
       params.rec_params = llmrec->to(device);
     }
-
-    params.cp_prefill_inputs = cp_prefill_inputs.to(device);
 
     return params;
   }
 
   void print() const {
     LOG(INFO) << "ModelInputParams: batch_forward_type is "
-              << batch_forward_type.to_string() << " , num_sequences is "
-              << num_sequences << " , kv_max_seq_len is " << kv_max_seq_len
-              << " , q_max_seq_len is " << q_max_seq_len;
-    LOG(INFO) << "ModelInputParams: kv_seq_lens_vec is " << kv_seq_lens_vec;
-    LOG(INFO) << "ModelInputParams: q_seq_lens_vec is " << q_seq_lens_vec;
+              << meta.batch_forward_type.to_string() << " , num_sequences is "
+              << meta.num_sequences << " , kv_max_seq_len is "
+              << meta.kv_max_seq_len << " , q_max_seq_len is "
+              << meta.q_max_seq_len;
+    LOG(INFO) << "ModelInputParams: attention.host.kv_seq_lens is "
+              << attention.host.kv_seq_lens;
+    LOG(INFO) << "ModelInputParams: attention.host.q_seq_lens is "
+              << attention.host.q_seq_lens;
     LOG(INFO) << "ModelInputParams: batch_forward_type is "
-              << batch_forward_type.to_string();
-    print_tensor(kv_seq_lens, "ModelInputParams: kv_seq_lens", 4);
-    print_tensor(q_seq_lens, "ModelInputParams: q_seq_lens", 4);
-    print_tensor(q_cu_seq_lens, "ModelInputParams: q_cu_seq_lens", 4);
-    print_tensor(new_cache_slots, "ModelInputParams: new_cache_slots", 4);
-    print_tensor(block_tables, "ModelInputParams: block_tables", 4);
+              << meta.batch_forward_type.to_string();
+    print_tensor(
+        attention.device.kv_seq_lens, "ModelInputParams: kv_seq_lens", 4);
+    print_tensor(
+        attention.device.q_seq_lens, "ModelInputParams: q_seq_lens", 4);
+    print_tensor(
+        attention.device.q_cu_seq_lens, "ModelInputParams: q_cu_seq_lens", 4);
+    print_tensor(attention.device.new_cache_slots,
+                 "ModelInputParams: new_cache_slots",
+                 4);
+    print_tensor(
+        attention.device.block_tables, "ModelInputParams: block_tables", 4);
     LOG(INFO) << "ModelInputParams: dp_global_token_nums is "
-              << dp_global_token_nums << ", dp_is_decode: " << dp_is_decode;
+              << parallel.dp_global_token_nums
+              << ", dp_is_decode: " << parallel.dp_is_decode;
+    LOG(INFO) << "ModelInputParams: is_spec_verify is " << is_spec_verify
+              << ", is_dflash_proposal is " << is_dflash_proposal;
+    print_tensor(num_accepted_tokens,
+                 "ModelInputParams: num_accepted_tokens",
+                 /*max_elements=*/4);
 
-    if (const auto* onerec = onerec_params()) {
+    if (const auto* onerec_xattn = onerec_xattention_params()) {
+      LOG(INFO) << "ModelInputParams: has onerec_xattention_params";
+      onerec_xattn->print();
+    } else if (const auto* onerec = onerec_params()) {
       LOG(INFO) << "ModelInputParams: has onerec_params";
       onerec->print();
     } else if (const auto* llmrec = llmrec_params()) {
@@ -447,147 +1155,145 @@ struct ModelInputParams {
 
   int32_t get_q_seq_len(int32_t seq_idx) const {
 #if defined(USE_NPU)
-    CHECK(seq_idx < q_seq_lens_vec.size()) << "seq_idx out of range";
-    return q_seq_lens_vec[seq_idx];
+    CHECK(seq_idx < attention.host.q_seq_lens.size()) << "seq_idx out of range";
+    return attention.host.q_seq_lens[seq_idx];
 #else
-    CHECK(seq_idx < q_seq_lens_vec.size() - 1) << "seq_idx out of range";
-    return q_seq_lens_vec[seq_idx + 1] - q_seq_lens_vec[seq_idx];
+    CHECK(seq_idx < attention.host.q_seq_lens.size() - 1)
+        << "seq_idx out of range";
+    return attention.host.q_seq_lens[seq_idx + 1] -
+           attention.host.q_seq_lens[seq_idx];
 #endif
   }
 
-  bool synchronize_layer(uint32_t layer_idx) const {
-#if defined(USE_NPU)
-    if (layer_wise_load_synchronizer != nullptr &&
-        layer_idx % layers_per_bacth_copy == 0) {
-      if (!layer_wise_load_synchronizer->synchronize_layer(
-              layer_idx / layers_per_bacth_copy)) {
+  bool synchronize_layer(int64_t layer_idx) const {
+    if (parallel.layer_wise_load_synchronizer == nullptr) {
+      return true;
+    }
+    CHECK_GE(layer_idx, 0) << "Layer index must be non-negative.";
+    if (static_cast<uint64_t>(layer_idx) % parallel.layers_per_event == 0) {
+      return parallel.layer_wise_load_synchronizer->synchronize_layer(
+          layer_idx / parallel.layers_per_event);
+    }
+    return true;
+  }
+
+  bool synchronize_all_layers() const {
+    if (parallel.layer_wise_load_synchronizer == nullptr) {
+      return true;
+    }
+    for (uint32_t event_index = 0;
+         event_index < parallel.layer_wise_load_synchronizer->size();
+         ++event_index) {
+      if (!parallel.layer_wise_load_synchronizer->synchronize_layer(
+              static_cast<int64_t>(event_index))) {
         return false;
       }
     }
+    return true;
+  }
+
+  bool synchronize_draft_layer() const {
+    if (parallel.layer_wise_load_synchronizer == nullptr) {
+      return true;
+    }
+    if (!parallel.draft_load_event_index.has_value()) {
+      return true;
+    }
+    return parallel.layer_wise_load_synchronizer->synchronize_layer(
+        static_cast<int64_t>(*parallel.draft_load_event_index));
+  }
+
+  bool record_layer(uint32_t layer_idx, const torch::Device& device) const {
+#if defined(USE_MLU) || defined(USE_DCU)
+    if (parallel.layer_synchronizer != nullptr) {
+      return parallel.layer_synchronizer->record_current(layer_idx,
+                                                         device.index());
+    }
+#else
+    (void)layer_idx;
+    (void)device;
 #endif
     return true;
   }
 
-  // Compatibility fallback for metadata builders that are not wired with
-  // ModelArgs yet.
-  bool enable_mla = false;
+  BatchInputMeta meta;
+  ExecutionBatchMetadata execution_batch;
+  AttentionInput attention;
+  ModelEmbeddingInput embedding;
+  ParallelInput parallel;
+  BlockCopyInput block_copy;
+  MultiModalInput multimodal;
+  ExpertInput expert;
+  GraphInput graph;
 
-  BatchForwardType batch_forward_type;
+  // Multi block manager block tables for DeepSeek V4.
+  // Each tensor is [batch_size, max_block_len] for one manager.
+  std::vector<torch::Tensor> multi_block_tables;
 
-  // total number of sequences in the batch
-  int32_t num_sequences = 0;
+  // Shifted target token ids for MTP training/evaluation paths.
+  torch::Tensor mtp_shifted_token_ids;
 
-  // max length for qkv.
-  int32_t kv_max_seq_len = 0;
-  int32_t q_max_seq_len = 0;
+  // Structured per-row linear-state cache operations.
+  // Worker-produced per-row result declaring whether the recurrent state is
+  // valid for model-forward consumption after restore processing.
+  LinearStateValidityMask linear_state_validity_mask;
+  // Graph executors supply a persistent device copy to avoid materializing the
+  // host mask while the accelerator queue is under graph capture.
+  torch::Tensor linear_state_validity_mask_tensor;
 
-  uint64_t batch_id;
-
-  torch::Tensor q_seq_lens;
-  torch::Tensor kv_seq_lens;
-  torch::Tensor q_cu_seq_lens;
-  std::vector<int> kv_seq_lens_vec;
-  std::vector<int> q_seq_lens_vec;
-
-  // IntTensor: [n_tokens]
-  torch::Tensor new_cache_slots;
-
-  // IntTensor: [n_seq, max_n_blocks]
-  torch::Tensor block_tables;
-
-  // the indptr of the paged kv-cache
-  // used in flashinfer
-  // IntTensor: [n_seq + 1]
-  torch::Tensor paged_kv_indptr;
-
-  // the page indices of the paged kv cache
-  // used in flashinfer
-  torch::Tensor paged_kv_indices;
-
-  // the number of entries in the last page of each request in
-  // the paged kv cache
-  // used in flashinfer
-  // IntTensor: [n_seq]
-  torch::Tensor paged_kv_last_page_len;
-
-  // new slot offsets for continuous kvcache
-  // used to store kv-cache to right position
-  // IntTensor: [n_tokens]
-  torch::Tensor new_cache_slot_offsets;
-
-  // kvcache offset of sequence in the xtensor for all layers
-  // IntTensor: [n_seq]
-  torch::Tensor kv_cache_start_offsets;
-
-  // input embedding
-  mutable torch::Tensor input_embedding;
-
-  // num tokens of all workers，mainly used for dp case
-  std::vector<int32_t> dp_global_token_nums;
-  std::vector<int32_t> dp_is_decode;
-
-  // embedding ids of each sequence
-  std::vector<int32_t> embedding_ids;
-
-  // request ids of each sequence, used by suffix decoding request identity
-  std::vector<std::string> request_ids;
-
-  // chunked prefill case of speculative decoding
-  // extra token ids for each sequence, and -1 for last chunk
-  std::vector<int32_t> extra_token_ids;
-
-  // swap
-  std::vector<BlockTransferInfo> swap_blocks;
-
-  // block copy kernel
-  torch::Tensor src_block_indices;
-  torch::Tensor dst_block_indices;
-  torch::Tensor cum_sum;
-
-  // multimodal
-  mutable MMBatchData mm_data;
-
-  // deep_stack for Qwen3-VL
-  mutable std::vector<torch::Tensor> deep_stacks;
-  // visual pos mask for Qwen3-VL
-  mutable torch::Tensor visual_pos_masks;
-
-#if defined(USE_NPU)
-  std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer = nullptr;
-  uint32_t layers_per_bacth_copy = std::numeric_limits<uint32_t>::max();
-  std::shared_ptr<NPULayerSynchronizerImpl> layer_wise_load_synchronizer =
-      nullptr;
-#endif
-
-  DpEpPaddingData dp_ep_padding_data;
-  CpEpPaddingData cp_ep_padding_data;
-  CpPrefillInputs cp_prefill_inputs;
-
-  torch::Tensor expert_load_data;
-  torch::Tensor expert_array;
-
-  torch::Tensor kv_cache_tokens_nums;
-  std::vector<int32_t> kv_cache_tokens_nums_host;
-  torch::Tensor history_compressed_kv;
-  torch::Tensor history_k_rope;
-  torch::Tensor ring_cur_seqlen;
-  std::vector<int32_t> ring_cur_seqlen_host;
-  torch::Tensor ring_cache_seqlen;
-  std::vector<int32_t> ring_cache_seqlen_host;
+  bool is_spec_verify = false;
+  // DFlash2 draft query is a proposal block, not a target spec-verify.
+  bool is_dflash_proposal = false;
+  // Propagated to AttentionMetadata for caller-managed cacheless prefill.
+  bool prefill_without_cache = false;
+  torch::Tensor num_accepted_tokens;
+  // Backend-neutral state reused by the next MTP draft step.
+  MtpTopkStatePtr mtp_topk_state;
+  std::vector<int64_t> num_accepted_tokens_host;
 
   RecModelInputParams rec_params;
 
+  // dit input data
+  std::optional<DiTForwardInput> dit_forward_input;
+
   const OneRecModelInputParams* onerec_params() const {
-    return std::get_if<OneRecModelInputParams>(&rec_params);
+    if (const auto* params = std::get_if<OneRecModelInputParams>(&rec_params)) {
+      return params;
+    }
+    if (const auto* params = std::get_if<OneRecXAttentionParams>(&rec_params)) {
+      return static_cast<const OneRecModelInputParams*>(params);
+    }
+    return nullptr;
   }
 
   bool has_onerec_params() const { return onerec_params() != nullptr; }
 
   OneRecModelInputParams& mutable_onerec_params() {
+    if (auto* params = std::get_if<OneRecModelInputParams>(&rec_params)) {
+      return *params;
+    }
+    if (auto* params = std::get_if<OneRecXAttentionParams>(&rec_params)) {
+      return static_cast<OneRecModelInputParams&>(*params);
+    }
     if (!has_onerec_params()) {
       rec_params.emplace<OneRecModelInputParams>();
     }
     return std::get<OneRecModelInputParams>(rec_params);
+  }
+
+  const OneRecXAttentionParams* onerec_xattention_params() const {
+    return std::get_if<OneRecXAttentionParams>(&rec_params);
+  }
+
+  bool has_onerec_xattention_params() const {
+    return onerec_xattention_params() != nullptr;
+  }
+
+  OneRecXAttentionParams& mutable_onerec_xattention_params() {
+    if (!has_onerec_xattention_params()) {
+      rec_params.emplace<OneRecXAttentionParams>();
+    }
+    return std::get<OneRecXAttentionParams>(rec_params);
   }
 
   // Accessors for LLM Rec multi-round params inside rec_params variant
@@ -604,18 +1310,12 @@ struct ModelInputParams {
     return std::get<LlmRecMultiRoundParams>(rec_params);
   }
 
-  struct GraphBuffer {
-    torch::Tensor attn_mask;
-    torch::Tensor tiling_data;
-  };
-  GraphBuffer graph_buffer;
-
   // Optional attention metadata, built by executor
   // Using shared_ptr with forward declaration to avoid circular dependency
   std::shared_ptr<layer::AttentionMetadata> attn_metadata;
 
-  // Flag for CUDA graph capture mode
-  bool enable_cuda_graph = false;
+  // Flag for graph capture/replay mode.
+  bool enable_graph = false;
 };
 
 }  // namespace xllm

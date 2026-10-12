@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,6 +27,8 @@ limitations under the License.
 #include <cuda.h>
 #elif defined(USE_MUSA)
 #include <musa.h>
+#elif defined(USE_DCU)
+#include <hip/hip_runtime_api.h>
 #endif
 
 namespace xllm {
@@ -43,6 +45,9 @@ using PhyMemHandle = CUmemGenericAllocationHandle;
 #elif defined(USE_MUSA)
 using VirPtr = MUdeviceptr;
 using PhyMemHandle = MUmemGenericAllocationHandle;
+#elif defined(USE_DCU)
+using VirPtr = void*;
+using PhyMemHandle = hipMemGenericAllocationHandle_t;
 #endif
 
 template <typename T>
@@ -89,6 +94,14 @@ size_t get_recommended_granularity(int32_t device_id);
 // create a physical memory handle for a specific device
 void create_phy_mem_handle(PhyMemHandle& phy_mem_handle, int32_t device_id);
 
+// create a physical memory handle of an explicit size (must be a multiple of
+// the device allocation granularity). Unlike the granularity-sized overload
+// above, this does NOT mutate any global KV cache config, so it is safe to use
+// for large (chunked) allocations such as the RL sleep/wakeup regions.
+void create_phy_mem_handle(PhyMemHandle& phy_mem_handle,
+                           int32_t device_id,
+                           size_t size);
+
 // create a virtual memory pointer with a specific aligned size
 void create_vir_ptr(VirPtr& vir_ptr, size_t aligned_size);
 
@@ -107,6 +120,12 @@ void map(VirPtr& vir_ptr,
 
 // unmap a virtual memory pointer with a specific aligned size
 void unmap(VirPtr& vir_ptr, size_t aligned_size);
+
+// unmap a single contiguous chunk that was mapped by ONE map() call covering
+// the whole `size` (as opposed to per-granularity-page mapping). On NPU this
+// issues a single aclrtUnmapMem at the base address; on other platforms it is
+// equivalent to a single cuMemUnmap/cnMemUnmap/... of the whole range.
+void unmap_chunk(VirPtr& vir_ptr, size_t size);
 
 }  // namespace vmm
 }  // namespace xllm

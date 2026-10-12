@@ -7,16 +7,32 @@
 #include <string>
 #include <vector>
 
+#include "audio_generation.pb.h"
+#include "core/util/binary_payload.h"
 #include "dit_request_output.h"
 #include "dit_request_state.h"
 #include "image_generation.pb.h"
 #include "request.h"
 #include "tensor.pb.h"
+#include "text_generation.pb.h"
+#include "video_generation.pb.h"
 namespace xllm {
 
 struct DiTRequestParams {
   DiTRequestParams() = default;
   DiTRequestParams(const proto::ImageGenerationRequest& request,
+                   const std::string& x_rid,
+                   const std::string& x_rtime,
+                   const BinaryPayload& request_payload = {});
+  DiTRequestParams(const proto::AudioGenerationRequest& request,
+                   const std::string& x_rid,
+                   const std::string& x_rtime,
+                   const BinaryPayload& request_payload = {});
+  DiTRequestParams(const proto::VideoGenerationRequest& request,
+                   const std::string& x_rid,
+                   const std::string& x_rtime,
+                   const BinaryPayload& request_payload = {});
+  DiTRequestParams(const proto::TextGenerationRequest& request,
                    const std::string& x_rid,
                    const std::string& x_rtime);
 
@@ -29,10 +45,15 @@ struct DiTRequestParams {
 
   std::string model;
 
+  DiTRequestKind request_kind = DiTRequestKind::kImage;
+
   DiTInputParams input_params;
   // Mandatory: Generation control parameters (encapsulates all fields related
   // to "image generation process")
   DiTGenerationParams generation_params;
+
+  Status request_parse_status;
+  std::string output_type = "base64";
 };
 
 }  // namespace xllm

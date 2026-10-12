@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -35,7 +35,7 @@ int32_t get_num_numa_nodes();
 
 /**
  * @brief Get the NUMA node ID for a given device index
- * @param device_index The device index (e.g., GPU/NPU index)
+ * @param device_index The backend-visible device index (e.g., CUDA/MLU ordinal)
  * @return The NUMA node ID, or -1 if unable to determine
  */
 int32_t get_device_numa_node(int32_t device_index);

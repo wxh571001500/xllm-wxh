@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +19,10 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include "common/types.h"
+#include "core/framework/speculative/speculative_profile_registry.h"
 #include "forward_params.h"
+#include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/model/causal_lm.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -48,39 +51,41 @@ class WorkerClient {
 
   virtual folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options);
 
+  virtual folly::SemiFuture<bool> update_weights_async(
+      const std::string& weights_path);
+
+  // Start/stop online timeline profiling on the underlying worker.
+  virtual folly::SemiFuture<bool> start_profile_async();
+
+  virtual folly::SemiFuture<bool> stop_profile_async();
+
   virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
 
   // allocate kv cache. blocking call
-  virtual bool allocate_kv_cache(
-      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+  virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
 
-  virtual void get_device_info(std::string& device_ip, uint16_t& port);
+  virtual bool set_speculative_validate_time_predictor(
+      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
 
   virtual void get_cache_info(uint64_t& cluster_id,
                               std::string& addr,
-                              int64_t& k_cache_id,
-                              int64_t& v_cache_id);
+                              uint16_t& port);
 
   virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,
-                            const std::vector<std::string>& device_ips,
                             const std::vector<uint16_t>& ports);
 
   virtual bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                               const std::vector<std::string>& addrs,
-                              const std::vector<std::string>& device_ips,
                               const std::vector<uint16_t>& ports);
 
-  // D2D link for weight transfer
-  virtual bool link_d2d(const std::string& remote_addr);
-  virtual bool unlink_d2d(const std::string& remote_addr);
+  // P2P link for weight transfer
+  virtual bool link_p2p(const std::string& remote_addr);
+  virtual bool unlink_p2p(const std::string& remote_addr);
 
   virtual bool pull_kv_blocks(const uint64_t src_cluster_id,
                               const std::string& src_addr,
-                              const int64_t src_k_cache_id,
-                              const int64_t src_v_cache_id,
-                              const std::vector<uint64_t>& src_blocks,
-                              const std::vector<uint64_t>& dst_blocks);
+                              const std::vector<KVTransferMapping>& mappings);
 
   // prepare input for execution
   virtual ForwardInput prepare_inputs(Batch& batch);
@@ -98,19 +103,16 @@ class WorkerClient {
 
   // allocate kv cache. async call
   virtual folly::SemiFuture<bool> allocate_kv_cache_async(
-      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+      const KVCacheShape& kv_cache_shape);
 
   // allocate kv cache with kv cache transfer. async call
   virtual folly::SemiFuture<bool> allocate_kv_cache_with_transfer_async(
-      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+      const KVCacheShape& kv_cache_shape);
 
   virtual folly::SemiFuture<bool> pull_kv_blocks_async(
       const uint64_t src_cluster_id,
       const std::string& src_addr,
-      const int64_t src_k_cache_id,
-      const int64_t src_v_cache_id,
-      const std::vector<uint64_t>& src_blocks,
-      const std::vector<uint64_t>& dst_blocks);
+      const std::vector<KVTransferMapping>& mappings);
 
   virtual folly::SemiFuture<uint32_t> transfer_kv_blocks(
       const std::vector<BlockTransferInfo>& block_transfer_info);
@@ -120,18 +122,19 @@ class WorkerClient {
       const std::vector<BlockTransferInfo>& block_transfer_info);
 
   virtual void prefetch_from_storage(
-      const std::vector<BlockTransferInfo>& block_transfer_info,
-      std::shared_ptr<std::atomic<int32_t>> flag,
-      std::shared_ptr<std::atomic<uint32_t>> success_cnt);
+      const std::shared_ptr<const StoragePrefetchRequest>& request,
+      std::shared_ptr<PrefetchResult> result,
+      size_t worker_index);
 
   // Run the model on the given input. async call
-  // the future returns a successfull status with no meaningful value
+  // the future returns a successful status with no meaningful value
   virtual folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& inputs);
 
-  // for multi-node serving, we pass an non-tensor params to remote workers.
-  virtual folly::SemiFuture<std::optional<RawForwardOutput>> step_async(
-      const RawForwardInput& inputs);
+  // Remote execution path: send ForwardInput transport payload and decode
+  // worker response as RawForwardOutput for distributed engine handling.
+  virtual folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
+      const ForwardInput& inputs);
 
   virtual folly::SemiFuture<folly::Unit> process_group_test_async();
 

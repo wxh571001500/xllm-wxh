@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,6 +12,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+
+#pragma once
+
 #include "base_loader.h"
 
 namespace xllm {
@@ -32,13 +35,15 @@ class DeekseekV2DecoderLoader : public BaseLoader {
                           int32_t num_key_value_heads,
                           int32_t v_head_dim,
                           bool prefill_isBF16,
-                          bool decode_isBF16);
+                          bool decode_isBF16,
+                          LoadMode mode = LoadMode::kEager);
 
   void load_state_dict(const StateDict& state_dict) override;
   void verify_loaded_weights(const std::string& prefix) const override;
-  void merge_loaded_weights() override;
 
  protected:
+  void merge_host_at_weights() override;
+
   void initialize_device_expert_list(int num_device, int num_device_expert);
 
   int extract_expert_index(const std::string& name);
@@ -66,8 +71,6 @@ class DeekseekV2DecoderLoader : public BaseLoader {
                      const std::string& tensor_name,
                      int weight_position,
                      int dim);
-
-  torch::Tensor convert_fp16_to_int64();
 
   void preprocess_linear_for_rope();
 
@@ -99,13 +102,17 @@ class DeekseekV2DecoderLoader : public BaseLoader {
 
   void merge_experts_weights();
 
+  void preprocess_w4a8_dynamic_experts_weights();
+
+  bool use_quant_weight_mapping() const;
+
+  int get_w4a8_expert_shard_dim(const std::string& suffix) const;
+
   torch::Tensor merge_experts_weights(std::vector<torch::Tensor>& experts,
-                                      at::Device device,
                                       bool transpose = false);
 
   torch::Tensor merge_experts_weights(std::vector<torch::Tensor>& experts_up,
                                       std::vector<torch::Tensor>& experts_gate,
-                                      at::Device device,
                                       bool transpose = false);
 
   void squeeze_experts_weights();
@@ -139,6 +146,7 @@ class DeekseekV2DecoderLoader : public BaseLoader {
   int32_t end_expert_id_;
   int32_t ep_rank_;
   int32_t redundant_experts_num_;
+  int32_t quant_group_size_ = 0;
 
   int32_t layer_id_;
   int32_t qk_nope_head_dim_;
@@ -152,6 +160,8 @@ class DeekseekV2DecoderLoader : public BaseLoader {
   int32_t decode_worldSize_;
   bool prefill_isBF16_;
   bool decode_isBF16_;
+  bool enable_kimi_k25_moe_scale_dtype_fix_{false};
+  bool norm_has_bias_{false};
   std::mutex shared_experts_mutex_;
   std::mutex experts_mutex_;
 

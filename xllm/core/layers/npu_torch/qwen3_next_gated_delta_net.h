@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -43,9 +43,10 @@ class Qwen3NextGatedDeltaNetImpl : public Qwen3GatedDeltaNetBaseImpl {
                              const torch::TensorOptions& options,
                              bool init_projections);
 
-  std::pair<torch::Tensor, torch::Tensor> project_padded_inputs(
-      const torch::Tensor& hidden_states,
-      const AttentionMetadata& attn_metadata) override;
+  std::pair<torch::Tensor, torch::Tensor> project_decode_inputs(
+      const torch::Tensor& hidden_states) override;
+  std::pair<torch::Tensor, torch::Tensor> project_flat_inputs(
+      const torch::Tensor& hidden_states) override;
 
   virtual void load_projection_state_dict(const StateDict& state_dict);
   virtual void verify_projection_weights(const std::string& prefix) const;

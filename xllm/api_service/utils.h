@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,7 +27,10 @@ limitations under the License.
 
 #include "api_service/stream_output_parser.h"
 #include "chat.pb.h"
+#include "common.pb.h"
 #include "core/common/types.h"
+#include "core/framework/chat_template/thinking_mode_resolver.h"
+#include "core/framework/request/usage.h"
 #include "function_call/function_call.h"
 
 namespace xllm {
@@ -36,6 +39,30 @@ namespace api_service {
 // Check for unstreamed tool arguments and send them using the provided sender
 // This is shared between Chat API and Anthropic API implementations
 using SendFunc = std::function<bool(const std::string&, int)>;
+
+inline void set_proto_usage(proto::Usage* proto_usage,
+                            const xllm::Usage& usage) {
+  CHECK(proto_usage != nullptr);
+  proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
+  proto_usage->set_completion_tokens(usage.num_generated_tokens);
+  proto_usage->set_total_tokens(usage.num_total_tokens);
+  auto* prompt_tokens_details = proto_usage->mutable_prompt_tokens_details();
+  prompt_tokens_details->set_cached_tokens(usage.num_cached_tokens);
+  prompt_tokens_details->set_audio_tokens(0);
+
+  auto* completion_tokens_details =
+      proto_usage->mutable_completion_tokens_details();
+  completion_tokens_details->set_reasoning_tokens(0);
+  completion_tokens_details->set_audio_tokens(0);
+}
+
+inline bool get_enable_thinking_from_request(
+    const nlohmann::json& chat_template_kwargs,
+    const std::string& reasoning_parser_format) {
+  return thinking_mode::is_enabled(chat_template_kwargs,
+                                   reasoning_parser_format);
+}
+
 inline bool check_for_unstreamed_tool_args(
     std::shared_ptr<StreamOutputParser> stream_parser,
     size_t index,
@@ -98,15 +125,20 @@ inline ToolCallResult process_tool_calls(
     return result;
   }
 
-  if (finish_reason == "stop") {
-    result.finish_reason = "tool_calls";
-  } else {
-    result.finish_reason = std::move(finish_reason);
-  }
+  result.text = text;
+  result.finish_reason = finish_reason;
 
   try {
     auto [parsed_text, call_info_list] = parser.parse_non_stream(text);
     result.text = std::move(parsed_text);
+
+    if (call_info_list.empty()) {
+      return result;
+    }
+
+    if (finish_reason == "stop") {
+      result.finish_reason = "tool_calls";
+    }
 
     google::protobuf::RepeatedPtrField<proto::ToolCall> tool_calls;
 

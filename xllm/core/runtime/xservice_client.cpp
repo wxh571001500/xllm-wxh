@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,14 +18,15 @@ limitations under the License.
 #include <absl/strings/str_split.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
-#include <folly/executors/GlobalExecutor.h>
-#include <folly/futures/Future.h>
 #include <glog/logging.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <unordered_map>
 
+#include "core/framework/config/distributed_config.h"
+#include "core/framework/config/service_config.h"
+#include "util/env_var.h"
 #include "util/hash_util.h"
 #include "util/net.h"
 #include "util/uuid.h"
@@ -34,7 +35,9 @@ namespace xllm {
 namespace {
 static std::string ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
 static std::string ETCD_XSERVICES_KEY_PREFIX =
-    "XLLM:SERVICE:";  // all xllm_service registeration prefix
+    "XLLM:SERVICE:";  // all xllm_service registration prefix
+constexpr const char* kEtcdUsernameEnvVar = "ETCD_USERNAME";
+constexpr const char* kEtcdPasswordEnvVar = "ETCD_PASSWORD";
 static std::unordered_map<xllm_service::proto::InstanceType, std::string>
     ETCD_KEYS_PREFIX_MAP = {
         {xllm_service::proto::InstanceType::DEFAULT, "XLLM:DEFAULT:"},
@@ -71,7 +74,8 @@ bool check_instance_name(const std::string& name) {
 
 bool XServiceClient::init(const std::string& etcd_addr,
                           const std::string& instance_name,
-                          const BlockManagerPool* block_manager_pool) {
+                          const BlockManagerPool* block_manager_pool,
+                          const std::string& etcd_namespace) {
   if (initialize_done_) {
     LOG(INFO) << "XServiceClient is already initialized, skipping.";
     return true;
@@ -88,9 +92,26 @@ bool XServiceClient::init(const std::string& etcd_addr,
     incarnation_id_ = uuid.random();
   }
   chan_options_.max_retry = 3;
-  chan_options_.timeout_ms = FLAGS_rpc_channel_timeout_ms;
+  chan_options_.timeout_ms =
+      ::xllm::ServiceConfig::get_instance().rpc_channel_timeout_ms();
 
-  etcd_client_ = std::make_unique<EtcdClient>(etcd_addr);
+  const std::string etcd_username =
+      util::get_optional_string_env(kEtcdUsernameEnvVar).value_or("");
+  const std::string etcd_password =
+      util::get_optional_string_env(kEtcdPasswordEnvVar).value_or("");
+  const bool has_etcd_auth_user = !etcd_username.empty();
+  const bool has_etcd_auth_password = !etcd_password.empty();
+  if (has_etcd_auth_user != has_etcd_auth_password) {
+    LOG(ERROR) << "Both " << kEtcdUsernameEnvVar << " and "
+               << kEtcdPasswordEnvVar << " must be set together.";
+    return false;
+  }
+  if (has_etcd_auth_user) {
+    etcd_client_ = std::make_unique<EtcdClient>(
+        etcd_addr, etcd_username, etcd_password, etcd_namespace);
+  } else {
+    etcd_client_ = std::make_unique<EtcdClient>(etcd_addr, etcd_namespace);
+  }
 
   // connect master xllm_service
   while (!etcd_client_->get_master_service(ETCD_MASTER_SERVICE_KEY,
@@ -130,14 +151,17 @@ bool XServiceClient::init(const std::string& etcd_addr,
       &XServiceClient::reconcile_registration_loop, this);
 
   // watch master xllm_service change
-  auto master_func = std::bind(&XServiceClient::handle_master_service_watch,
-                               this,
-                               std::placeholders::_1);
+  auto master_func = [this](const etcd::Response& response,
+                            uint64_t prefix_len) {
+    handle_master_service_watch(response, prefix_len);
+  };
   etcd_client_->add_watch(ETCD_MASTER_SERVICE_KEY, master_func);
 
   // watch all xllm_service changes
-  auto xservices_func = std::bind(
-      &XServiceClient::handle_xservices_watch, this, std::placeholders::_1);
+  auto xservices_func = [this](const etcd::Response& response,
+                               uint64_t prefix_len) {
+    handle_xservices_watch(response, prefix_len);
+  };
   etcd_client_->add_watch(ETCD_XSERVICES_KEY_PREFIX, xservices_func);
 
   block_manager_pool_ = block_manager_pool;
@@ -167,7 +191,8 @@ std::string XServiceClient::get_instance_name() { return instance_name_; }
 bool XServiceClient::register_instance_with_retry(const std::string& key,
                                                   const std::string& value) {
   int retry_cnt = 0;
-  while (!etcd_client_->register_instance(key, value, FLAGS_etcd_ttl)) {
+  while (!etcd_client_->register_instance(
+      key, value, ::xllm::DistributedConfig::get_instance().etcd_ttl())) {
     if (retry_cnt >= 30) {
       LOG(ERROR) << "Register instance failed! key: " << key;
       return false;
@@ -207,8 +232,9 @@ bool XServiceClient::reconcile_registration() {
 
 void XServiceClient::reconcile_registration_loop() {
   while (!exited_.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(
-        static_cast<int64_t>(FLAGS_heart_beat_interval * 1000)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(
+        ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
+        1000)));
     if (!register_done_.load()) continue;
 
     if (!reconcile_registration()) {
@@ -260,6 +286,51 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   LOG(INFO) << "Success register instance to etcd.";
 }
 
+InstanceInfo instance_info_from_proto(
+    const xllm_service::proto::InstanceMetaInfo& response) {
+  InstanceInfo result;
+  result.name = response.name();
+  result.rpc_address = response.rpc_address();
+  result.incarnation_id = response.incarnation_id();
+  result.register_ts_ms = response.register_ts_ms();
+  if (response.type() == xllm_service::proto::InstanceType::PREFILL) {
+    result.type = "PREFILL";
+  } else if (response.type() == xllm_service::proto::InstanceType::DECODE) {
+    result.type = "DECODE";
+  } else if (response.type() == xllm_service::proto::InstanceType::MIX) {
+    result.type = "MIX";
+  } else {
+    result.type = "DEFAULT";
+  }
+  // parse kv cache info
+  result.cluster_ids.reserve(static_cast<size_t>(response.cluster_ids_size()));
+  for (auto& cluster_id : response.cluster_ids()) {
+    result.cluster_ids.emplace_back(cluster_id);
+  }
+  result.addrs.reserve(static_cast<size_t>(response.addrs_size()));
+  for (auto& addr : response.addrs()) {
+    result.addrs.emplace_back(addr);
+  }
+  result.dp_size = response.dp_size();
+  // Copied verbatim, including proto3's 0 for "the field was not present": a
+  // peer that never declared a width must stay distinguishable from one that
+  // declares 1, because the PUSH transfer plan keys on the DECLARED width.
+  // Folding 0 into the record's 1 default is what made a decode intending
+  // dcp=4 (behind a service that does not carry InstanceMetaInfo.kv_split_size)
+  // silently take the 1:1 mapping path. See plan_kv_split_widths().
+  result.kv_split_size = response.kv_split_size();
+  // Same verbatim contract for the CP index write mode: 0 is an instance
+  // (or a serving master) that predates the field, and admission keeps the
+  // legacy behavior for it rather than guessing a mode.
+  result.cp_index_write_mode = response.cp_index_write_mode();
+  result.ports.reserve(static_cast<size_t>(response.ports_size()));
+  for (auto& port : response.ports()) {
+    result.ports.emplace_back(port);
+  }
+
+  return result;
+}
+
 InstanceInfo XServiceClient::get_instance_info(
     const std::string& instance_name) {
   InstanceInfo result;
@@ -282,49 +353,14 @@ InstanceInfo XServiceClient::get_instance_info(
                << master_addr << ", error text: " << cntl.ErrorText();
     return result;
   }
-  result.name = resp.name();
-  result.rpc_address = resp.rpc_address();
-  result.incarnation_id = resp.incarnation_id();
-  result.register_ts_ms = resp.register_ts_ms();
-  if (resp.type() == xllm_service::proto::InstanceType::PREFILL) {
-    result.type = "PREFILL";
-  } else if (resp.type() == xllm_service::proto::InstanceType::DECODE) {
-    result.type = "DECODE";
-  } else if (resp.type() == xllm_service::proto::InstanceType::MIX) {
-    result.type = "MIX";
-  } else {
-    result.type = "DEFAULT";
-  }
-  // parse kv cache info
-  for (auto& cluster_id : resp.cluster_ids()) {
-    result.cluster_ids.emplace_back(cluster_id);
-  }
-  for (auto& addr : resp.addrs()) {
-    result.addrs.emplace_back(addr);
-  }
-  for (auto& k_cache_id : resp.k_cache_ids()) {
-    result.k_cache_ids.emplace_back(k_cache_id);
-  }
-  for (auto& v_cache_id : resp.v_cache_ids()) {
-    result.v_cache_ids.emplace_back(v_cache_id);
-  }
-  result.dp_size = resp.dp_size();
-  for (auto& ip : resp.device_ips()) {
-    result.device_ips.emplace_back(ip);
-  }
-  for (auto& port : resp.ports()) {
-    result.ports.emplace_back(port);
-  }
-
-  return result;
+  return instance_info_from_proto(resp);
 }
 
 void XServiceClient::heartbeat() {
-  KvCacheEvent event;
   while (!exited_.load()) {
-    event.clear();
-    std::this_thread::sleep_for(std::chrono::milliseconds(
-        static_cast<int64_t>(FLAGS_heart_beat_interval * 1000)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(
+        ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
+        1000)));
     if (!register_done_.load()) continue;
 
     if (block_manager_pool_ == nullptr || scheduler_ == nullptr) continue;
@@ -333,24 +369,6 @@ void XServiceClient::heartbeat() {
     xllm_service::proto::HeartbeatRequest req;
     req.set_name(instance_name_);
     req.set_incarnation_id(incarnation_id_);
-    if (block_manager_pool_->options().enable_prefix_cache()) {
-      block_manager_pool_->get_merged_kvcache_event(&event);
-      auto cache_event = req.mutable_cache_event();
-      if (event.stored_cache.size()) {
-        cache_event->mutable_stored_cache()->Reserve(event.stored_cache.size());
-        for (auto& hash_key : event.stored_cache) {
-          cache_event->add_stored_cache(hash_key.data, sizeof(hash_key.data));
-        }
-      }
-
-      if (event.removed_cache.size()) {
-        cache_event->mutable_removed_cache()->Reserve(
-            event.removed_cache.size());
-        for (auto& hash_key : event.removed_cache) {
-          cache_event->add_removed_cache(hash_key.data, sizeof(hash_key.data));
-        }
-      }
-    }
 
     req.mutable_load_metrics()->set_gpu_cache_usage_perc(
         block_manager_pool_->get_gpu_cache_usage_perc());
@@ -529,6 +547,8 @@ std::vector<bool> XServiceClient::generations(
       proto_usage->set_num_generated_tokens(
           output.usage.value().num_generated_tokens);
       proto_usage->set_num_total_tokens(output.usage.value().num_total_tokens);
+      proto_usage->set_num_cached_tokens(
+          output.usage.value().num_cached_tokens);
     }
     req->mutable_outputs()->Reserve(output.outputs.size());
     for (auto& seq_output : output.outputs) {
@@ -580,88 +600,80 @@ std::vector<bool> XServiceClient::generations(
     }
   }
 
-  struct ServiceCallResult {
-    bool rpc_success = false;
-    std::vector<bool> all_status_ok;
+  // Use brpc semi-synchronous RPC pattern (DoNothing + Join) instead of
+  // folly thread pool. brpc::Join is bthread-aware: it yields the brpc worker
+  // thread via butex_wait, avoiding the deadlock that occurs when
+  // folly::SemiFuture::wait() blocks all brpc workers with a pthread futex.
+  struct AsyncCallContext {
+    std::string service_addr;
+    brpc::Controller cntl;
+    proto::StatusSet resp;
+    proto::DisaggStreamGenerations gens;
+    bool issued = false;
   };
 
+  const size_t num_services = service_requests_map.size();
+  std::vector<AsyncCallContext> contexts(num_services);
   std::vector<std::string> service_order;
-  service_order.reserve(service_requests_map.size());
-  std::vector<folly::SemiFuture<ServiceCallResult>> futures;
-  futures.reserve(service_requests_map.size());
+  service_order.reserve(num_services);
 
-  // send requests to each xllm_service in parallel
+  // Fire all RPCs asynchronously
+  size_t idx = 0;
   for (const auto& pair : service_requests_map) {
-    const std::string service_addr = pair.first;
-    auto gens = std::make_shared<proto::DisaggStreamGenerations>(pair.second);
-    service_order.push_back(service_addr);
+    auto& ctx = contexts[idx++];
+    ctx.service_addr = pair.first;
+    ctx.gens = pair.second;
+    service_order.push_back(ctx.service_addr);
 
-    futures.emplace_back(folly::via(
-        folly::getGlobalCPUExecutor(),
-        [this, service_addr, gens]() -> ServiceCallResult {
-          ServiceCallResult call_result;
+    if (!connect_to_xservice(ctx.service_addr)) {
+      LOG(ERROR) << "Failed to connect target xservice: " << ctx.service_addr;
+      continue;
+    }
 
-          if (!connect_to_xservice(service_addr)) {
-            LOG(ERROR) << "Failed to connect target xservice: " << service_addr;
-            return call_result;
-          }
-
-          proto::StatusSet resp;
-          brpc::Controller cntl;
-          {
-            std::shared_lock<std::shared_mutex> lock(mutex_);
-            auto* service_stub = find_stub_locked(service_addr);
-            if (service_stub == nullptr) {
-              LOG(ERROR) << "No stub available for xservice: " << service_addr;
-              return call_result;
-            }
-            service_stub->Generations(&cntl, gens.get(), &resp, nullptr);
-          }
-
-          if (cntl.Failed()) {
-            LOG(ERROR) << "Fail to response tokens to xservice server "
-                       << service_addr << ", error text: " << cntl.ErrorText();
-            return call_result;
-          }
-
-          call_result.rpc_success = true;
-          call_result.all_status_ok.reserve(resp.all_status_size());
-          for (const auto& status : resp.all_status()) {
-            call_result.all_status_ok.push_back(status.ok());
-          }
-          return call_result;
-        }));
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto* service_stub = find_stub_locked(ctx.service_addr);
+    if (service_stub == nullptr) {
+      LOG(ERROR) << "No stub available for xservice: " << ctx.service_addr;
+      continue;
+    }
+    ctx.issued = true;
+    service_stub->Generations(
+        &ctx.cntl, &ctx.gens, &ctx.resp, brpc::DoNothing());
   }
 
-  auto try_results = folly::collectAll(futures).get();
-  for (size_t i = 0; i < try_results.size(); ++i) {
+  // Wait for all RPCs — bthread-aware, yields brpc worker properly
+  for (auto& ctx : contexts) {
+    if (ctx.issued) {
+      brpc::Join(ctx.cntl.call_id());
+    }
+  }
+
+  // Process results
+  for (size_t i = 0; i < contexts.size(); ++i) {
     const std::string& service_addr = service_order[i];
+    auto& ctx = contexts[i];
     auto index_it = service_outputs_map.find(service_addr);
     CHECK(index_it != service_outputs_map.end())
         << "No output index found for service: " << service_addr;
     const auto& indices = index_it->second;
 
-    if (try_results[i].hasException()) {
-      LOG(ERROR) << "Async call throws exception for xservice: "
-                 << service_addr;
+    if (!ctx.issued || ctx.cntl.Failed()) {
+      if (ctx.cntl.Failed()) {
+        LOG(ERROR) << "Fail to response tokens to xservice server "
+                   << service_addr << ", error text: " << ctx.cntl.ErrorText();
+      }
       mark_service_failed(service_addr);
       continue;
     }
 
-    const auto& call_result = try_results[i].value();
-    if (!call_result.rpc_success) {
-      mark_service_failed(service_addr);
-      continue;
-    }
-
-    CHECK_EQ(call_result.all_status_ok.size(), indices.size())
+    CHECK_EQ(ctx.resp.all_status_size(), static_cast<int>(indices.size()))
         << "The size of status set is not equal to the size of outputs for "
            "service: "
         << service_addr;
 
-    for (size_t j = 0; j < call_result.all_status_ok.size(); ++j) {
+    for (size_t j = 0; j < indices.size(); ++j) {
       size_t original_idx = indices[j];
-      results[original_idx] = call_result.all_status_ok[j];
+      results[original_idx] = ctx.resp.all_status(j).ok();
     }
   }
 
@@ -771,8 +783,8 @@ void XServiceClient::disconnect_xservice(const std::string& xservice_addr) {
   }
 }
 
-void XServiceClient::handle_master_service_watch(
-    const etcd::Response& response) {
+void XServiceClient::handle_master_service_watch(const etcd::Response& response,
+                                                 const uint64_t& prefix_len) {
   if (response.events().empty() || exited_.load()) {
     return;
   }
@@ -807,7 +819,8 @@ void XServiceClient::handle_master_service_watch(
   }
 }
 
-void XServiceClient::handle_xservices_watch(const etcd::Response& response) {
+void XServiceClient::handle_xservices_watch(const etcd::Response& response,
+                                            const uint64_t& prefix_len) {
   if (response.events().empty() || exited_.load()) {
     return;
   }
@@ -817,17 +830,17 @@ void XServiceClient::handle_xservices_watch(const etcd::Response& response) {
     std::string service_addr;
     if (event.event_type() == etcd::Event::EventType::PUT) {
       if (event.has_kv()) {
-        event_key = event.kv().key();
+        event_key = event.kv().key().substr(prefix_len);
         service_addr = event.kv().as_string();
       }
     } else if (event.event_type() == etcd::Event::EventType::DELETE_) {
       if (event.has_prev_kv()) {
-        event_key = event.prev_kv().key();
+        event_key = event.prev_kv().key().substr(prefix_len);
         service_addr = event.prev_kv().as_string();
       }
       if (service_addr.empty() && event.has_kv()) {
         if (event_key.empty()) {
-          event_key = event.kv().key();
+          event_key = event.kv().key().substr(prefix_len);
         }
         service_addr = event.kv().as_string();
       }

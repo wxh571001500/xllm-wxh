@@ -1,5 +1,4 @@
 include(cc_library)
-include(cc_test)
 
 add_subdirectory(tokenizers)
 
@@ -13,6 +12,7 @@ cc_library(
     tiktoken_tokenizer.h
     sentencepiece_tokenizer.h
     fast_tokenizer.h
+    rwkv_tokenizer.h
     tokenizer_proxy.h
     rec_tokenizer.h
   SRCS
@@ -20,6 +20,7 @@ cc_library(
     tiktoken_tokenizer.cpp
     sentencepiece_tokenizer.cpp
     fast_tokenizer.cpp
+    rwkv_tokenizer.cpp
     tokenizer_proxy.cpp
     rec_tokenizer.cpp
   DEPS
@@ -27,19 +28,10 @@ cc_library(
     :sentencepiece
     state_dict
     absl::flat_hash_map
+    absl::flat_hash_set
     absl::strings
     glog::glog
+    nlohmann_json::nlohmann_json
     rust_tokenizers
     re2::re2
-)
-
-cc_test(
-  NAME
-    fast_tokenizer_test
-  SRCS
-    tests/fast_tokenizer_tests.cpp
-  DEPS
-    :tokenizer
-    glog::glog
-    GTest::gtest_main
 )

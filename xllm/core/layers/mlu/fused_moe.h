@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -34,6 +35,8 @@ limitations under the License.
 #include "util/tensor_helper.h"
 
 namespace xllm {
+class ModelContext;
+
 namespace layer {
 
 class FusedMoEImpl : public torch::nn::Module {
@@ -44,25 +47,34 @@ class FusedMoEImpl : public torch::nn::Module {
   };
 
   FusedMoEImpl() = default;
+  FusedMoEImpl(const ModelContext& context, const FusedMoEArgs& moe_args);
   FusedMoEImpl(const ModelArgs& model_args,
                const FusedMoEArgs& moe_args,
                const QuantArgs& quant_args,
                const ParallelArgs& parallel_args,
-               const torch::TensorOptions& options);
+               const torch::TensorOptions& options,
+               const std::shared_ptr<Stream>& routed_comm_stream,
+               const std::shared_ptr<Stream>& shared_compute_stream);
 
-  RouteInfo prep_route(torch::Tensor& hidden_states);
+  RouteInfo prep_route(
+      torch::Tensor& hidden_states,
+      const std::optional<torch::Tensor>& input_ids = std::nullopt);
   torch::Tensor forward_experts(
       const torch::Tensor& hidden_states,
       bool enable_all2all_communication,
-      const std::optional<RouteInfo>& route_info = std::nullopt);
+      const std::optional<RouteInfo>& route_info = std::nullopt,
+      const std::optional<torch::Tensor>& input_ids = std::nullopt);
   torch::Tensor forward_shared(const torch::Tensor& hidden_states);
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const ModelInputParams& input_params);
-  void load_state_dict(const StateDict& state_dict);
+  virtual void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights() const;
+  bool has_shared() const { return static_cast<bool>(shared_experts_); }
   ProcessGroup* shared_pg() const { return shared_pg_; }
+  Stream* shared_stream() const { return shared_stream_.get(); }
+  Stream* routed_stream() const { return routed_stream_.get(); }
 
- private:
+ protected:
   // struct to store the selected expert info
   struct SelectedExpertInfo {
     torch::Tensor reduce_weight;
@@ -80,11 +92,12 @@ class FusedMoEImpl : public torch::nn::Module {
 
   torch::Tensor forward_experts_base(
       const torch::Tensor& hidden_states,
-      const std::optional<RouteInfo>& route_info);
+      const std::optional<RouteInfo>& route_info,
+      const std::optional<torch::Tensor>& input_ids);
 
-  void final_comm_allreduce(torch::Tensor& final_hidden_states,
-                            const torch::Tensor& hidden_states,
-                            torch::Tensor& shared_expert_output);
+  virtual void final_comm_allreduce(torch::Tensor& final_hidden_states,
+                                    const torch::Tensor& hidden_states,
+                                    torch::Tensor& shared_expert_output);
 
   // ===== All2All path methods (DeepEP communication mode) =====
   void select_experts_all2all(const torch::Tensor& hidden_states_2d,
@@ -94,7 +107,8 @@ class FusedMoEImpl : public torch::nn::Module {
 
   torch::Tensor forward_experts_all2all(
       const torch::Tensor& hidden_states,
-      const std::optional<RouteInfo>& route_info);
+      const std::optional<RouteInfo>& route_info,
+      const std::optional<torch::Tensor>& input_ids);
 
   // Result structure for combine_step
   struct CombineResult {
@@ -108,14 +122,12 @@ class FusedMoEImpl : public torch::nn::Module {
                              const torch::Tensor& hidden_states,
                              int64_t num_token_expand);
 
-  std::pair<torch::Tensor, std::optional<torch::List<int64_t>>>
-  prepare_group_gemm_weight_scale(const torch::Tensor& b_scale) const;
   RouteInfo get_route(torch::Tensor& hidden_states_2d,
                       bool enable_all2all_communication,
-                      const std::optional<RouteInfo>& route_info);
+                      const std::optional<RouteInfo>& route_info,
+                      const std::optional<torch::Tensor>& input_ids);
   void check_route(const torch::Tensor& hidden_states_2d,
                    const RouteInfo& route_info) const;
-  void init_streams(const torch::Tensor& hidden_states);
   torch::Tensor compute_routed_experts(
       torch::Tensor expand_hidden_states,
       torch::ScalarType hidden_states_dtype,
@@ -123,7 +135,7 @@ class FusedMoEImpl : public torch::nn::Module {
       int64_t expert_size,
       SelectedExpertInfo& selected_expert_info);
 
- private:
+ protected:
   int64_t num_total_experts_;
   int64_t topk_;
   int64_t hidden_size_;
@@ -131,7 +143,7 @@ class FusedMoEImpl : public torch::nn::Module {
   bool is_gated_;
   bool enable_result_reduction_;
   std::string hidden_act_;
-  bool is_smoothquant_;
+  bool use_a8_quant_;
   int64_t moe_weight_bits_ = 8;
   int64_t weight_pack_factor_ = 1;
 
@@ -145,13 +157,14 @@ class FusedMoEImpl : public torch::nn::Module {
   torch::Tensor dispatch_recv_token_tensor_head_;
   torch::Tensor dispatch_recv_token_tensor_tail_;
 
-  // streams for parallel shared experts
-  std::unique_ptr<Stream> shared_stream_;
-  std::unique_ptr<Stream> routed_stream_;
+  // Model-scoped streams for the final communication/shared-expert overlap.
+  std::shared_ptr<Stream> shared_stream_;
+  std::shared_ptr<Stream> routed_stream_;
   xllm::Device device_;
-  bool stream_initialized_ = false;
+  bool use_hash_ = false;
 
   MoEGate gate_{nullptr};
+  std::optional<float> swiglu_limit_;
   DenseMLP shared_experts_{nullptr};
   DeepEP deep_ep_{nullptr};
 
@@ -172,7 +185,17 @@ class FusedMoEImpl : public torch::nn::Module {
   DEFINE_FUSED_WEIGHT(input_smooth);
   DEFINE_FUSED_WEIGHT(act_smooth);
 
+  torch::List<int64_t> w13_scale_quant_flag_;
+  torch::List<int64_t> w2_scale_quant_flag_;
+  bool scale_layout_prepared_ = false;
+  bool ct_verified_ = false;
+
+  void load_ct_experts(const StateDict& state_dict);
+
   void load_experts(const StateDict& state_dict);
+
+  void prepare_scale_layout();
+
   // create the group gemm output tensor with the workspace
   torch::Tensor create_group_gemm_output(const torch::Tensor& a,
                                          const torch::Tensor& b,

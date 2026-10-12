@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,7 +18,11 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <glog/logging.h>
 
-#include <future>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
+#include "common/global_flags.h"
 
 namespace xllm {
 
@@ -68,41 +72,15 @@ bool CommChannel::check_health() {
   return resp.ok();
 }
 
-bool CommChannel::allocate_kv_cache(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+bool CommChannel::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
+  if (!kv_cache_shape.has_key_cache_shape() ||
+      kv_cache_shape.key_cache_shape().empty()) {
+    LOG(ERROR) << "allocate_kv_cache failed: key cache shape is empty";
+    return false;
+  }
   proto::AllocateKVCacheRequest request;
+  kv_cache_shape.to_proto(request.mutable_kv_cache_shape());
 
-  auto* shape = request.mutable_kv_cache_shape();
-  shape->mutable_key_shape()->Reserve(kv_cache_shape[0].size());
-  shape->mutable_value_shape()->Reserve(kv_cache_shape[1].size());
-
-  // add key shape
-  for (size_t i = 0; i < kv_cache_shape[0].size(); ++i) {
-    shape->add_key_shape(kv_cache_shape[0][i]);
-  }
-
-  // add value shape
-  for (size_t i = 0; i < kv_cache_shape[1].size(); ++i) {
-    shape->add_value_shape(kv_cache_shape[1][i]);
-  }
-
-  // add index shape if exists
-  if (kv_cache_shape.size() == kKVCacheShapeSizeWithIndex) {
-    shape->mutable_index_shape()->Reserve(kv_cache_shape[2].size());
-    for (size_t i = 0; i < kv_cache_shape[2].size(); ++i) {
-      shape->add_index_shape(kv_cache_shape[2][i]);
-    }
-  } else if (kv_cache_shape.size() == kKVCacheShapeSizeWithConvAndSsm) {
-    // Use for Qwen-3.5, Qwen3-next, etc
-    shape->mutable_conv_shape()->Reserve(kv_cache_shape[2].size());
-    shape->mutable_ssm_shape()->Reserve(kv_cache_shape[3].size());
-    for (size_t i = 0; i < kv_cache_shape[2].size(); ++i) {
-      shape->add_conv_shape(kv_cache_shape[2][i]);
-    }
-    for (size_t i = 0; i < kv_cache_shape[3].size(); ++i) {
-      shape->add_ssm_shape(kv_cache_shape[3][i]);
-    }
-  }
   proto::Status s;
   brpc::Controller cntl;
   stub_->AllocateKVCache(&cntl, &request, &s, nullptr);
@@ -115,26 +93,27 @@ bool CommChannel::allocate_kv_cache(
   return true;
 }
 
-bool CommChannel::get_device_info(std::string& device_ip, uint16_t& port) {
-  proto::Empty req;
-  proto::DeviceInfo resp;
-  brpc::Controller cntl;
+bool CommChannel::set_speculative_validate_time_predictor(
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+  proto::SpeculativeValidateTimePredictor request;
+  request.set_intercept_ms(predictor.intercept_ms);
+  request.set_query_token_ms(predictor.query_token_ms);
+  request.set_query_prefix_ms(predictor.query_prefix_ms);
 
-  stub_->GetDeviceInfo(&cntl, &req, &resp, nullptr);
-  if (cntl.Failed()) {
-    LOG(ERROR) << "GetDeviceInfo failed: " << cntl.ErrorText();
+  proto::Status s;
+  brpc::Controller cntl;
+  stub_->SetSpeculativeValidateTimePredictor(&cntl, &request, &s, nullptr);
+  if (cntl.Failed() || !s.ok()) {
+    LOG(ERROR) << "SetSpeculativeValidateTimePredictor failed: "
+               << cntl.ErrorText();
     return false;
   }
-
-  device_ip = resp.device_ip();
-  port = resp.listen_port();
   return true;
 }
 
 bool CommChannel::get_cache_info(uint64_t& cluster_id,
                                  std::string& addr,
-                                 int64_t& k_cache_id,
-                                 int64_t& v_cache_id) {
+                                 uint16_t& port) {
   proto::Empty req;
   proto::CacheInfo resp;
   brpc::Controller cntl;
@@ -147,25 +126,21 @@ bool CommChannel::get_cache_info(uint64_t& cluster_id,
 
   cluster_id = resp.cluster_id();
   addr = resp.addr();
-  k_cache_id = resp.k_cache_id();
-  v_cache_id = resp.v_cache_id();
+  port = static_cast<uint16_t>(resp.listen_port());
   return true;
 }
 
 bool CommChannel::link_cluster(const std::vector<uint64_t>& cluster_ids,
                                const std::vector<std::string>& addrs,
-                               const std::vector<std::string>& device_ips,
                                const std::vector<uint16_t>& ports) {
   proto::ClusterInfo cluster_info;
   cluster_info.mutable_cluster_ids()->Reserve(cluster_ids.size());
   cluster_info.mutable_addrs()->Reserve(addrs.size());
-  cluster_info.mutable_device_ips()->Reserve(device_ips.size());
   cluster_info.mutable_ports()->Reserve(ports.size());
 
   for (size_t i = 0; i < cluster_ids.size(); ++i) {
     cluster_info.add_cluster_ids(cluster_ids[i]);
     cluster_info.add_addrs(addrs[i]);
-    cluster_info.add_device_ips(device_ips[i]);
     cluster_info.add_ports(ports[i]);
   }
 
@@ -182,18 +157,15 @@ bool CommChannel::link_cluster(const std::vector<uint64_t>& cluster_ids,
 
 bool CommChannel::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                                  const std::vector<std::string>& addrs,
-                                 const std::vector<std::string>& device_ips,
                                  const std::vector<uint16_t>& ports) {
   proto::ClusterInfo cluster_info;
   cluster_info.mutable_cluster_ids()->Reserve(cluster_ids.size());
   cluster_info.mutable_addrs()->Reserve(addrs.size());
-  cluster_info.mutable_device_ips()->Reserve(device_ips.size());
   cluster_info.mutable_ports()->Reserve(ports.size());
 
   for (size_t i = 0; i < cluster_ids.size(); ++i) {
     cluster_info.add_cluster_ids(cluster_ids[i]);
     cluster_info.add_addrs(addrs[i]);
-    cluster_info.add_device_ips(device_ips[i]);
     cluster_info.add_ports(ports[i]);
   }
 
@@ -208,31 +180,31 @@ bool CommChannel::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
   return true;
 }
 
-bool CommChannel::link_d2d(const std::string& remote_addr) {
-  proto::D2DLinkWorkerRequest req;
+bool CommChannel::link_p2p(const std::string& remote_addr) {
+  proto::P2PLinkWorkerRequest req;
   req.set_remote_addr(remote_addr);
 
   proto::Status s;
   brpc::Controller cntl;
-  stub_->LinkD2D(&cntl, &req, &s, nullptr);
+  stub_->LinkP2P(&cntl, &req, &s, nullptr);
 
   if (cntl.Failed() || !s.ok()) {
-    LOG(ERROR) << "LinkD2D failed: " << cntl.ErrorText();
+    LOG(ERROR) << "LinkP2P failed: " << cntl.ErrorText();
     return false;
   }
   return true;
 }
 
-bool CommChannel::unlink_d2d(const std::string& remote_addr) {
-  proto::D2DLinkWorkerRequest req;
+bool CommChannel::unlink_p2p(const std::string& remote_addr) {
+  proto::P2PLinkWorkerRequest req;
   req.set_remote_addr(remote_addr);
 
   proto::Status s;
   brpc::Controller cntl;
-  stub_->UnlinkD2D(&cntl, &req, &s, nullptr);
+  stub_->UnlinkP2P(&cntl, &req, &s, nullptr);
 
   if (cntl.Failed() || !s.ok()) {
-    LOG(ERROR) << "UnlinkD2D failed: " << cntl.ErrorText();
+    LOG(ERROR) << "UnlinkP2P failed: " << cntl.ErrorText();
     return false;
   }
   return true;
@@ -289,20 +261,21 @@ bool CommChannel::estimate_kv_cache_capacity(int64_t& available_memory,
   return true;
 }
 
-bool CommChannel::pull_kv_blocks(const uint64_t src_cluster_id,
-                                 const std::string& src_addr,
-                                 const int64_t src_k_cache_id,
-                                 const int64_t src_v_cache_id,
-                                 const std::vector<uint64_t>& src_blocks,
-                                 const std::vector<uint64_t>& dst_blocks) {
+bool CommChannel::pull_kv_blocks(
+    const uint64_t src_cluster_id,
+    const std::string& src_addr,
+    const std::vector<KVTransferMapping>& mappings) {
   proto::PullKVCacheRequest request;
   request.set_cluster_id(src_cluster_id);
   request.set_addr(src_addr);
-  request.set_k_cache_id(src_k_cache_id);
-  request.set_v_cache_id(src_v_cache_id);
 
-  ADD_VECTOR_TO_PROTO(request.mutable_src_blocks(), src_blocks);
-  ADD_VECTOR_TO_PROTO(request.mutable_dst_blocks(), dst_blocks);
+  for (const KVTransferMapping& mapping : mappings) {
+    proto::KVTransferMapping* proto_mapping = request.add_mappings();
+    proto_mapping->set_group_id(mapping.group_id);
+    ADD_VECTOR_TO_PROTO(proto_mapping->mutable_local_ids(), mapping.local_ids);
+    ADD_VECTOR_TO_PROTO(proto_mapping->mutable_remote_ids(),
+                        mapping.remote_ids);
+  }
 
   proto::Status s;
   brpc::Controller cntl;
@@ -312,7 +285,7 @@ bool CommChannel::pull_kv_blocks(const uint64_t src_cluster_id,
 }
 
 void CommChannel::execute_model_async(
-    const RawForwardInput& input,
+    const ForwardInput& input,
     folly::Promise<std::optional<RawForwardOutput>>& promise) {
   execute_model_with_brpc(input, promise);
 }
@@ -331,30 +304,15 @@ bool CommChannel::process_group_test() {
 }
 
 bool CommChannel::allocate_kv_cache_with_transfer(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+    const KVCacheShape& kv_cache_shape) {
+  if (!kv_cache_shape.has_key_cache_shape() ||
+      kv_cache_shape.key_cache_shape().empty()) {
+    LOG(ERROR)
+        << "AllocateKVCacheWithTransfer failed: key cache shape is empty";
+    return false;
+  }
   proto::AllocateKVCacheRequest request;
-
-  auto* shape = request.mutable_kv_cache_shape();
-  shape->mutable_key_shape()->Reserve(kv_cache_shape[0].size());
-  shape->mutable_value_shape()->Reserve(kv_cache_shape[1].size());
-
-  // add key shape
-  for (size_t i = 0; i < kv_cache_shape[0].size(); ++i) {
-    shape->add_key_shape(kv_cache_shape[0][i]);
-  }
-
-  // add value shape
-  for (size_t i = 0; i < kv_cache_shape[1].size(); ++i) {
-    shape->add_value_shape(kv_cache_shape[1][i]);
-  }
-
-  // add index shape if exists
-  if (kv_cache_shape.size() > 2) {
-    shape->mutable_index_shape()->Reserve(kv_cache_shape[2].size());
-    for (size_t i = 0; i < kv_cache_shape[2].size(); ++i) {
-      shape->add_index_shape(kv_cache_shape[2][i]);
-    }
-  }
+  kv_cache_shape.to_proto(request.mutable_kv_cache_shape());
 
   proto::Status s;
   brpc::Controller cntl;
@@ -388,15 +346,17 @@ void CommChannel::transfer_kv_blocks(
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
   proto::BlockTransferInfos pb_block_transfer_info;
-  if (!block_transfer_info_to_proto(
-          batch_id, block_transfer_info, &pb_block_transfer_info)) {
-    LOG(ERROR) << "transfer_kv_blocks with batch id " << batch_id
-               << " fail: create proto fail!";
-    return;
-  }
+  CHECK(block_transfer_info_to_proto(
+      batch_id, block_transfer_info, &pb_block_transfer_info))
+      << "Failed to serialize H2D transfer for batch_id=" << batch_id;
   brpc::Controller cntl;
   proto::TransferStatus response;
   stub_->TransferBlocks(&cntl, &pb_block_transfer_info, &response, nullptr);
+  CHECK(!cntl.Failed()) << "H2D transfer registration RPC failed for batch_id="
+                        << batch_id << ": " << cntl.ErrorText();
+  CHECK_EQ(response.success_cnt(), block_transfer_info.size())
+      << "H2D transfer registration was not acknowledged for batch_id="
+      << batch_id;
 }
 
 bool CommChannel::sleep(MasterStatus master_status) {
@@ -408,6 +368,20 @@ bool CommChannel::sleep(MasterStatus master_status) {
   stub_->Sleep(&cntl, &req, &s, nullptr);
   if (cntl.Failed() || !s.ok()) {
     LOG(ERROR) << "Sleep failed: " << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
+bool CommChannel::update_weights(const std::string& weights_path) {
+  proto::UpdateWeightsRequest req;
+  proto::Status s;
+  brpc::Controller cntl;
+
+  req.set_weights_path(weights_path);
+  stub_->UpdateWeights(&cntl, &req, &s, nullptr);
+  if (cntl.Failed() || !s.ok()) {
+    LOG(ERROR) << "UpdateWeights failed: " << cntl.ErrorText();
     return false;
   }
   return true;
@@ -440,92 +414,146 @@ bool CommChannel::wakeup(const WakeupOptions& options) {
   return true;
 }
 
-class ClientStreamReceiver : public brpc::StreamInputHandler {
+bool CommChannel::start_profile() {
+  proto::Empty req;
+  proto::Status s;
+  brpc::Controller cntl;
+
+  stub_->StartProfile(&cntl, &req, &s, nullptr);
+  if (cntl.Failed() || !s.ok()) {
+    LOG(ERROR) << "StartProfile failed: " << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
+bool CommChannel::stop_profile() {
+  proto::Empty req;
+  proto::Status s;
+  brpc::Controller cntl;
+
+  stub_->StopProfile(&cntl, &req, &s, nullptr);
+  if (cntl.Failed() || !s.ok()) {
+    LOG(ERROR) << "StopProfile failed: " << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
+class ClientStreamReceiver final : public brpc::StreamInputHandler {
  private:
-  std::shared_ptr<std::atomic<int32_t>> termination_flag_;
-  std::shared_ptr<std::atomic<uint32_t>> success_cnt_;
-  std::promise<void> close_promise_;
-  std::atomic<bool> promise_set_{false};
+  std::shared_ptr<PrefetchResult> result_;
+  size_t worker_index_ = 0;
 
- public:
-  ClientStreamReceiver(std::shared_ptr<std::atomic<int32_t>> termination_flag,
-                       std::shared_ptr<std::atomic<uint32_t>> success_cnt)
-      : termination_flag_(termination_flag), success_cnt_(success_cnt) {}
-
-  ~ClientStreamReceiver() {
-    if (!promise_set_.exchange(true)) {
-      close_promise_.set_value();
-    }
+  void fail_and_close(brpc::StreamId id) {
+    result_->mark_worker_failed();
+    brpc::StreamClose(id);
   }
 
-  std::future<void> get_close_future() { return close_promise_.get_future(); }
+  bool send_control(brpc::StreamId id, PrefetchControl control) {
+    const uint8_t control_byte = static_cast<uint8_t>(control);
+    butil::IOBuf response;
+    response.append(&control_byte, sizeof(control_byte));
+    if (brpc::StreamWrite(id, response) == 0) {
+      return true;
+    }
+    LOG(ERROR) << "Failed to write Mooncake prefetch decision: worker="
+               << worker_index_;
+    result_->mark_worker_failed();
+    brpc::StreamClose(id);
+    return false;
+  }
+
+ public:
+  ClientStreamReceiver(std::shared_ptr<PrefetchResult> result,
+                       size_t worker_index)
+      : result_(std::move(result)), worker_index_(worker_index) {
+    CHECK(result_ != nullptr);
+    CHECK_LT(worker_index_, result_->worker_count());
+  }
 
   int on_received_messages(brpc::StreamId id,
                            butil::IOBuf* const messages[],
                            size_t size) override {
-    for (size_t i = 0; i < size; ++i) {
-      std::string msg_str = messages[i]->to_string();
-      int32_t success_cnt = std::stoi(msg_str);
+    const size_t batch_size = result_->batch_wire_size();
+    // The worker pads a short final batch to the configured batch size. The
+    // result object validates the configured size and ignores padding units.
+    const size_t expected_bytes = batch_size * 2;
+    if (size != 1 || messages[0]->length() != expected_bytes) {
+      LOG(ERROR) << "Invalid Mooncake prefetch result frame: worker="
+                 << worker_index_ << ", messages=" << size
+                 << ", bytes=" << (size == 1 ? messages[0]->length() : 0)
+                 << ", expected_bytes=" << expected_bytes;
+      fail_and_close(id);
+      return -1;
+    }
 
-      if (success_cnt > 0 &&
-          termination_flag_->load(std::memory_order_acquire) > 0) {
-        success_cnt_->fetch_add(success_cnt, std::memory_order_relaxed);
-      } else {
-        termination_flag_->fetch_sub(1, std::memory_order_release);
-        if (!promise_set_.exchange(true)) {
-          close_promise_.set_value();
-        }
-        break;
-      }
+    std::vector<uint8_t> gated_hits(batch_size);
+    std::vector<uint8_t> non_gated_hits(batch_size);
+    messages[0]->copy_to(gated_hits.data(), gated_hits.size());
+    messages[0]->copy_to(
+        non_gated_hits.data(), non_gated_hits.size(), gated_hits.size());
+    const std::optional<PrefetchControl> control =
+        result_->record_batch_result(worker_index_, gated_hits, non_gated_hits);
+    if (!control.has_value()) {
+      LOG(ERROR) << "Unexpected Mooncake prefetch result: worker="
+                 << worker_index_;
+      fail_and_close(id);
+      return -1;
+    }
+    if (!send_control(id, *control)) {
+      return -1;
     }
     return 0;
   }
 
-  virtual void on_idle_timeout(brpc::StreamId id) override {
-    if (!promise_set_.exchange(true)) {
-      close_promise_.set_value();
-    }
+  void on_idle_timeout(brpc::StreamId id) override { fail_and_close(id); }
+
+  void on_failed(brpc::StreamId /*id*/,
+                 int /*error_code*/,
+                 const std::string& /*error_text*/) override {
+    result_->mark_worker_failed();
   }
 
-  virtual void on_closed(brpc::StreamId id) override {
-    if (!promise_set_.exchange(true)) {
-      close_promise_.set_value();
-    }
+  void on_closed(brpc::StreamId /*id*/) override {
+    result_->mark_worker_ended(worker_index_);
+    delete this;
   }
 };
 
-void CommChannel::prefetch_from_storage(
-    const std::vector<BlockTransferInfo>& block_transfer_info,
-    std::shared_ptr<std::atomic<int32_t>> flag,
-    std::shared_ptr<std::atomic<uint32_t>> success_cnt) {
-  proto::BlockTransferInfos pb_block_transfer_info;
-  if (!block_transfer_info_to_proto(block_transfer_info,
-                                    &pb_block_transfer_info)) {
-    LOG(ERROR) << "prefetch_from_storage fail: create proto fail!";
+void CommChannel::prefetch_from_storage(const StoragePrefetchRequest& request,
+                                        std::shared_ptr<PrefetchResult> result,
+                                        size_t worker_index) {
+  CHECK(result != nullptr);
+  CHECK(request.valid());
+  proto::PrefetchRequest proto_request;
+  if (!storage_prefetch_request_to_proto(request, &proto_request)) {
+    LOG(ERROR) << "Failed to serialize Mooncake prefetch request.";
+    result->mark_worker_ended(worker_index, /*worker_ok=*/false);
     return;
   }
-  ClientStreamReceiver receiver(flag, success_cnt);
+
+  auto* receiver = new ClientStreamReceiver(result, worker_index);
   brpc::Controller cntl;
   brpc::StreamOptions stream_options;
   brpc::StreamId stream_id;
   proto::Status response;
-  stream_options.handler = &receiver;
-  stream_options.idle_timeout_ms = 30;
+  stream_options.handler = receiver;
+  stream_options.idle_timeout_ms = result->stream_idle_timeout_ms();
   if (brpc::StreamCreate(&stream_id, cntl, &stream_options) != 0) {
-    LOG(ERROR) << "Failed to create stream";
+    LOG(ERROR) << "Failed to create Mooncake prefetch stream.";
+    delete receiver;
+    result->mark_worker_ended(worker_index, /*worker_ok=*/false);
     return;
   }
 
-  stub_->PrefetchFromStorage(
-      &cntl, &pb_block_transfer_info, &response, nullptr);
-
+  stub_->PrefetchFromStorage(&cntl, &proto_request, &response, nullptr);
   if (cntl.Failed() || !response.ok()) {
-    LOG(ERROR) << "Fail to connect stream, " << cntl.ErrorText();
-    return;
+    LOG(ERROR) << "Failed to connect Mooncake prefetch stream: "
+               << cntl.ErrorText();
+    result->mark_worker_failed();
+    brpc::StreamClose(stream_id);
   }
-
-  receiver.get_close_future().wait();
-  brpc::StreamClose(stream_id);
 }
 
 bool CommChannel::get_last_step_result_async(
@@ -581,13 +609,16 @@ bool CommChannel::get_active_activation_memory_async(
 }
 
 bool CommChannel::execute_model_with_brpc(
-    const RawForwardInput& input,
+    const ForwardInput& input,
     folly::Promise<std::optional<RawForwardOutput>>& promise) {
-  // convert to proto::ForwardInput
   proto::ForwardInput pb_forward_input;
-  forward_input_to_proto(input, &pb_forward_input);
+  auto* packed_input = pb_forward_input.mutable_packed_input();
+  if (!forward_input_to_packed_proto(input, packed_input)) {
+    LOG(ERROR) << "failed to pack ForwardInput for remote execution";
+    promise.setValue(std::optional<RawForwardOutput>(std::nullopt));
+    return false;
+  }
 
-  // call ExecuteModel with callback
   auto done = new ExecuteModelClosure();
   done->promise = std::move(promise);
   stub_->ExecuteModel(&done->cntl, &pb_forward_input, &done->pb_output, done);

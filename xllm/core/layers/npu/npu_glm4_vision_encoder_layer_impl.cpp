@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,7 +17,10 @@ limitations under the License.
 #include "npu_glm4_vision_encoder_layer_impl.h"
 
 #include <glog/logging.h>
+#include <mstx/ms_tools_ext.h>
 
+#include "common/global_flags.h"
+#include "core/framework/config/load_config.h"
 #include "xllm_atb_layers/models/glm4v/glm4v_encoder.h"
 
 namespace xllm {
@@ -61,8 +64,25 @@ NpuGlm4VisionEncoderLayerImpl::NpuGlm4VisionEncoderLayerImpl(
   param_from_args(encode_param_, model_args, parallel_args);
   atb_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
   dtype_ = c10::typeMetaToScalarType(options.dtype());
-  loader_ = std::make_unique<Glm4VisionEncoderLoader>(WEIGHT_COUNT_PER_LAYER,
-                                                      context);
+  loader_ = std::make_unique<Glm4VisionEncoderLoader>(
+      WEIGHT_COUNT_PER_LAYER,
+      context,
+      ::xllm::LoadConfig::get_instance().enable_manual_loader()
+          ? LoadMode::kManual
+          : LoadMode::kEager);
+}
+
+void NpuGlm4VisionEncoderLayerImpl::merge_loaded_weights() {
+  CHECK(loader_ != nullptr) << "glm4 vision encoder loader is not initialized";
+  loader_->merge_loaded_weights();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+
+  Device::empty_cache(device_.index());
+  init_layer();
 }
 
 int64_t NpuGlm4VisionEncoderLayerImpl::init_layer() {
@@ -108,24 +128,17 @@ torch::Tensor NpuGlm4VisionEncoderLayerImpl::forward(
     torch::Tensor& sin_pos,
     torch::Tensor& cu_seqlen,
     std::vector<int>& cu_seqlen_vec,
-    ModelInputParams& input_params,
     int node_id,
     aclrtEvent* event,
     std::atomic<bool>* event_flag) {
   atb::Status st;
 
-  build_node_variant_pack(encode_node_,
-                          x,
-                          cos_pos,
-                          sin_pos,
-                          cu_seqlen,
-                          cu_seqlen_vec,
-                          input_params,
-                          true);
+  build_node_variant_pack(
+      encode_node_, x, cos_pos, sin_pos, cu_seqlen, cu_seqlen_vec, true);
   // mstxRangeEnd(id);
   st = execute_node(encode_node_, node_id);
   LOG_IF(FATAL, st != 0) << model_name_
-                         << "excute encode layer fail, error code: " << st;
+                         << "execute encode layer fail, error code: " << st;
   return x;
 }
 
@@ -136,7 +149,6 @@ void NpuGlm4VisionEncoderLayerImpl::build_node_variant_pack(
     torch::Tensor& sin_pos,
     torch::Tensor& cu_seqlen,
     std::vector<int>& cu_seqlen_vec,
-    ModelInputParams& input_params,
     bool is_prefill) {
   internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(x);
 

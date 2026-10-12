@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -63,7 +63,7 @@ struct ModelTensors {
   int32_t dp_size = 0;
   int32_t tp_size = 0;
 
-  // ============== Weight Segments (for D2D transfer) ==============
+  // ============== Weight Segments (for P2P transfer) ==============
   // Ordered list of weight segments in GlobalXTensor.
   // For contiguous allocation: single segment.
   // For fallback (XTensor): multiple segments from non-contiguous pages.
@@ -203,7 +203,7 @@ class XTensorAllocator {
   // ============== PD Disaggregation Support (XTensor Mode) ==============
 
   // Convert a block_id to GlobalXTensor offsets for KV cache transfer.
-  // This is only used when FLAGS_enable_xtensor is true for PD disaggregation.
+  // This is only used when --enable_xtensor=true for PD disaggregation.
   //
   // Parameters:
   //   model_id: Model identifier
@@ -272,9 +272,6 @@ class XTensorAllocator {
 
   // Per-model tensors storage (key: model_id)
   std::unordered_map<std::string, ModelTensors> model_tensors_;
-
-  // Zero page pointer (owned by PhyPagePool, not this class)
-  PhyPage* zero_page_ = nullptr;
 
   // Multi-node XTensor dist members
   int32_t world_size_ = 0;  // total workers = dp_size * tp_size

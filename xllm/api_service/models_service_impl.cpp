@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,8 +27,10 @@ namespace xllm {
 
 ModelsServiceImpl::ModelsServiceImpl(
     const std::vector<std::string>& model_names,
+    const std::vector<std::string>& model_repository_names,
     const std::vector<std::string>& model_versions)
     : model_names_(model_names),
+      model_repository_names_(model_repository_names),
       model_versions_(model_versions),
       created_(absl::ToUnixSeconds(absl::Now())) {}
 
@@ -47,9 +49,9 @@ bool ModelsServiceImpl::list_models(const proto::ModelListRequest* request,
 std::string ModelsServiceImpl::list_model_versions() {
   nlohmann::json model_states_array = nlohmann::json::array();
 
-  for (size_t i = 0; i < model_names_.size(); ++i) {
+  for (size_t i = 0; i < model_versions_.size(); ++i) {
     nlohmann::json model_state;
-    model_state["name"] = model_names_[i];
+    model_state["name"] = model_repository_names_[i];
     model_state["version"] = model_versions_[i];
     model_state["state"] = "READY";
     model_state["reason"] = "normal";

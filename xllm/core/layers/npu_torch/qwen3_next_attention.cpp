@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,9 +17,42 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <string>
 #include <tuple>
+#include <vector>
+
+#include "common/flash_comm1_context.h"
+#include "core/framework/config/execution_config.h"
+#include "kernels/npu/utils.h"
+
 namespace xllm {
 namespace layer {
+
+bool is_qwen3_5_model_type(const std::string& model_type) {
+  return model_type == "qwen3_5" || model_type == "qwen3_5_text" ||
+         model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text" ||
+         model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp";
+}
+
+bool should_enable_qwen3_5_fia_decode(const std::string& model_type) {
+  return ExecutionConfig::get_instance().enable_fia_decode() &&
+         is_qwen3_5_model_type(model_type);
+}
+
+std::optional<std::string> validate_qwen_dcp_kv_head_replicas(
+    int64_t tp_size,
+    int64_t total_num_kv_heads,
+    int64_t num_kv_head_replicas,
+    int32_t dcp_size) {
+  if (num_kv_head_replicas % dcp_size == 0) {
+    return std::nullopt;
+  }
+  return "Qwen DCP requires dcp_size to divide the replicated KV-head group "
+         "(dcp_size=" +
+         std::to_string(dcp_size) + ", tp_size=" + std::to_string(tp_size) +
+         ", total_num_kv_heads=" + std::to_string(total_num_kv_heads) +
+         ", num_kv_head_replicas=" + std::to_string(num_kv_head_replicas) + ")";
+}
 
 Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
     const ModelArgs& args,
@@ -44,6 +77,18 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
     num_kv_heads_ = 1;
     num_kv_head_replicas_ = tp_size / total_num_kv_heads;
   }
+  if (parallel_args.dcp_group_ != nullptr) {
+    CHECK(!kernel::npu::is_ascend950())
+        << "Qwen3.5 DCP is not supported on Ascend950 because its TND "
+           "attention fallback does not return softmax LSE";
+    const std::optional<std::string> validation_error =
+        validate_qwen_dcp_kv_head_replicas(
+            tp_size,
+            total_num_kv_heads,
+            num_kv_head_replicas_,
+            parallel_args.dcp_group_->world_size());
+    CHECK(!validation_error.has_value()) << *validation_error;
+  }
 
   head_dim_ = args.head_dim();
   q_size_ = num_heads_ * head_dim_;
@@ -61,7 +106,8 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
                         /*bias=*/args.attention_bias(),
                         /*gather_output=*/false,
                         parallel_args,
-                        options));
+                        options,
+                        quant_args));
 
   // 2. O proj
   o_proj_ = register_module("o_proj",
@@ -96,95 +142,193 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
                                              options));
 
   // 6. Attention
-  attn_ = register_module("attn",
-                          Attention(num_heads_,
-                                    head_dim_,
-                                    scaling_,
-                                    num_kv_heads_,
-                                    args.sliding_window()));
+  attn_ = register_module(
+      "attn",
+      Attention(num_heads_,
+                head_dim_,
+                scaling_,
+                num_kv_heads_,
+                args.sliding_window(),
+                /*enable_fia_decode=*/
+                should_enable_qwen3_5_fia_decode(args.model_type()),
+                /*dcp_group=*/parallel_args.dcp_group_));
+
+  // 7. Fused split_qkv_rmsnorm_mrope kernel setup
+  rotary_dim_ = static_cast<int64_t>(head_dim_ * args.partial_rotary_factor());
+  rms_norm_eps_ = args.rms_norm_eps();
+  mrope_section_ = args.rope_scaling_mrope_section();
+  is_interleaved_ = args.rope_scaling_mrope_interleaved();
+  use_fused_qkv_ = false;
+  if (attn_output_gate_ && !mrope_section_.empty() &&
+      mrope_section_.size() == 3 && rotary_dim_ > 0 &&
+      xllm::kernel::has_split_qkv_rmsnorm_mrope_specialization(
+          num_heads_, num_kv_heads_, head_dim_)) {
+    mrope_gather_pattern_ =
+        xllm::kernel::build_split_qkv_rmsnorm_mrope_gather_pattern(
+            rotary_dim_, mrope_section_, is_interleaved_, options.device());
+    use_fused_qkv_ = true;
+    LOG(INFO) << "Qwen3NextAttention layer " << layer_id_
+              << ": using fused split_qkv_rmsnorm_mrope kernel";
+  }
+}
+
+torch::Tensor Qwen3NextAttentionImpl::build_mrope_cos_sin(
+    const torch::Tensor& positions) const {
+  auto cos_sin_cache = rotary_emb_->get_cos_sin_cache();
+  if (positions.dim() == 1) {
+    return cos_sin_cache.index_select(0, positions).repeat({1, 3});
+  }
+  // positions is [3, T] for mRoPE (graph mode or VL)
+  // transpose from [3, T] to [T, 3]
+  auto positions_t = positions.permute({1, 0}).contiguous();
+  auto gathered = cos_sin_cache.index_select(0, positions_t.view({-1}));
+  // [T, 3, rope_dim]
+  return gathered.view({positions.size(1), -1});
 }
 
 torch::Tensor Qwen3NextAttentionImpl::forward(
     const torch::Tensor& positions,
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
-    KVCache& kv_cache) {
-  // 1. qkv projection
-  auto qkv = qkv_proj_->forward(hidden_states);
+    KVCache& kv_cache,
+    const torch::Tensor& mrope_cos_sin) {
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+  torch::Tensor h = hidden_states;
+
+  if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+    h = gather_sequence(hidden_states, *fc1_ctx);
+  }
+
+  auto qkv = qkv_proj_->forward(h);
+
+  if (use_fused_qkv_) {
+    const int64_t T = qkv.size(0);
+    xllm::kernel::SplitQkvRmsnormMropeParams params;
+    params.qkvg = qkv;
+    params.q_weight = q_norm_->weight();
+    params.k_weight = k_norm_->weight();
+    params.cos_sin = mrope_cos_sin;
+    params.gather_pattern = mrope_gather_pattern_;
+    params.eps = rms_norm_eps_;
+    params.num_q_heads = num_heads_;
+    params.num_kv_heads = num_kv_heads_;
+    params.head_size = head_dim_;
+
+    auto [q, k, v, gate] = xllm::kernel::split_qkv_rmsnorm_mrope(params);
+
+    auto q_flat = q.view({T, q_size_});
+    auto k_flat = k.view({T, kv_size_});
+    auto v_flat = v.view({T, kv_size_});
+
+    auto out = std::get<0>(
+        attn_->forward(attn_metadata, q_flat, k_flat, v_flat, kv_cache));
+    out = out * torch::sigmoid(gate.view({T, q_size_}));
+
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      return o_proj_->forward(out, row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+    }
+    return o_proj_->forward(out);
+  }
+
+  // Fallback path: weight-reordered layout [Q | G | K | V]
   torch::Tensor q, k, v;
   torch::Tensor gate;
 
   if (attn_output_gate_) {
-    // Split qkv for attn_output_gate case: [q_size*2, kv_size, kv_size]
-    auto q_gate = qkv.slice(/*dim=*/-1, 0, q_size_ * 2);
-    k = qkv.slice(/*dim=*/-1, q_size_ * 2, q_size_ * 2 + kv_size_);
-    v = qkv.slice(
-        /*dim=*/-1, q_size_ * 2 + kv_size_, q_size_ * 2 + kv_size_ * 2);
-    v = v.contiguous();
-
-    std::vector<int64_t> orig_shape;
-    int64_t q_gate_dim = q_gate.dim();
-    orig_shape =
-        std::vector<int64_t>(q_gate.sizes().slice(0, q_gate_dim - 1).begin(),
-                             q_gate.sizes().slice(0, q_gate_dim - 1).end());
-
-    std::vector<int64_t> new_shape = orig_shape;
-    new_shape.push_back(num_heads_);
-    int64_t orig_total = 1;
-    for (auto d : orig_shape) orig_total *= d;
-    int64_t last_dim = q_gate.numel() / (orig_total * num_heads_);
-    new_shape.push_back(last_dim);
-
-    torch::Tensor q_gate_reshaped = q_gate.reshape(new_shape);
-
-    auto chunks = torch::chunk(q_gate_reshaped, 2, /*dim=*/-1);
-    q = chunks[0];
-    gate = chunks[1];
-
-    std::vector<int64_t> q_new_shape = orig_shape;
-    q_new_shape.push_back(q.numel() / orig_total);
-    q = q.reshape(q_new_shape);
-
-    std::vector<int64_t> gate_new_shape = orig_shape;
-    gate_new_shape.push_back(gate.numel() / orig_total);
-    gate = gate.reshape(gate_new_shape);
+    q = qkv.slice(-1, 0, q_size_);
+    gate = qkv.slice(-1, q_size_, q_size_ * 2);
+    k = qkv.slice(-1, q_size_ * 2, q_size_ * 2 + kv_size_);
+    v = qkv.slice(-1, q_size_ * 2 + kv_size_, q_size_ * 2 + kv_size_ * 2);
   } else {
-    // Normal case: [q_size, kv_size, kv_size]
-    q = qkv.slice(/*dim=*/-1, 0, q_size_);
-    k = qkv.slice(/*dim=*/-1, q_size_, q_size_ + kv_size_);
-    v = qkv.slice(/*dim=*/-1, q_size_ + kv_size_, q_size_ + 2 * kv_size_);
+    q = qkv.slice(-1, 0, q_size_);
+    k = qkv.slice(-1, q_size_, q_size_ + kv_size_);
+    v = qkv.slice(-1, q_size_ + kv_size_, q_size_ + 2 * kv_size_);
   }
 
   const int64_t T = q.size(0);
-
-  auto q_reshaped = q.reshape({T, num_heads_, head_dim_});
-  auto q_normed = q_norm_->forward(q_reshaped);
-  auto k_reshaped = k.reshape({T, num_kv_heads_, head_dim_});
-  auto k_normed = k_norm_->forward(k_reshaped);
-
-  q = q_normed.view({T, q_size_});
-  k = k_normed.view({T, kv_size_});
+  auto q_3d = q.view({T, num_heads_, head_dim_});
+  q = std::get<0>(q_norm_->forward(q_3d)).view({T, q_size_});
+  auto k_3d = k.view({T, num_kv_heads_, head_dim_});
+  k = std::get<0>(k_norm_->forward(k_3d)).view({T, kv_size_});
 
   rotary_emb_->forward(positions, q, k);
   auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
 
   if (attn_output_gate_) {
-    gate = torch::sigmoid(gate);
-    out = out * gate;
+    out = out * torch::sigmoid(gate);
   }
 
-  out = o_proj_->forward(out);
-  return out;
+  if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+    return o_proj_->forward(out, row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+  }
+  return o_proj_->forward(out);
 }
 
 void Qwen3NextAttentionImpl::load_state_dict(const StateDict& state_dict) {
   qkv_proj_->load_state_dict(state_dict, {"q_proj.", "k_proj.", "v_proj."});
+
+  if (attn_output_gate_ && qkv_proj_->is_weight_loaded() &&
+      !qkv_weight_reordered_) {
+    // Rearrange q_proj rows from per-head interleaved [q0,g0,q1,g1,...]
+    // to grouped [q0,q1,...,g0,g1,...] so forward output is [Q|G|K|V].
+    auto w = qkv_proj_->weight();
+    auto qg_rows = w.slice(0, 0, q_size_ * 2);
+    const int64_t hidden = w.size(1);
+    auto qg_3d = qg_rows.view({num_heads_, 2 * head_dim_, hidden});
+    auto q_part = qg_3d.slice(1, 0, head_dim_);
+    auto g_part = qg_3d.slice(1, head_dim_, 2 * head_dim_);
+    auto reordered = torch::cat(
+        {q_part.reshape({q_size_, hidden}), g_part.reshape({q_size_, hidden})},
+        0);
+    qg_rows.copy_(reordered);
+
+    // Reorder weight_scale and weight_offset for W8A8 dynamic quantization.
+    // These are per-channel (per output row) tensors that must match the
+    // reordered weight layout for correct dequantization.
+    const int64_t qg_size = q_size_ * 2;
+    auto reorder_per_channel = [this, qg_size](torch::Tensor tensor) {
+      if (!tensor.defined() || tensor.numel() == 0) {
+        return;
+      }
+      auto qg_part = tensor.slice(0, 0, qg_size);
+      auto qg_2d = qg_part.view({num_heads_, 2 * head_dim_});
+      auto q_scale = qg_2d.slice(1, 0, head_dim_);
+      auto g_scale = qg_2d.slice(1, head_dim_, 2 * head_dim_);
+      auto reordered_scale = torch::cat(
+          {q_scale.reshape({q_size_}), g_scale.reshape({q_size_})}, 0);
+      qg_part.copy_(reordered_scale);
+    };
+
+    if (qkv_proj_->is_weight_scale_loaded()) {
+      reorder_per_channel(qkv_proj_->weight_scale());
+    }
+    if (qkv_proj_->is_weight_offset_loaded()) {
+      reorder_per_channel(qkv_proj_->weight_offset());
+    }
+
+    qkv_weight_reordered_ = true;
+  }
+
   o_proj_->load_state_dict(state_dict.get_dict_with_prefix("o_proj."));
   if (auto w = state_dict.get_tensor("q_norm.weight"); w.defined()) {
     q_norm_->load_state_dict(StateDict({{"weight", w}}));
   }
   if (auto w = state_dict.get_tensor("k_norm.weight"); w.defined()) {
     k_norm_->load_state_dict(StateDict({{"weight", w}}));
+  }
+
+  // Gemma RMSNorm uses (1 + w) as the scale factor, but the fused kernel
+  // uses standard RMSNorm (w only). Pre-add 1 so the fused kernel produces
+  // the same result as Qwen3NextRMSNorm (gemma_rms_norm).
+  if (use_fused_qkv_) {
+    if (q_norm_->is_weight_loaded() && !q_norm_weight_adjusted_) {
+      q_norm_->weight().add_(1.0);
+      q_norm_weight_adjusted_ = true;
+    }
+    if (k_norm_->is_weight_loaded() && !k_norm_weight_adjusted_) {
+      k_norm_->weight().add_(1.0);
+      k_norm_weight_adjusted_ = true;
+    }
   }
 }
 

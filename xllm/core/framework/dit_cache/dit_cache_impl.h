@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,6 +22,8 @@ limitations under the License.
 
 namespace xllm {
 
+struct ParallelArgs;
+
 using TensorMap = std::unordered_map<std::string, torch::Tensor>;
 
 class DitCacheImpl {
@@ -29,25 +31,37 @@ class DitCacheImpl {
   DitCacheImpl() = default;
   virtual ~DitCacheImpl() = default;
 
-  virtual void init(const DiTCacheConfig& cfg) = 0;
+  // Startup-time init. parallel_args carries the fixed parallel topology
+  // (e.g. the SP group used to all-reduce the similarity metric).
+  virtual void init(const DiTCacheConfig& cfg,
+                    const ParallelArgs& parallel_args) = 0;
 
-  virtual bool on_before_block(const CacheBlockIn& blockin) = 0;
-  virtual CacheBlockOut on_after_block(const CacheBlockIn& blockin) = 0;
+  virtual bool on_before_block(const CacheBlockIn& block_input) = 0;
+  virtual CacheBlockOut on_after_block(const CacheBlockIn& block_input) = 0;
 
   virtual bool on_before_step(const CacheStepIn& stepin) = 0;
   virtual CacheStepOut on_after_step(const CacheStepIn& stepin) = 0;
 
+  // Per-generation params, refreshed on every forward().
+  virtual void set_context(const CacheContext& context) {
+    infer_steps_ = context.infer_steps;
+    num_blocks_ = context.num_blocks;
+  }
+
  protected:
-  int64_t num_inference_steps_;
   int64_t warmup_steps_;
   int64_t current_step_;
+  int64_t infer_steps_;
+  int64_t num_blocks_;
   TensorMap buffers;
+  // Non-owning: the worker's ParallelArgs outlives this cache singleton.
+  const ParallelArgs* parallel_args_ = nullptr;
 
   static torch::Tensor get_tensor_or_empty(const TensorMap& m,
                                            const std::string& k);
-  static bool is_similar(const torch::Tensor& lhs,
-                         const torch::Tensor& rhs,
-                         float threshold);
+  bool is_similar(const torch::Tensor& lhs,
+                  const torch::Tensor& rhs,
+                  float threshold) const;
 };
 
 std::unique_ptr<DitCacheImpl> create_dit_cache(const DiTCacheConfig& cfg);

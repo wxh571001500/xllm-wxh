@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -61,19 +61,31 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Deallocate blocks
   void deallocate(const Slice<Block>& blocks) override;
 
+  // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
+  // (physical allocate() maps VMM pages) and return them; the
+  // CompositeBlockManager commits them under BlockType::KV. std::nullopt on
+  // shortage. XTensor derives from BlockManager (the pure interface), not
+  // BlockManagerImpl (whose pool is a free list, not VMM pages), so it
+  // implements this directly.
+  std::optional<std::vector<Block>> allocate_for_sequence(
+      Sequence* seq,
+      KVCacheState& kv_state,
+      size_t num_tokens) override;
+
   // Allocate shared blocks (prefix cache not supported)
   std::vector<Block> allocate_shared(
-      const Slice<int32_t>& tokens_ids,
-      const Slice<Block>& existed_shared_blocks = {}) override;
+      const Slice<int32_t>& token_ids,
+      const Slice<Block>& existed_shared_blocks = {},
+      const MMData& mm_data = MMData(),
+      const Slice<XXH3Key>& block_hashes = {}) override;
 
   // Cache blocks (prefix cache not supported)
   void cache(const Slice<int32_t>& token_ids,
              std::vector<Block>& blocks,
-             size_t existed_shared_blocks_num = 0) override;
+             size_t existed_shared_blocks_num = 0,
+             const MMData& mm_data = MMData(),
+             const Slice<XXH3Key>& block_hashes = {}) override;
   void cache(const std::vector<Block>& blocks) override;
-
-  // Get merged KV cache event
-  void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
   // Get number of blocks in prefix cache (always 0, not supported)
   size_t num_blocks_in_prefix_cache() const override { return 0; }
@@ -113,7 +125,7 @@ class XTensorBlockManagerImpl : public BlockManager {
 
   // Reserve padding block for padding tokens.
   // Should be called after KV tensors are created.
-  void reserve_xtensor_padding_blocks();
+  void reserve_xtensor_padding_blocks() override;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(XTensorBlockManagerImpl);

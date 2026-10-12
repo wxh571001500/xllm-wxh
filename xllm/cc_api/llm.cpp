@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,7 +24,7 @@ limitations under the License.
 #include <atomic>
 #include <exception>
 
-#include "core/common/global_flags.h"
+#include "core/framework/config/beam_search_config.h"
 #include "internal.h"
 
 namespace xllm {
@@ -59,7 +59,6 @@ LLM::~LLM() {
 }
 
 bool LLM::Initialize(const std::string& model_path,
-                     const std::string& devices,
                      const XLLM_InitLLMOptions& init_options) {
   if (!init_options.log_dir.empty()) {
     InitGlog(init_options.log_dir);
@@ -74,9 +73,7 @@ bool LLM::Initialize(const std::string& model_path,
     Options options;
     options.model_path(model_path)
         .task_type(init_options.task)
-        .devices(devices)
         .draft_model_path(init_options.draft_model)
-        .draft_devices(init_options.draft_devices)
         .backend("llm")
         .block_size(init_options.block_size)
         .max_cache_size(init_options.max_cache_size)
@@ -92,9 +89,8 @@ bool LLM::Initialize(const std::string& model_path,
         .rank_tablefile(init_options.rank_tablefile)
         .expert_parallel_degree(init_options.expert_parallel_degree)
         .enable_chunked_prefill(init_options.enable_chunked_prefill)
-        .enable_prefill_sp(init_options.enable_prefill_sp)
+        .cp_size(init_options.cp_size)
         .master_node_addr(init_options.master_node_addr)
-        .device_ip(init_options.device_ip)
         .transfer_listen_port(init_options.transfer_listen_port)
         .nnodes(init_options.nnodes)
         .node_rank(init_options.node_rank)
@@ -113,10 +109,9 @@ bool LLM::Initialize(const std::string& model_path,
         .is_local(init_options.is_local)
         .server_idx(init_options.server_idx);
 
-#if !defined(USE_NPU)
-    FLAGS_enable_block_copy_kernel = false;
+#if !defined(USE_NPU) && !defined(USE_CUDA) && !defined(USE_MUSA)
+    BeamSearchConfig::get_instance().enable_block_copy_kernel(false);
 #endif
-
     llm_core_ = new LLMCore();
     llm_core_->master = std::make_unique<LLMMaster>(options);
     llm_core_->master->run();

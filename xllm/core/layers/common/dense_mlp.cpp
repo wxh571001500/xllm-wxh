@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,11 +17,37 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include "common/flash_comm1_context.h"
 #include "kernels/ops_api.h"
-#include "platform/device.h"
+#include "platform/platform.h"
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+#if defined(USE_NPU)
+W8A8DynamicInput quantize_and_gather_w8a8_dynamic_input(
+    const torch::Tensor& input,
+    const FlashComm1Context& fc1_ctx) {
+  xllm::kernel::NpuQuantizeParams quantize_params;
+  quantize_params.input = input;
+
+  torch::Tensor quantized_input;
+  std::optional<torch::Tensor> per_token_scale;
+  std::tie(quantized_input, per_token_scale) =
+      xllm::kernel::dynamic_quant(quantize_params);
+  CHECK(per_token_scale.has_value() && per_token_scale->defined())
+      << "dynamic_quant must return per-token scale before AllGather.";
+
+  torch::Tensor gathered_input = gather_sequence(quantized_input, fc1_ctx);
+  torch::Tensor gathered_scale =
+      gather_sequence(per_token_scale->reshape({-1, 1}), fc1_ctx).reshape({-1});
+  return W8A8DynamicInput{gathered_input, gathered_scale};
+}
+#endif
+
+}  // namespace
 
 DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                            int64_t intermediate_size,
@@ -31,11 +57,16 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                            bool enable_result_reduction,
                            const QuantArgs& quant_args,
                            ProcessGroup* process_group,
-                           const torch::TensorOptions& options)
+                           const torch::TensorOptions& options,
+                           const std::string& module_prefix,
+                           double swiglu_limit,
+                           bool apply_fc1_sequence_parallel)
     : is_gated_(is_gated),
       intermediate_size_(intermediate_size),
       process_group_(process_group),
-      hidden_act_(hidden_act) {
+      hidden_act_(hidden_act),
+      swiglu_limit_(swiglu_limit),
+      apply_fc1_sequence_parallel_(apply_fc1_sequence_parallel) {
   // Check if using w8a8 smoothquant quantization
   is_smoothquant_ = quant_args.quant_method() == kQuantMethodSmoothquant;
 
@@ -70,43 +101,80 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                                            options,
                                            gate_up_proj_extra_args));
 
-  act_ = register_module("act", Activation(hidden_act_, is_gated_));
+  act_ =
+      register_module("act", Activation(hidden_act_, is_gated_, swiglu_limit_));
 
   // 2. down
+  const auto down_proj_quant_args =
+      module_prefix.empty()
+          ? quant_args
+          : quant_args.for_module(module_prefix + ".down_proj");
   down_proj_ = register_module("down_proj",
                                RowParallelLinear(intermediate_size_,
                                                  hidden_size,
                                                  /*bias=*/has_bias,
                                                  /*input_is_parallelized=*/true,
                                                  enable_result_reduction,
-                                                 quant_args,
+                                                 down_proj_quant_args,
                                                  process_group_,
                                                  options,
                                                  down_proj_extra_args));
 }
 
 torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
-  // input shape: [num_tokens, hidden_size]
-  auto gate_up = gate_up_proj_->forward(hidden_states);
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+  const bool use_fc1_sequence_parallel =
+      apply_fc1_sequence_parallel_ && fc1_ctx && is_sequence_sharded(*fc1_ctx);
+  torch::Tensor gate_up;
+#if defined(USE_NPU)
+  const bool use_quantized_allgather = use_fc1_sequence_parallel &&
+                                       hidden_states.dim() == 2 &&
+                                       gate_up_proj_->uses_w8a8_dynamic_quant();
+  if (use_quantized_allgather) {
+    const W8A8DynamicInput quantized_input =
+        quantize_and_gather_w8a8_dynamic_input(hidden_states, *fc1_ctx);
+    gate_up = gate_up_proj_->forward_quantized(quantized_input);
+  }
+#endif
+  if (!gate_up.defined()) {
+    torch::Tensor h = hidden_states;
+    if (use_fc1_sequence_parallel) {
+      h = gather_sequence(hidden_states, *fc1_ctx);
+    }
+    gate_up = gate_up_proj_->forward(h);
+  }
 
   if (is_smoothquant_) {
-    // For w8a8 quantization, the active operation is fused with the down_proj
-    return down_proj_->forward(gate_up);
-  } else {
-    torch::Tensor output;
-    if (Device::type_str() != "npu") {
-      int64_t batch_size = gate_up.sizes()[0];
-      output = torch::empty(
-          {batch_size, intermediate_size_ / process_group_->world_size()},
-          gate_up.options());
+    if (use_fc1_sequence_parallel) {
+      return down_proj_->forward(gate_up,
+                                 row_parallel_reduce_mode_for_fc1(*fc1_ctx));
     }
 
-    act_->forward(gate_up, output);
-    return down_proj_->forward(output);
+    return down_proj_->forward(gate_up);
   }
+
+  torch::Tensor output;
+  if (!Platform::is_npu() && !Platform::is_musa()) {
+    const int64_t batch_size = gate_up.sizes()[0];
+    output = torch::empty(
+        {batch_size, intermediate_size_ / process_group_->world_size()},
+        gate_up.options());
+  }
+
+  act_->forward(gate_up, output);
+
+  if (use_fc1_sequence_parallel) {
+    return down_proj_->forward(output,
+                               row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+  }
+  return down_proj_->forward(output);
 }
 
 void DenseMLPImpl::load_state_dict(const StateDict& state_dict) {
+  gate_proj_weight_seen_ =
+      gate_proj_weight_seen_ || state_dict.has("gate_proj.weight");
+  up_proj_weight_seen_ =
+      up_proj_weight_seen_ || state_dict.has("up_proj.weight");
   gate_up_proj_->load_state_dict(state_dict, {"gate_proj.", "up_proj."});
   down_proj_->load_state_dict(state_dict.get_dict_with_prefix("down_proj."));
 }
@@ -116,13 +184,35 @@ void DenseMLPImpl::load_state_dict(const StateDict& state_dict,
                                    const std::string& down_name) {
   if (is_gated_) {
     CHECK_EQ(gate_up_name.size(), 2);
+    gate_proj_weight_seen_ =
+        gate_proj_weight_seen_ || state_dict.has(gate_up_name[0] + "weight");
+    up_proj_weight_seen_ =
+        up_proj_weight_seen_ || state_dict.has(gate_up_name[1] + "weight");
     gate_up_proj_->load_state_dict(state_dict, gate_up_name);
   } else {
     CHECK_EQ(gate_up_name.size(), 1);
+    up_proj_weight_seen_ =
+        up_proj_weight_seen_ || state_dict.has(gate_up_name[0] + "weight");
     gate_up_proj_->load_state_dict(
         state_dict.get_dict_with_prefix(gate_up_name[0]));
   }
   down_proj_->load_state_dict(state_dict.get_dict_with_prefix(down_name));
+}
+
+void DenseMLPImpl::verify_loaded_weights(const std::string& prefix) const {
+  if (!gate_up_proj_->is_weight_loaded()) {
+    if (is_gated_) {
+      CHECK(gate_proj_weight_seen_)
+          << "weight is not loaded for " << prefix + "gate_proj.weight";
+    }
+    CHECK(up_proj_weight_seen_)
+        << "weight is not loaded for " << prefix + "up_proj.weight";
+  }
+  CHECK(gate_up_proj_->is_weight_loaded())
+      << "weight is not loaded for " << prefix
+      << (is_gated_ ? "{gate_proj,up_proj}.weight" : "up_proj.weight");
+  CHECK(down_proj_->is_weight_loaded())
+      << "weight is not loaded for " << prefix + "down_proj.weight";
 }
 
 std::optional<torch::Tensor> DenseMLPImpl::get_fp8_input_scale() const {

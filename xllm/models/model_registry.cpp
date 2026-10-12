@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,9 +19,15 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <iostream>
+#include <mutex>
 #include <unordered_set>
 
-#include "core/common/global_flags.h"
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/model/model_args.h"
+#include "core/util/dit_model_discovery.h"
+#include "llm/py_causal_lm.h"
 #include "models.h"
 
 namespace {
@@ -67,14 +73,21 @@ constexpr char kTorchBackend[] = "TORCH";
 
 bool is_torch_only_model_type(const std::string& model_type) {
   static const std::unordered_set<std::string> kTorchOnlyModelTypes = {
+      "deepseek_v4",
+      "deepseek_v4_dspark",
+      "deepseek_v4_mtp",
+      "deepseek_v41",
+      "glm5_next_mtp",
       "qwen3_5",
       "qwen3_5_text",
       "qwen3_5_moe",
       "qwen3_5_moe_text",
       "qwen3_5_mtp",
       "qwen3_5_moe_mtp",
-      "qwen3_next"};
-  return kTorchOnlyModelTypes.count(model_type) != 0;
+      "qwen3_next",
+      "minimax_m2"};
+  return kTorchOnlyModelTypes.count(model_type) != 0 ||
+         is_dflash2_draft_model_type(model_type);
 }
 #endif
 
@@ -109,8 +122,14 @@ bool resolve_model_registration(const std::string& model_type,
   if (backend == kAutoBackend) {
     effective_backend =
         is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
-  } else if (model_type == "qwen3") {
-    // qwen3 supports both backends.
+  } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
+             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
+             model_type == "qwen3_vl" || model_type == "deepseek_v32_mtp" ||
+             model_type == "glm5_next" || model_type == "joyai_asr") {
+    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl/deepseek_v32_mtp/glm5_next
+    // support both backends. glm5_next is served via --model_impl=python,
+    // which forces npu_kernel_backend=TORCH; the python graph owns all
+    // attention. joyai_asr likewise runs on the Python model executor.
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
@@ -130,9 +149,19 @@ bool resolve_model_registration(const std::string& model_type,
   if (effective_npu_kernel_backend != nullptr) {
     *effective_npu_kernel_backend = effective_backend;
   }
-  *resolved_name = (model_type == "qwen3" && effective_backend == kAtbBackend)
-                       ? "qwen3_atb"
-                       : model_type;
+  if (model_type == "qwen3" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen3_atb";
+  } else if (model_type == "qwen3_moe" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen3_moe_atb";
+  } else if (model_type == "qwen2" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen2_atb";
+  } else if (model_type == "qwen2_5_vl" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen2_5_vl_atb";
+  } else if (model_type == "qwen3_vl" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen3_vl_atb";
+  } else {
+    *resolved_name = model_type;
+  }
   return true;
 #else
   *resolved_name = model_type;
@@ -144,15 +173,54 @@ bool resolve_model_registration_name(const std::string& model_type,
                                      std::string* resolved_name,
                                      std::string* error_message) {
 #if defined(USE_NPU)
-  return resolve_model_registration(model_type,
-                                    FLAGS_npu_kernel_backend,
-                                    nullptr,
-                                    resolved_name,
-                                    error_message);
+  return resolve_model_registration(
+      model_type,
+      ::xllm::KernelConfig::get_instance().npu_kernel_backend(),
+      nullptr,
+      resolved_name,
+      error_message);
 #else
   return resolve_model_registration(
       model_type, "", nullptr, resolved_name, error_message);
 #endif
+}
+
+bool is_npu_model_cp_capable(const std::string& resolved_name) {
+  // Registers model-side CP capability for master-side validation. Note this
+  // is not the same switch as the worker-side NpuCpPlan gate: deepseek_v4 and
+  // deepseek_v4_mtp own their CP split inside the model (TORCH backend) and
+  // deliberately keep model_supports_model_cp() false so the worker does not
+  // shard a second time.
+  static const std::unordered_set<std::string> kCpCapableModels = {
+      "deepseek_v32",
+      "deepseek_v32_mtp",
+      "deepseek_v4",
+      "deepseek_v4_mtp",
+      "glm_moe_dsa",
+      "glm_moe_dsa_mtp",
+  };
+  static std::once_flag once;
+  std::call_once(once, []() {
+    for (const std::string& name : kCpCapableModels) {
+      ModelRegistry::register_cp_sharding_mode(name, CpShardingMode::MODEL);
+    }
+  });
+  return kCpCapableModels.contains(resolved_name);
+}
+
+bool is_mlu_model_cp_capable(const std::string& resolved_name) {
+  static const std::unordered_set<std::string> kCpCapableModels = {
+      "deepseek_v4",
+      "glm5_next",
+      "glm_moe_dsa",
+  };
+  static std::once_flag once;
+  std::call_once(once, []() {
+    for (const std::string& name : kCpCapableModels) {
+      ModelRegistry::register_cp_sharding_mode(name, CpShardingMode::MODEL);
+    }
+  });
+  return kCpCapableModels.contains(resolved_name);
 }
 
 ModelRegistry* ModelRegistry::get_instance() {
@@ -200,34 +268,6 @@ void ModelRegistry::register_causalvlm_factory(const std::string& name,
   }
 }
 
-void ModelRegistry::register_vlm_embedding_factory(
-    const std::string& name,
-    EmbeddingVLMFactory factory) {
-  ModelRegistry* instance = get_instance();
-
-  if (instance->model_registry_[name].embedding_vlm_factory != nullptr) {
-    SAFE_LOG_WARNING("embedding vlm factory for " << name
-                                                  << " already registered.");
-  } else {
-    instance->model_registry_[name].embedding_vlm_factory = factory;
-    instance->model_backend_[name] = "vlm";
-  }
-}
-
-void ModelRegistry::register_mm_embedding_vlm_factory(
-    const std::string& name,
-    MMEmbeddingVLMFactory factory) {
-  ModelRegistry* instance = get_instance();
-
-  if (instance->model_registry_[name].mm_embedding_vlm_factory != nullptr) {
-    SAFE_LOG_WARNING("mm embedding vlm factory for " << name
-                                                     << " already registered.");
-  } else {
-    instance->model_registry_[name].mm_embedding_vlm_factory = factory;
-    instance->model_backend_[name] = "vlm";
-  }
-}
-
 void ModelRegistry::register_dit_model_factory(const std::string& name,
                                                DiTModelFactory factory) {
   ModelRegistry* instance = get_instance();
@@ -241,29 +281,28 @@ void ModelRegistry::register_dit_model_factory(const std::string& name,
   }
 }
 
-void ModelRegistry::register_input_processor_factory(
-    const std::string& name,
-    InputProcessorFactory factory) {
+void ModelRegistry::register_model_backend(const std::string& name,
+                                           const std::string& backend) {
   ModelRegistry* instance = get_instance();
-
-  if (instance->model_registry_[name].input_processor_factory != nullptr) {
-    SAFE_LOG_WARNING("input processor factory for " << name
-                                                    << " already registered.");
-  } else {
-    instance->model_registry_[name].input_processor_factory = factory;
+  auto [it, inserted] = instance->model_backend_.emplace(name, backend);
+  if (!inserted && it->second != backend) {
+    SAFE_LOG_WARNING("model backend for "
+                     << name << " already registered as " << it->second
+                     << "; ignoring conflicting backend " << backend << ".");
   }
 }
 
-void ModelRegistry::register_image_processor_factory(
+void ModelRegistry::register_multimodal_processor_factory(
     const std::string& name,
-    ImageProcessorFactory factory) {
+    MultimodalProcessorFactory factory) {
   ModelRegistry* instance = get_instance();
 
-  if (instance->model_registry_[name].image_processor_factory != nullptr) {
-    SAFE_LOG_WARNING("image processor factory for " << name
-                                                    << " already registered.");
+  if (instance->model_registry_[name].multimodal_processor_factory != nullptr) {
+    SAFE_LOG_WARNING("multimodal processor factory for "
+                     << name << " already registered.");
   } else {
-    instance->model_registry_[name].image_processor_factory = factory;
+    instance->model_registry_[name].multimodal_processor_factory =
+        std::move(factory);
   }
 }
 
@@ -276,6 +315,63 @@ void ModelRegistry::register_model_args_loader(const std::string& name,
                                               << " already registered.");
   } else {
     instance->model_registry_[name].model_args_loader = loader;
+  }
+}
+
+void ModelRegistry::register_mtp_args_adapter(const std::string& name,
+                                              MtpArgsAdapter adapter) {
+  get_instance()->model_registry_[name].mtp_args_adapter = std::move(adapter);
+}
+
+void ModelRegistry::register_mtp_capabilities(
+    const std::string& name,
+    MtpModelCapabilities capabilities) {
+  get_instance()->model_registry_[name].mtp_capabilities = capabilities;
+}
+
+MtpModelCapabilities ModelRegistry::get_mtp_capabilities(
+    const std::string& name) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(name);
+  if (it == registry.end()) {
+    return MtpModelCapabilities();
+  }
+  return it->second.mtp_capabilities;
+}
+
+void ModelRegistry::register_graph_history_capacity(
+    const std::string& name,
+    GraphHistoryCapacityAdapter adapter) {
+  get_instance()->model_registry_[name].graph_history_capacity_adapter =
+      std::move(adapter);
+}
+
+int64_t ModelRegistry::get_graph_history_capacity(const std::string& name,
+                                                  const ModelArgs& args,
+                                                  int64_t default_capacity) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(name);
+  if (it == registry.end() || !it->second.graph_history_capacity_adapter) {
+    return default_capacity;
+  }
+  return it->second.graph_history_capacity_adapter(args);
+}
+
+void ModelRegistry::configure_mtp_args(ModelArgs& args,
+                                       std::string_view algorithm,
+                                       bool is_draft_engine,
+                                       bool is_python_model) {
+  if (!is_draft_engine || !SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+    return;
+  }
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(args.model_type());
+  if (it != registry.end() && it->second.mtp_args_adapter) {
+    if (!is_python_model && !it->second.mtp_capabilities
+                                 .supports_native_index_share_for_iteration) {
+      args.index_share_for_mtp_iteration(false);
+    }
+    it->second.mtp_args_adapter(args, is_python_model);
   }
 }
 
@@ -303,6 +399,21 @@ void ModelRegistry::register_tokenizer_args_loader(const std::string& name,
   }
 }
 
+void ModelRegistry::register_cp_sharding_mode(const std::string& name,
+                                              CpShardingMode mode) {
+  ModelRegistry* instance = get_instance();
+  instance->model_registry_[name].cp_sharding_mode = mode;
+}
+
+CpShardingMode ModelRegistry::get_cp_sharding_mode(const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  if (it == instance->model_registry_.end()) {
+    return CpShardingMode::NONE;
+  }
+  return it->second.cp_sharding_mode;
+}
+
 CausalLMFactory ModelRegistry::get_causallm_factory(const std::string& name) {
   ModelRegistry* instance = get_instance();
 
@@ -321,37 +432,15 @@ CausalVLMFactory ModelRegistry::get_causalvlm_factory(const std::string& name) {
   return instance->model_registry_[name].causal_vlm_factory;
 }
 
-EmbeddingVLMFactory ModelRegistry::get_embeddingvlm_factory(
-    const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].embedding_vlm_factory;
-}
-
-MMEmbeddingVLMFactory ModelRegistry::get_mm_embedding_vlm_factory(
-    const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].mm_embedding_vlm_factory;
-}
-
 DiTModelFactory ModelRegistry::get_dit_model_factory(const std::string& name) {
   ModelRegistry* instance = get_instance();
   return instance->model_registry_[name].dit_model_factory;
 }
 
-InputProcessorFactory ModelRegistry::get_input_processor_factory(
+MultimodalProcessorFactory ModelRegistry::get_multimodal_processor_factory(
     const std::string& name) {
   ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].input_processor_factory;
-}
-
-ImageProcessorFactory ModelRegistry::get_image_processor_factory(
-    const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].image_processor_factory;
+  return instance->model_registry_[name].multimodal_processor_factory;
 }
 
 ModelArgsLoader ModelRegistry::get_model_args_loader(const std::string& name) {
@@ -373,12 +462,113 @@ TokenizerArgsLoader ModelRegistry::get_tokenizer_args_loader(
   return instance->model_registry_[name].tokenizer_args_loader;
 }
 
+bool ModelRegistry::has_dit_model_factory(const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  if (it == instance->model_registry_.end()) {
+    return false;
+  }
+  return it->second.dit_model_factory != nullptr;
+}
+
+namespace util {
+
+namespace {
+
+std::string try_resolve_from_component_key(const std::string& key) {
+  if (key.empty()) {
+    return {};
+  }
+  if (ModelRegistry::has_dit_model_factory(key)) {
+    return key;
+  }
+
+  auto try_prefix = [](const std::string& prefix) -> std::string {
+    if (ModelRegistry::has_dit_model_factory(prefix)) {
+      return prefix;
+    }
+    for (const char* suffix : {"_dlm", "_dit", "_diffusion", "_model"}) {
+      const std::string candidate = prefix + suffix;
+      if (ModelRegistry::has_dit_model_factory(candidate)) {
+        return candidate;
+      }
+    }
+    return {};
+  };
+
+  if (key.size() > 4 && key.substr(key.size() - 4) == "_dit") {
+    if (std::string resolved = try_prefix(key.substr(0, key.size() - 4));
+        !resolved.empty()) {
+      return resolved;
+    }
+  }
+  if (key.size() > 4 && key.substr(key.size() - 4) == "_vae") {
+    if (std::string resolved = try_prefix(key.substr(0, key.size() - 4));
+        !resolved.empty()) {
+      return resolved;
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+std::string resolve_dit_pipeline_type(
+    const std::vector<DitDiscoveredComponent>& components) {
+  if (components.empty()) {
+    return {};
+  }
+
+  for (const auto& component : components) {
+    if (std::string resolved =
+            try_resolve_from_component_key(component.component_type);
+        !resolved.empty()) {
+      return resolved;
+    }
+    if (component.name != component.component_type) {
+      if (std::string resolved = try_resolve_from_component_key(component.name);
+          !resolved.empty()) {
+        return resolved;
+      }
+    }
+  }
+
+  std::string component_summary;
+  for (const auto& component : components) {
+    if (!component_summary.empty()) {
+      component_summary += "; ";
+    }
+    component_summary +=
+        component.name + " (model_type=" + component.component_type + ")";
+  }
+  LOG(FATAL) << "Unable to resolve a registered DiT pipeline type from "
+                "discovered components: "
+             << component_summary;
+  return {};
+}
+
+}  // namespace util
+
 std::string ModelRegistry::get_model_backend(const std::string& name) {
   ModelRegistry* instance = get_instance();
   return instance->model_backend_[name];
 }
 
 std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context) {
+  // Python model executor: build the graph via the embedded interpreter instead
+  // of resolving a C++ model class from the registry.
+  const auto& model_impl = context.get_model_impl();
+#if defined(USE_CUDA) || defined(USE_NPU)
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    return std::make_unique<PyCausalLM>(context, /*is_vlm=*/false);
+  }
+#else
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    LOG(ERROR) << "--model_impl=python is only supported on CUDA/NPU builds.";
+    return nullptr;
+  }
+#endif
+
   std::string resolved_name;
   std::string error_message;
   if (!resolve_model_registration_name(context.get_model_args().model_type(),
@@ -421,6 +611,16 @@ std::unique_ptr<CausalLM> create_rec_model(const ModelContext& context) {
 }
 
 std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
+  // Python model executor: build the graph in Python (e.g. GLM-5.3-Flash-VL via
+  // xllm.python.models.glm5_next_vl.Glm5NextVLModel). PyCausalLM is-a
+  // CausalVLM so it satisfies this factory's return type; PyExecutorImpl drives
+  // encode/get_input_embeddings via pybind. Read from the global ModelConfig:
+  // the VLM worker does not populate context.model_impl, unlike the LLM worker.
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    return std::make_unique<PyCausalLM>(context, /*is_vlm=*/true);
+  }
+
   std::string resolved_name;
   std::string error_message;
   if (!resolve_model_registration_name(context.get_model_args().model_type(),
@@ -431,50 +631,6 @@ std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
   }
 
   auto factory = ModelRegistry::get_causalvlm_factory(resolved_name);
-  if (factory) {
-    return factory(context);
-  }
-
-  LOG(ERROR) << "Unsupported model type: "
-             << context.get_model_args().model_type();
-
-  return nullptr;
-}
-
-std::unique_ptr<EmbeddingVLM> create_vlm_embedding_model(
-    const ModelContext& context) {
-  std::string resolved_name;
-  std::string error_message;
-  if (!resolve_model_registration_name(context.get_model_args().model_type(),
-                                       &resolved_name,
-                                       &error_message)) {
-    LOG(ERROR) << error_message;
-    return nullptr;
-  }
-
-  auto factory = ModelRegistry::get_embeddingvlm_factory(resolved_name);
-  if (factory) {
-    return factory(context);
-  }
-
-  LOG(ERROR) << "Unsupported model type: "
-             << context.get_model_args().model_type();
-
-  return nullptr;
-}
-
-std::unique_ptr<MMEmbeddingVLM> create_vlm_mm_embedding_model(
-    const ModelContext& context) {
-  std::string resolved_name;
-  std::string error_message;
-  if (!resolve_model_registration_name(context.get_model_args().model_type(),
-                                       &resolved_name,
-                                       &error_message)) {
-    LOG(ERROR) << error_message;
-    return nullptr;
-  }
-
-  auto factory = ModelRegistry::get_mm_embedding_vlm_factory(resolved_name);
   if (factory) {
     return factory(context);
   }

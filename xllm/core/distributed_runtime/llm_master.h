@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <folly/Function.h>
+#include <glog/logging.h>
 
 #include <functional>
 #include <future>
@@ -25,7 +26,8 @@ limitations under the License.
 
 #include "common/options.h"
 #include "common/rate_limiter.h"
-#include "framework/chat_template/jinja_chat_template.h"
+#include "framework/chat_template/chat_template.h"
+#include "framework/request/llm_request_factory.h"
 #include "framework/request/request_output.h"
 #include "framework/request/request_params.h"
 #include "llm_engine.h"
@@ -73,7 +75,11 @@ class LLMMaster : public Master {
   std::vector<bool> handle_rpc_responses(
       const std::vector<RequestOutput>& outputs);
 
-  const Tokenizer& tokenizer() const { return *tokenizer_; }
+  const Tokenizer& tokenizer() const {
+    CHECK(tokenizer_ != nullptr)
+        << "tokenizer() is only available on the leader rank (node_rank == 0).";
+    return *tokenizer_;
+  }
 
   // start running loop
   void run() override;
@@ -88,24 +94,17 @@ class LLMMaster : public Master {
 
   bool wakeup(const WakeupOptions& options) override;
 
-  bool link_d2d(const std::vector<std::string>& device_ips) override;
+  bool update_weights(const std::string& weights_path) override;
 
-  bool unlink_d2d(const std::vector<std::string>& device_ips) override;
+  bool link_p2p(const std::vector<std::string>& remote_addrs) override;
 
- private:
-  std::shared_ptr<Request> generate_request(
-      std::string prompt,
-      std::optional<std::vector<int>> prompt_tokens,
-      const RequestParams& sp,
-      std::optional<Call*> call,
-      OutputCallback callback);
+  bool unlink_p2p(const std::vector<std::string>& remote_addrs) override;
 
-  std::shared_ptr<Request> generate_request(
-      const std::vector<Message>& messages,
-      std::optional<std::vector<int>> prompt_tokens,
-      const RequestParams& sp,
-      std::optional<Call*> call,
-      OutputCallback callback);
+  // Async RL training support: pause/resume.
+  // mode: "keep" (default), "abort", or "wait" — see ContinuousScheduler.
+  void pause_scheduler(const std::string& mode = "keep");
+  void resume_scheduler();
+  bool is_scheduler_paused() const;
 
  private:
   XServiceClient* xservice_client_ = nullptr;
@@ -123,7 +122,10 @@ class LLMMaster : public Master {
   std::unique_ptr<Tokenizer> tokenizer_;
 
   // chat template instance
-  std::unique_ptr<JinjaChatTemplate> chat_template_;
+  std::unique_ptr<ChatTemplate> chat_template_;
+
+  // builds Request aggregates from prompts/messages + RequestParams
+  std::unique_ptr<LLMRequestFactory> request_factory_;
 
   // thread for moving forward the scheduler
   std::thread loop_thread_;
@@ -135,19 +137,6 @@ class LLMMaster : public Master {
   std::atomic_bool running_{false};
 
   std::string task_type_;
-};
-
-class LLMAssistantMaster : public Master {
- public:
-  LLMAssistantMaster(const Options& options);
-  ~LLMAssistantMaster();
-  void run() override;
-
-  static void handle_signal(int signum) { running_ = false; }
-
- private:
-  std::thread loop_thread_;
-  static volatile bool running_;
 };
 
 }  // namespace xllm

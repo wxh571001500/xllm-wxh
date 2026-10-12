@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,18 +24,10 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/types.h"
+#include "core/framework/multimodal/embedding_output.h"
+#include "core/framework/request/usage.h"
 
 namespace xllm {
-struct Usage {
-  // the number of tokens in the prompt.
-  int32_t num_prompt_tokens = 0;
-
-  // the number of tokens in the generated completion.
-  int32_t num_generated_tokens = 0;
-
-  // the total number of tokens used in the request (prompt + completion).
-  int32_t num_total_tokens = 0;
-};
 
 struct LogProbData {
   // the text of the token.
@@ -53,11 +45,6 @@ struct LogProb : public LogProbData {
   std::optional<std::vector<LogProbData>> top_logprobs;
 };
 
-struct EmbeddingOutput {
-  torch::Tensor embedding;
-  std::unordered_map<std::string, torch::Tensor> metadata;
-};
-
 struct SequenceOutput {
   // the index of the sequence in the request.
   size_t index;
@@ -71,11 +58,26 @@ struct SequenceOutput {
   // the token ids of the generated text.
   std::vector<int32_t> token_ids;
 
+  // the decoded item id for constrained recommendation output.
+  std::optional<int64_t> item_ids;
+
+  // decoded item ids for multi-item recommendation output.
+  std::vector<int64_t> item_ids_list;
+
+  // the decoded extended item info for constrained recommendation output.
+  std::optional<RecItemInfo> item_info;
+
+  // decoded extended item infos for multi-item recommendation output.
+  std::vector<RecItemInfo> item_infos_list;
+
   // the reason the sequence finished.
   std::optional<std::string> finish_reason;
 
   // log probabilities of the generated tokens.
   std::optional<std::vector<LogProb>> logprobs;
+
+  // token-aligned logprobs for REC / OneRec outputs.
+  std::vector<std::optional<float>> token_ids_logprobs;
 
   // the embeddings of the prompt token
   std::optional<std::vector<float>> embeddings;

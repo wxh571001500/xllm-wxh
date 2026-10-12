@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,20 +16,173 @@ limitations under the License.
 #include "npu_deepseek_v32_decoder_layer_impl.h"
 
 #include <gflags/gflags.h>
+#include <torch_npu/csrc/aten/CustomFunctions.h>
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <cctype>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <utility>
 #include <vector>
 
-#include "common/global_flags.h"
-#include "framework/model/npu_cp_prepare.h"
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/layers/common/dsa_topk_share_plan.h"
+#include "framework/parallel_state/npu_cp_plan.h"
+#include "framework/quant_args.h"
 #include "layers/common/rotary_embedding_util.h"
+#include "loader/deepseek_v32_decoder_loader.h"
 
 namespace xllm {
 namespace layer {
+
+namespace {
+constexpr int32_t kQProjBLinearIndex = 1;
+constexpr int32_t kIndexerWqBLinearIndex = 6;
+constexpr int32_t kIndexerProjLinearIndex = 8;
+constexpr int32_t kMoeDownLinearIndex = 3;
+constexpr int32_t kTranspose = 1;
+constexpr int32_t kNotTranspose = 0;
+
+std::string normalize_quant_type(std::string value) {
+  std::transform(
+      value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+  return value;
+}
+
+std::optional<std::string> get_layer_quant_desc(
+    const QuantArgs& quant_args,
+    int32_t layer_id,
+    const std::vector<std::string>& local_prefixes) {
+  const std::string layer_prefix =
+      "model.layers." + std::to_string(layer_id) + ".";
+  std::optional<std::pair<std::string, std::string>> resolved;
+  std::optional<std::string> unresolved_prefix;
+  for (const std::string& local_prefix : local_prefixes) {
+    const std::string prefix = layer_prefix + local_prefix;
+    auto quant_desc = quant_args.get_quant_method(prefix, "weight");
+    if (!quant_desc.has_value()) {
+      if (resolved.has_value()) {
+        LOG(FATAL) << "Inconsistent quant_desc for prefix '" << prefix
+                   << "': unresolved, but prefix '" << resolved->first
+                   << "' resolved to '" << resolved->second << "'.";
+      }
+      unresolved_prefix = prefix;
+      continue;
+    }
+    const std::string quant_type = normalize_quant_type(quant_desc.value());
+    if (unresolved_prefix.has_value()) {
+      LOG(FATAL) << "Inconsistent quant_desc for prefix '"
+                 << unresolved_prefix.value() << "': unresolved, but prefix '"
+                 << prefix << "' resolved to '" << quant_type << "'.";
+    }
+    if (!resolved.has_value()) {
+      resolved = std::make_pair(prefix, quant_type);
+      continue;
+    }
+    CHECK_EQ(resolved->second, quant_type)
+        << "Inconsistent quant_desc for prefix '" << prefix << "' resolved to '"
+        << quant_type << "', but prefix '" << resolved->first
+        << "' resolved to '" << resolved->second << "'.";
+  }
+  if (!resolved.has_value()) {
+    CHECK(quant_args.quant_descs().empty())
+        << "Missing quant_desc for layer " << layer_id
+        << " attention prefixes: "
+        << boost::algorithm::join(local_prefixes, ", ");
+    return std::nullopt;
+  }
+  return resolved->second;
+}
+
+std::optional<std::string> get_optional_layer_quant_desc(
+    const QuantArgs& quant_args,
+    int32_t layer_id,
+    const std::string& local_prefix) {
+  const std::string prefix =
+      "model.layers." + std::to_string(layer_id) + "." + local_prefix;
+  auto quant_desc = quant_args.get_quant_method(prefix, "weight");
+  if (!quant_desc.has_value()) {
+    return std::nullopt;
+  }
+  return normalize_quant_type(quant_desc.value());
+}
+
+int32_t quant_desc_to_linear_desc(const std::optional<std::string>& quant_desc,
+                                  int32_t default_desc) {
+  if (!quant_desc.has_value()) {
+    return default_desc;
+  }
+  const std::string quant_type = normalize_quant_type(quant_desc.value());
+  if (quant_type == "float") {
+    return static_cast<int32_t>(LinearTypeV2::FLOAT16);
+  }
+  if (quant_type == "w8a8_dynamic") {
+    return static_cast<int32_t>(LinearTypeV2::W8A8_DYNAMIC);
+  }
+  if (quant_type == "w8a8") {
+    return static_cast<int32_t>(LinearTypeV2::W8A8);
+  }
+  LOG(FATAL) << "Unsupported DeepSeek V32 attention quant_desc: "
+             << quant_desc.value();
+  return default_desc;
+}
+
+std::vector<int32_t> resolve_attn_linear_quant_types(
+    const QuantArgs& quant_args,
+    int32_t layer_id) {
+  const int32_t w8a8_desc = static_cast<int32_t>(LinearTypeV2::W8A8);
+  const int32_t fp16_desc = static_cast<int32_t>(LinearTypeV2::FLOAT16);
+  const int32_t q_a_desc = quant_desc_to_linear_desc(
+      get_layer_quant_desc(quant_args, layer_id, {"self_attn.q_a_proj"}),
+      w8a8_desc);
+  const int32_t kv_a_desc = quant_desc_to_linear_desc(
+      get_layer_quant_desc(
+          quant_args, layer_id, {"self_attn.kv_a_proj_with_mqa"}),
+      w8a8_desc);
+  const int32_t q_b_desc = quant_desc_to_linear_desc(
+      get_layer_quant_desc(quant_args, layer_id, {"self_attn.q_b_proj"}),
+      w8a8_desc);
+  const int32_t o_desc = quant_desc_to_linear_desc(
+      get_layer_quant_desc(quant_args, layer_id, {"self_attn.o_proj"}),
+      w8a8_desc);
+  const int32_t indexer_wq_b_desc = quant_desc_to_linear_desc(
+      get_optional_layer_quant_desc(
+          quant_args, layer_id, "self_attn.indexer.wq_b"),
+      fp16_desc);
+  CHECK_EQ(q_a_desc, kv_a_desc)
+      << "DeepSeek V32 currently requires self_attn.q_a_proj and "
+      << "self_attn.kv_a_proj_with_mqa to share the same quant_desc.";
+  return {q_a_desc,
+          q_b_desc,
+          kv_a_desc,
+          fp16_desc,
+          fp16_desc,
+          o_desc,
+          indexer_wq_b_desc,
+          fp16_desc,
+          fp16_desc};
+}
+
+std::vector<int> to_atb_linear_quant_types(
+    const std::vector<int32_t>& linear_quant_types) {
+  std::vector<int> atb_linear_quant_types;
+  atb_linear_quant_types.reserve(linear_quant_types.size());
+  for (int32_t linear_quant_type : linear_quant_types) {
+    atb_linear_quant_types.emplace_back(static_cast<int>(linear_quant_type));
+  }
+  return atb_linear_quant_types;
+}
+}  // namespace
 
 enum DecoderLayerTensorId : int {
   IN_INPUT_NORM_WEIGHT = 0,
@@ -192,20 +345,37 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
 
   auto parallel_args = context.get_parallel_args();
   auto model_args = context.get_model_args();
+  auto quant_args = context.get_quant_args();
   auto options = context.get_tensor_options();
+  const DsaTopkShareDecision topk_decision =
+      get_dsa_topk_share_decision(model_args, layer_id_);
+  skip_topk_ = topk_decision.reuse_topk;
+  output_topk_ = topk_decision.output_topk;
 
   rank_ = parallel_args.rank();
   first_k_dense_replace_ = model_args.first_k_dense_replace();
   n_layers_ = model_args.n_layers();
   num_experts_ = model_args.n_routed_experts();
+  quant_group_size_ = static_cast<int32_t>(quant_args.group_size());
+  attn_linear_quant_types_ =
+      resolve_attn_linear_quant_types(quant_args, layer_id_);
+  if (quantize_type_ == "w4a8_dynamic") {
+    CHECK_GE(quant_group_size_, 0)
+        << "W4A8_DYNAMIC group_size must be >= 0, got " << quant_group_size_;
+    CHECK_EQ(quant_args.quant_version(), "1.0.0")
+        << "W4A8_DYNAMIC only supports quant_version 1.0.0, got "
+        << (quant_args.quant_version().empty() ? "<empty>"
+                                               : quant_args.quant_version());
+  }
   localWorldSize_ = parallel_args.mapping().localWorldSize();
   ep_size_ = parallel_args.ep_size();
   ep_local_tp_size_ = parallel_args.world_size() / ep_size_;
   CHECK_EQ(parallel_args.world_size(), ep_size_ * ep_local_tp_size_);
   ep_local_tp_rank_ = parallel_args.rank() % ep_local_tp_size_;
   num_experts_per_partition_ = model_args.n_routed_experts() / ep_size_;
-  redundant_experts_num_ = FLAGS_redundant_experts_num;
-  if (FLAGS_enable_eplb) {
+  redundant_experts_num_ =
+      ::xllm::EPLBConfig::get_instance().redundant_experts_num();
+  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     num_experts_per_partition_ += redundant_experts_num_;
   }
   ep_rank_ = parallel_args.rank() / ep_local_tp_size_;
@@ -222,6 +392,23 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       prefill_param_, model_args, parallel_args, /*is_prefill=*/true);
   param_from_args(
       decode_param_, model_args, parallel_args, /*is_prefill=*/false);
+  if (decode_param_.enableMegaMoe) {
+    // MegaMoe stores the down projection as [intermediate, hidden]. Reuse that
+    // storage in the generic prefill path without transposing it again.
+    prefill_param_.moeLinearTransposeType[kMoeDownLinearIndex] = kNotTranspose;
+  }
+  initialize_mega_moe_resource(parallel_args);
+  has_mtp_topk_fallback_ =
+      skip_topk_ && model_args.index_share_for_mtp_iteration() &&
+      model_args.model_type().find("_mtp") != std::string::npos;
+  if (has_mtp_topk_fallback_) {
+    mtp_prefill_fallback_param_ = prefill_param_;
+    mtp_prefill_fallback_param_.skipTopk = false;
+    mtp_prefill_fallback_param_.outputTopk = true;
+    mtp_decode_fallback_param_ = decode_param_;
+    mtp_decode_fallback_param_.skipTopk = false;
+    mtp_decode_fallback_param_.outputTopk = true;
+  }
 
   loader_ = std::make_unique<DeekseekV32DecoderLoader>(
       WEIGHT_COUNT_PER_LAYER,
@@ -237,7 +424,12 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       num_key_value_heads_,
       v_head_dim_,
       prefill_param_.isBF16,
-      decode_param_.isBF16);
+      decode_param_.isBF16,
+      attn_linear_quant_types_,
+      skip_topk_ && !has_mtp_topk_fallback_,
+      ::xllm::LoadConfig::get_instance().enable_manual_loader()
+          ? LoadMode::kManual
+          : LoadMode::kEager);
   initialize_tensors(options);
 }
 
@@ -262,7 +454,7 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_tensors(
           .to(device_);
 
   auto& device_expert_list = loader_->get_device_expert_list();
-  if (FLAGS_enable_eplb) {
+  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     auto layer_expert_routing_map_ =
         build_expert_routing_map(device_expert_list);
     std::vector<torch::Tensor> tensors_vec;
@@ -297,12 +489,27 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_basic_parameters(
   param.enableLcoc = true;
   // TODO: modify xllm_atb_layers
 
-  param.attnLinearTransposeType = {1, 1, 1, 1, 1, 1};
+  param.attnLinearTransposeType = {
+      kTranspose, kTranspose, kTranspose, kTranspose, kTranspose, kTranspose};
+  if (attn_linear_quant_types_.size() > kQProjBLinearIndex &&
+      attn_linear_quant_types_[kQProjBLinearIndex] ==
+          static_cast<int>(LinearTypeV2::W8A8_DYNAMIC)) {
+    param.attnLinearTransposeType[kQProjBLinearIndex] = kNotTranspose;
+  }
+  if (attn_linear_quant_types_.size() > kIndexerWqBLinearIndex &&
+      param.attnLinearTransposeType.size() <= kIndexerProjLinearIndex) {
+    param.attnLinearTransposeType.insert(param.attnLinearTransposeType.end(),
+                                         {kTranspose, kTranspose, kTranspose});
+  }
   param.mlpLinearTransposeType = {1, -1, 1, -1};
 
-  param.moeLinearTransposeType = (layer_id_ < args.first_k_dense_replace())
-                                     ? std::vector<int>{-1, -1, -1, -1}
-                                     : std::vector<int>{1, 0, -1, 1};
+  if (layer_id_ < args.first_k_dense_replace()) {
+    param.moeLinearTransposeType = {-1, -1, -1, -1};
+  } else if (quantize_type_ == "w4a8_dynamic") {
+    param.moeLinearTransposeType = {1, 0, -1, 0};
+  } else {
+    param.moeLinearTransposeType = {1, 0, -1, 1};
+  }
 
   param.worldSize = parallel_args.world_size();
   param.normEps = args.rms_norm_eps();
@@ -312,14 +519,15 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_basic_parameters(
   param.numKeyValueHeadsPerRank = 1;
   // static_cast<int>(optionalValue.value()) / param.worldSize;
   param.rank = parallel_args.rank();
-  param.backend = FLAGS_communication_backend;
-  param.rankTableFile = FLAGS_rank_tablefile;
+  param.backend =
+      ::xllm::ParallelConfig::get_instance().communication_backend();
+  param.rankTableFile = ::xllm::EPLBConfig::get_instance().rank_tablefile();
 
   param.layerId = layer_id_;
   param.numHiddenLayers = args.n_layers();
   param.enableIntraLayerAddNorm = true;
   param.enableInterLayerAddNorm = false;
-  if (quantize_type_ == "") {
+  if (quantize_type_ == "" || quantize_type_ == "w4a8_dynamic") {
     param.enableGMMSwigluQuant = false;
   } else {
     param.enableGMMSwigluQuant =
@@ -332,7 +540,19 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_basic_parameters(
     param.enableSpeculate = true;
   }
   param.maskfree = true;  // TODO
-  param.enableSwiGLUQuantForSharedExperts = false;
+  const bool is_shared_expert_layer =
+      layer_id_ >= args.first_k_dense_replace() && args.n_shared_experts() > 0;
+  param.enableSwiGLUQuantForSharedExperts =
+      (quantize_type_ == "w8a8_dynamic" || quantize_type_ == "w4a8_dynamic") &&
+      is_shared_expert_layer;
+  if ((::xllm::KVCacheConfig::get_instance().enable_prefix_cache() ||
+       ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) &&
+      ::xllm::ParallelConfig::get_instance().cp_size() > 1 && is_prefill) {
+    param.enablePrefixCacheCP = true;
+    // kv_split_size==1: skip prefix AllGather (identity reshape).
+    param.enablePrefixCacheLocal =
+        (parallel_args.kv_split_size_effective() == 1);
+  }
   num_key_value_heads_ = static_cast<int>(args.n_kv_heads().value());
   qk_nope_head_dim_ = args.qk_nope_head_dim();
   v_head_dim_ = args.v_head_dim();
@@ -356,7 +576,9 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
   param.kvLoraRank = args.kv_lora_rank();
   param.softmaxScale = sm_scale_;
   // not support in glm_moe_dsa
-  if (quantize_type_ == "w8a8_dynamic" && args.model_type() != "glm_moe_dsa") {
+  bool is_glm_moe_dsa =
+      args.model_type().find("glm_moe_dsa") != std::string::npos;
+  if (quantize_type_ == "w8a8_dynamic" && !is_glm_moe_dsa) {
     param.enableMlaPreprocess = true;
   } else {
     param.enableMlaPreprocess = false;
@@ -368,20 +590,26 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
   param.index_head_dim = args.index_head_dim();
   param.index_n_heads = args.index_n_heads();
   param.index_topk = args.index_topk();
+  param.skipTopk = skip_topk_;
+  param.outputTopk = output_topk_;
 }
 
 void NpuDeepseekV32DecoderLayerImpl::initialize_mlp_parameters(
     atb_speed::deepseekV2::DecoderLayerParam& param,
     const ModelArgs& args,
     const ParallelArgs& parallel_args) {
+  const bool is_glm_moe_dsa =
+      args.model_type().find("glm_moe_dsa") != std::string::npos;
   param.hasSharedExpert = (args.n_shared_experts() > 0);
   param.hasSharedExpertGate = false;
   param.processLogits = "normScaling";
   param.routedScalingFactor = args.routed_scaling_factor();
   param.numOfSelectedExperts = {args.num_experts_per_tok()};
+  param.enableDispatchCombineV2 = is_glm_moe_dsa && !param.isPrefill;
 
   if (ep_size_ > 1) {
-    param.expertParallelDegree = std::max(FLAGS_expert_parallel_degree, 1);
+    param.expertParallelDegree = std::max(
+        ::xllm::EPLBConfig::get_instance().expert_parallel_degree(), 1);
   } else {
     param.expertParallelDegree = 0;
   }
@@ -394,14 +622,14 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_mlp_parameters(
   param.numOfDeviceExperts = num_experts_per_partition_;
   param.maskStartIdx = 0;
   param.firstKDenseReplace = args.first_k_dense_replace();
-  // param.numOfSharedExperts = args.n_shared_experts();
-  param.numOfSharedExperts = 2;
+  param.numOfSharedExperts = args.n_shared_experts();
   param.routingMethod = "noAuxTc";
   param.numOfGroups = args.n_group();
   param.topkGroups = atb::SVector<int>{args.topk_group()};
   param.isDynamicEp = param.expertParallelDegree == 2 ? true : false;
 
-  param.quantGroupSize = 0;
+  param.quantGroupSize =
+      quantize_type_ == "w4a8_dynamic" ? quant_group_size_ : 0;
   if (quantize_type_ == "") {
     param.enableInitQuant = false;
     param.enableSwigluQuant = false;
@@ -426,13 +654,52 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_mlp_parameters(
   param.enableATBGateMatmul = true;
 
   param.enableIndexGmm = false;
-  param.enableLcocAll2All = param.isPrefill && dp_size_ == 1;
+  // LCOC fused all2all path is unstable under ACL graph launch in current
+  // runtime and initializes a separate communicator from MegaMoe. Keep BF16,
+  // graph execution, and MegaMoe deployments on the standard dynamic-ep path.
+  param.enableLcocAll2All =
+      quantize_type_ == "w8a8_dynamic" && param.isPrefill && cp_size_ == 1 &&
+      dp_size_ == 1 &&
+      !::xllm::KernelConfig::get_instance().enable_mega_moe() &&
+      !::xllm::ExecutionConfig::get_instance().enable_graph();
+
+  const bool is_mtp_model = args.model_type().find("_mtp") != std::string::npos;
+  const bool is_mega_moe_quantized =
+      quantize_type_ == "w4a8_dynamic" || quantize_type_ == "w8a8_dynamic";
+  const bool is_mega_moe_bf16 = quantize_type_.empty() && param.isBF16;
+  const bool enable_mega_moe =
+      ::xllm::KernelConfig::get_instance().enable_mega_moe();
+  param.enableMegaMoe = enable_mega_moe && !param.isPrefill && !is_mtp_model &&
+                        (is_mega_moe_quantized || is_mega_moe_bf16) &&
+                        layer_id_ >= param.firstKDenseReplace && ep_size_ > 1 &&
+                        param.isDynamicEp &&
+                        !::xllm::EPLBConfig::get_instance().enable_eplb();
+  if (param.enableMegaMoe) {
+    const atb_speed::common::ParallelInfo moe_ep_info =
+        parallel_args.mapping().Get(atb_speed::base::MOE_EP);
+    param.megaMoeParam.moeExpertNum =
+        static_cast<int64_t>(args.n_routed_experts());
+    param.megaMoeParam.epWorldSize = static_cast<int64_t>(ep_size_);
+    param.megaMoeParam.cclBufferSize =
+        static_cast<int64_t>(moe_ep_info.bufferSize);
+    param.megaMoeParam.weight1TensorNum = 1;
+    param.megaMoeParam.weight2TensorNum = 1;
+    if (is_mega_moe_quantized) {
+      param.megaMoeParam.dispatchQuantMode = 2;
+      param.megaMoeParam.weightScales1TensorNum = 1;
+      param.megaMoeParam.weightScales2TensorNum = 1;
+    }
+    if (quantize_type_ == "w4a8_dynamic") {
+      param.megaMoeParam.bias1TensorNum = 1;
+      param.megaMoeParam.bias2TensorNum = 1;
+    }
+  }
 
   if (layer_id_ >= param.firstKDenseReplace) {
     param.enableQkvdownDp = false;
     param.enableSharedExpertDp = false;
     param.enableGatingDp = false;
-    if (FLAGS_enable_eplb) {
+    if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       param.enableExpertCumSumOutput = param.isPrefill ? false : true;
       param.enableEPWB = true;
       param.numOfRedundantExpert = ep_size_ * redundant_experts_num_;
@@ -447,7 +714,10 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_parallel_parameters(
     atb_speed::deepseekV2::DecoderLayerParam& param,
     const ParallelArgs& parallel_args) {
   param.lmHeadLocalTp = dp_local_tp_size_;
-  param.enableSharedExpertOverlap = false;  // TODO
+  param.enableSharedExpertOverlap =
+      param.enableDispatchCombineV2 && !param.isPrefill &&
+      param.expertParallelDegree == 2 && param.isDynamicEp &&
+      param.hasSharedExpert && !param.isDenseLayer;
 
   param.enableAllToAllMC2 = (param.expertParallelDegree == 2);
   param.enableGatherPreNorm = true;
@@ -475,6 +745,9 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_quantization_parameters(
                                  static_cast<int>(LinearType::FP),
                                  static_cast<int>(LinearType::FP),
                                  static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
                                  static_cast<int>(LinearType::FP)};
     param.mlpLinearQuantType = {static_cast<int>(LinearType::FP),
                                 static_cast<int>(LinearType::INVALID),
@@ -491,16 +764,35 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_quantization_parameters(
                                   static_cast<int>(LinearType::INVALID),
                                   static_cast<int>(LinearType::FP)};
     }
-  } else {
+  } else if (quantize_type_ == "w8a8_dynamic") {
     param.moePackQuantType = static_cast<int>(PackType::ALL_W8A8_DYNAMIC);
     param.packQuantType = {static_cast<int>(PackType::MIX_W8A8),
                            static_cast<int>(PackType::ALL_W8A8_DYNAMIC)};
-    param.attnLinearQuantType = {static_cast<int>(LinearType::INT),
-                                 static_cast<int>(LinearType::INT),
-                                 static_cast<int>(LinearType::FP),
-                                 static_cast<int>(LinearType::FP),
-                                 static_cast<int>(LinearType::FP),
-                                 static_cast<int>(LinearType::INT)};
+    param.attnLinearQuantType =
+        to_atb_linear_quant_types(attn_linear_quant_types_);
+    param.mlpLinearQuantType = {static_cast<int>(LinearType::INT),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INT),
+                                static_cast<int>(LinearType::INVALID)};
+    if (layer_id_ < param.firstKDenseReplace) {
+      param.moeLinearQuantType = {static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INVALID)};
+    } else {
+      param.moeLinearQuantType = {static_cast<int>(LinearType::FP),
+                                  static_cast<int>(LinearType::INT),
+                                  static_cast<int>(LinearType::INVALID),
+                                  static_cast<int>(LinearType::INT)};
+    }
+  } else if (quantize_type_ == "w4a8_dynamic") {
+    param.moePackQuantType = static_cast<int>(PackType::ALL_W4A8);
+    // The ATB W4A8 path keeps dense/shared MLP linears on W8A8 dynamic;
+    // only routed experts use W4A8 GMM.
+    param.packQuantType = {static_cast<int>(PackType::MIX_W8A8),
+                           static_cast<int>(PackType::ALL_W8A8_DYNAMIC)};
+    param.attnLinearQuantType =
+        to_atb_linear_quant_types(attn_linear_quant_types_);
     param.mlpLinearQuantType = {static_cast<int>(LinearType::INT),
                                 static_cast<int>(LinearType::INVALID),
                                 static_cast<int>(LinearType::INT),
@@ -519,13 +811,100 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_quantization_parameters(
   }
 }
 
+void NpuDeepseekV32DecoderLayerImpl::initialize_mega_moe_resource(
+    const ParallelArgs& parallel_args) {
+  if (!decode_param_.enableMegaMoe) {
+    return;
+  }
+
+  CHECK(parallel_args.moe_ep_group_ != nullptr)
+      << "ATB MegaMoe requires a dedicated MoE EP process group.";
+
+  ProcessGroup* ep_group = parallel_args.moe_ep_group_;
+  MegaMoeCommSpec comm_spec;
+  comm_spec.group_name = ep_group->hccl_comm_name(/*init_comm=*/true);
+  comm_spec.hccl_comm = ep_group->hccl_comm();
+  comm_spec.ep_world_size = ep_group->world_size();
+  comm_spec.device_index = device_id_;
+  comm_spec.max_num_tokens_per_rank =
+      ::xllm::SchedulerConfig::get_instance().max_seqs_per_batch() *
+      (num_speculative_tokens_ + 1);
+  mega_moe_comm_resource_ = ep_group->acquire_mega_moe_comm_resource(comm_spec);
+  CHECK(mega_moe_comm_resource_ != nullptr)
+      << "Failed to acquire ATB MegaMoe communication resource.";
+
+  mega_moe_context_tensor_ = atb_speed::Utils::AtTensor2Tensor(
+      mega_moe_comm_resource_->context_tensor());
+  const int64_t ccl_buffer_size = mega_moe_comm_resource_->ccl_buffer_size();
+  const int64_t max_tokens_per_rank =
+      mega_moe_comm_resource_->max_num_tokens_per_rank();
+  decode_param_.megaMoeParam.cclBufferSize = ccl_buffer_size;
+  decode_param_.megaMoeParam.numMaxTokensPerRank = max_tokens_per_rank;
+  decode_param_.megaMoeParam.dispatchQuantOutDtype =
+      quantize_type_.empty() ? ACL_BF16 : ACL_INT8;
+}
+
+torch::Tensor NpuDeepseekV32DecoderLayerImpl::encode_mega_moe_scale(
+    const torch::Tensor& scale,
+    const torch::Tensor& offset) const {
+  CHECK(scale.defined()) << "ATB MegaMoe requires a defined weight scale.";
+  CHECK(offset.defined()) << "ATB MegaMoe requires a defined weight offset.";
+  CHECK_EQ(scale.sizes(), offset.sizes())
+      << "ATB MegaMoe weight scale and offset shapes must match.";
+
+  const std::vector<int64_t> original_shape = scale.sizes().vec();
+  torch::Tensor flat_scale =
+      scale.to(torch::kFloat32).contiguous().reshape({-1});
+  torch::Tensor flat_offset =
+      offset.to(torch::kFloat32).contiguous().reshape({-1});
+  torch::Tensor encoded = at_npu::native::custom_ops::npu_trans_quant_param(
+      flat_scale, flat_offset, /*round_mode=*/0);
+  CHECK_EQ(encoded.scalar_type(), torch::kInt64)
+      << "ATB MegaMoe encoded weight scale must use int64 storage.";
+  return encoded.reshape(original_shape).contiguous();
+}
+
 void NpuDeepseekV32DecoderLayerImpl::merge_loaded_weights() {
   loader_->merge_loaded_weights();
   auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  if (decode_param_.enableMegaMoe) {
+    if (quantize_type_.empty()) {
+      at_weight_tensors[IN_MLP_GATEUP_WEIGHT_EXPERT] =
+          at_npu::native::npu_format_cast(
+              at_weight_tensors[IN_MLP_GATEUP_WEIGHT_EXPERT], ACL_FORMAT_ND);
+      at_weight_tensors[IN_MLP_DOWN_WEIGHT_EXPERT] =
+          at_npu::native::npu_format_cast(
+              at_weight_tensors[IN_MLP_DOWN_WEIGHT_EXPERT], ACL_FORMAT_ND)
+              .transpose(1, 2)
+              .contiguous();
+    } else {
+      prefill_gateup_scale_ = at_weight_tensors[IN_MLP_GATEUP_SCALE_EXPERT];
+      prefill_down_scale_ = at_weight_tensors[IN_MLP_DOWN_SCALE_EXPERT];
+      at_weight_tensors[IN_MLP_DOWN_WEIGHT_EXPERT] =
+          at_npu::native::npu_format_cast(
+              at_weight_tensors[IN_MLP_DOWN_WEIGHT_EXPERT]
+                  .transpose(1, 2)
+                  .contiguous(),
+              ACL_FORMAT_FRACTAL_NZ);
+      at_weight_tensors[IN_MLP_GATEUP_SCALE_EXPERT] =
+          encode_mega_moe_scale(at_weight_tensors[IN_MLP_GATEUP_SCALE_EXPERT],
+                                at_weight_tensors[IN_MLP_GATEUP_OFFSET_EXPERT]);
+      at_weight_tensors[IN_MLP_DOWN_SCALE_EXPERT] =
+          encode_mega_moe_scale(at_weight_tensors[IN_MLP_DOWN_SCALE_EXPERT],
+                                at_weight_tensors[IN_MLP_DOWN_OFFSET_EXPERT]);
+    }
+  }
   Device::empty_cache(device_.index());
   for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
     atb_weight_tensors_[i] =
         atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  prefill_atb_weight_tensors_ = atb_weight_tensors_;
+  if (prefill_gateup_scale_.defined()) {
+    prefill_atb_weight_tensors_[IN_MLP_GATEUP_SCALE_EXPERT] =
+        atb_speed::Utils::AtTensor2Tensor(prefill_gateup_scale_);
+    prefill_atb_weight_tensors_[IN_MLP_DOWN_SCALE_EXPERT] =
+        atb_speed::Utils::AtTensor2Tensor(prefill_down_scale_);
   }
   init_layer();
 }
@@ -704,6 +1083,12 @@ void NpuDeepseekV32DecoderLayerImpl::update_expert_weight() {
         atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[index]);
     prefill_node_.inTensors.at(index) = &atb_weight_tensors_[index];
     decode_node_.inTensors.at(index) = &atb_weight_tensors_[index];
+    if (has_mtp_topk_fallback_) {
+      mtp_prefill_fallback_node_.inTensors.at(index) =
+          &atb_weight_tensors_[index];
+      mtp_decode_fallback_node_.inTensors.at(index) =
+          &atb_weight_tensors_[index];
+    }
   }
   expert_routing_map_[layer_id_ - first_k_dense_replace_] =
       expert_routing_map_buffer_;
@@ -715,13 +1100,19 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_layer() {
   model_name_ = "DeepSeek_V2";
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
   CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
+  if (has_mtp_topk_fallback_) {
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(mtp_prefill_fallback_node_, mtp_prefill_fallback_param_));
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(mtp_decode_fallback_node_, mtp_decode_fallback_param_));
+  }
   return atb::NO_ERROR;
 }
 
 int64_t NpuDeepseekV32DecoderLayerImpl::init_node(
     atb_speed::Model::Node& node,
     atb_speed::deepseekV2::DecoderLayerParam& param) {
-  bool eplb_enabled = FLAGS_enable_eplb &&
+  bool eplb_enabled = ::xllm::EPLBConfig::get_instance().enable_eplb() &&
                       layer_id_ >= decode_param_.firstKDenseReplace &&
                       !decode_param_.isPrefill;
   atb::Operation* operation = nullptr;
@@ -737,31 +1128,29 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_node(
   }
   node.inTensors.resize(node.operation->GetInputNum());
 
+  size_t out_tensor_num = 1;
   if (eplb_enabled) {
-    node.outTensors.resize(2);
-  } else {
-    node.outTensors.resize(1);
+    ++out_tensor_num;
   }
+  if (param.outputTopk) {
+    ++out_tensor_num;
+  }
+  node.outTensors.resize(out_tensor_num);
 
   size_t inTensorId = 1;
 
   for (size_t weightTensorId = 0; weightTensorId < WEIGHT_COUNT_PER_LAYER;
        ++weightTensorId) {
-    node.inTensors.at(weightTensorId) = &atb_weight_tensors_[weightTensorId];
+    std::vector<atb::Tensor>& weight_tensors =
+        param.isPrefill ? prefill_atb_weight_tensors_ : atb_weight_tensors_;
+    node.inTensors.at(weightTensorId) = &weight_tensors[weightTensorId];
   }
 
   node.variantPack.inTensors.reserve(node.inTensors.size());
   node.variantPack.inTensors.resize(node.inTensors.size());
 
-  // eplb used in decode stage, while multi stream parallel used in prefill
-  // stage
-  if (eplb_enabled) {
-    node.variantPack.outTensors.reserve(2);
-    node.variantPack.outTensors.resize(2);  // TODO
-  } else {
-    node.variantPack.outTensors.reserve(1);
-    node.variantPack.outTensors.resize(1);
-  }
+  node.variantPack.outTensors.reserve(out_tensor_num);
+  node.variantPack.outTensors.resize(out_tensor_num);
   return atb::NO_ERROR;
 }
 
@@ -775,10 +1164,37 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward(
     aclrtEvent* event,
     std::atomic<bool>* event_flag,
     int node_id) {
+  CHECK(!is_topk_sharing_enabled())
+      << "DSA top-k sharing layer requires forward_with_topk.";
+  return forward_with_topk(x,
+                           cos_pos,
+                           sin_pos,
+                           attn_mask,
+                           kv_cache,
+                           input_params,
+                           torch::Tensor(),
+                           nullptr,
+                           event,
+                           event_flag,
+                           node_id);
+}
+
+torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
+    torch::Tensor& x,
+    torch::Tensor& cos_pos,
+    torch::Tensor& sin_pos,
+    torch::Tensor& attn_mask,
+    KVCache& kv_cache,
+    const ModelInputParams& input_params,
+    const torch::Tensor& shared_topk_indices,
+    torch::Tensor* output_topk_indices,
+    aclrtEvent* event,
+    std::atomic<bool>* event_flag,
+    int node_id) {
   atb::Status st;
   ModelInputParams& input_params_new =
       const_cast<ModelInputParams&>(input_params);
-  if (input_params_new.batch_forward_type.is_decode()) {
+  if (input_params_new.meta.batch_forward_type.is_decode()) {
     build_node_variant_pack(decode_node_,
                             x,
                             cos_pos,
@@ -786,10 +1202,15 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward(
                             attn_mask,
                             kv_cache,
                             input_params_new,
-                            false);
+                            false,
+                            shared_topk_indices,
+                            output_topk_indices,
+                            skip_topk_,
+                            output_topk_,
+                            decode_param_.enableMegaMoe);
     st = execute_node(decode_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
-                           << "execute prefill layer fail, error code: " << st;
+                           << "execute decode layer fail, error code: " << st;
   } else {
     build_node_variant_pack(prefill_node_,
                             x,
@@ -798,11 +1219,72 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward(
                             attn_mask,
                             kv_cache,
                             input_params_new,
-                            true);
+                            true,
+                            shared_topk_indices,
+                            output_topk_indices,
+                            skip_topk_,
+                            output_topk_,
+                            prefill_param_.enableMegaMoe);
     st = execute_node(prefill_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
   }
+  return tensor_placeholder_;
+}
+
+torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_mtp_topk_fallback(
+    torch::Tensor& x,
+    torch::Tensor& cos_pos,
+    torch::Tensor& sin_pos,
+    torch::Tensor& attn_mask,
+    KVCache& kv_cache,
+    const ModelInputParams& input_params,
+    torch::Tensor* output_topk_indices,
+    aclrtEvent* event,
+    std::atomic<bool>* event_flag,
+    int node_id) {
+  CHECK(has_mtp_topk_fallback_)
+      << "MTP top-k fallback is only valid for NextN sharing layers.";
+  CHECK(output_topk_indices != nullptr && output_topk_indices->defined())
+      << "MTP top-k fallback requires an output top-k tensor.";
+
+  atb::Status st;
+  ModelInputParams& input_params_new =
+      const_cast<ModelInputParams&>(input_params);
+  if (input_params_new.meta.batch_forward_type.is_decode()) {
+    build_node_variant_pack(mtp_decode_fallback_node_,
+                            x,
+                            cos_pos,
+                            sin_pos,
+                            attn_mask,
+                            kv_cache,
+                            input_params_new,
+                            false,
+                            torch::Tensor(),
+                            output_topk_indices,
+                            false,
+                            true,
+                            mtp_decode_fallback_param_.enableMegaMoe);
+    st = execute_node(mtp_decode_fallback_node_, node_id, event, event_flag);
+  } else {
+    build_node_variant_pack(mtp_prefill_fallback_node_,
+                            x,
+                            cos_pos,
+                            sin_pos,
+                            attn_mask,
+                            kv_cache,
+                            input_params_new,
+                            true,
+                            torch::Tensor(),
+                            output_topk_indices,
+                            false,
+                            true,
+                            mtp_prefill_fallback_param_.enableMegaMoe);
+    st = execute_node(mtp_prefill_fallback_node_, node_id, event, event_flag);
+  }
+  LOG_IF(FATAL, st != 0)
+      << model_name_
+      << "execute MTP top-k fallback layer fail, error code: " << st;
   return tensor_placeholder_;
 }
 
@@ -814,25 +1296,35 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     torch::Tensor& attn_mask,
     KVCache& kv_cache,
     ModelInputParams& input_params,
-    bool is_prefill) {
+    bool is_prefill,
+    const torch::Tensor& shared_topk_indices,
+    torch::Tensor* output_topk_indices,
+    bool skip_topk,
+    bool output_topk,
+    bool enable_mega_moe) {
   internal_tensor_ = atb_speed::Utils::AtTensor2Tensor(x);
   // final_hidden_states_ = torch::zeros_like(x);
   int32_t input_idx = 0;
-  auto& dp_ep_padding = input_params.dp_ep_padding_data;
-  auto& cp_ep_padding = input_params.cp_ep_padding_data;
-  auto& cp_inputs = input_params.cp_prefill_inputs;
+  auto& dp_ep_padding = input_params.parallel.dp_ep_padding_data;
+  const CpEpMeta& cp_ep_meta = input_params.parallel.cp_plan.cp_ep_meta();
+  const CpAttentionMeta& cp_attention_meta =
+      input_params.parallel.cp_plan.attention_meta();
   const bool use_cp_ep_padding = (cp_size_ > 1 && is_prefill);
+  const bool uses_dsa_attention =
+      (is_prefill ? prefill_param_ : decode_param_).index_n_heads > 0;
+  // DSA passes sequence lengths to LightningIndexer/SparseFlashAttention as
+  // device aclTensors. Only dense MLA converts these inputs from hostData into
+  // aclIntArray metadata.
 
   if (dp_size_ <= 1 && ep_size_ <= 1 || cp_size_ > 1) {
     dp_ep_padding.set_placeholder(tensor_placeholder_);
   }
-  if (!use_cp_ep_padding) {
-    cp_ep_padding.set_placeholder(tensor_placeholder_);
-  }
   // set micro batch 0 input part
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensor_;
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
-      atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.expert_array());
+      atb_speed::Utils::AtTensor2Tensor(use_cp_ep_padding
+                                            ? cp_ep_meta.expert_array
+                                            : dp_ep_padding.expert_array());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 2) =
       atb_speed::Utils::AtTensor2Tensor(expert_group_);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 3) =
@@ -853,17 +1345,23 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
 
-  if ((!input_params.block_tables.defined() ||
-       input_params.block_tables.storage().data() == nullptr)) {
+  if ((!input_params.attention.device.block_tables.defined() ||
+       input_params.attention.device.block_tables.storage().data() ==
+           nullptr)) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
         atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
-        const_cast<int32_t*>(placeholder_vec_.data());
+    if (!uses_dsa_attention) {
+      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
+          const_cast<int32_t*>(placeholder_vec_.data());
+    }
   } else {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.kv_seq_lens);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
-        const_cast<int32_t*>(input_params.kv_seq_lens_vec.data());
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.kv_seq_lens);
+    if (!uses_dsa_attention) {
+      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
+          const_cast<int32_t*>(input_params.attention.host.kv_seq_lens.data());
+    }
   }
 
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12) =
@@ -875,31 +1373,39 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
       atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
 
-  if (!input_params.block_tables.defined() ||
-      input_params.block_tables.storage().data() == nullptr) {
+  if (!input_params.attention.device.block_tables.defined() ||
+      input_params.attention.device.block_tables.storage().data() == nullptr) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
         atb_speed::Utils::AtTensor2Tensor(block_tables_placeholder_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
         atb_speed::Utils::AtTensor2Tensor(slot_tensor_placeholder_);
   } else {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.block_tables);
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.block_tables);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.new_cache_slots);
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.new_cache_slots);
   }
 
   if (num_speculative_tokens_ > 0 && !is_prefill) {
-    if ((!input_params.block_tables.defined() ||
-         input_params.block_tables.storage().data() == nullptr)) {
+    if ((!input_params.attention.device.block_tables.defined() ||
+         input_params.attention.device.block_tables.storage().data() ==
+             nullptr)) {
       node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17) =
           atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
-      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17).hostData =
-          const_cast<int32_t*>(placeholder_vec_.data());
+      if (!uses_dsa_attention) {
+        node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17).hostData =
+            const_cast<int32_t*>(placeholder_vec_.data());
+      }
     } else {
       node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17) =
-          atb_speed::Utils::AtTensor2Tensor(input_params.q_seq_lens);
-      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17).hostData =
-          const_cast<int32_t*>(input_params.q_seq_lens_vec.data());
+          atb_speed::Utils::AtTensor2Tensor(
+              input_params.attention.device.q_seq_lens);
+      if (!uses_dsa_attention) {
+        node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17).hostData =
+            const_cast<int32_t*>(input_params.attention.host.q_seq_lens.data());
+      }
     }
   } else {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17) =
@@ -907,48 +1413,56 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   }
 
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 18) =
-      atb_speed::Utils::AtTensor2Tensor(use_cp_ep_padding
-                                            ? cp_ep_padding.attn_padding_idx()
-                                            : dp_ep_padding.attn_padding_idx());
+      atb_speed::Utils::AtTensor2Tensor(
+          use_cp_ep_padding ? cp_ep_meta.attention_tp_padding_indices
+                            : dp_ep_padding.attn_padding_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 19) =
       atb_speed::Utils::AtTensor2Tensor(
-          use_cp_ep_padding ? cp_ep_padding.attn_unpadding_idx()
+          use_cp_ep_padding ? cp_ep_meta.attention_tp_unpadding_indices
                             : dp_ep_padding.attn_unpadding_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 20) =
       atb_speed::Utils::AtTensor2Tensor(use_cp_ep_padding
-                                            ? cp_ep_padding.ffn_padding_idx()
+                                            ? cp_ep_meta.ffn_padding_indices
                                             : dp_ep_padding.ffn_padding_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 21) =
       atb_speed::Utils::AtTensor2Tensor(
-          use_cp_ep_padding ? cp_ep_padding.ffn_unpadding_idx()
+          use_cp_ep_padding ? cp_ep_meta.ffn_unpadding_indices
                             : dp_ep_padding.ffn_unpadding_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 22) =
       atb_speed::Utils::AtTensor2Tensor(
           use_cp_ep_padding
-              ? cp_ep_padding.lm_head_skip_padding_token_indices()
+              ? cp_ep_meta.lm_head_skip_padding_indices
               : dp_ep_padding.lm_head_skip_padding_token_indices());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 23) =
       atb_speed::Utils::AtTensor2Tensor(
-          use_cp_ep_padding ? cp_ep_padding.gather_prenorm_idx()
+          use_cp_ep_padding ? cp_ep_meta.prenorm_gather_indices
                             : dp_ep_padding.gather_prenorm_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 24) =
       atb_speed::Utils::AtTensor2Tensor(at_start_expert_id_);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 25) =
       atb_speed::Utils::AtTensor2Tensor(at_in_device_expert_count_);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 26) =
-      atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.padding_idx());
+      atb_speed::Utils::AtTensor2Tensor(
+          use_cp_ep_padding ? cp_ep_meta.attention_padding_indices
+                            : dp_ep_padding.padding_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 27) =
-      atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.un_padding_idx());
+      atb_speed::Utils::AtTensor2Tensor(
+          use_cp_ep_padding ? cp_ep_meta.attention_unpadding_indices
+                            : dp_ep_padding.un_padding_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 28) =
-      atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.dynamic_ep_idx());
+      atb_speed::Utils::AtTensor2Tensor(use_cp_ep_padding
+                                            ? cp_ep_meta.dynamic_ep_indices
+                                            : dp_ep_padding.dynamic_ep_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 29) =
-      atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.moe_idx());
-  if (FLAGS_enable_eplb && layer_id_ >= decode_param_.firstKDenseReplace) {
+      atb_speed::Utils::AtTensor2Tensor(
+          use_cp_ep_padding ? cp_ep_meta.moe_indices : dp_ep_padding.moe_idx());
+  if (::xllm::EPLBConfig::get_instance().enable_eplb() &&
+      layer_id_ >= decode_param_.firstKDenseReplace) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 30) =
         atb_speed::Utils::AtTensor2Tensor(expert_routing_map_);
     if (!is_prefill) {
       node.variantPack.outTensors.at(1) = atb_speed::Utils::AtTensor2Tensor(
-          input_params
+          input_params.expert
               .expert_load_data[layer_id_ - decode_param_.firstKDenseReplace]);
     }
   }
@@ -959,43 +1473,85 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.inTensors.at(i) = *node.inTensors.at(i);
   }
 
+  const torch::Tensor index_cache = kv_cache.get_index_cache();
+  CHECK(index_cache.defined() || skip_topk)
+      << "DSA full indexer layer requires an allocated indexer cache.";
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 30) =
-      atb_speed::Utils::AtTensor2Tensor(kv_cache.get_index_cache());
+      atb_speed::Utils::AtTensor2Tensor(
+          index_cache.defined() ? index_cache : tensor_placeholder_);
 
-  if (input_params.q_seq_lens.numel() != 0) {
+  const bool empty_eager_batch =
+      !input_params.enable_graph && input_params.meta.num_sequences == 0;
+  const bool empty_graph_batch =
+      input_params.enable_graph && input_params.meta.actual_num_sequences == 0;
+  const bool empty_batch = empty_eager_batch || empty_graph_batch;
+  const bool use_q_cu_seq_lens =
+      !empty_batch && input_params.attention.device.q_cu_seq_lens.defined() &&
+      input_params.attention.device.q_cu_seq_lens.numel() != 0;
+  if (use_q_cu_seq_lens) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.q_cu_seq_lens);
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.q_cu_seq_lens);
   } else {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
         atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
   }
 
+  int32_t cp_input_index = WEIGHT_COUNT_PER_LAYER + 32;
+  if (skip_topk) {
+    CHECK(shared_topk_indices.defined())
+        << "DSA top-k sharing requires previous top-k indices.";
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(shared_topk_indices);
+  }
+
   if (cp_size_ > 1 && is_prefill) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 32) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_o_recover_idx);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 33) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_kv_recover_idx);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 34) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_load_balance_idx);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 35) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.k_gather_index_prev);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 36) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.k_gather_index_next);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 37) =
+    node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(
-            cp_inputs.actual_seq_lengths_query_prev);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 38) =
+            cp_attention_meta.attention_output_reorder_indices);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(cp_attention_meta.kv_reorder_indices);
+    node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(
-            cp_inputs.actual_seq_lengths_query_next);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 39) =
+            cp_attention_meta.query_balance_indices);
+    node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(
-            cp_inputs.actual_seq_lengths_key_prev);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 40) =
+            cp_attention_meta.prev_kv_gather_indices);
+    node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(
-            cp_inputs.actual_seq_lengths_key_next);
+            cp_attention_meta.next_kv_gather_indices);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(
+            cp_attention_meta.prev_query_cu_seq_lens);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(
+            cp_attention_meta.next_query_cu_seq_lens);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(
+            cp_attention_meta.prev_key_cu_seq_lens);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(
+            cp_attention_meta.next_key_cu_seq_lens);
+    if (::xllm::KVCacheConfig::get_instance().enable_prefix_cache() ||
+        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
+      node.variantPack.inTensors.at(cp_input_index++) =
+          atb_speed::Utils::AtTensor2Tensor(
+              input_params.attention.device.in_prefix_slots);
+    }
+  }
+
+  if (enable_mega_moe) {
+    node.variantPack.inTensors.at(node.variantPack.inTensors.size() - 1) =
+        mega_moe_context_tensor_;
   }
 
   node.variantPack.outTensors.at(0) = internal_tensor_;
+  if (output_topk) {
+    CHECK(output_topk_indices != nullptr && output_topk_indices->defined())
+        << "DSA top-k sharing output tensor is not initialized.";
+    node.variantPack.outTensors.at(node.variantPack.outTensors.size() - 1) =
+        atb_speed::Utils::AtTensor2Tensor(*output_topk_indices);
+  }
 }
 
 }  // namespace layer

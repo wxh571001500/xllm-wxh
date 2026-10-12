@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -38,6 +38,7 @@ bool RecTokenizer::encode(int64_t item_id,
 bool RecTokenizer::decode(const Slice<int32_t>& token_ids,
                           bool skip_special_tokens,
                           std::vector<int64_t>* item_ids) const {
+  (void)skip_special_tokens;
   CHECK_EQ(token_ids.size(), REC_TOKEN_SIZE);
 
   RecTokenTriple rec_token_triple;
@@ -45,6 +46,18 @@ bool RecTokenizer::decode(const Slice<int32_t>& token_ids,
 
   return VersionSingleton<RecVocabDict>::GetInstance(model_version_)
       ->get_items_by_tokens(rec_token_triple, item_ids);
+}
+
+bool RecTokenizer::decode_item_infos(
+    const Slice<int32_t>& token_ids,
+    std::vector<RecItemInfo>* item_infos) const {
+  CHECK_EQ(token_ids.size(), REC_TOKEN_SIZE);
+
+  RecTokenTriple rec_token_triple;
+  std::copy(token_ids.begin(), token_ids.end(), rec_token_triple.begin());
+
+  return VersionSingleton<RecVocabDict>::GetInstance(model_version_)
+      ->get_item_infos_by_tokens(rec_token_triple, item_infos);
 }
 
 size_t RecTokenizer::vocab_size() const {

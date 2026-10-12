@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <unordered_map>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
@@ -30,154 +31,15 @@ limitations under the License.
 #include "core/layers/npu/npu_rms_norm_impl.h"
 #include "models/llm/npu/qwen2.h"
 #include "models/model_registry.h"
-#include "processors/input_processor.h"
+#include "models/vlm/mposition/mposition.h"
+#include "models/vlm/utils/multimodal_utils.h"
 #include "processors/qwen2_vl_image_processor.h"
-#include "xllm_atb_layers/core/include/atb_speed/log.h"
+#include "processors/qwen2_vl_prompt_processor.h"
+#include "processors/qwen2_vl_video_processor.h"
 
 namespace xllm::npu::model {
 
 #define PrintTensor(tensor) print_tensor(tensor, #tensor, 10, true, false);
-
-class Qwen2_5_VLInputProcessor : public InputProcessor {
-  enum class TokenType {
-    INVALID,
-    IMAGE,
-    VIDEO,
-  };
-
- public:
-  Qwen2_5_VLInputProcessor(const ModelArgs& args) {
-    merge_size_ = args.mm_image_merge_size();
-    vision_start_token_id_ = args.vision_start_token_id();
-    vision_end_token_id_ = args.vision_end_token_id();
-    image_token_id_ = args.image_token_id();
-    video_token_id_ = args.video_token_id();
-  }
-
-  void process(std::string& prompt, const MMData& mm_data) override {
-    torch::Tensor image_grid_thw;
-    if (auto res = mm_data.get<torch::Tensor>("image_grid_thw"))
-      image_grid_thw = res.value();
-
-    torch::Tensor video_grid_thw;
-    if (auto res = mm_data.get<torch::Tensor>("video_grid_thw"))
-      video_grid_thw = res.value();
-
-    if (!image_grid_thw.defined() && !video_grid_thw.defined()) return;
-
-    auto merge_length = merge_size_ * merge_size_;
-    int total_image_token = 0;
-    if (image_grid_thw.defined()) {
-      auto count = image_grid_thw.sizes()[0];
-      for (int idx = 0; idx < count; ++idx)
-        total_image_token +=
-            image_grid_thw[idx].prod().item<int>() / merge_length;
-    }
-
-    int total_video_token = 0;
-    if (video_grid_thw.defined()) {
-      auto count = video_grid_thw.sizes()[0];
-      for (int idx = 0; idx < count; ++idx)
-        total_video_token +=
-            video_grid_thw[idx].prod().item<int>() / merge_length;
-    }
-
-    size_t total_token_len = total_image_token * image_token_.size() +
-                             total_video_token * video_token_.size();
-    std::string data;
-    data.reserve(prompt.size() + total_token_len);
-
-    int image_index = 0;
-    int video_index = 0;
-
-    const torch::Tensor* grid_thw = nullptr;
-    const std::string* token = nullptr;
-    int* index = 0;
-
-    size_t begin = 0;
-    auto pair = find_vision_token(prompt, begin);
-
-    while (pair.second != std::string::npos) {
-      data.append(prompt, begin, pair.second - begin);
-
-      if (pair.first == TokenType::IMAGE) {
-        grid_thw = &image_grid_thw;
-        token = &image_token_;
-        index = &image_index;
-      } else if (pair.first == TokenType::VIDEO) {
-        grid_thw = &video_grid_thw;
-        token = &video_token_;
-        index = &video_index;
-      } else {
-        assert(false);
-      }
-
-      auto token_num = (*grid_thw)[(*index)].prod().item<int>() / merge_length;
-      while (token_num--) data.append(*token);
-
-      ++(*index);
-      begin = pair.second + token->size();
-      pair = find_vision_token(prompt, begin);
-    }
-
-    if (begin < prompt.size()) data.append(prompt, begin, std::string::npos);
-
-    prompt = std::move(data);
-  }
-
-  void find_mm_spans(const std::vector<int>& prompt, MMData& mm_data) {
-    auto start = prompt.begin();
-    uint32_t global_mm_index = 0;
-    uint32_t offset = 0;
-    uint32_t length = 0;
-    auto& mm_items = mm_data.items<MMItemVec>();
-    while (true) {
-      auto vision_start_it =
-          std::find(start, prompt.end(), vision_start_token_id_);
-      auto vision_end_it = std::find(start, prompt.end(), vision_end_token_id_);
-      if (vision_start_it == prompt.end()) {
-        break;
-      }
-      offset = std::distance(prompt.begin(), vision_start_it);
-      length = std::distance(vision_start_it + 1, vision_end_it);
-
-      auto& item = mm_items[global_mm_index];
-      if (*(vision_start_it + 1) == image_token_id_) {
-        item.mutable_state().mutable_token_pos() = {offset + 1, length};
-      } else if (*(vision_start_it + 1) == video_token_id_) {
-        item.mutable_state().mutable_token_pos() = {offset + 1, length};
-      }
-      global_mm_index++;
-      start = std::next(vision_end_it);
-    }
-  }
-
- private:
-  std::pair<TokenType, size_t> find_vision_token(const std::string& prompt,
-                                                 size_t begin) {
-    auto img_pos = prompt.find(image_token_, begin);
-    auto vid_pos = prompt.find(video_token_, begin);
-
-    if (img_pos == std::string::npos && vid_pos == std::string::npos)
-      return {TokenType::INVALID, std::string::npos};
-    else if (vid_pos == std::string::npos)
-      return {TokenType::IMAGE, img_pos};
-    else if (img_pos == std::string::npos)
-      return {TokenType::VIDEO, vid_pos};
-    else
-      return img_pos < vid_pos ? std::make_pair(TokenType::IMAGE, img_pos)
-                               : std::make_pair(TokenType::VIDEO, vid_pos);
-  }
-
- private:
-  const std::string image_token_ = "<|image_pad|>";
-  const std::string video_token_ = "<|video_pad|>";
-  int32_t vision_start_token_id_;
-  int32_t vision_end_token_id_;
-  int32_t image_token_id_;
-  int32_t video_token_id_;
-  int32_t merge_size_ = 0;
-};
 
 class Qwen2_5_VisionBlockImpl : public torch::nn::Module {
  public:
@@ -192,15 +54,9 @@ class Qwen2_5_VisionBlockImpl : public torch::nn::Module {
                         torch::Tensor& m_sin_pos,
                         torch::Tensor& cu_seq_len,
                         std::vector<int>& cu_seq_len_vec,
-                        ModelInputParams& input_params,
                         int node_id) {
-    return encoder_layer_(x,
-                          m_cos_pos,
-                          m_sin_pos,
-                          cu_seq_len,
-                          cu_seq_len_vec,
-                          input_params,
-                          node_id);
+    return encoder_layer_(
+        x, m_cos_pos, m_sin_pos, cu_seq_len, cu_seq_len_vec, node_id);
   }
 
   // load the weight from the checkpoint
@@ -560,8 +416,7 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
   }
 
   torch::Tensor forward(torch::Tensor hidden_states,
-                        torch::Tensor grid_thw,  // [batch,thw]
-                        const ModelInputParams& input_params) {
+                        torch::Tensor grid_thw) {  // [batch,thw]
     // patchify
     // hidden_states = x.to(device=self.device, dtype=self.dtype);
     hidden_states = patch_embed_(hidden_states);
@@ -614,8 +469,6 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
 
     m_cos = m_cos.repeat({1, 2});
     m_sin = m_sin.repeat({1, 2});
-    ModelInputParams& input_params_new =
-        const_cast<ModelInputParams&>(input_params);
     torch::Tensor cu_seqlens_cpu = cu_seqlens.cpu();
     torch::Tensor cu_window_seqlens_cpu = cu_window_seqlens.cpu();
     std::vector<int> cu_seqlens_vec(
@@ -624,6 +477,7 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
     std::vector<int> cu_w_seqlens_vec(
         cu_window_seqlens_cpu.data_ptr<int>(),  // windows seqlen vec
         cu_window_seqlens_cpu.data_ptr<int>() + cu_window_seqlens_cpu.numel());
+
     for (int idx = 0; idx < blocks_->size(); ++idx) {
       torch::Tensor cu_seqlens_now;
       std::vector<int> cu_seqlens_now_vec;
@@ -634,13 +488,8 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
         cu_seqlens_now = cu_window_seqlens;
         cu_seqlens_now_vec = cu_w_seqlens_vec;
       }
-      hidden_states = layers_[idx](hidden_states,
-                                   m_cos,
-                                   m_sin,
-                                   cu_seqlens_now,
-                                   cu_seqlens_now_vec,
-                                   input_params_new,
-                                   idx);
+      hidden_states = layers_[idx](
+          hidden_states, m_cos, m_sin, cu_seqlens_now, cu_seqlens_now_vec, idx);
     }
     // adapter
     hidden_states = merger_(hidden_states);
@@ -715,7 +564,17 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
   Qwen2_5_VLForConditionalGenerationImpl(const ModelContext& context)
       : model_args_(context.get_model_args()),
         options_(context.get_tensor_options()) {
-    visual_ = register_module("visual", Qwen2_5_VisionTransformer(context));
+    encoder_dp_group_ = context.get_parallel_args().encoder_dp_group_;
+    use_encoder_dp_ =
+        encoder_dp_group_ != nullptr && encoder_dp_group_->world_size() > 1;
+    if (use_encoder_dp_) {
+      ModelContext visual_context = context.with_parallel_args(ParallelArgs(
+          /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr));
+      visual_ =
+          register_module("visual", Qwen2_5_VisionTransformer(visual_context));
+    } else {
+      visual_ = register_module("visual", Qwen2_5_VisionTransformer(context));
+    }
 
     language_model_ =
         register_module("language_model", QWen2ForCausalLM(context));
@@ -725,7 +584,7 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       const ModelInputParams& input_params,
       std::optional<Qwen2_5_VLImageInputs>& image_inputs,
       std::optional<Qwen2_5_VLVideoInputs>& video_inputs) {
-    const auto& mm_data = input_params.mm_data;
+    const auto& mm_data = input_params.multimodal.mm_data;
     torch::Tensor pixel_values;
     if (const auto& res = mm_data.get<torch::Tensor>("pixel_values"))
       pixel_values = res.value();
@@ -759,50 +618,39 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     std::optional<Qwen2_5_VLImageInputs> image_input;
     std::optional<Qwen2_5_VLVideoInputs> video_input;
     prepare_encoder_input(input_params, image_input, video_input);
-    auto merge_size = model_args_.mm_image_merge_size();
     MMDict multimodal_embeds;
     if (image_input) {
-      // visual
-      auto image_embeds = visual_(image_input->pixel_values.to(options_),
-                                  image_input->image_grid_thw,
-                                  input_params);
-      auto image_tokens =
-          (image_input->image_grid_thw.prod(-1) / merge_size / merge_size)
-              .cpu()
-              .contiguous()
-              .to(torch::kLong);
-      std::vector<int64_t> image_tokens_vec(
-          image_tokens.data_ptr<int64_t>(),
-          image_tokens.data_ptr<int64_t>() + image_tokens.numel());
-      multimodal_embeds["image|embedding"] =
-          image_embeds.split(image_tokens_vec, 0 /*dim*/);
+      torch::Tensor image_pixels = image_input->pixel_values.to(options_);
+      torch::Tensor image_grid =
+          image_input->image_grid_thw.to(options_.device());
+      std::vector<int32_t> image_token_nums =
+          get_mm_token_nums(input_params.multimodal.mm_data, MMType::IMAGE);
+      if (!use_encoder_dp_) {
+        auto image_embeds = visual_(image_pixels, image_grid);
+        multimodal_embeds["image|embedding"] =
+            split_by_token_nums(image_embeds, image_token_nums);
+      } else {
+        multimodal_embeds["image|embedding"] =
+            run_dp_encoder(visual_,
+                           image_pixels,
+                           image_grid,
+                           image_token_nums,
+                           model_args_.mm_projection_dim(),
+                           encoder_dp_group_);
+      }
     }
     if (video_input) {
-      // visual
-      auto video_embeds = visual_(video_input->pixel_values_videos.to(options_),
-                                  video_input->video_grid_thw,
-                                  input_params);
-      auto video_tokens =
-          (video_input->video_grid_thw.prod(-1) / merge_size / merge_size)
-              .cpu()
-              .contiguous()
-              .to(torch::kLong);
-      std::vector<int64_t> video_tokens_vec(
-          video_tokens.data_ptr<int64_t>(),
-          video_tokens.data_ptr<int64_t>() + video_tokens.numel());
-
+      torch::Tensor video_pixels =
+          video_input->pixel_values_videos.to(options_);
+      torch::Tensor video_grid =
+          video_input->video_grid_thw.to(options_.device());
+      std::vector<int32_t> video_token_nums =
+          get_mm_token_nums(input_params.multimodal.mm_data, MMType::VIDEO);
+      auto video_embeds = visual_(video_pixels, video_grid);
       multimodal_embeds["video|embedding"] =
-          video_embeds.split(video_tokens_vec, 0 /*dim*/);
+          split_by_token_nums(video_embeds, video_token_nums);
     }
     return multimodal_embeds;
-  }
-
-  torch::Tensor generate_multimodal_mask(torch::Tensor input_ids) {
-    auto special_token_ids = torch::tensor(
-        {model_args_.image_token_id(), model_args_.video_token_id()},
-        input_ids.options().dtype(torch::kInt64));
-    auto is_multimodal = torch::isin(input_ids, special_token_ids);
-    return is_multimodal;
   }
 
   torch::Tensor merge_multimodal_embeddings(
@@ -815,18 +663,20 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
 
   torch::Tensor get_input_embeddings(const torch::Tensor input_ids,
                                      const ModelInputParams& input_params) {
-    const auto& mm_data = input_params.mm_data;
-    torch::Tensor multimodal_embeds;
-    if (const auto& emb = mm_data.get<torch::Tensor>("embedding")) {
-      multimodal_embeds = emb.value();
-    }
+    const auto& mm_data = input_params.multimodal.mm_data;
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
-    if (!multimodal_embeds.defined()) {
-      return inputs_embeds;
-    }
-    auto is_multimodal = generate_multimodal_mask(input_ids);
-    inputs_embeds = merge_multimodal_embeddings(
-        inputs_embeds, multimodal_embeds, is_multimodal);
+    auto merge_modality = [&](const std::string& embed_key,
+                              const std::string& mask_key) {
+      auto emb = mm_data.get<torch::Tensor>(embed_key);
+      if (!emb.has_value()) return;
+      auto mask = mm_data.get<torch::Tensor>(mask_key);
+      if (!mask.has_value()) return;
+      inputs_embeds =
+          merge_multimodal_embeddings(inputs_embeds, emb.value(), mask.value());
+    };
+
+    merge_modality("image|embedding", "image|mask");
+    merge_modality("video|embedding", "video|mask");
     return inputs_embeds;
   }
 
@@ -835,6 +685,19 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) {
     return language_model_(tokens, positions, kv_caches, input_params);
+  }
+
+  torch::Tensor pooler(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes) {
+    auto h = hidden_states;
+    // return full embeddings if set flag
+
+    if (seleted_idxes.defined()) {
+      h = h.index_select(/*dim=*/0, seleted_idxes);
+    }
+    auto pooler_output = torch::nn::functional::normalize(
+        h, torch::nn::functional::NormalizeFuncOptions().p(2).dim(1));
+    return pooler_output;
   }
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
@@ -852,7 +715,7 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     visual_->verify_loaded_weights("visual.");
     visual_->merge_loaded_weights();
 
-    if (!model_args_.image_embedding_mode()) {
+    if (!model_args_.encoder_embedding_mode()) {
       language_model_->load_model(std::move(loader));
     }
   }
@@ -874,17 +737,26 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
  private:
   ModelArgs model_args_;
   torch::TensorOptions options_;
+  ProcessGroup* encoder_dp_group_ = nullptr;
+  bool use_encoder_dp_ = false;
 
   Qwen2_5_VisionTransformer visual_{nullptr};
   QWen2ForCausalLM language_model_{nullptr};
 };
 TORCH_MODULE(Qwen2_5_VLForConditionalGeneration);
 
-REGISTER_INPUT_PROCESSOR(qwen2_5_vl, Qwen2_5_VLInputProcessor);
-REGISTER_CAUSAL_VLM_MODEL(qwen2_5_vl, Qwen2_5_VLForConditionalGeneration);
-REGISTER_IMAGE_PROCESSOR(qwen2_5_vl, Qwen2VLImageProcessor);
+using Qwen25VLMultimodalProcessor = MultimodalProcessor<Qwen2VLPromptProcessor,
+                                                        Qwen2VLImageProcessor,
+                                                        Qwen2VLVideoProcessor>;
+REGISTER_MULTIMODAL_PROCESSOR_WITH_VARNAME(qwen2_5_vl_atb,
+                                           qwen2_5_vl_atb,
+                                           Qwen25VLMultimodalProcessor);
+REGISTER_CAUSAL_VLM_MODEL_WITH_VARNAME(qwen2_5_vl_atb,
+                                       qwen2_5_vl_atb,
+                                       Qwen2_5_VLForConditionalGeneration);
+REGISTER_MPOSITION_GENERATOR(qwen2_5_vl, xllm::QwenVLMPositionGenerator);
 
-REGISTER_MODEL_ARGS(qwen2_5_vl, [&] {
+REGISTER_MODEL_ARGS_WITH_VARNAME(qwen2_5_vl_atb, qwen2_5_vl_atb, [&] {
   // text config
   // LOAD_ARG_OR(attention_dropout, "attention_dropout", 0.0);
   LOAD_ARG_OR(bos_token_id, "bos_token_id", 151643);
@@ -937,8 +809,7 @@ REGISTER_MODEL_ARGS(qwen2_5_vl, [&] {
     return args->mm_hidden_size() / args->mm_num_attention_heads();
   });
 
-  LOAD_ARG_OR(
-      rope_scaling_rope_type, "vision_config.rope_scaling.type", "mrope");
+  LOAD_ARG_OR(rope_scaling_rope_type, "rope_scaling.type", "mrope");
   LOAD_ARG(rope_scaling_mrope_section, "rope_scaling.mrope_section");
   LOAD_ARG_OR(vocab_size, "vocab_size", 152064);
 });

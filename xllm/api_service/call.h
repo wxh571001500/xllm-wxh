@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,26 +16,51 @@ limitations under the License.
 #pragma once
 
 #include <brpc/controller.h>
+#include <butil/iobuf.h>
 
 #include <string>
+#include <utility>
 
 namespace xllm {
 
+template <typename Request>
+std::string request_body_x_request_id(const Request* request) {
+  if constexpr (requires(const Request& value) {
+                  value.has_x_request_id();
+                  value.x_request_id();
+                }) {
+    if (request != nullptr && request->has_x_request_id()) {
+      return request->x_request_id();
+    }
+  }
+  return "";
+}
+
 class Call {
  public:
-  Call(brpc::Controller* controller);
+  Call(brpc::Controller* controller,
+       std::string body_x_request_id = "",
+       bool is_http_request = false);
   virtual ~Call() = default;
 
-  std::string get_x_request_id() { return x_request_id_; }
-  std::string get_x_request_time() { return x_request_time_; }
+  const std::string& get_x_request_id() const { return x_request_id_; }
+  const std::string& get_x_request_time() const { return x_request_time_; }
 
-  std::string take_request_payload() { return std::move(request_payload_); }
+  std::string take_request_payload();
+  butil::IOBuf take_request_iobuf() {
+    return butil::IOBuf(request_payload_.movable());
+  }
   void init_request_payload();
+
+  // Sets the payload for handlers.
+  void set_request_payload(butil::IOBuf payload) {
+    request_payload_ = std::move(payload);
+  }
 
   virtual bool is_disconnected() const = 0;
 
  protected:
-  void init();
+  void init(std::string body_x_request_id, bool is_http_request);
 
  protected:
   brpc::Controller* controller_;
@@ -43,7 +68,7 @@ class Call {
   std::string x_request_id_;
   std::string x_request_time_;
 
-  std::string request_payload_;
+  butil::IOBuf request_payload_;
 };
 
 }  // namespace xllm

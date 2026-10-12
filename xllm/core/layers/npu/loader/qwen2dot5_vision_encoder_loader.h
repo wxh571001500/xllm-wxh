@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,11 +27,14 @@ class Qwen2dot5VisionEncoderLoader : public BaseLoader {
  public:
   Qwen2dot5VisionEncoderLoader(uint64_t weight_count,
                                const ModelContext& context,
-                               int64_t numAttentionHeadsPerRank);
+                               int64_t numAttentionHeadsPerRank,
+                               LoadMode mode = LoadMode::kEager);
 
   void load_state_dict(const StateDict& state_dict) override;
   void verify_loaded_weights() const override;
-  void merge_loaded_weights() override;
+
+ protected:
+  void merge_host_at_weights() override;
 
  private:
   void get_weights_col_packed_qkv();
@@ -41,16 +44,11 @@ class Qwen2dot5VisionEncoderLoader : public BaseLoader {
                            int64_t target_shape,
                            int64_t dim = 0);
 
- protected:
-  std::string model_name_;
-  torch::Tensor cu_seqlen_;
-  torch::Tensor at_placeholder_;
-  std::vector<torch::Tensor> qkv_weight;
-  std::vector<torch::Tensor> qkv_bias;
-  int device_id_;
-  int encode_param_rank;
-  int encode_param_worldSize;
-  int64_t encode_param_numAttentionHeadsPerRank;
+  std::vector<torch::Tensor> qkv_weight_;
+  std::vector<torch::Tensor> qkv_bias_;
+  int encode_param_rank_;
+  int encode_param_world_size_;
+  int64_t encode_param_num_attention_heads_per_rank_;
 };
 
 }  // namespace layer

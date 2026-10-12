@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,9 +16,13 @@ limitations under the License.
 #include "suffix_worker_impl.h"
 
 #include <algorithm>
+#include <unordered_map>
 
 #include "common/metrics.h"
-#include "framework/sampling/rejection_sampler.h"
+#include "core/framework/eplb/eplb_utils.h"
+#include "core/framework/speculative/spec_verify.h"
+#include "framework/sampling/sampler.h"
+#include "framework/sampling/sampling_params.h"
 #include "util/slice.h"
 #include "util/timer.h"
 #include "util/utils.h"
@@ -34,6 +38,99 @@ void append_tokens_with_limit(std::vector<int32_t>& history,
   if (history.size() > max_size) {
     history.erase(history.begin(), history.end() - max_size);
   }
+}
+
+void extend_validation_history(const SamplingParameters& original,
+                               const std::vector<int32_t>& proposals,
+                               int32_t num_sequences,
+                               int32_t draft_width,
+                               SamplingParameters& expanded) {
+  if (!original.unique_token_ids.defined()) {
+    return;
+  }
+  const torch::Device device = expanded.unique_token_ids.device();
+  torch::Tensor ids =
+      original.unique_token_ids.to(torch::kCPU).to(torch::kLong).contiguous();
+  torch::Tensor counts =
+      original.unique_token_counts.to(torch::kCPU).to(torch::kInt).contiguous();
+  torch::Tensor lengths = original.unique_token_ids_lens.to(torch::kCPU)
+                              .to(torch::kInt)
+                              .contiguous();
+  CHECK_EQ(ids.size(0), num_sequences);
+  const int32_t width = draft_width + 1;
+  const int64_t capacity = ids.size(1) + draft_width;
+  torch::Tensor new_ids =
+      torch::zeros({num_sequences * width, capacity}, torch::kLong);
+  torch::Tensor new_counts =
+      torch::zeros({num_sequences * width, capacity}, torch::kInt);
+  torch::Tensor new_lengths =
+      torch::zeros({num_sequences * width}, torch::kInt);
+  const auto old_ids = ids.accessor<int64_t, 2>();
+  const auto old_counts = counts.accessor<int32_t, 2>();
+  const auto old_lengths = lengths.accessor<int32_t, 1>();
+  auto out_ids = new_ids.accessor<int64_t, 2>();
+  auto out_counts = new_counts.accessor<int32_t, 2>();
+  auto out_lengths = new_lengths.accessor<int32_t, 1>();
+  for (int32_t seq = 0; seq < num_sequences; ++seq) {
+    std::unordered_map<int64_t, int32_t> history;
+    history.reserve(static_cast<size_t>(capacity));
+    for (int32_t i = 0; i < old_lengths[seq]; ++i) {
+      history[old_ids[seq][i]] = old_counts[seq][i];
+    }
+    for (int32_t pos = 0; pos < width; ++pos) {
+      const int32_t row = seq * width + pos;
+      int32_t column = 0;
+      for (const auto& [token, count] : history) {
+        out_ids[row][column] = token;
+        out_counts[row][column] = count;
+        ++column;
+      }
+      out_lengths[row] = column;
+      if (pos < draft_width) {
+        ++history[proposals[seq * draft_width + pos]];
+      }
+    }
+  }
+  expanded.unique_token_ids = new_ids.to(device);
+  expanded.unique_token_counts = new_counts.to(device);
+  expanded.unique_token_ids_lens = new_lengths.to(device);
+}
+
+// The target may emit one punctuation token that the CTC hypothesis omits
+// (e.g. a pause marker); a single-token history gap bridges it. Gap 0
+// measured strictly worse acceptance; gaps >= 2 measured no extra gain.
+constexpr int32_t kMaxHistoryGap = 1;
+// Longest prompt suffix considered when anchoring the hint tail.
+constexpr size_t kMaxPromptMatchWidth = 16;
+
+std::vector<int32_t> find_prompt_lookup_draft(std::span<const int32_t> history,
+                                              std::span<const int32_t> hint,
+                                              int32_t max_tokens) {
+  if (history.empty() || hint.empty() || max_tokens <= 0) {
+    return {};
+  }
+  const size_t max_gap =
+      std::min<size_t>(static_cast<size_t>(kMaxHistoryGap), history.size() - 1);
+  // Exact suffixes take priority. A bounded gap can bridge a punctuation
+  // token emitted by the target but absent from the CTC hypothesis.
+  for (size_t gap = 0; gap <= max_gap; ++gap) {
+    const auto prefix = history.first(history.size() - gap);
+    const size_t max_match = std::min(kMaxPromptMatchWidth, prefix.size());
+    for (size_t width = max_match; width > 0; --width) {
+      for (size_t end = width; end < hint.size(); ++end) {
+        if (!std::equal(prefix.end() - width,
+                        prefix.end(),
+                        hint.begin() + end - width)) {
+          continue;
+        }
+        const size_t count = std::min<size_t>(static_cast<size_t>(max_tokens),
+                                              hint.size() - end);
+        return std::vector<int32_t>(hint.begin() + end,
+                                    hint.begin() + end + count);
+      }
+    }
+  }
+  return {};
 }
 
 std::string summarize_int32_span(std::span<const int32_t> values,
@@ -65,27 +162,64 @@ runtime::Options SuffixTargetOptions(const runtime::Options& options) {
 
 SuffixWorkerImpl::SuffixWorkerImpl(const ParallelArgs& parallel_args,
                                    const torch::Device& device,
-                                   const runtime::Options& options)
+                                   const runtime::Options& options,
+                                   WorkerType worker_type)
     : SpeculativeWorkerImpl(parallel_args,
                             device,
                             options,
-                            SuffixTargetOptions(options)) {
+                            SuffixTargetOptions(options),
+                            worker_type) {
   suffix_cache_ = std::make_unique<SuffixDecodingCache>(
       options_.speculative_suffix_cache_max_depth(),
       options_.speculative_suffix_max_cached_requests());
+  vlm_target_ = worker_type == WorkerType::VLM;
+}
+
+void SuffixWorkerImpl::store_prompt_hint(const std::string& request_id,
+                                         std::vector<int32_t> hint) {
+  // Hints are advisory; the bound only stops unbounded growth from requests
+  // that finish inside prefill and never reach decode cleanup. Eviction
+  // follows insertion order and only degrades acceptance, never correctness.
+  const size_t limit =
+      static_cast<size_t>(std::max(1, options_.max_seqs_per_batch())) * 2;
+  const bool is_new =
+      model_prompt_hints_.find(request_id) == model_prompt_hints_.end();
+  if (is_new && model_prompt_hints_.size() >= limit) {
+    model_prompt_hints_.erase(model_prompt_hints_order_.front());
+    model_prompt_hints_order_.pop_front();
+  }
+  if (is_new) {
+    model_prompt_hints_order_.push_back(request_id);
+  }
+  model_prompt_hints_.insert_or_assign(request_id, std::move(hint));
+}
+
+void SuffixWorkerImpl::drop_prompt_hint(const std::string& request_id) {
+  if (model_prompt_hints_.erase(request_id) > 0) {
+    const auto it = std::find(model_prompt_hints_order_.begin(),
+                              model_prompt_hints_order_.end(),
+                              request_id);
+    if (it != model_prompt_hints_order_.end()) {
+      model_prompt_hints_order_.erase(it);
+    }
+  }
 }
 
 std::optional<ForwardOutput> SuffixWorkerImpl::step_empty(
     const ForwardInput& input) {
-  if (!input.input_params.batch_forward_type.is_decode()) {
+  if (!input.input_params.meta.batch_forward_type.is_decode()) {
     auto output = impl_->step(input);
     output->sample_output.embeddings = torch::Tensor();
     return output;
   } else {
     ForwardInput new_input = input;
-    for (auto& it : new_input.input_params.dp_global_token_nums) {
+    for (auto& it : new_input.input_params.parallel.dp_global_token_nums) {
       it *= options_.num_speculative_tokens() + 1;
     }
+    new_input.input_params.expert.eplb_decode_token_mask =
+        eplb::expand_decode_token_mask(
+            new_input.input_params.expert.eplb_decode_token_mask,
+            options_.num_speculative_tokens() + 1);
 
     auto future = impl_->step_async(new_input);
     ForwardOutput output = std::move(future).get().value();
@@ -104,15 +238,14 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
               timer.elapsed_seconds());
 
   const auto& input_params = input.input_params;
-  const int32_t num_sequences = input_params.num_sequences;
-  const auto& request_ids = input_params.request_ids;
+  const int32_t num_sequences = input_params.meta.num_sequences;
+  const auto& request_ids = input_params.embedding.request_ids;
 
   if (suffix_cache_ != nullptr &&
       request_ids.size() == static_cast<size_t>(num_sequences)) {
-    torch::Tensor token_ids = safe_to(input.token_ids, torch::kCPU);
-    Slice<int32_t> tokens_ids_slice = {
-        token_ids.data_ptr<int32_t>(),
-        static_cast<size_t>(input.token_ids.numel())};
+    const torch::Tensor& token_ids = input.token_ids_host;
+    Slice<int32_t> tokens_ids_slice = {token_ids.data_ptr<int32_t>(),
+                                       static_cast<size_t>(token_ids.numel())};
 
     int32_t start_idx = 0;
     for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
@@ -136,6 +269,32 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
           suffix_recent_tokens_[req_id],
           seq_tokens,
           static_cast<size_t>(suffix_cache_->max_tree_depth()));
+    }
+
+    std::vector<int32_t> audio_sequences;
+    audio_sequences.reserve(static_cast<size_t>(num_sequences));
+    for (const auto& data : input_params.multimodal.mm_data.mm_data_vec()) {
+      if (!data.hold<MMItemVec>()) {
+        continue;
+      }
+      for (const auto& item : data.items<MMItemVec>()) {
+        if (item.type() != MMType::AUDIO) {
+          continue;
+        }
+        audio_sequences.emplace_back(item.state().seq_index());
+      }
+    }
+    if (!audio_sequences.empty()) {
+      auto hints = impl_->get_prompt_lookup_hints();
+      if (!hints.empty()) {
+        CHECK_EQ(hints.size(), audio_sequences.size());
+        for (size_t i = 0; i < hints.size(); ++i) {
+          const int32_t seq = audio_sequences[i];
+          CHECK_GE(seq, 0);
+          CHECK_LT(seq, num_sequences);
+          store_prompt_hint(request_ids[seq], std::move(hints[i]));
+        }
+      }
     }
 
     torch::Tensor next_tokens =
@@ -175,9 +334,9 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
 std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
     const ForwardInput& input) {
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  const int32_t num_sequences = input.input_params.num_sequences;
+  const int32_t num_sequences = input.input_params.meta.num_sequences;
   const int32_t num_val_tokens = num_speculative_tokens + 1;
-  const auto& request_ids = input.input_params.request_ids;
+  const auto& request_ids = input.input_params.embedding.request_ids;
 
   const bool has_request_ids =
       suffix_cache_ != nullptr &&
@@ -196,17 +355,26 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
           suffix_cache_->stop_request(req_id);
         }
         suffix_recent_tokens_.erase(req_id);
+        drop_prompt_hint(req_id);
       }
     }
     suffix_active_decode_req_ids_ = std::move(current_req_ids);
   }
 
-  torch::Tensor input_token_ids = safe_to(input.token_ids, torch::kCPU);
+  const torch::Tensor& input_token_ids = input.token_ids_host;
   Slice<int32_t> input_tokens_slice = {
       input_token_ids.data_ptr<int32_t>(),
       static_cast<size_t>(input_token_ids.numel())};
 
   Timer timer;
+
+  // The CTC hint path requires greedy verification to reproduce the target's
+  // autoregressive output exactly (per-position processor application plus
+  // greedy compare). Non-greedy batches degrade to the standard suffix-cache
+  // flow with raw-logits greedy verify — the same behavior as the LLM suffix
+  // path — instead of failing the request.
+  const bool vlm_greedy_verify =
+      vlm_target_ && input.sampling_params.all_greedy_sample;
 
   std::vector<int32_t> draft_tokens_flat;
   draft_tokens_flat.reserve(num_sequences * num_speculative_tokens);
@@ -246,15 +414,50 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
           std::span<const int32_t>(&fallback_token, 1),
           static_cast<size_t>(suffix_cache_->max_tree_depth()));
     }
+    // A stored model hint takes priority over the suffix-cache draft for
+    // this request until it finishes; the suffix history bookkeeping above
+    // stays maintained either way. Hints are only consulted for greedy
+    // batches. Slots the hint cannot fill (short tail at transcription end)
+    // are completed from the suffix cache; if both run short, the remaining
+    // slots keep the fallback token — the same short-draft semantics as the
+    // standard suffix path below. Greedy verify truncates at the first
+    // mismatch, so this only wastes slots, never correctness.
+    const auto speculate_cache = [&](int32_t max_spec_tokens) {
+      return suffix_cache_->speculate(
+          req_id,
+          std::span<const int32_t>(history.data(), history.size()),
+          /*max_spec_tokens=*/max_spec_tokens,
+          options_.speculative_suffix_max_spec_factor(),
+          options_.speculative_suffix_max_spec_offset(),
+          options_.speculative_suffix_min_token_prob(),
+          options_.speculative_suffix_use_tree_spec());
+    };
+    const auto hint = vlm_greedy_verify ? model_prompt_hints_.find(req_id)
+                                        : model_prompt_hints_.end();
+    if (hint != model_prompt_hints_.end()) {
+      const auto proposed = find_prompt_lookup_draft(
+          history, hint->second, num_speculative_tokens);
+      if (!proposed.empty()) {
+        for (size_t i = 0; i < proposed.size(); ++i) {
+          draft_tokens_flat[seq_id * num_speculative_tokens + i] = proposed[i];
+        }
+        const int32_t remaining =
+            num_speculative_tokens - static_cast<int32_t>(proposed.size());
+        if (remaining > 0) {
+          const SuffixDecodingDraft tail = speculate_cache(remaining);
+          const int32_t fill =
+              std::min<int32_t>(remaining, tail.token_ids.size());
+          for (int32_t i = 0; i < fill; ++i) {
+            draft_tokens_flat[seq_id * num_speculative_tokens +
+                              static_cast<int32_t>(proposed.size()) + i] =
+                tail.token_ids[i];
+          }
+        }
+        continue;
+      }
+    }
 
-    SuffixDecodingDraft draft = suffix_cache_->speculate(
-        req_id,
-        std::span<const int32_t>(history.data(), history.size()),
-        /*max_spec_tokens=*/num_speculative_tokens,
-        options_.speculative_suffix_max_spec_factor(),
-        options_.speculative_suffix_max_spec_offset(),
-        options_.speculative_suffix_min_token_prob(),
-        options_.speculative_suffix_use_tree_spec());
+    SuffixDecodingDraft draft = speculate_cache(num_speculative_tokens);
 
     const int32_t fill_count =
         std::min<int32_t>(num_speculative_tokens, draft.token_ids.size());
@@ -265,7 +468,8 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   }
 
   ForwardInput validate_input;
-  prepare_validate_inputs(input, validate_input);
+  prepare_validate_inputs(
+      input, validate_input, /*repeat_unique_history=*/!vlm_greedy_verify);
   validate_input.skip_sampling_for_logits_only = true;
 
   auto& validate_token_ids = validate_input.token_ids;
@@ -282,6 +486,14 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
     validate_token_ids.masked_scatter_(mask, draft_col_tensor);
   }
 
+  if (vlm_greedy_verify) {
+    extend_validation_history(input.sampling_params,
+                              draft_tokens_flat,
+                              num_sequences,
+                              num_speculative_tokens,
+                              validate_input.sampling_params);
+  }
+
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
 
@@ -291,23 +503,27 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
+  if (vlm_greedy_verify) {
+    // The target returned raw logits; apply the original request's
+    // processors in place, using the history of each verification position.
+    // validate() below samples the processed logits (bonus argmax plus the
+    // rejection sampler's greedy compare), so the sampler's own argmax and
+    // softmax passes would be discarded work.
+    Sampler::apply_logits_processors(target_output.logits,
+                                     validate_input.sampling_params);
+  }
+
   torch::Tensor draft_token_ids =
       torch::tensor(draft_tokens_flat,
                     torch::TensorOptions().dtype(torch::kLong))
           .view({num_sequences, num_speculative_tokens})
           .to(target_output.logits.device());
 
-  // RejectionSampler::forward requires draft_probs tensor for interface
-  // compatibility, but greedy-only validation does not use its values.
-  // Use a minimal placeholder to avoid one-hot scatter over vocab.
-  auto draft_probs = torch::empty({num_sequences, num_speculative_tokens, 1},
-                                  torch::TensorOptions()
-                                      .dtype(torch::kFloat32)
-                                      .device(target_output.logits.device()));
+  DraftProposal draft_proposal = DraftProposal(std::move(draft_token_ids));
 
   timer.reset();
-  SampleOutput val_output = validate(
-      input.sampling_params, draft_token_ids, draft_probs, target_output);
+  SampleOutput val_output =
+      validate(input.sampling_params, draft_proposal, target_output);
   COUNTER_ADD(speculative_execution_latency_seconds_validation,
               timer.elapsed_seconds());
 
@@ -381,13 +597,12 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
 
 SampleOutput SuffixWorkerImpl::validate(
     const SamplingParameters& sampling_params,
-    const torch::Tensor& draft_token_ids,
-    const torch::Tensor& draft_probs,
+    const DraftProposal& draft_proposal,
     const ForwardOutput& target_output) {
   (void)sampling_params;
   const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
   const int32_t batch_size =
-      static_cast<int32_t>(draft_token_ids.size(/*dim=*/0));
+      static_cast<int32_t>(draft_proposal.token_ids().size(/*dim=*/0));
   const int32_t vocab_size =
       static_cast<int32_t>(target_output.logits.size(/*dim=*/-1));
   CHECK_EQ(target_output.logits.size(/*dim=*/0),
@@ -402,37 +617,15 @@ SampleOutput SuffixWorkerImpl::validate(
       target_logits.index({ISlice(), num_val_tokens - 1, ISlice()})
           .argmax(/*dim=*/-1, /*keepdim=*/true);
 
-  // Suffix decoding always uses greedy sampling for validation,
-  // regardless of the user's sampling parameters.
   auto greedy_do_sample = torch::zeros({batch_size}, torch::kBool);
-  auto rejection_sampler =
-      std::make_unique<RejectionSampler>(greedy_do_sample,
-                                         /*all_random_sample=*/false,
-                                         /*all_greedy_sample=*/true,
-                                         target_output.logprobs,
-                                         target_output.max_top_logprobs,
-                                         rate_controller_,
-                                         enable_fused_kernel_);
-
-  SampleOutput sample_output =
-      rejection_sampler->forward(draft_token_ids.to(bonus_token_ids),
-                                 draft_probs.to(target_logits.device()),
-                                 target_logits,
-                                 bonus_token_ids,
-                                 /*mask_out_rejected_tokens=*/true);
-
-  auto embeddings = target_output.sample_output.embeddings;
-  sample_output.embeddings =
-      embeddings.view({batch_size, num_val_tokens, embeddings.size(-1)});
-
-  torch::Tensor mask = (sample_output.next_tokens == -1).to(torch::kInt64);
-  size_t count = mask.sum().item<int64_t>();
-  size_t num_draft_tokens =
-      static_cast<size_t>(batch_size) * options_.num_speculative_tokens();
-  COUNTER_ADD(speculative_num_draft_tokens_total, num_draft_tokens);
-  COUNTER_ADD(speculative_num_accepted_tokens_total, num_draft_tokens - count);
-
-  return sample_output;
+  return spec_verify::run_rejection_sampling({.do_sample = greedy_do_sample,
+                                              .all_random_sample = false,
+                                              .all_greedy_sample = true},
+                                             draft_proposal,
+                                             target_logits,
+                                             target_output,
+                                             bonus_token_ids,
+                                             enable_fused_kernel_);
 }
 
 }  // namespace xllm

@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,11 +25,15 @@ limitations under the License.
 #include <optional>
 #include <utility>
 
-#include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/framework/config/speculative_config.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
+#include "runtime/dflash2_worker_impl.h"
+#include "runtime/dflash_worker_impl.h"
+#include "runtime/dit_worker_impl.h"
+#include "runtime/dspark_worker_impl.h"
 #include "runtime/eagle3_worker_impl.h"
 #include "runtime/embed_vlm_worker_impl.h"
 #include "runtime/embed_worker_impl.h"
@@ -47,15 +51,26 @@ Worker::Worker(const ParallelArgs& parallel_args,
                const runtime::Options& options,
                WorkerType worker_type) {
   if (options.enable_speculative_decode()) {
-    auto algo = FLAGS_speculative_algorithm;
-    LOG(INFO) << "Speculative decode is enabled, algorithm: " << algo;
-    if (algo == "Eagle3") {
-      impl_ = new Eagle3WorkerImpl(parallel_args, device, options);
-    } else if (algo == "Suffix") {
-      impl_ = new SuffixWorkerImpl(parallel_args, device, options);
+    const std::string& algorithm = options.speculative_algorithm();
+    LOG(INFO) << "Speculative decode is enabled, algorithm: " << algorithm;
+    if (algorithm == "Eagle3") {
+      impl_ = new Eagle3WorkerImpl(parallel_args, device, options, worker_type);
+    } else if (algorithm == "DFlash") {
+      impl_ = new DFlashWorkerImpl(parallel_args, device, options);
+    } else if (SpeculativeConfig::is_dflash2_algorithm(algorithm)) {
+#if !defined(USE_NPU) && !defined(USE_MLU)
+      LOG(FATAL)
+          << "DFlash2 speculative decoding is only supported on NPU and MLU.";
+#endif
+      impl_ = new DFlash2WorkerImpl(parallel_args, device, options);
+    } else if (algorithm == "DSpark") {
+      impl_ = new DSparkWorkerImpl(parallel_args, device, options);
+    } else if (algorithm == "Suffix") {
+      impl_ = new SuffixWorkerImpl(parallel_args, device, options, worker_type);
+    } else if (SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+      impl_ = new MTPWorkerImpl(parallel_args, device, options, worker_type);
     } else {
-      // Default: MTP
-      impl_ = new MTPWorkerImpl(parallel_args, device, options);
+      LOG(FATAL) << "Unsupported speculative decoding algorithm: " << algorithm;
     }
   } else if (worker_type == WorkerType::LLM) {
     impl_ = new LLMWorkerImpl(parallel_args, device, options);
@@ -69,6 +84,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
     impl_ = new RecWorkerImpl(parallel_args, device, options);
   } else if (worker_type == WorkerType::MMEVLM) {
     impl_ = new MMEmbedVLMWorkerImpl(parallel_args, device, options);
+  } else if (worker_type == WorkerType::DIT) {
+    impl_ = new DiTWorkerImpl(parallel_args, device, options);
   } else {
     LOG(ERROR) << "Unknown worker type, please check logic";
   }
@@ -82,42 +99,41 @@ bool Worker::init_model(const std::string& model_weights_path,
   return impl_->init_model(model_weights_path, random_seed, master_status);
 }
 
-bool Worker::allocate_kv_cache(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+bool Worker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return impl_->allocate_kv_cache(kv_cache_shape);
 }
 
-void Worker::get_device_info(std::string& device_ip, uint16_t& port) {
-  impl_->get_device_info(device_ip, port);
+bool Worker::set_speculative_validate_time_predictor(
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+  SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
+      predictor);
+  return true;
 }
 
 void Worker::get_cache_info(uint64_t& cluster_id,
                             std::string& addr,
-                            int64_t& k_cache_id,
-                            int64_t& v_cache_id) {
-  impl_->get_cache_info(cluster_id, addr, k_cache_id, v_cache_id);
+                            uint16_t& port) {
+  impl_->get_cache_info(cluster_id, addr, port);
 }
 
 bool Worker::link_cluster(const std::vector<uint64_t>& cluster_ids,
                           const std::vector<std::string>& addrs,
-                          const std::vector<std::string>& device_ips,
                           const std::vector<uint16_t>& ports) {
-  return impl_->link_cluster(cluster_ids, addrs, device_ips, ports);
+  return impl_->link_cluster(cluster_ids, addrs, ports);
 }
 
 bool Worker::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,
-                            const std::vector<std::string>& device_ips,
                             const std::vector<uint16_t>& ports) {
-  return impl_->unlink_cluster(cluster_ids, addrs, device_ips, ports);
+  return impl_->unlink_cluster(cluster_ids, addrs, ports);
 }
 
-bool Worker::link_d2d(const std::string& remote_addr) {
-  return impl_->link_d2d(remote_addr);
+bool Worker::link_p2p(const std::string& remote_addr) {
+  return impl_->link_p2p(remote_addr);
 }
 
-bool Worker::unlink_d2d(const std::string& remote_addr) {
-  return impl_->unlink_d2d(remote_addr);
+bool Worker::unlink_p2p(const std::string& remote_addr) {
+  return impl_->unlink_p2p(remote_addr);
 }
 
 std::tuple<int64_t, int64_t> Worker::estimate_kv_cache_capacity() {
@@ -158,28 +174,20 @@ folly::SemiFuture<bool> Worker::init_model_async(
 }
 
 folly::SemiFuture<bool> Worker::allocate_kv_cache_async(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+    const KVCacheShape& kv_cache_shape) {
   return impl_->allocate_kv_cache_async(kv_cache_shape);
 }
 
 folly::SemiFuture<bool> Worker::allocate_kv_cache_with_transfer_async(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+    const KVCacheShape& kv_cache_shape) {
   return impl_->allocate_kv_cache_with_transfer_async(kv_cache_shape);
 }
 
 folly::SemiFuture<bool> Worker::pull_kv_blocks_async(
     const uint64_t src_cluster_id,
     const std::string& src_addr,
-    const int64_t src_k_cache_id,
-    const int64_t src_v_cache_id,
-    const std::vector<uint64_t>& src_blocks,
-    const std::vector<uint64_t>& dst_blocks) {
-  return impl_->pull_kv_blocks_async(src_cluster_id,
-                                     src_addr,
-                                     src_k_cache_id,
-                                     src_v_cache_id,
-                                     src_blocks,
-                                     dst_blocks);
+    const std::vector<KVTransferMapping>& mappings) {
+  return impl_->pull_kv_blocks_async(src_cluster_id, src_addr, mappings);
 }
 
 uint32_t Worker::transfer_kv_blocks(
@@ -192,6 +200,17 @@ uint32_t Worker::transfer_kv_blocks(
     const uint64_t batch_id,
     Slice<BlockTransferInfo>& block_transfer_info) {
   return impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+}
+
+std::vector<uint8_t> Worker::prefetch_kv_blocks(
+    Slice<BlockTransferInfo>& block_transfer_info,
+    StoreGetStats* stats) {
+  return impl_->prefetch_kv_blocks(block_transfer_info, stats);
+}
+
+std::vector<uint8_t> Worker::probe_kv_blocks(
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  return impl_->probe_kv_blocks(block_transfer_info);
 }
 
 const torch::Device& Worker::device() const { return impl_->device(); }
@@ -227,11 +246,37 @@ bool Worker::wakeup(const WakeupOptions& options) {
   return impl_->wakeup(options);
 }
 
+bool Worker::update_weights(const std::string& weights_path) {
+  return impl_->update_weights(weights_path);
+}
+
 folly::SemiFuture<bool> Worker::wakeup_async(const WakeupOptions& options) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this, options, promise = std::move(promise)]() mutable {
     promise.setValue(this->wakeup(options));
+  });
+  return future;
+}
+
+bool Worker::start_profile() { return impl_->start_profile(); }
+
+bool Worker::stop_profile() { return impl_->stop_profile(); }
+
+folly::SemiFuture<bool> Worker::start_profile_async() {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this, promise = std::move(promise)]() mutable {
+    promise.setValue(this->start_profile());
+  });
+  return future;
+}
+
+folly::SemiFuture<bool> Worker::stop_profile_async() {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this, promise = std::move(promise)]() mutable {
+    promise.setValue(this->stop_profile());
   });
   return future;
 }

@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -32,7 +32,9 @@ void beam_search(torch::Tensor acc_logprob,
                  torch::Tensor out_beam_count_prefix_sums,
                  torch::Tensor out_sequence_group,
                  uint32_t batch_size,
+                 uint32_t num_return_sequences,
                  uint32_t current_step) {
+  (void)num_return_sequences;
   torch::Device device = acc_logprob.device();
 
   uint32_t beam_size = in_sequence_group.size(1);

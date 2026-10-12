@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include "core/common/global_flags.h"
+#include "core/framework/config/execution_config.h"
 #include "cuda_ops_api.h"
 #include "global_capture_instance.h"
 
@@ -115,7 +116,9 @@ void batch_prefill_with_optional_piecewise_capture(
     torch::Tensor output,
     std::optional<torch::Tensor>& output_lse) {
   // This function is only called for prefill, so is_prefill is always true
-  if (FLAGS_enable_graph && FLAGS_enable_prefill_piecewise_graph &&
+  if (::xllm::ExecutionConfig::get_instance().enable_graph() &&
+      ::xllm::ExecutionConfig::get_instance()
+          .enable_prefill_piecewise_graph() &&
       ::xllm::runtime::cuda::GlobalCaptureInstance::get_instance()
           .is_capturing()) {
     // Create temporary runner

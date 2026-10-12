@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,11 +17,13 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <string>
 
 #include "common/instance_name.h"
 #include "distributed_runtime/llm_master.h"
 #include "embedding_output_builder.h"
+#include "framework/config/model_config.h"
 #include "framework/request/request_params.h"
 #include "mm_service_utils.h"
 #include "util/utils.h"
@@ -59,10 +61,13 @@ bool send_result_to_client_brpc(std::shared_ptr<EmbeddingCall> call,
     }
     if (output.mm_embeddings.has_value()) {
       call->set_bytes_to_base64(true);
-      mm_embeddings_output_builder.build_repeated_embedding_output(
-          *output.mm_embeddings,
-          *(data->mutable_mm_embeddings()),
-          binary_payload);
+      if (!mm_embeddings_output_builder.build_repeated_embedding_output(
+              *output.mm_embeddings,
+              *(data->mutable_mm_embeddings()),
+              binary_payload)) {
+        return call->finish_with_error(
+            StatusCode::UNKNOWN, "Failed to serialize multimodal embeddings");
+      }
     }
   }
 
@@ -159,6 +164,21 @@ void MMEmbeddingServiceImpl::process_async_impl(
           req_messages, messages, call, master_->get_image_limit())) {
     return;
   }
+
+  // mm_embed encodes multimodal inputs, so a text-only request is invalid.
+  if (::xllm::ModelConfig::get_instance().task() == "mm_embed") {
+    const bool has_multimodal_content =
+        std::any_of(messages.begin(), messages.end(), [](Message& msg) {
+          return msg.has_mm_content();
+        });
+    if (!has_multimodal_content) {
+      call->finish_with_error(
+          StatusCode::INVALID_ARGUMENT,
+          "mm_embed request must contain multimodal content.");
+      return;
+    }
+  }
+
   auto request_id = request_params.request_id;
 
   auto payload = call->take_request_payload();

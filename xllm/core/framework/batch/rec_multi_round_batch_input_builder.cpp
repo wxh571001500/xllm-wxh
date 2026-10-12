@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,8 +27,9 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
-#include "core/common/rec_model_utils.h"
-#include "framework/batch/mposition.h"
+#include "core/framework/config/beam_search_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/util/rec_model_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
@@ -42,6 +43,30 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+namespace {
+
+std::vector<int32_t> build_q_cu_seq_lens_vec(
+    const std::vector<int32_t>& q_seq_lens) {
+  std::vector<int32_t> q_cu_seq_lens;
+  if (q_seq_lens.empty()) {
+    return q_cu_seq_lens;
+  }
+#if defined(USE_NPU)
+  q_cu_seq_lens.reserve(q_seq_lens.size());
+  int32_t cum_seq_len = 0;
+  for (int32_t q_len : q_seq_lens) {
+    cum_seq_len += q_len;
+    q_cu_seq_lens.emplace_back(cum_seq_len);
+  }
+#else
+  CHECK(q_seq_lens.front() == 0)
+      << "q_seq_lens must be cumulative with leading zero";
+  q_cu_seq_lens.assign(q_seq_lens.begin() + 1, q_seq_lens.end());
+#endif
+  return q_cu_seq_lens;
+}
+
+}  // namespace
 
 RecMultiRoundBatchInputBuilder::RecMultiRoundBatchInputBuilder(
     const std::vector<SequencesGroup*>& sequence_groups,
@@ -52,7 +77,7 @@ RecMultiRoundBatchInputBuilder::RecMultiRoundBatchInputBuilder(
     const uint64_t batch_id,
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
-    ThreadPool* thread_pool)
+    MPMCThreadPool* thread_pool)
     : allowed_max_tokens_(allowed_max_tokens),
       input_embeddings_vec_(input_embeddings_vec),
       mm_data_vec_(mm_data_vec),
@@ -119,7 +144,8 @@ void RecMultiRoundBatchInputBuilder::process_single_sequence(
 #if defined(USE_NPU)
   base_state.seq_lens.push_back(seq_len);
   base_state.q_seq_lens.push_back(q_seq_len);
-#elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU)
+#elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU) || \
+    defined(USE_DCU)
   base_state.seq_lens.push_back(base_state.seq_lens.back() + seq_len);
   base_state.q_seq_lens.push_back(base_state.q_seq_lens.back() + q_seq_len);
 #endif
@@ -183,13 +209,6 @@ void RecMultiRoundBatchInputBuilder::extract_tokens_and_positions(
     ++adjusted_token_to_count_map[token_ids[j]];
   }
 
-  // Handle MRope positions
-  if (use_mrope_) {
-    const auto& args = *args_;
-    MPositionHelper helper(*sequence, args);
-    base_state.mrope_positions_vec.push_back(helper.get_positions());
-  }
-
   // Process each token
   for (uint32_t j = n_kv_cache_tokens; j < seq_len; ++j) {
     base_state.flatten_tokens_vec.push_back(token_ids[j]);
@@ -241,12 +260,18 @@ void RecMultiRoundBatchInputBuilder::extract_tokens_and_positions(
     }
   }
 
+  // `linear_state_ids` is consumed per sequence, so preserve one entry per
+  // logical batch row even when this slice is not the last prefill chunk. The
+  // slot is drawn from the dedicated LinearStateBlockManager and is -1 when
+  // linear state is disabled.
+  base_state.linear_state_ids.push_back(sequence->get_linear_state_slot_id());
+
   // Add extra token id
   if (n_tokens == seq_len) {
     // last chunk of prefill and decode
     // add -1 as extra token id
     base_state.extra_token_ids.push_back(-1);
-    base_state.embedding_ids.push_back(sequence->get_embedding_id());
+    base_state.embedding_ids.push_back(sequence->get_embedding_block_id());
   } else {
     base_state.extra_token_ids.push_back(token_ids[seq_len]);
   }
@@ -256,7 +281,8 @@ void RecMultiRoundBatchInputBuilder::extract_tokens_and_positions(
   uint32_t prompt_len = sequence->num_prompt_tokens();
   state_ptr->decode_positions_vec.push_back(static_cast<int32_t>(prompt_len));
 
-  int32_t bw = std::max(1, FLAGS_beam_width);
+  int32_t bw =
+      std::max(1, ::xllm::BeamSearchConfig::get_instance().beam_width());
   const int32_t sel_start =
       static_cast<int32_t>(state_ptr->decode_selected_token_idxes.size());
   state_ptr->decode_selected_token_idxes.reserve(sel_start + bw);
@@ -288,7 +314,7 @@ void RecMultiRoundBatchInputBuilder::setup_kv_cache_info(
 #if defined(USE_NPU)
   (void)write_block_ids_ptr;
   BuilderState& state = *state_ptr;
-  const auto blocks = sequence->kv_state().kv_blocks();
+  const auto blocks = sequence->kv_state().blocks(BlockType::KV);
   std::vector<int32_t> block_ids;
   block_ids.reserve(blocks.size());
   for (const auto& block : blocks) {
@@ -296,7 +322,7 @@ void RecMultiRoundBatchInputBuilder::setup_kv_cache_info(
   }
   state.block_tables_vec.emplace_back(std::move(block_ids));
 #elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU) || \
-    defined(USE_MUSA)
+    defined(USE_MUSA) || defined(USE_DCU)
   // TODO: refactor this branch when NPU multi-round xattention lands.
   RecMultiRoundBuilderState& state = rec_multi_round_state_;
   BuilderState& base_state = state.base_state;
@@ -318,6 +344,7 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
   // Create tensors (same as BatchInputBuilder)
   forward_input.token_ids =
       torch::tensor(state.flatten_tokens_vec, torch::kInt);
+  forward_input.token_ids_host = forward_input.token_ids;
 
   if (!use_mrope_) {
     forward_input.positions =
@@ -325,44 +352,62 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
   } else {
     forward_input.positions = torch::cat(state.mrope_positions_vec, 1);
   }
+  forward_input.positions_host = forward_input.positions;
 
   auto& input_params = forward_input.input_params;
-  input_params.batch_forward_type = state.batch_forward_type;
-  input_params.num_sequences = state.block_tables_vec.size();
-  input_params.kv_max_seq_len = state.max_seq_len;
-  input_params.q_max_seq_len = state.q_max_seq_len;
-  input_params.kv_seq_lens = torch::tensor(state.seq_lens, torch::kInt);
-  input_params.q_seq_lens = torch::tensor(state.q_seq_lens, torch::kInt);
-  input_params.kv_seq_lens_vec = std::move(state.seq_lens);
-  input_params.q_seq_lens_vec = std::move(state.q_seq_lens);
-  input_params.new_cache_slots =
+  input_params.meta.batch_forward_type = state.batch_forward_type;
+  input_params.meta.num_sequences = state.block_tables_vec.size();
+  input_params.meta.kv_max_seq_len = state.max_seq_len;
+  input_params.meta.q_max_seq_len = state.q_max_seq_len;
+  input_params.attention.device.kv_seq_lens =
+      torch::tensor(state.seq_lens, torch::kInt);
+  input_params.attention.device.q_seq_lens =
+      torch::tensor(state.q_seq_lens, torch::kInt);
+  std::vector<int32_t> q_cu_seq_lens =
+      build_q_cu_seq_lens_vec(state.q_seq_lens);
+  input_params.attention.device.q_cu_seq_lens =
+      torch::tensor(q_cu_seq_lens, torch::kInt);
+  input_params.attention.host.kv_seq_lens = std::move(state.seq_lens);
+  input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens);
+  input_params.attention.host.q_seq_lens = std::move(state.q_seq_lens);
+  input_params.attention.device.new_cache_slots =
       torch::tensor(state.new_token_slot_ids, torch::kInt);
 
   // for flashinfer
-  input_params.paged_kv_indptr =
+  input_params.attention.device.paged_kv_indptr =
       torch::tensor(state.paged_kv_indptr, torch::kInt);
-  input_params.paged_kv_indices =
+  input_params.attention.device.paged_kv_indices =
       torch::tensor(state.paged_kv_indices, torch::kInt);
-  input_params.paged_kv_last_page_len =
+  input_params.attention.device.paged_kv_last_page_len =
       torch::tensor(state.paged_kv_last_page_len, torch::kInt);
 
   // Setup multimodal data
-  input_params.mm_data.batch(mm_data_vec_);
+  input_params.multimodal.mm_data.batch(mm_data_vec_);
 
   // Setup block tables
   util::pad_2d_vector(state.block_tables_vec, /*pad_value=*/0);
-  input_params.block_tables =
+  input_params.attention.device.block_tables =
       create_2d_tensor(state.block_tables_vec, torch::kInt);
+  input_params.attention.host.block_tables =
+      input_params.attention.device.block_tables;
 
   if (input_embeddings_vec_.size() != 0) {
-    input_params.input_embedding = torch::cat(input_embeddings_vec_);
+    input_params.embedding.input_embedding = torch::cat(input_embeddings_vec_);
   }
+  input_params.embedding.embedding_ids = std::move(state.embedding_ids);
+  input_params.embedding.linear_state_ids = std::move(state.linear_state_ids);
+  if (!input_params.embedding.linear_state_ids.empty()) {
+    input_params.embedding.linear_state_indices =
+        torch::tensor(input_params.embedding.linear_state_ids, torch::kInt);
+  }
+  input_params.embedding.extra_token_ids = std::move(state.extra_token_ids);
 
   if (swap_block_transfer_infos_ != nullptr &&
       swap_block_transfer_infos_->size() > 0) {
-    input_params.swap_blocks.insert(input_params.swap_blocks.end(),
-                                    swap_block_transfer_infos_->begin(),
-                                    swap_block_transfer_infos_->end());
+    input_params.block_copy.swap_blocks.insert(
+        input_params.block_copy.swap_blocks.end(),
+        swap_block_transfer_infos_->begin(),
+        swap_block_transfer_infos_->end());
   }
 
   CHECK_EQ(state.sampling_params.size(), state.selected_token_idxes.size());
@@ -381,7 +426,8 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
 
   // Rec multi-round specific metadata.
   rec_multi_round_state_.total_steps = get_rec_multi_round_decode_rounds();
-  const int32_t beam_width = FLAGS_beam_width;
+  const int32_t beam_width =
+      ::xllm::BeamSearchConfig::get_instance().beam_width();
   const int32_t total_round = rec_multi_round_state_.total_steps;
   const int32_t current_round = 0;
   std::vector<int64_t> full_kv_shape;
@@ -414,11 +460,13 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
     int64_t head_dim = args_ ? args_->head_dim() : 0;
 
     int32_t decode_rounds = get_rec_multi_round_decode_rounds();
-    full_kv_shape = {FLAGS_max_tokens_per_batch +
-                         FLAGS_max_seqs_per_batch * FLAGS_beam_width *
-                             std::max(0, decode_rounds - 1),
-                     n_kv_heads,
-                     head_dim};
+    full_kv_shape = {
+        ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch() +
+            ::xllm::SchedulerConfig::get_instance().max_seqs_per_batch() *
+                ::xllm::BeamSearchConfig::get_instance().beam_width() *
+                std::max(0, decode_rounds - 1),
+        n_kv_heads,
+        head_dim};
   }
 
   // Decode positions
@@ -438,7 +486,7 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
   }
 
   // Batch ID
-  input_params.batch_id = batch_id_;
+  input_params.meta.batch_id = batch_id_;
 
   return forward_input;
 }

@@ -1,0 +1,119 @@
+include(cc_test)
+
+cc_test(
+  NAME
+    apply_token_bitmask_wrapper_test
+  SRCS
+    apply_token_bitmask_wrapper_test.cpp
+  DEPS
+    :json_object_grammar
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    rope_wrapper_test
+  SRCS
+    rope_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    spec_verify_token_update_wrapper_test
+  SRCS
+    spec_verify_token_update_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    spec_verify_attention_tiling_update_wrapper_test
+  SRCS
+    spec_verify_attention_tiling_update_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    fused_gdn_gating_wrapper_test
+  SRCS
+    fused_gdn_gating_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    fused_sigmoid_gating_delta_rule_wrapper_test
+  SRCS
+    fused_sigmoid_gating_delta_rule_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    split_qkv_rmsnorm_mrope_wrapper_test
+  SRCS
+    split_qkv_rmsnorm_mrope_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    causal_conv1d_decode_wrapper_test
+  SRCS
+    causal_conv1d_decode_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
+    sfa_dcp_remap_wrapper_test
+  SRCS
+    sfa_dcp_remap_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)

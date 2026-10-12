@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,6 +62,8 @@ RequestParams transfer_request_params(
   xllm_request_params.top_p = request_params.top_p;
   xllm_request_params.ignore_eos = request_params.ignore_eos;
   xllm_request_params.skip_special_tokens = request_params.skip_special_tokens;
+  xllm_request_params.include_stop_str_in_output =
+      request_params.include_stop_str_in_output;
   xllm_request_params.n = request_params.n;
   xllm_request_params.max_tokens = request_params.max_tokens;
   xllm_request_params.frequency_penalty = request_params.frequency_penalty;
@@ -70,6 +72,8 @@ RequestParams transfer_request_params(
   xllm_request_params.stop = request_params.stop;
   xllm_request_params.stop_token_ids = request_params.stop_token_ids;
   xllm_request_params.beam_width = request_params.beam_width;
+  xllm_request_params.num_return_sequences =
+      request_params.num_return_sequences;
   xllm_request_params.top_logprobs = request_params.top_logprobs;
 
   return xllm_request_params;
@@ -145,6 +149,7 @@ XLLM_Response build_success_response(const RequestOutput& output,
     response.usage.prompt_tokens = usage.num_prompt_tokens;
     response.usage.completion_tokens = usage.num_generated_tokens;
     response.usage.total_tokens = usage.num_total_tokens;
+    response.usage.cached_tokens = usage.num_cached_tokens;
   }
 
   return response;

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,11 +16,12 @@ limitations under the License.
 #include <c10/cuda/CUDAStream.h>
 
 #include "cuda_ops_api.h"
+#include "device_utils.cuh"
 
 namespace xllm::kernel::cuda {
 
 template <typename T>
-__global__ void reshape_paged_cache_kernel(
+__global__ void XLLM_KERNEL_ATTR(1024) reshape_paged_cache_kernel(
     const int* __restrict__ slot_ids,  // [n_tokens]
     const T* __restrict__ keys,        // [n_tokens, n_heads, head_dim]
     const T* __restrict__ values,      // [n_tokens, n_heads, head_dim]
@@ -35,6 +36,9 @@ __global__ void reshape_paged_cache_kernel(
   const int64_t bid = blockIdx.x;
   // which slot to write to
   const int64_t slot_id = slot_ids[bid];
+  if (slot_id < 0) {
+    return;
+  }
   // block index
   const int64_t block_idx = slot_id / block_size;
   // offset within block

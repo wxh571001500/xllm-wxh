@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,206 +29,15 @@ limitations under the License.
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "models/llm/npu/glm4.h"
 #include "models/model_registry.h"
+#include "models/vlm/mposition/mposition.h"
+#include "models/vlm/utils/multimodal_utils.h"
 #include "processors/glm4v_image_processor.h"
-#include "processors/input_processor.h"
+#include "processors/glm4v_prompt_processor.h"
+#include "processors/glm4v_video_processor.h"
 #include "torch_npu/csrc/aten/CustomFunctions.h"
 #include "xllm/core/layers/npu/npu_glm4_vision_encoder_layer_impl.h"
-#include "xllm_atb_layers/core/include/atb_speed/log.h"
 
 namespace xllm::npu::model {
-
-class GLM4VInputProcessor : public InputProcessor {
-  enum class TokenType {
-    INVALID,
-    IMAGE,
-    VIDEO,
-  };
-
- public:
-  GLM4VInputProcessor(const ModelArgs& args) {
-    merge_size_ = args.mm_image_merge_size();
-    image_start_token_id_ = args.image_start_token_id();
-    image_end_token_id_ = args.image_end_token_id();
-    video_start_token_id_ = args.video_start_token_id();
-    video_end_token_id_ = args.video_end_token_id();
-    image_token_id_ = args.image_token_id();
-  }
-
-  void process(std::string& prompt, const MMData& mm_data) override {
-    torch::Tensor image_grid_thw;
-    if (auto res = mm_data.get<torch::Tensor>("image_grid_thw"))
-      image_grid_thw = res.value();
-
-    torch::Tensor video_grid_thw;
-    if (auto res = mm_data.get<torch::Tensor>("video_grid_thw"))
-      video_grid_thw = res.value();
-
-    if (!image_grid_thw.defined() && !video_grid_thw.defined()) return;
-
-    std::vector<VideoMetadata> video_metadata;
-    mm_data.get_metadata(MMType::VIDEO, video_metadata);
-
-    if (video_metadata.size() > 0) {
-      CHECK(video_metadata.size() ==
-            static_cast<size_t>(video_grid_thw.sizes()[0]));
-    }
-
-    auto merge_length = merge_size_ * merge_size_;
-    int total_image_token = 0;
-
-    if (image_grid_thw.defined()) {
-      auto count = image_grid_thw.sizes()[0];
-      for (int idx = 0; idx < count; ++idx)
-        total_image_token +=
-            image_grid_thw[idx].prod().item<int>() / merge_length;
-    }
-
-    int total_video_token = 0;
-    if (video_grid_thw.defined()) {
-      auto count = video_grid_thw.sizes()[0];
-      for (int idx = 0; idx < count; ++idx)
-        total_video_token += video_grid_thw[idx].prod().item<int>() /
-                             merge_length / video_grid_thw[idx][0].item<int>();
-    }
-
-    size_t total_token_len = total_image_token * image_token_.size() +
-                             total_video_token * image_token_.size();
-    std::string data;
-    data.reserve(prompt.size() + total_token_len);
-
-    int image_index = 0;
-    int video_index = 0;
-
-    size_t begin = 0;
-    auto pair = find_vision_token(prompt, begin);
-
-    while (pair.second != std::string::npos) {
-      data.append(prompt, begin, pair.second - begin);
-
-      if (pair.first == TokenType::IMAGE) {
-        auto token_num =
-            image_grid_thw[image_index].prod().item<int>() / merge_length;
-        while (token_num--) data.append(image_token_);
-
-        image_index++;
-        begin = pair.second + image_token_.size();
-      } else if (pair.first == TokenType::VIDEO) {
-        auto num_frames = video_grid_thw[video_index][0].item<int>();
-        auto timestamps = video_metadata[video_index].timestamps;
-        CHECK(!timestamps.empty());
-
-        auto selected = build_timestamps(timestamps, num_frames);
-        auto token_num = video_grid_thw[video_index].prod().item<int>() /
-                         merge_length / num_frames;
-
-        for (size_t idx = 0; idx < num_frames; ++idx) {
-          data.append(begin_of_image_token_);
-
-          auto num = token_num;
-          while (num--) data.append(image_token_);
-
-          data.append(end_of_image_token_);
-          data.append(format_timestamp_str(selected[idx]));
-        }
-
-        video_index++;
-        begin = pair.second + video_token_.size();
-      } else {
-        assert(false);
-      }
-
-      pair = find_vision_token(prompt, begin);
-    }
-
-    if (begin < prompt.size()) data.append(prompt, begin, std::string::npos);
-
-    prompt = std::move(data);
-  }
-
-  void find_mm_spans(const std::vector<int>& prompt, MMData& mm_data) override {
-    size_t tokens_num = prompt.size();
-    uint32_t global_mm_index = 0;
-    uint32_t offset = 0;
-    uint32_t length = 0;
-    bool is_video = false;
-    auto& mm_items = mm_data.items<MMItemVec>();
-    // TODO:support video info.
-    for (size_t idx = 0; idx < tokens_num; ++idx) {
-      auto token = prompt[idx];
-      if (token == video_start_token_id_) {
-        is_video = true;
-      } else if (token == video_end_token_id_) {
-        is_video = false;
-      }
-      if (is_video) continue;
-      if (token == image_start_token_id_) {
-        offset = idx + 1;
-      }
-      if (token == image_token_id_) {
-        length++;
-      } else if (token == image_end_token_id_) {
-        auto& item = mm_items[global_mm_index++];
-        item.mutable_state().mutable_token_pos() = {offset, length};
-        length = 0;
-      }
-    }
-  }
-
- private:
-  std::pair<TokenType, size_t> find_vision_token(const std::string& prompt,
-                                                 size_t begin) {
-    auto img_pos = prompt.find(image_token_, begin);
-    auto vid_pos = prompt.find(video_token_, begin);
-
-    if (img_pos == std::string::npos && vid_pos == std::string::npos)
-      return {TokenType::INVALID, std::string::npos};
-    else if (vid_pos == std::string::npos)
-      return {TokenType::IMAGE, img_pos};
-    else if (img_pos == std::string::npos)
-      return {TokenType::VIDEO, vid_pos};
-    else
-      return img_pos < vid_pos ? std::make_pair(TokenType::IMAGE, img_pos)
-                               : std::make_pair(TokenType::VIDEO, vid_pos);
-  }
-
-  std::vector<double> build_timestamps(const std::vector<double>& timestamps,
-                                       size_t num_frames) {
-    std::vector<double> vec;
-    vec.reserve(num_frames);
-
-    for (size_t i = 0; i < timestamps.size(); i += 2) {
-      vec.push_back(timestamps[i]);
-      if (vec.size() == num_frames) break;
-    }
-
-    while (vec.size() < num_frames) {
-      vec.push_back(vec.back());
-    }
-
-    return vec;
-  }
-
-  std::string format_timestamp_str(double timestamp) {
-    char buffer[32];
-    sprintf(buffer, "%.1f seconds", timestamp);
-    return buffer;
-  }
-
- private:
-  const std::string image_token_ = "<|image|>";
-  const std::string video_token_ = "<|video|>";
-
-  const std::string begin_of_image_token_ = "<|begin_of_image|>";
-  const std::string end_of_image_token_ = "<|end_of_image|>";
-
-  int32_t image_start_token_id_;
-  int32_t image_end_token_id_;
-  int32_t video_start_token_id_;
-  int32_t video_end_token_id_;
-  int32_t image_token_id_;
-
-  int32_t merge_size_ = 0;
-};
 
 class Glm4VisionRmsNormImpl : public torch::nn::Module {
  public:
@@ -319,15 +128,9 @@ class Glm4_VisionBlockImpl : public torch::nn::Module {
                         torch::Tensor& m_sin_pos,
                         torch::Tensor& cu_seq_len,
                         std::vector<int>& cu_seq_len_vec,
-                        ModelInputParams& input_params,
                         int node_id) {
-    return encoder_layer_(x,
-                          m_cos_pos,
-                          m_sin_pos,
-                          cu_seq_len,
-                          cu_seq_len_vec,
-                          input_params,
-                          node_id);
+    return encoder_layer_(
+        x, m_cos_pos, m_sin_pos, cu_seq_len, cu_seq_len_vec, node_id);
   }
 
   // load the weight from the checkpoint
@@ -703,9 +506,7 @@ class Glm4VisionTransformerImpl : public torch::nn::Module {
     return std::make_tuple(rotary_pos_emb, pos_ids);
   }
 
-  torch::Tensor forward(torch::Tensor hidden_states,
-                        torch::Tensor grid_thw,
-                        const ModelInputParams& input_params) {
+  torch::Tensor forward(torch::Tensor hidden_states, torch::Tensor grid_thw) {
     hidden_states = patch_embed_(hidden_states);
     hidden_states = post_conv_layernorm_(hidden_states);
 
@@ -747,21 +548,14 @@ class Glm4VisionTransformerImpl : public torch::nn::Module {
                                 grid_thw,
                                 image_type_ids.select(1, 0),
                                 image_type_ids.select(1, 1));
-    ModelInputParams& input_params_new =
-        const_cast<ModelInputParams&>(input_params);
     torch::Tensor cu_seqlens_cpu = cu_seqlens.cpu();
     std::vector<int> cu_seqlens_vec(
         cu_seqlens_cpu.data_ptr<int>(),
         cu_seqlens_cpu.data_ptr<int>() + cu_seqlens_cpu.numel());
     cu_seqlens = cu_seqlens.to(hidden_states.device());
     for (int idx = 0; idx < blocks_->size(); ++idx) {
-      hidden_states = layers_[idx](hidden_states,
-                                   m_cos,
-                                   m_sin,
-                                   cu_seqlens,
-                                   cu_seqlens_vec,
-                                   input_params_new,
-                                   idx);
+      hidden_states = layers_[idx](
+          hidden_states, m_cos, m_sin, cu_seqlens, cu_seqlens_vec, idx);
     }
     hidden_states = post_layernorm_(hidden_states);
     hidden_states = hidden_states.view(
@@ -878,7 +672,17 @@ class Glm4vForConditionalGenerationImpl : public torch::nn::Module {
   Glm4vForConditionalGenerationImpl(const ModelContext& context)
       : model_args_(context.get_model_args()),
         options_(context.get_tensor_options()) {
-    visual_ = register_module("visual", Glm4VisionTransformer(context));
+    encoder_dp_group_ = context.get_parallel_args().encoder_dp_group_;
+    use_encoder_dp_ =
+        encoder_dp_group_ != nullptr && encoder_dp_group_->world_size() > 1;
+    if (use_encoder_dp_) {
+      ModelContext visual_context = context.with_parallel_args(ParallelArgs(
+          /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr));
+      visual_ =
+          register_module("visual", Glm4VisionTransformer(visual_context));
+    } else {
+      visual_ = register_module("visual", Glm4VisionTransformer(context));
+    }
 
     language_model_ =
         register_module("language_model", Glm4ForCausalLM(context));
@@ -887,7 +691,7 @@ class Glm4vForConditionalGenerationImpl : public torch::nn::Module {
   void prepare_encoder_input(const ModelInputParams& input_params,
                              std::optional<Glm4VImageInputs>& image_inputs,
                              std::optional<Glm4VVideoInputs>& video_inputs) {
-    const auto& mm_data = input_params.mm_data;
+    const auto& mm_data = input_params.multimodal.mm_data;
     torch::Tensor pixel_values;
     if (const auto& res = mm_data.get<torch::Tensor>("pixel_values"))
       pixel_values = res.value();
@@ -916,62 +720,49 @@ class Glm4vForConditionalGenerationImpl : public torch::nn::Module {
     std::optional<Glm4VVideoInputs> video_input;
     prepare_encoder_input(input_params, image_input, video_input);
 
-    auto merge_size = model_args_.mm_image_merge_size();
     MMDict multimodal_embeds;
     if (image_input) {
-      // visual
-      auto image_embeds = visual_(image_input->pixel_values.to(options_),
-                                  image_input->image_grid_thw,
-                                  input_params);
-      auto image_tokens =
-          (image_input->image_grid_thw.prod(-1) / merge_size / merge_size)
-              .cpu()
-              .contiguous()
-              .to(torch::kLong);
-
-      std::vector<int64_t> image_tokens_vec(
-          image_tokens.data_ptr<int64_t>(),
-          image_tokens.data_ptr<int64_t>() + image_tokens.numel());
-      multimodal_embeds["image|embedding"] =
-          image_embeds.split(image_tokens_vec, 0 /*dim*/);
+      torch::Tensor image_pixels = image_input->pixel_values.to(options_);
+      torch::Tensor image_grid =
+          image_input->image_grid_thw.to(options_.device());
+      std::vector<int32_t> image_token_nums =
+          get_mm_token_nums(input_params.multimodal.mm_data, MMType::IMAGE);
+      if (!use_encoder_dp_) {
+        auto image_embeds = visual_(image_pixels, image_grid);
+        multimodal_embeds["image|embedding"] =
+            split_by_token_nums(image_embeds, image_token_nums);
+      } else {
+        multimodal_embeds["image|embedding"] =
+            run_dp_encoder(visual_,
+                           image_pixels,
+                           image_grid,
+                           image_token_nums,
+                           model_args_.mm_projection_dim(),
+                           encoder_dp_group_);
+      }
     }
     if (video_input) {
       std::vector<torch::Tensor> temp_frames_hw;
+      torch::Tensor video_grid =
+          video_input->video_grid_thw.to(options_.device());
       for (int i = 0; i < video_input->video_grid_thw.size(0); ++i) {
-        auto t = video_input->video_grid_thw[i][0].item<int32_t>();
-        auto h = video_input->video_grid_thw[i][1].item<int32_t>();
-        auto w = video_input->video_grid_thw[i][2].item<int32_t>();
+        auto t = video_grid[i][0].item<int32_t>();
+        auto h = video_grid[i][1].item<int32_t>();
+        auto w = video_grid[i][2].item<int32_t>();
         auto repeated_row =
             torch::tensor({1, h, w}).unsqueeze(0).repeat({t, 1});
         temp_frames_hw.push_back(repeated_row);
       }
       auto flatten_video_grid_thw = torch::cat(temp_frames_hw, 0);
-      // visual
-      auto video_embeds = visual_(video_input->pixel_values_videos.to(options_),
-                                  flatten_video_grid_thw,
-                                  input_params);
-      auto t = video_input->video_grid_thw.index({torch::indexing::Slice(), 0});
-      auto video_tokens =
-          ((video_input->video_grid_thw.prod(-1) / merge_size / merge_size) / t)
-              .cpu()
-              .contiguous()
-              .to(torch::kLong);
-      std::vector<int64_t> video_tokens_vec(
-          video_tokens.data_ptr<int64_t>(),
-          video_tokens.data_ptr<int64_t>() + video_tokens.numel());
-
+      torch::Tensor video_pixels =
+          video_input->pixel_values_videos.to(options_);
+      std::vector<int32_t> video_token_nums =
+          get_mm_token_nums(input_params.multimodal.mm_data, MMType::VIDEO);
+      auto video_embeds = visual_(video_pixels, flatten_video_grid_thw);
       multimodal_embeds["video|embedding"] =
-          video_embeds.split(video_tokens_vec, 0 /*dim*/);
+          split_by_token_nums(video_embeds, video_token_nums);
     }
     return multimodal_embeds;
-  }
-
-  torch::Tensor generate_multimodal_mask(torch::Tensor input_ids) {
-    auto special_token_ids =
-        torch::tensor({model_args_.image_token_id()},
-                      input_ids.options().dtype(torch::kInt64));
-    auto is_multimodal = torch::isin(input_ids, special_token_ids);
-    return is_multimodal;
   }
 
   torch::Tensor merge_multimodal_embeddings(
@@ -984,18 +775,21 @@ class Glm4vForConditionalGenerationImpl : public torch::nn::Module {
 
   torch::Tensor get_input_embeddings(const torch::Tensor input_ids,
                                      const ModelInputParams& input_params) {
-    const auto& mm_data = input_params.mm_data;
-    torch::Tensor multimodal_embeds;
-    if (const auto& emb = mm_data.get<torch::Tensor>("embedding")) {
-      multimodal_embeds = emb.value();
-    }
+    const auto& mm_data = input_params.multimodal.mm_data;
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
-    if (!multimodal_embeds.defined()) {
-      return inputs_embeds;
-    }
-    auto is_multimodal = generate_multimodal_mask(input_ids);
-    inputs_embeds = merge_multimodal_embeddings(
-        inputs_embeds, multimodal_embeds, is_multimodal);
+    auto merge_modality = [&](const std::string& embed_key,
+                              const std::string& mask_key) {
+      auto emb = mm_data.get<torch::Tensor>(embed_key);
+      if (!emb.has_value()) return;
+      auto mask = mm_data.get<torch::Tensor>(mask_key);
+      if (!mask.has_value()) return;
+      inputs_embeds =
+          merge_multimodal_embeddings(inputs_embeds, emb.value(), mask.value());
+    };
+
+    merge_modality("image|embedding", "image|mask");
+    merge_modality("video|embedding", "video|mask");
+
     return inputs_embeds;
   }
 
@@ -1018,7 +812,7 @@ class Glm4vForConditionalGenerationImpl : public torch::nn::Module {
     }
     visual_->verify_loaded_weights("model.visual.");
     visual_->merge_loaded_weights();
-    if (!model_args_.image_embedding_mode()) {
+    if (!model_args_.encoder_embedding_mode()) {
       language_model_->load_model(std::move(loader), "model.language_model.");
     }
   }
@@ -1041,14 +835,19 @@ class Glm4vForConditionalGenerationImpl : public torch::nn::Module {
  private:
   ModelArgs model_args_;
   torch::TensorOptions options_;
+  ProcessGroup* encoder_dp_group_ = nullptr;
+  bool use_encoder_dp_ = false;
   Glm4VisionTransformer visual_{nullptr};
   Glm4ForCausalLM language_model_{nullptr};
 };
 TORCH_MODULE(Glm4vForConditionalGeneration);
 
-REGISTER_INPUT_PROCESSOR(glm4v, GLM4VInputProcessor);
+using Glm4vMultimodalProcessor = MultimodalProcessor<GLM4VPromptProcessor,
+                                                     Glm4VImageProcessor,
+                                                     Glm4VVideoProcessor>;
+REGISTER_MULTIMODAL_PROCESSOR(glm4v, Glm4vMultimodalProcessor);
 REGISTER_CAUSAL_VLM_MODEL(glm4v, Glm4vForConditionalGeneration);
-REGISTER_IMAGE_PROCESSOR(glm4v, Glm4VImageProcessor);
+REGISTER_MPOSITION_GENERATOR(glm4v, xllm::Glm4VMPositionGenerator);
 // register the model args
 REGISTER_MODEL_ARGS(glm4v, [&] {
   LOAD_ARG_OR(model_type, "model_type", "glm4v");
@@ -1111,7 +910,12 @@ REGISTER_MODEL_ARGS(glm4v, [&] {
   // LOAD_ARG_OR(mm_rms_norm_eps, "vision_config.rms_norm_eps", 1e-05);
   LOAD_ARG_OR(mm_spatial_merge_size, "vision_config.spatial_merge_size", 2);
   LOAD_ARG_OR(mm_temporal_patch_size, "vision_config.temporal_patch_size", 2);
-  LOAD_ARG_OR_FUNC(mm_head_dim, "head_dim", [&] {
+  // Vision-scoped key so JsonReader's text_config fallback cannot resolve
+  // "head_dim" against text_config.head_dim (which is 0 for GLM-5.3-Flash and
+  // 128 for future GLM4V variants that adopt the nested HF multimodal layout).
+  // vision_config has no head_dim; the fallback lambda derives it from
+  // mm_hidden_size / mm_num_attention_heads.
+  LOAD_ARG_OR_FUNC(mm_head_dim, "vision_config.head_dim", [&] {
     return args->mm_hidden_size() / args->mm_num_attention_heads();
   });
 

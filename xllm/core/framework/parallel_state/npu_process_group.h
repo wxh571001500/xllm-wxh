@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,8 +19,9 @@ limitations under the License.
 #include <torch_npu/csrc/core/npu/NPUEvent.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include "core/common/global_flags.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "hccl/hccl.h"
-#include "process_group.h"
 
 namespace xllm {
 
@@ -41,13 +42,21 @@ class ProcessGroupImpl : public ProcessGroup {
                    const std::string& group_name,
                    const torch::Device& device);
 
+  ProcessGroupImpl(int32_t global_rank,
+                   int32_t local_rank,
+                   const std::vector<int32_t>& group_ranks,
+                   int32_t world_size,
+                   int32_t rank_size,
+                   int32_t port,
+                   const std::string& host,
+                   const std::string& group_name,
+                   const torch::Device& device);
+
   // Destructor.
   ~ProcessGroupImpl() override;
 
-  void allreduce(torch::Tensor& input) override;
-
-  void allgather(const torch::Tensor& input,
-                 std::vector<torch::Tensor>& outputs) override;
+  std::string hccl_comm_name(bool init_comm = true) override;
+  HcclComm hccl_comm() override;
 
  private:
   HcclComm comm_ = nullptr;

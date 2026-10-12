@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <source_location>
@@ -44,13 +45,19 @@ inline torch::Tensor create_2d_tensor(const std::vector<std::vector<T> >& vec,
                        .dtype(dtype)
                        .device(torch::kCPU)
                        .pinned_memory(true));
-  for (int64_t i = 0; i < n_rows; ++i) {
+  // Fill the contiguous pinned buffer row-by-row with a plain memcpy. The
+  // element type T must match `dtype`'s storage; every current caller pairs
+  // int32_t with kInt and int64_t with kInt64. Copying directly avoids a
+  // per-row pinned allocation plus an autograd-aware `tensor[i] = ...`
+  // indexed assignment, which dominated large-batch input building.
+  CHECK_EQ(
+      torch::empty({0}, torch::TensorOptions().dtype(dtype)).element_size(),
+      sizeof(T))
+      << "create_2d_tensor element type does not match dtype storage size";
+  auto* dst = static_cast<T*>(tensor.data_ptr());
+  for (size_t i = 0; i < n_rows; ++i) {
     CHECK_EQ(vec[i].size(), n_cols);
-    tensor[i] = torch::tensor(vec[i],
-                              torch::TensorOptions()
-                                  .dtype(dtype)
-                                  .device(torch::kCPU)
-                                  .pinned_memory(true));
+    std::memcpy(dst + i * n_cols, vec[i].data(), n_cols * sizeof(T));
   }
   return tensor;
 };
@@ -59,6 +66,12 @@ inline torch::Tensor safe_to(const torch::Tensor& t,
                              const torch::TensorOptions& options,
                              bool non_blocking = false) {
   return t.defined() ? t.to(options, non_blocking) : t;
+};
+
+// Creates an independent contiguous tensor that is detached from autograd.
+inline torch::Tensor clone_contiguous_detached_tensor(
+    const torch::Tensor& tensor) {
+  return tensor.contiguous().clone().detach();
 };
 
 inline std::vector<char> get_the_bytes(std::string filename) {
@@ -127,6 +140,23 @@ inline void print_tensor(
 inline bool file_exists(const std::string& path) {
   std::ifstream file(path);
   return file.good();
+}
+
+inline bool tensor_batch_signature_matches(const torch::Tensor& lhs,
+                                           const torch::Tensor& rhs) {
+  if (!lhs.defined() || !rhs.defined()) {
+    return lhs.defined() == rhs.defined();
+  }
+  if (lhs.scalar_type() != rhs.scalar_type() || lhs.device() != rhs.device() ||
+      lhs.dim() != rhs.dim()) {
+    return false;
+  }
+  for (int64_t i = 0; i < lhs.dim(); ++i) {
+    if (lhs.size(i) != rhs.size(i)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 inline torch::Tensor safe_concat(const torch::Tensor& t1,
@@ -328,36 +358,116 @@ inline std::optional<torch::ScalarType> try_get_scalar_type_from_string(
 inline torch::Tensor get_tensor_from_blob(const std::vector<int64_t>& dims,
                                           const torch::ScalarType dtype,
                                           const void* dev_addr) {
+#if defined(USE_NPU)
   c10::DeviceType device_type = c10::DeviceType::PrivateUse1;
   torch::TensorOptions option =
       torch::TensorOptions().dtype(dtype).device(device_type);
 
   auto tensor = torch::empty({0}, option);
-#if defined(USE_NPU)
   auto address = const_cast<void*>(dev_addr);
   torch::DataPtr c10_data_ptr(address, address, [](void*) {}, tensor.device());
 
   size_t tensor_nbytes = at::detail::computeStorageNbytesContiguous(
       dims, tensor.dtype().itemsize());
+  if (tensor_nbytes == 0) {
+    return torch::empty(dims, option);
+  }
+
   torch::Storage storage;
-  // get npu storage constructor from register and construct storage
   auto fptr = c10::GetStorageImplCreate(device_type);
   auto allocator = c10::GetAllocator(device_type);
 
-  // PyTorch 2.7+: StorageImpl now takes DataPtr instead of raw allocator
   storage = fptr(c10::StorageImpl::use_byte_size_t(),
                  c10::SymInt(tensor_nbytes),
                  std::move(c10_data_ptr),
                  allocator,
-                 true);
+                 /*resizable=*/true);
 
   tensor.set_(storage, 0, dims);
-#endif
   return tensor;
+#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MLU) || \
+    defined(USE_DCU)
+  auto options = torch::TensorOptions()
+                     .dtype(dtype)
+#if defined(USE_CUDA) || defined(USE_DCU)
+                     .device(torch::kCUDA)
+#else
+                     .device(torch::kPrivateUse1)
+#endif
+                     .requires_grad(
+                         /*requires_grad=*/false);
+  return torch::from_blob(const_cast<void*>(dev_addr), dims, options);
+#else
+  LOG(FATAL)
+      << "get_tensor_from_blob only supports NPU, CUDA, MUSA, MLU and DCU";
+#endif
+}
+
+inline torch::Tensor get_tensor_from_blob(const std::vector<int64_t>& dims,
+                                          const torch::ScalarType dtype,
+                                          const void* dev_addr,
+                                          const torch::Tensor& owner) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MLU) || \
+    defined(USE_DCU)
+  CHECK(owner.defined())
+      << "get_tensor_from_blob requires a valid owner tensor";
+
+  auto options = torch::TensorOptions()
+                     .dtype(dtype)
+#if defined(USE_CUDA) || defined(USE_DCU)
+                     .device(torch::kCUDA)
+#else
+                     .device(torch::kPrivateUse1)
+#endif
+                     .requires_grad(
+                         /*requires_grad=*/false);
+  auto owner_ref = owner;
+  auto deleter = [owner_ref](void*) {};
+  return torch::from_blob(const_cast<void*>(dev_addr), dims, deleter, options);
+#else
+  (void)owner;
+  return get_tensor_from_blob(dims, dtype, dev_addr);
+#endif
 }
 
 inline int32_t get_dtype_size(torch::ScalarType dtype) {
   return static_cast<int32_t>(torch::elementSize(dtype));
 }
 
+inline torch::ScalarType resolve_ssm_dtype(
+    const std::string& mamba_ssm_dtype_str,
+    torch::ScalarType default_dtype) {
+  if (mamba_ssm_dtype_str.empty()) {
+    return default_dtype;
+  }
+  auto parsed = try_get_scalar_type_from_string(mamba_ssm_dtype_str);
+  if (parsed) {
+    return parsed.value();
+  }
+  LOG(WARNING) << "Failed to parse mamba_ssm_dtype='" << mamba_ssm_dtype_str
+               << "', falling back to default_dtype: " << default_dtype;
+  return default_dtype;
+}
+
+inline int64_t resolve_ssm_dtype_size(const std::string& mamba_ssm_dtype_str,
+                                      int64_t default_dtype_size) {
+  if (mamba_ssm_dtype_str.empty()) {
+    return default_dtype_size;
+  }
+  auto parsed = try_get_scalar_type_from_string(mamba_ssm_dtype_str);
+  if (parsed) {
+    return get_dtype_size(parsed.value());
+  }
+  LOG(WARNING) << "Failed to parse mamba_ssm_dtype='" << mamba_ssm_dtype_str
+               << "', falling back to default dtype size";
+  return default_dtype_size;
+}
+
+inline std::vector<int64_t> get_tensor_shape(const torch::Tensor& tensor) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return {};
+  }
+  c10::IntArrayRef sizes = tensor.sizes();
+  return std::vector<int64_t>(sizes.begin(), sizes.end());
+}
 }  // namespace xllm

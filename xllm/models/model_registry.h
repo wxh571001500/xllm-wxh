@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,20 +18,19 @@ limitations under the License.
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "core/framework/dit_model_context.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/dit_model.h"
-#include "core/framework/model/embedding_vlm.h"
-#include "core/framework/model/mm_embedding_vlm.h"
+#include "core/framework/model/rec_causal_lm.h"
 #include "core/framework/model_context.h"
 #include "core/framework/tokenizer/tokenizer_args.h"
 #include "core/util/json_reader.h"
 #include "core/util/type_traits.h"  // IWYU pragma: keep
-#include "processors/image_processor.h"
-#include "processors/input_processor.h"
+#include "processors/multimodal_processor.h"
 
 namespace xllm {
 
@@ -39,28 +38,52 @@ using CausalLMFactory =
     std::function<std::unique_ptr<CausalLM>(const ModelContext& context)>;
 
 using RecModelFactory =
-    std::function<std::unique_ptr<CausalLM>(const ModelContext& context)>;
+    std::function<std::unique_ptr<RecCausalLM>(const ModelContext& context)>;
 
 using CausalVLMFactory =
     std::function<std::unique_ptr<CausalVLM>(const ModelContext& context)>;
 
-using EmbeddingVLMFactory =
-    std::function<std::unique_ptr<EmbeddingVLM>(const ModelContext& context)>;
-
-using MMEmbeddingVLMFactory =
-    std::function<std::unique_ptr<MMEmbeddingVLM>(const ModelContext& context)>;
-
 using DiTModelFactory =
     std::function<std::unique_ptr<DiTModel>(const DiTModelContext& context)>;
 
-using InputProcessorFactory =
-    std::function<std::unique_ptr<InputProcessor>(const ModelArgs& args)>;
-
-using ImageProcessorFactory =
-    std::function<std::unique_ptr<ImageProcessor>(const ModelArgs& args)>;
+using MultimodalProcessorFactory =
+    std::function<std::unique_ptr<MultimodalProcessorBase>(
+        const ModelArgs& model_args,
+        std::shared_ptr<Tokenizer> tokenizer,
+        const TokenizerArgs& tokenizer_args)>;
 
 using ModelArgsLoader =
     std::function<bool(const JsonReader& json, ModelArgs* args)>;
+
+using MtpArgsAdapter = std::function<void(ModelArgs&, bool)>;
+using GraphHistoryCapacityAdapter = std::function<int64_t(const ModelArgs&)>;
+
+enum class MtpReplayFamily : int8_t {
+  NONE,
+  GLM5,
+  QWEN35,
+};
+
+enum class MtpGraphHistoryPolicy : int8_t {
+  MAX_CONTEXT,
+  QWEN_FULL_ATTENTION,
+  KPOOL_FIXED,
+};
+
+struct MtpModelCapabilities {
+  // A platform-native implementation must explicitly opt out until its cache
+  // updates and graph execution support cross-step index sharing.
+  bool supports_native_index_share_for_iteration = true;
+  bool supports_accepted_span_replay = false;
+  bool allow_tail_fallback = false;
+  MtpReplayFamily replay_family = MtpReplayFamily::NONE;
+  bool supports_causal_replay_target = false;
+  bool supports_expanded_replay_target = false;
+  bool supports_grouped_mtp_graph = false;
+  MtpGraphHistoryPolicy graph_history = MtpGraphHistoryPolicy::MAX_CONTEXT;
+  bool native_draft_owns_embedding_and_lm_head = false;
+  bool python_draft_owns_embedding_and_lm_head = false;
+};
 
 using QuantArgsLoader =
     std::function<bool(const JsonReader& json, QuantArgs* args)>;
@@ -68,19 +91,27 @@ using QuantArgsLoader =
 using TokenizerArgsLoader =
     std::function<bool(const JsonReader& json, TokenizerArgs* args)>;
 
+// Model-advertised CP mode: NONE or MODEL (shard after embed / merge before
+// LM head). Backend capability queries decide the concrete model data path.
+enum class CpShardingMode : int8_t {
+  NONE = 0,
+  MODEL = 1,
+};
+
 // TODO: add default args loader.
 struct ModelMeta {
   CausalLMFactory causal_lm_factory;
   RecModelFactory rec_model_factory;
   CausalVLMFactory causal_vlm_factory;
-  EmbeddingVLMFactory embedding_vlm_factory;
-  MMEmbeddingVLMFactory mm_embedding_vlm_factory;
   DiTModelFactory dit_model_factory;
-  InputProcessorFactory input_processor_factory;
-  ImageProcessorFactory image_processor_factory;
+  MultimodalProcessorFactory multimodal_processor_factory;
   ModelArgsLoader model_args_loader;
+  MtpArgsAdapter mtp_args_adapter;
+  GraphHistoryCapacityAdapter graph_history_capacity_adapter;
+  MtpModelCapabilities mtp_capabilities;
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
+  CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
 };
 
 // Model registry is a singleton class that registers all models with the
@@ -98,17 +129,33 @@ class ModelRegistry {
   static void register_causalvlm_factory(const std::string& name,
                                          CausalVLMFactory factory);
 
-  static void register_vlm_embedding_factory(const std::string& name,
-                                             EmbeddingVLMFactory factory);
-
-  static void register_mm_embedding_vlm_factory(const std::string& name,
-                                                MMEmbeddingVLMFactory factory);
-
   static void register_dit_model_factory(const std::string& name,
                                          DiTModelFactory factory);
 
+  static void register_model_backend(const std::string& name,
+                                     const std::string& backend);
+
   static void register_model_args_loader(const std::string& name,
                                          ModelArgsLoader loader);
+
+  static void register_mtp_args_adapter(const std::string& name,
+                                        MtpArgsAdapter adapter);
+
+  static void register_mtp_capabilities(const std::string& name,
+                                        MtpModelCapabilities capabilities);
+
+  static MtpModelCapabilities get_mtp_capabilities(const std::string& name);
+  static void register_graph_history_capacity(
+      const std::string& name,
+      GraphHistoryCapacityAdapter adapter);
+  static int64_t get_graph_history_capacity(const std::string& name,
+                                            const ModelArgs& args,
+                                            int64_t default_capacity);
+
+  static void configure_mtp_args(ModelArgs& args,
+                                 std::string_view algorithm,
+                                 bool is_draft_engine,
+                                 bool is_python_model);
 
   static void register_quant_args_loader(const std::string& name,
                                          QuantArgsLoader loader);
@@ -116,21 +163,24 @@ class ModelRegistry {
   static void register_tokenizer_args_loader(const std::string& name,
                                              TokenizerArgsLoader loader);
 
-  static void register_input_processor_factory(const std::string& name,
-                                               InputProcessorFactory factory);
-  static void register_image_processor_factory(const std::string& name,
-                                               ImageProcessorFactory factory);
+  static void register_multimodal_processor_factory(
+      const std::string& name,
+      MultimodalProcessorFactory factory);
+
+  // Register the model-side CP sharding mode advertised by `name`. Defaults to
+  // NONE for any unregistered model.
+  static void register_cp_sharding_mode(const std::string& name,
+                                        CpShardingMode mode);
+
+  // Read-only query of the registered CP sharding mode. Returns NONE when
+  // `name` is unknown or the model did not opt into model-side CP.
+  static CpShardingMode get_cp_sharding_mode(const std::string& name);
 
   static CausalLMFactory get_causallm_factory(const std::string& name);
 
   static RecModelFactory get_rec_model_factory(const std::string& name);
 
   static CausalVLMFactory get_causalvlm_factory(const std::string& name);
-
-  static EmbeddingVLMFactory get_embeddingvlm_factory(const std::string& name);
-
-  static MMEmbeddingVLMFactory get_mm_embedding_vlm_factory(
-      const std::string& name);
 
   static DiTModelFactory get_dit_model_factory(const std::string& name);
 
@@ -140,11 +190,10 @@ class ModelRegistry {
 
   static TokenizerArgsLoader get_tokenizer_args_loader(const std::string& name);
 
-  static InputProcessorFactory get_input_processor_factory(
+  static MultimodalProcessorFactory get_multimodal_processor_factory(
       const std::string& name);
 
-  static ImageProcessorFactory get_image_processor_factory(
-      const std::string& name);
+  static bool has_dit_model_factory(const std::string& name);
 
   static std::string get_model_backend(const std::string& name);
 
@@ -157,6 +206,15 @@ bool resolve_model_registration_name(const std::string& model_type,
                                      std::string* resolved_name,
                                      std::string* error_message = nullptr);
 
+// Lazily register the NPU ATB model-side CP pipeline capability for the four
+// supported models (deepseek_v32, deepseek_v32_mtp, glm_moe_dsa,
+// glm_moe_dsa_mtp) and return whether `resolved_name` is CP-capable.
+// Idempotent. `resolved_name` must already be backend-resolved (see
+// resolve_model_registration) so qwen3_atb etc. are not misclassified.
+bool is_npu_model_cp_capable(const std::string& resolved_name);
+
+bool is_mlu_model_cp_capable(const std::string& resolved_name);
+
 bool resolve_model_registration(const std::string& model_type,
                                 const std::string& requested_npu_kernel_backend,
                                 std::string* effective_npu_kernel_backend,
@@ -168,12 +226,6 @@ std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context);
 std::unique_ptr<CausalLM> create_rec_model(const ModelContext& context);
 
 std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context);
-
-std::unique_ptr<EmbeddingVLM> create_vlm_embedding_model(
-    const ModelContext& context);
-
-std::unique_ptr<MMEmbeddingVLM> create_vlm_mm_embedding_model(
-    const ModelContext& context);
 
 std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 
@@ -199,7 +251,7 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
         #ModelType, [](const ModelContext& context) {                   \
           ModelClass model(context);                                    \
           model->eval();                                                \
-          return std::make_unique<xllm::CausalLMImpl<ModelClass>>(      \
+          return std::make_unique<xllm::RecCausalLMImpl<ModelClass>>(   \
               std::move(model), context.get_tensor_options());          \
         });                                                             \
     return true;                                                        \
@@ -223,38 +275,6 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 #define REGISTER_CAUSAL_VLM_MODEL(ModelType, ModelClass) \
   REGISTER_CAUSAL_VLM_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
 
-#define REGISTER_EMBEDDING_VLM_MODEL_WITH_VARNAME(                     \
-    VarName, ModelType, ModelClass)                                    \
-  const bool VarName##_registered = []() {                             \
-    ModelRegistry::register_vlm_embedding_factory(                     \
-        #ModelType, [](const ModelContext& context) {                  \
-          ModelClass model(context);                                   \
-          model->eval();                                               \
-          return std::make_unique<xllm::EmbeddingVLMImpl<ModelClass>>( \
-              std::move(model), context.get_tensor_options());         \
-        });                                                            \
-    return true;                                                       \
-  }()
-
-#define REGISTER_EMBEDDING_VLM_MODEL(ModelType, ModelClass) \
-  REGISTER_EMBEDDING_VLM_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
-
-#define REGISTER_MM_EMBEDDING_VLM_MODEL_WITH_VARNAME(                    \
-    VarName, ModelType, ModelClass)                                      \
-  const bool VarName##_registered = []() {                               \
-    ModelRegistry::register_mm_embedding_vlm_factory(                    \
-        #ModelType, [](const ModelContext& context) {                    \
-          ModelClass model(context);                                     \
-          model->eval();                                                 \
-          return std::make_unique<xllm::MMEmbeddingVLMImpl<ModelClass>>( \
-              std::move(model), context.get_tensor_options());           \
-        });                                                              \
-    return true;                                                         \
-  }()
-
-#define REGISTER_MM_EMBEDDING_VLM_MODEL(ModelType, ModelClass) \
-  REGISTER_MM_EMBEDDING_VLM_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
-
 #define REGISTER_DIT_MODEL_WITH_VARNAME(VarName, ModelType, ModelClass) \
   const bool VarName##_registered = []() {                              \
     ModelRegistry::register_dit_model_factory(                          \
@@ -270,33 +290,32 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 #define REGISTER_DIT_MODEL(ModelType, ModelClass) \
   REGISTER_DIT_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
 
-#define REGISTER_INPUT_PROCESSOR_WITH_VARNAME(                \
-    VarName, ModelType, InputProcessorClass)                  \
-  const bool VarName##_input_processor_registered = []() {    \
-    ModelRegistry::register_input_processor_factory(          \
-        #ModelType, [](const ModelArgs& args) {               \
-          return std::make_unique<InputProcessorClass>(args); \
-        });                                                   \
-    return true;                                              \
+#define REGISTER_MODEL_BACKEND_WITH_VARNAME(VarName, ModelType, Backend) \
+  const bool VarName##_backend_registered = []() {                       \
+    ModelRegistry::register_model_backend(#ModelType, Backend);          \
+    return true;                                                         \
   }()
 
-#define REGISTER_INPUT_PROCESSOR(ModelType, InputProcessorClass) \
-  REGISTER_INPUT_PROCESSOR_WITH_VARNAME(                         \
-      ModelType, ModelType, InputProcessorClass)
+#define REGISTER_MODEL_BACKEND(ModelType, Backend) \
+  REGISTER_MODEL_BACKEND_WITH_VARNAME(ModelType, ModelType, Backend)
 
-#define REGISTER_IMAGE_PROCESSOR_WITH_VARNAME(                \
-    VarName, ModelType, ImageProcessorClass)                  \
-  const bool VarName##_image_processor_registered = []() {    \
-    ModelRegistry::register_image_processor_factory(          \
-        #ModelType, [](const ModelArgs& args) {               \
-          return std::make_unique<ImageProcessorClass>(args); \
-        });                                                   \
-    return true;                                              \
+#define REGISTER_MULTIMODAL_PROCESSOR_WITH_VARNAME(              \
+    VarName, ModelType, ProcessorClass)                          \
+  const bool VarName##_multimodal_processor_registered = []() {  \
+    ModelRegistry::register_multimodal_processor_factory(        \
+        #ModelType,                                              \
+        [](const ModelArgs& model_args,                          \
+           std::shared_ptr<Tokenizer> tokenizer,                 \
+           const TokenizerArgs& tokenizer_args) {                \
+          return std::make_unique<ProcessorClass>(               \
+              model_args, std::move(tokenizer), tokenizer_args); \
+        });                                                      \
+    return true;                                                 \
   }()
 
-#define REGISTER_IMAGE_PROCESSOR(ModelType, ImageProcessorClass) \
-  REGISTER_IMAGE_PROCESSOR_WITH_VARNAME(                         \
-      ModelType, ModelType, ImageProcessorClass)
+#define REGISTER_MULTIMODAL_PROCESSOR(ModelType, ProcessorClass) \
+  REGISTER_MULTIMODAL_PROCESSOR_WITH_VARNAME(                    \
+      ModelType, ModelType, ProcessorClass)
 
 // Macro to register a model args loader with the ModelRegistry
 #define REGISTER_MODEL_ARGS_LOADER_WITH_VARNAME(VarName, ModelType, Loader) \

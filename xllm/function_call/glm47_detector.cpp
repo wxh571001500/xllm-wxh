@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 namespace xllm {
 namespace function_call {
@@ -131,6 +132,38 @@ std::vector<std::pair<size_t, size_t>> Glm47Detector::find_tool_call_ranges(
     search_pos = end_pos + eot_len;
   }
   return ranges;
+}
+
+std::string Glm47Detector::extract_normal_text(
+    const std::string& text,
+    const std::vector<std::pair<size_t, size_t>>& ranges) const {
+  if (ranges.empty()) {
+    return trim_whitespace(text);
+  }
+
+  std::string normal_text;
+  size_t last_end = 0;
+  const size_t bot_len = bot_token_.length();
+  const size_t eot_len = eot_token_.length();
+
+  for (const auto& range : ranges) {
+    size_t block_start = range.first - bot_len;
+    if (block_start > last_end) {
+      normal_text.append(text, last_end, block_start - last_end);
+    }
+    last_end = range.second + eot_len;
+  }
+
+  if (last_end < text.length()) {
+    size_t trailing_bot = text.find(bot_token_, last_end);
+    if (trailing_bot == std::string::npos) {
+      normal_text.append(text, last_end, std::string::npos);
+    } else if (trailing_bot > last_end) {
+      normal_text.append(text, last_end, trailing_bot - last_end);
+    }
+  }
+
+  return trim_whitespace(normal_text);
 }
 
 std::pair<std::string, std::string> Glm47Detector::parse_tool_call_content(
@@ -324,24 +357,22 @@ Glm47Detector::parse_argument_pairs(
 StreamingParseResult Glm47Detector::detect_and_parse(
     const std::string& text,
     const std::vector<JsonTool>& tools) {
-  size_t idx = text.find(bot_token_);
-  std::string normal_text =
-      (idx != std::string::npos) ? text.substr(0, idx) : text;
-
-  // Trim normal text
-  if (!normal_text.empty()) {
-    normal_text = trim_whitespace(normal_text);
-  }
-
-  if (idx == std::string::npos) {
-    return StreamingParseResult(normal_text, {});
-  }
-
   std::vector<ToolCallItem> calls;
 
   try {
     // Use string-based parsing instead of regex to avoid stack overflow
     auto ranges = find_tool_call_ranges(text);
+
+    if (ranges.empty()) {
+      size_t idx = text.find(bot_token_);
+      std::string normal_text = trim_whitespace(text);
+      if (idx != std::string::npos) {
+        normal_text = trim_whitespace(text.substr(0, idx));
+      }
+      return StreamingParseResult(normal_text, {});
+    }
+
+    std::string normal_text = extract_normal_text(text, ranges);
 
     for (const auto& range : ranges) {
       std::string content =
@@ -651,7 +682,19 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
       return StreamingParseResult("", {});
     }
 
-    size_t content_start = bot_pos + bot_token_.length();
+    // Normal text buffered before the marker must be returned to the client.
+    // The marker can share one increment with the tail of the normal text (MTP
+    // emits several tokens per step, and delayed streaming callbacks can carry
+    // several steps at once), and this branch used to discard that prefix,
+    // silently truncating the response. The non-streaming path keeps it through
+    // extract_normal_text().
+    std::string normal_text = current_text.substr(0, bot_pos);
+    if (!normal_text.empty()) {
+      current_text.erase(0, bot_pos);
+      buffer_ = current_text;
+    }
+
+    size_t content_start = bot_token_.length();
     size_t eot_pos = current_text.find(eot_token_, content_start);
     bool is_tool_end_flag = (eot_pos != std::string::npos);
 
@@ -692,7 +735,7 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
       // - Or we have </tool_call> (tool call ended with no args)
       if (func_name.empty() || (func_args_raw.empty() && !is_tool_end_flag)) {
         // Function name not yet complete, wait for more data
-        return StreamingParseResult("", {});
+        return StreamingParseResult(normal_text, {});
       }
       calls.push_back(ToolCallItem(current_tool_id_, func_name, ""));
       current_tool_name_sent_ = true;
@@ -725,12 +768,15 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
       }
 
       if (is_tool_end_flag) {
+        // Root '{' is emitted on the first <arg_key>. Always close it here.
+        // Do NOT use last_arguments_.back()=='}' as a proxy: an object/array
+        // arg_value also ends with '}', which previously skipped the root '}'.
         if (is_first_param_) {
           std::string empty_object = "{}";
           calls.push_back(
               ToolCallItem(current_tool_id_, std::nullopt, empty_object));
           last_arguments_ += empty_object;
-        } else if (last_arguments_.empty() || last_arguments_.back() != '}') {
+        } else {
           std::string closing_brace = "}";
           calls.push_back(
               ToolCallItem(current_tool_id_, std::nullopt, closing_brace));
@@ -749,7 +795,7 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
         // Remove the completed tool call from buffer
         buffer_ = current_text.substr(eot_pos + eot_token_.length());
 
-        StreamingParseResult result("", calls);
+        StreamingParseResult result(std::move(normal_text), calls);
         current_tool_id_++;
         last_arguments_ = "";
         current_tool_name_sent_ = false;
@@ -759,7 +805,7 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
       }
     }
 
-    return StreamingParseResult("", calls);
+    return StreamingParseResult(std::move(normal_text), calls);
 
   } catch (const std::exception& e) {
     LOG(ERROR) << "Error in parse_streaming_increment: " << e.what();

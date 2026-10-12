@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +19,10 @@ limitations under the License.
 #include <openssl/sha.h>
 #include <string.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "util/hash_util.h"
@@ -28,6 +31,121 @@ limitations under the License.
 namespace xllm {
 
 class BlockManager;
+
+// Identity of a KV block's cache role inside a sequence's KVCacheState. Used as
+// the key of the per-sequence block map: the legacy flat attention KV lives
+// under KV; the grouped-cache models use one triple each -- V4 under
+// SWA/C4/C128 and V4.1 under SWA/C2/C1. EMBEDDING and LINEAR are
+// per-sequence single-resource slots (one block per sequence): EMBEDDING backs
+// the spec-decode embedding-row id, LINEAR backs the GDN recurrent state (its
+// slot id also indexes the conv/ssm KV tensors, which are tagged as the LINEAR
+// cache group). A block carries no type identity itself; the owning
+// BlockManager decides which key to store it under when it fills the state.
+// APPEND-ONLY: never renumber or remove an existing enumerator. This type is
+// serialized by number -- as proto BlockType over RPC (worker.proto) and as the
+// cache-group id in persisted Mooncake Store keys -- so a renumber is silently
+// misread by a rolling/mixed-version peer and cold-invalidates store keys. C1
+// and C2 are appended values; both names are new and carry no historical wire
+// or persistence meaning.
+enum class BlockType : int8_t {
+  KV = 0,         // normal/Qwen flat attention KV, exported to block_tables
+  SWA = 1,        // DSV4 sliding window, exported to multi_block_tables[0]
+  C4 = 2,         // DSV4 compressed, exported to multi_block_tables[1]
+  C128 = 3,       // DSV4 compressed, exported to multi_block_tables[2]
+  EMBEDDING = 4,  // per-sequence spec-decode embedding-row slot, exported via
+                  // get_embedding_block_id() (embedding_ids). Value kept at 4
+                  // for proto BlockType wire compatibility.
+  LINEAR = 5,     // per-sequence linear-state (GDN recurrent) live slot, drawn
+                  // from LinearStateBlockManager; exported via
+                  // get_linear_block_id() (linear_state_ids). Also the cache
+                  // group for the conv/ssm recurrent-state KV tensors.
+  C1 = 6,         // appended: DSV4.1 compressed TOKEN group (kv-source layers,
+                  // ratio 1), exported to multi_block_tables[2] on V4.1 models
+  C2 = 7,         // appended: DSV4.1 compressed TOKEN group (kv-source layers,
+                  // ratio 2), exported to multi_block_tables[1] on V4.1 models
+};
+
+// Fixed column order of worker multi_block_tables. The exported tables must
+// follow this order so they line up with the worker-side DSA group_infos; it
+// must never depend on std::map iteration order or config traversal order.
+// A model only ever populates its own triple: V4 exports [SWA, C4, C128] and
+// V4.1 exports [SWA, C2, C1], so each model's tables stay contiguous and line
+// up with its block-manager registration order. The order below is the
+// registration order, NOT the enum order: build_cache_specs_v41 registers the
+// V4.1 TOKEN groups as [C2 (ratio 2), C1 (ratio 1)] (first kv-source
+// appearance for the standard layer plan), while V4 registers [C4, C128].
+inline constexpr std::array<BlockType, 5> kMultiBlockExportOrder = {
+    BlockType::SWA,
+    BlockType::C4,
+    BlockType::C128,
+    BlockType::C2,
+    BlockType::C1};
+
+// Stable cache-group identity used by PD transfer. BlockType remains a local
+// storage key; the serialized group id is intentionally opaque to transfer
+// backends.
+inline constexpr int32_t cache_group_id(BlockType type) {
+  return static_cast<int32_t>(type);
+}
+
+// KV-split widens one source-side logical block across multiple destination
+// blocks. This applies to ordinary KV and every grouped attention-cache pool,
+// but not to the sequence-scoped embedding or recurrent-state slots.
+inline constexpr bool is_kv_split_cache_block_type(BlockType type) {
+  switch (type) {
+    case BlockType::KV:
+    case BlockType::SWA:
+    case BlockType::C1:
+    case BlockType::C2:
+    case BlockType::C4:
+    case BlockType::C128:
+      return true;
+    case BlockType::EMBEDDING:
+    case BlockType::LINEAR:
+      return false;
+  }
+  return false;
+}
+
+inline constexpr bool is_prefetch_gate_block_type(BlockType type) {
+  switch (type) {
+    case BlockType::KV:
+    case BlockType::C4:
+    case BlockType::C128:
+      return true;
+    case BlockType::SWA:
+    case BlockType::EMBEDDING:
+    case BlockType::LINEAR:
+    case BlockType::C1:
+    case BlockType::C2:
+      return false;  // PD prefetch deferred for the V4.1 TOKEN groups.
+  }
+  return false;
+}
+
+inline constexpr std::optional<BlockType> block_type_from_cache_group_id(
+    int32_t group_id) {
+  switch (group_id) {
+    case cache_group_id(BlockType::KV):
+      return BlockType::KV;
+    case cache_group_id(BlockType::SWA):
+      return BlockType::SWA;
+    case cache_group_id(BlockType::C1):
+      return BlockType::C1;
+    case cache_group_id(BlockType::C2):
+      return BlockType::C2;
+    case cache_group_id(BlockType::C4):
+      return BlockType::C4;
+    case cache_group_id(BlockType::C128):
+      return BlockType::C128;
+    case cache_group_id(BlockType::EMBEDDING):
+      return BlockType::EMBEDDING;
+    case cache_group_id(BlockType::LINEAR):
+      return BlockType::LINEAR;
+    default:
+      return std::nullopt;
+  }
+}
 
 class Block final {
  public:
@@ -49,13 +167,25 @@ class Block final {
   constexpr uint32_t size() const { return size_; }
 
   // get the reference count, 0 if the block is invalid after move
-  uint32_t ref_count() const { return ref_count_ == nullptr ? 0 : *ref_count_; }
+  uint32_t ref_count() const {
+    return ref_count_ == nullptr ? 0
+                                 : ref_count_->load(std::memory_order_acquire);
+  }
 
   // check if the block is shared
   bool is_shared() const { return ref_count() > 1; }
 
   // check if the block is valid
   bool is_valid() const { return id_ >= 0 && ref_count_ != nullptr; }
+
+  // owner manager that allocated this block.
+  BlockManager* manager() const { return manager_; }
+
+  // Reassign this block's owning manager. Used by concurrency wrappers (e.g.
+  // ConcurrentBlockManagerImpl) to route Block dtor -> free() through the
+  // wrapper layer so the wrapper's lock covers the free path too. Must not be
+  // used to transfer ownership across pools.
+  void set_manager(BlockManager* manager) { manager_ = manager; }
 
   // NOTE: Below block `hash_value_` is used for prefix cache and
   // for recording the hash value of the current block and previous blocks.
@@ -84,8 +214,11 @@ class Block final {
   // block size
   uint32_t size_ = 0;
 
-  // reference count
-  uint32_t* ref_count_ = nullptr;
+  // reference count, shared across Block aliases of the same physical block.
+  // Atomic because aliases are copied/destroyed across threads outside the
+  // owning BlockManager's lock (e.g. disagg-PD scheduler match vs. prefill
+  // threadpool sequence teardown), so inc/dec must not race.
+  std::atomic<uint32_t>* ref_count_ = nullptr;
 
   // manager that manages this block
   BlockManager* manager_ = nullptr;
@@ -93,7 +226,7 @@ class Block final {
   uint8_t hash_value_[XXH3_128BITS_HASH_VALUE_LEN];
 };
 
-// equeal operator, mainly used for testing
+// equal operator, mainly used for testing
 inline constexpr bool operator==(const Block& lhs, const Block& rhs) {
   return lhs.id() == rhs.id();
 }

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,7 +17,9 @@ limitations under the License.
 
 namespace xllm {
 
-void FBCache::init(const DiTCacheConfig& cfg) {
+void FBCache::init(const DiTCacheConfig& cfg,
+                   const ParallelArgs& parallel_args) {
+  parallel_args_ = &parallel_args;
   CHECK_GE(cfg.fbcache.residual_diff_threshold, 0.0)
       << "residual_diff_threshold must be >= 0";
   CHECK_GE(cfg.fbcache.warmup_steps, 0) << "warmup_steps must be >= 0";
@@ -29,28 +31,30 @@ void FBCache::init(const DiTCacheConfig& cfg) {
   buffers.clear();
 }
 
-bool FBCache::on_before_block(const CacheBlockIn& blockin) {
+bool FBCache::on_before_block(const CacheBlockIn& block_input) {
   return use_cache_;
 }
 
-CacheBlockOut FBCache::on_after_block(const CacheBlockIn& blockin) {
+CacheBlockOut FBCache::on_after_block(const CacheBlockIn& block_input) {
   // If this is not the first transform block
   // just return the original tensors without caching.
-  if (blockin.block_id != 0 ||
-      blockin.tensors.find("encoder_hidden_states") == blockin.tensors.end()) {
+  if (block_input.block_id != 0 ||
+      block_input.tensors.find("encoder_hidden_states") ==
+          block_input.tensors.end()) {
     TensorMap out_map;
     out_map["hidden_states"] =
-        get_tensor_or_empty(blockin.tensors, "hidden_states");
+        get_tensor_or_empty(block_input.tensors, "hidden_states");
     out_map["encoder_hidden_states"] =
-        get_tensor_or_empty(blockin.tensors, "encoder_hidden_states");
+        get_tensor_or_empty(block_input.tensors, "encoder_hidden_states");
     return CacheBlockOut(out_map);
   }
 
-  auto hidden_states = get_tensor_or_empty(blockin.tensors, "hidden_states");
+  auto hidden_states =
+      get_tensor_or_empty(block_input.tensors, "hidden_states");
   auto original_hidden_states =
-      get_tensor_or_empty(blockin.tensors, "original_hidden_states");
+      get_tensor_or_empty(block_input.tensors, "original_hidden_states");
   auto encoder_hidden_states =
-      get_tensor_or_empty(blockin.tensors, "encoder_hidden_states");
+      get_tensor_or_empty(block_input.tensors, "encoder_hidden_states");
 
   torch::Tensor first_hidden_states_residual =
       hidden_states - original_hidden_states;
@@ -58,8 +62,8 @@ CacheBlockOut FBCache::on_after_block(const CacheBlockIn& blockin) {
 
   if (can_use_cache(first_hidden_states_residual)) {
     use_cache_ = true;
-    auto [new_hidden, new_encoder] =
-        apply_prev_hidden_states_residual(hidden_states, encoder_hidden_states);
+    auto [new_hidden, new_encoder] = apply_prev_hidden_states_residual(
+        original_hidden_states, encoder_hidden_states);
     output_hidden_states = std::move(new_hidden);
     output_encoder_hidden_states = std::move(new_encoder);
   } else {

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,6 +62,14 @@ std::string get_string_env(const std::string& name) {
   return std::string(val);
 }
 
+std::optional<std::string> get_optional_string_env(const std::string& name) {
+  const char* val = std::getenv(name.c_str());
+  if (val == nullptr) {
+    return std::nullopt;
+  }
+  return std::string(val);
+}
+
 double get_double_env(const std::string& key, double defaultValue = -1) {
   const char* val = std::getenv(key.c_str());
   if (val == nullptr) {
@@ -89,27 +97,10 @@ int64_t get_process_group_test_timeout_seconds() {
   return get_int_env(kTimeoutEnvVar, kDefaultTimeoutSeconds);
 }
 
-std::optional<double> get_fix_speculative_acceptance_rate() {
-  // XLLM_FIX_SPECULATIVE_ACCEPTANCE_RATE:
-  // Defines a fixed acceptance rate for speculative decoding to simulate
-  // specific performance scenarios.
-  // Valid values are in the range [0.0, 1.0].
-  // If not set, or set to an invalid value, the fixed rate logic is disabled
-  // (returns std::nullopt).
-  constexpr const char* kAcceptanceRateEnvVar =
-      "XLLM_FIX_SPECULATIVE_ACCEPTANCE_RATE";
-  double value = get_double_env(kAcceptanceRateEnvVar, -1.0);
-  if (value == -1.0) {
-    return std::nullopt;
-  }
-  // Validate the range. It must be a probability between 0 and 1.
-  if (value < 0.0 || value > 1.0) {
-    LOG(WARNING) << "Warning: Invalid value for " << kAcceptanceRateEnvVar
-                 << ": " << value << ". Must be in [0, 1]. Ignoring setting."
-                 << std::endl;
-    return std::nullopt;
-  }
-  return std::make_optional(value);
+bool store_prefetch_stats_enabled() {
+  static const bool enabled =
+      get_bool_env("XLLM_STORE_PREFETCH_STATS", /*defaultValue=*/false);
+  return enabled;
 }
 
 }  // namespace util

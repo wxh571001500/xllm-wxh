@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,9 +15,11 @@ limitations under the License.
 
 #include "executor.h"
 
-#include "common/global_flags.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/model_config.h"
 #include "executor_impl_factory.h"
 #include "platform/device.h"
+#include "platform/platform.h"
 
 namespace xllm {
 
@@ -25,9 +27,15 @@ Executor::Executor(CausalLM* model,
                    const ModelArgs& args,
                    const torch::Device& device,
                    const runtime::Options& options) {
-  std::string backend = (options.backend() != "vlm" && FLAGS_enable_graph)
-                            ? Device::type_str()
-                            : options.backend();
+  const auto& model_config = ModelConfig::get_instance();
+  std::string backend;
+  if (ModelConfig::is_python_model_impl(model_config.model_impl())) {
+    backend = "python";
+  } else if (options.backend() != "vlm" && options.enable_graph()) {
+    backend = Platform::type_str();
+  } else {
+    backend = options.backend();
+  }
   impl_ = ExecutorImplFactory::get_instance().create_executor_impl(
       model, args, device, options, backend);
 }
@@ -36,11 +44,28 @@ ForwardInput Executor::prepare_inputs(Batch& batch) {
   return impl_->prepare_inputs(batch);
 }
 
+void Executor::set_dp_process_group(ProcessGroup* group) {
+  impl_->set_dp_process_group(group);
+}
+
 ModelOutput Executor::forward(const torch::Tensor& tokens,
                               const torch::Tensor& positions,
                               std::vector<KVCache>& kv_caches,
                               const ModelInputParams& params) {
   return impl_->run(tokens, positions, kv_caches, params);
+}
+
+void Executor::prepare_graph_input(const torch::Tensor& tokens,
+                                   const torch::Tensor& positions,
+                                   std::vector<KVCache>& kv_caches,
+                                   const ModelInputParams& params) {
+  impl_->prepare_graph_input(tokens, positions, kv_caches, params);
+}
+
+bool Executor::prepare_static_mtp_graph_tasks(
+    const SpecVerifyGraphTaskSignal& signal,
+    const Stream& signal_stream) {
+  return impl_->prepare_static_mtp_graph_tasks(signal, signal_stream);
 }
 
 }  // namespace xllm

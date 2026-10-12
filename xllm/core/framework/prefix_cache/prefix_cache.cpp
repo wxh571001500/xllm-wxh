@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,90 +17,72 @@ limitations under the License.
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
-#include <string.h>
-#include <xxHash/xxhash.h>
 
 #include <iostream>
 #include <thread>
 
-#include "common/global_flags.h"
-#include "common/metrics.h"
+#include "core/framework/multimodal/mm_data.h"
 
 namespace xllm {
 
-void xxh3_128bits_hash(const uint8_t* pre_hash_value,
-                       const Slice<int32_t>& token_ids,
-                       uint8_t* hash_value) {
-  if (pre_hash_value == nullptr) {
-    XXH128_hash_t xxh3_128bits_hash_value =
-        XXH3_128bits_withSeed(reinterpret_cast<const void*>(token_ids.data()),
-                              sizeof(int32_t) * token_ids.size(),
-                              FLAGS_xxh3_128bits_seed);
-    memcpy(
-        hash_value, &xxh3_128bits_hash_value, sizeof(xxh3_128bits_hash_value));
-  } else {
-    uint8_t key[1024];
-
-    int32_t data_len =
-        sizeof(int32_t) * token_ids.size() + XXH3_128BITS_HASH_VALUE_LEN;
-    CHECK_GT(sizeof(key), data_len) << "key size is too small";
-
-    memcpy(key, pre_hash_value, XXH3_128BITS_HASH_VALUE_LEN);
-    memcpy(key + XXH3_128BITS_HASH_VALUE_LEN,
-           reinterpret_cast<const void*>(token_ids.data()),
-           sizeof(int32_t) * token_ids.size());
-
-    XXH128_hash_t xxh3_128bits_hash_value = XXH3_128bits_withSeed(
-        reinterpret_cast<const void*>(key), data_len, FLAGS_xxh3_128bits_seed);
-    memcpy(
-        hash_value, &xxh3_128bits_hash_value, sizeof(xxh3_128bits_hash_value));
-  }
-}
-
-std::vector<Block> PrefixCache::match(
-    const Slice<int32_t>& token_ids,
-    const Slice<Block>& existed_shared_blocks) {
-  // allign tokens to block boundary
-  const size_t n_tokens = round_down(token_ids.size(), block_size_);
-  if (n_tokens == 0) {
+std::vector<Block> PrefixCache::match(const Slice<int32_t>& token_ids,
+                                      const Slice<Block>& existed_shared_blocks,
+                                      const MMData& mm_data,
+                                      const Slice<XXH3Key>& block_hashes) {
+  const size_t n_blocks =
+      num_hash_blocks(hasher_type_, token_ids.size(), block_size_);
+  if (n_blocks == 0) {
     return std::vector<Block>();
   }
 
-  const int64_t now = absl::ToUnixMicros(absl::Now());
-  size_t n_blocks = n_tokens / block_size_;
   total_blocks_.fetch_add(n_blocks);
-
-  auto tokens_slice = token_ids.slice(0, n_tokens);
 
   std::vector<Block> blocks;
   blocks.reserve(n_blocks);
-  blocks.insert(
-      blocks.end(), existed_shared_blocks.begin(), existed_shared_blocks.end());
+  const size_t start_block = std::min(existed_shared_blocks.size(), n_blocks);
+  blocks.insert(blocks.end(),
+                existed_shared_blocks.begin(),
+                existed_shared_blocks.begin() + start_block);
 
   DNodeList node_list;
 
-  size_t start_index = existed_shared_blocks.size() * block_size_;
-  XXH3Key token_hash_key =
-      existed_shared_blocks.empty()
-          ? XXH3Key{}
-          : XXH3Key{existed_shared_blocks.back().get_immutable_hash_value()};
-  for (size_t i = start_index; i < n_tokens; i += block_size_) {
-    if (i == 0) {
-      xxh3_128bits_hash(
-          nullptr, token_ids.slice(i, i + block_size_), token_hash_key.data);
-    } else {
-      xxh3_128bits_hash(token_hash_key.data,
-                        token_ids.slice(i, i + block_size_),
-                        token_hash_key.data);
-    }
-
+  // Look up one block by its chained hash; on hit, record the block and move
+  // its LRU node to the front of the working list. Returns false on miss.
+  auto match_block = [&](const XXH3Key& token_hash_key) -> bool {
     auto iter = cached_blocks_.find(token_hash_key);
-    if (iter != cached_blocks_.end()) {
-      blocks.push_back(iter->second->block);
-      lru_lst_.remove_node(iter->second);
-      node_list.push_front(iter->second);
-    } else {
-      break;
+    if (iter == cached_blocks_.end()) {
+      return false;
+    }
+    blocks.emplace_back(iter->second->block);
+    lru_lst_.remove_node(iter->second);
+    node_list.push_front(iter->second);
+    return true;
+  };
+
+  // Fast path: precomputed chained hash covers every matchable block, so we
+  // only do hash-table lookups and never recompute a hash.
+  if (block_hashes.size() >= n_blocks) {
+    for (size_t b = start_block; b < n_blocks; ++b) {
+      if (!match_block(block_hashes[b])) {
+        break;
+      }
+    }
+  } else {
+    // Fallback: compute the chained hash on the fly.
+    XXH3Key token_hash_key =
+        existed_shared_blocks.empty()
+            ? XXH3Key{}
+            : XXH3Key{existed_shared_blocks.back().get_immutable_hash_value()};
+    auto hasher =
+        BlockHasher::create(hasher_type_, mm_data, start_block * block_size_);
+    for (size_t b = start_block; b < n_blocks; ++b) {
+      const size_t i = b * block_size_;
+      const uint8_t* pre_hash_value = (b == 0) ? nullptr : token_hash_key.data;
+      hasher->compute(
+          token_ids, i, i + block_size_, pre_hash_value, token_hash_key);
+      if (!match_block(token_hash_key)) {
+        break;
+      }
     }
   }
 
@@ -112,70 +94,58 @@ std::vector<Block> PrefixCache::match(
 
   matched_blocks_.fetch_add(blocks.size());
 
-  int64_t int_rate_percent = static_cast<int64_t>(
-      static_cast<double>(blocks.size()) * 100.0 / n_blocks);
-  HISTOGRAM_OBSERVE(prefix_cache_block_matched_rate, int_rate_percent);
-  HISTOGRAM_OBSERVE(prefix_cache_block_matched_num, blocks.size());
-
   return blocks;
 }
 
 size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
                            std::vector<Block>& blocks,
-                           size_t existed_shared_blocks_num) {
-  std::vector<XXH3Key> insert_keys;
-  return insert(token_ids, blocks, existed_shared_blocks_num, &insert_keys);
-}
-
-size_t PrefixCache::insert(const std::vector<Block>& blocks) {
-  Slice<Block> slice(blocks);
-  return insert(slice);
-}
-
-size_t PrefixCache::insert(Slice<Block>& blocks) {
-  std::vector<XXH3Key> insert_keys;
-  return insert(blocks, &insert_keys);
-}
-
-size_t PrefixCache::evict(size_t n_blocks) {
-  std::vector<XXH3Key> evict_keys;
-  return evict(n_blocks, &evict_keys);
-}
-
-size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
-                           std::vector<Block>& blocks,
                            size_t existed_shared_blocks_num,
-                           std::vector<XXH3Key>* insert_keys) {
+                           const MMData& mm_data,
+                           const Slice<XXH3Key>& block_hashes) {
   const int64_t now = absl::ToUnixMicros(absl::Now());
-  // allign tokens to block boundary
+  // align tokens to block boundary
   const size_t n_blocks =
-      std::min(token_ids.size() / block_size_, blocks.size());
-  const size_t n_tokens = n_blocks * block_size_;
+      std::min(num_hash_blocks(hasher_type_, token_ids.size(), block_size_),
+               blocks.size());
 
-  if (n_blocks == 0) {
-    return 0;
+  if (n_blocks <= existed_shared_blocks_num) {
+    return n_blocks * block_size_;
   }
-  CHECK_GE(n_blocks, existed_shared_blocks_num);
   // truncate the token ids and blocks to boundary
 
   DNodeList node_list;
+
+  // Fill `token_hash_key` with the chained hash of block `block_idx`, reusing
+  // the precomputed hash when it covers all blocks, otherwise computing it.
+  // The KV / C4 / C128 prefix is solid (no placeholders), so the compute path
+  // seeds the chain in O(1) from the previous block's stamped hash. SWA's
+  // slid-out placeholders are handled by LinearStatePrefixCache::insert, which
+  // overrides this.
+  const bool use_precomputed = block_hashes.size() >= n_blocks;
   XXH3Key token_hash_key = existed_shared_blocks_num == 0
                                ? XXH3Key{}
                                : XXH3Key{blocks[existed_shared_blocks_num - 1]
                                              .get_immutable_hash_value()};
-
-  uint32_t block_idx = existed_shared_blocks_num;
-  insert_keys->reserve(n_blocks);
-  for (size_t i = existed_shared_blocks_num * block_size_; i < n_tokens;
-       i += block_size_) {
-    if (i == 0) {
-      xxh3_128bits_hash(
-          nullptr, token_ids.slice(i, i + block_size_), token_hash_key.data);
-    } else {
-      xxh3_128bits_hash(token_hash_key.data,
-                        token_ids.slice(i, i + block_size_),
-                        token_hash_key.data);
+  std::unique_ptr<BlockHasher> hasher;
+  if (!use_precomputed) {
+    hasher = BlockHasher::create(
+        hasher_type_, mm_data, existed_shared_blocks_num * block_size_);
+  }
+  auto fill_block_hash = [&](size_t block_idx) {
+    if (use_precomputed) {
+      token_hash_key = block_hashes[block_idx];
+      return;
     }
+    const size_t i = block_idx * block_size_;
+    const uint8_t* pre_hash_value =
+        (block_idx == 0) ? nullptr : token_hash_key.data;
+    hasher->compute(
+        token_ids, i, i + block_size_, pre_hash_value, token_hash_key);
+  };
+
+  for (size_t block_idx = existed_shared_blocks_num; block_idx < n_blocks;
+       ++block_idx) {
+    fill_block_hash(block_idx);
     blocks[block_idx].set_hash_value(token_hash_key.data);
 
     auto iter = cached_blocks_.find(token_hash_key);
@@ -195,13 +165,10 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
 
       num_blocks_++;
-
-      insert_keys->emplace_back(token_hash_key.data);
     }
-
-    ++block_idx;
   }
 
+  const size_t n_tokens = n_blocks * block_size_;
   while (!node_list.is_empty()) {
     Node* node = node_list.pop_front();
     lru_lst_.push_back(node);
@@ -210,13 +177,16 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
   return n_tokens;
 }
 
-size_t PrefixCache::insert(Slice<Block>& blocks,
-                           std::vector<XXH3Key>* insert_keys) {
+size_t PrefixCache::insert(const std::vector<Block>& blocks) {
+  Slice<Block> slice(blocks);
+  return insert(slice);
+}
+
+size_t PrefixCache::insert(Slice<Block>& blocks) {
   const int64_t now = absl::ToUnixMicros(absl::Now());
   DNodeList node_list;
   XXH3Key token_hash_key;
 
-  insert_keys->reserve(blocks.size());
   for (size_t i = 0; i < blocks.size(); i++) {
     if (!blocks[i].is_valid()) {
       continue;
@@ -240,8 +210,6 @@ size_t PrefixCache::insert(Slice<Block>& blocks,
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
 
       num_blocks_++;
-
-      insert_keys->emplace_back(token_hash_key.data);
     }
   }
 
@@ -253,14 +221,26 @@ size_t PrefixCache::insert(Slice<Block>& blocks,
   return blocks.size() * block_size_;
 }
 
-size_t PrefixCache::evict(size_t n_blocks, std::vector<XXH3Key>* evict_keys) {
+Block PrefixCache::find(const XXH3Key& hash) {
+  auto iter = cached_blocks_.find(hash);
+  if (iter == cached_blocks_.end()) {
+    return Block();
+  }
+  lru_lst_.move_back(iter->second);
+  return iter->second->block;
+}
+
+bool PrefixCache::contains(const XXH3Key& hash) const {
+  return cached_blocks_.find(hash) != cached_blocks_.end();
+}
+
+size_t PrefixCache::evict(size_t n_blocks) {
   if (num_blocks_ == 0 || lru_lst_.is_empty()) {
     return 0;
   }
 
   size_t evict_count = 0;
   Node* iter_node = lru_lst_.get_first();
-  evict_keys->reserve(n_blocks);
   while (evict_count < n_blocks) {
     if (lru_lst_.is_last(iter_node)) {
       break;
@@ -283,8 +263,6 @@ size_t PrefixCache::evict(size_t n_blocks, std::vector<XXH3Key>* evict_keys) {
     delete del_node;
     ++evict_count;
     --num_blocks_;
-
-    evict_keys->emplace_back(std::move(token_hash_key));
   }
 
   return evict_count;

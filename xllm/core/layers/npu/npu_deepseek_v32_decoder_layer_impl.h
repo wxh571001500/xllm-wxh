@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,8 +24,9 @@ limitations under the License.
 #include "framework/eplb/expert_buffer_manager.h"
 #include "framework/eplb/expert_weight_buffer_shm.h"
 #include "framework/model/model_input_params.h"
-#include "framework/model/npu_dp_ep_padding.h"
 #include "framework/model_context.h"
+#include "framework/parallel_state/mega_moe_comm_resource.h"
+#include "framework/parallel_state/npu_dp_ep_padding.h"
 #include "framework/state_dict/state_dict.h"
 #include "loader/deepseek_v32_decoder_loader.h"
 #include "npu_base_layer.h"
@@ -42,7 +43,7 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
 
   ~NpuDeepseekV32DecoderLayerImpl() {};
 
-  virtual void merge_loaded_weights() override;
+  void merge_loaded_weights() override;
 
   torch::Tensor build_expert_routing_map(std::vector<int32_t> expert_lists);
 
@@ -50,7 +51,7 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
 
   void update_expert_weight();
 
-  virtual int64_t init_layer() override;
+  int64_t init_layer() override;
 
   torch::Tensor forward(torch::Tensor& x,
                         torch::Tensor& cos_pos,
@@ -61,6 +62,35 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
                         aclrtEvent* event = nullptr,
                         std::atomic<bool>* event_flag = nullptr,
                         int node_id = 0);
+
+  torch::Tensor forward_with_topk(torch::Tensor& x,
+                                  torch::Tensor& cos_pos,
+                                  torch::Tensor& sin_pos,
+                                  torch::Tensor& attn_mask,
+                                  KVCache& kv_cache,
+                                  const ModelInputParams& input_params,
+                                  const torch::Tensor& shared_topk_indices,
+                                  torch::Tensor* output_topk_indices,
+                                  aclrtEvent* event = nullptr,
+                                  std::atomic<bool>* event_flag = nullptr,
+                                  int node_id = 0);
+
+  torch::Tensor forward_with_mtp_topk_fallback(
+      torch::Tensor& x,
+      torch::Tensor& cos_pos,
+      torch::Tensor& sin_pos,
+      torch::Tensor& attn_mask,
+      KVCache& kv_cache,
+      const ModelInputParams& input_params,
+      torch::Tensor* output_topk_indices,
+      aclrtEvent* event = nullptr,
+      std::atomic<bool>* event_flag = nullptr,
+      int node_id = 0);
+
+  bool is_topk_sharing_enabled() const { return skip_topk_ || output_topk_; }
+  bool skip_topk() const { return skip_topk_; }
+  bool output_topk() const { return output_topk_; }
+  bool has_mtp_topk_fallback() const { return has_mtp_topk_fallback_; }
 
  private:
   struct ShardingConfig {
@@ -107,6 +137,11 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   void initialize_quantization_parameters(
       atb_speed::deepseekV2::DecoderLayerParam& param);
 
+  void initialize_mega_moe_resource(const ParallelArgs& parallel_args);
+
+  torch::Tensor encode_mega_moe_scale(const torch::Tensor& scale,
+                                      const torch::Tensor& offset) const;
+
   void merge_and_copy_gate_up_weights(
       torch::Tensor& target_buffer,
       const std::vector<torch::Tensor>& experts_gate,
@@ -126,7 +161,12 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
                                torch::Tensor& attn_mask,
                                KVCache& kv_cache,
                                ModelInputParams& input_params,
-                               bool is_prefill);
+                               bool is_prefill,
+                               const torch::Tensor& shared_topk_indices,
+                               torch::Tensor* output_topk_indices,
+                               bool skip_topk,
+                               bool output_topk,
+                               bool enable_mega_moe);
 
   torch::Tensor block_tables_placeholder_;
   std::string model_name_;
@@ -138,6 +178,9 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   int32_t v_head_dim_;
   int32_t kv_lora_rank_;
   int32_t qk_rope_head_dim_;
+  bool skip_topk_ = false;
+  bool output_topk_ = false;
+  bool has_mtp_topk_fallback_ = false;
 
   int32_t rank_;
   int32_t first_k_dense_replace_;
@@ -160,13 +203,20 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   int32_t cp_size_;
 
   float sm_scale_;
+  int32_t quant_group_size_ = 0;
   int32_t num_speculative_tokens_ = 0;
+  // Compatibility vector: entries may be legacy LinearType or new LinearDesc.
+  std::vector<int32_t> attn_linear_quant_types_;
 
   atb_speed::deepseekV2::DecoderLayerParam prefill_param_;
   atb_speed::deepseekV2::DecoderLayerParam decode_param_;
+  atb_speed::deepseekV2::DecoderLayerParam mtp_prefill_fallback_param_;
+  atb_speed::deepseekV2::DecoderLayerParam mtp_decode_fallback_param_;
 
   atb_speed::Model::Node prefill_node_;
   atb_speed::Model::Node decode_node_;
+  atb_speed::Model::Node mtp_prefill_fallback_node_;
+  atb_speed::Model::Node mtp_decode_fallback_node_;
 
   atb::Tensor internal_tensor_;
 
@@ -186,6 +236,11 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
 
   torch::Tensor expert_routing_map_;
   torch::Tensor expert_routing_map_buffer_;
+  std::vector<atb::Tensor> prefill_atb_weight_tensors_;
+  torch::Tensor prefill_gateup_scale_;
+  torch::Tensor prefill_down_scale_;
+  std::shared_ptr<MegaMoeCommResource> mega_moe_comm_resource_;
+  atb::Tensor mega_moe_context_tensor_;
 };
 TORCH_MODULE(NpuDeepseekV32DecoderLayer);
 

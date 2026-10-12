@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,7 +25,7 @@ limitations under the License.
 
 namespace xllm {
 Block::Block(int32_t id, BlockManager* manager)
-    : id_(id), ref_count_(new uint32_t(1)), manager_(manager) {
+    : id_(id), ref_count_(new std::atomic<uint32_t>(1)), manager_(manager) {
   // get the block size from the manager
   size_ = manager_ == nullptr ? 0 : manager_->block_size();
 }
@@ -100,12 +100,20 @@ Block& Block::operator=(Block&& other) noexcept {
 
 void Block::inc_ref_count() {
   if (ref_count_ != nullptr) {
-    ++(*ref_count_);
+    // Another alias appearing only needs atomicity, not ordering, so relaxed.
+    ref_count_->fetch_add(1, std::memory_order_relaxed);
   }
 }
 
 void Block::dec_ref_count() {
-  if (ref_count_ != nullptr && --(*ref_count_) == 0) {
+  if (ref_count_ == nullptr) {
+    return;
+  }
+  // acq_rel pairs the releasing decrements with the acquiring final one, so the
+  // thread that drives the count to zero observes all prior alias writes before
+  // it frees. fetch_sub returns the previous value; == 1 means we just hit
+  // zero.
+  if (ref_count_->fetch_sub(1, std::memory_order_acq_rel) == 1) {
     // release the reference count memory
     delete ref_count_;
     // return the block id to the manager

@@ -1,3 +1,18 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 syntax = "proto3";
 
 option go_package = "jd.com/jd-infer/xllm;xllm";
@@ -30,15 +45,28 @@ message DeviceMemory {
 }
 
 message KVCacheShape {
-  repeated int64 key_shape = 1;
-  repeated int64 value_shape = 2;
-  repeated int64 index_shape = 3;
-  repeated int64 conv_shape = 4;
-  repeated int64 ssm_shape = 5;
+  repeated int64 key_cache_shape = 1;
+  repeated int64 value_cache_shape = 2;
+  repeated int64 index_cache_shape = 3;
+  repeated int64 conv_cache_shape = 4;
+  repeated int64 ssm_cache_shape = 5;
+  repeated int64 index_cache_scale_shape = 6;
+  // Capability metadata used by workers to validate transfer/backend support.
+  bool grouped_cache_layout = 7;
+  int32 kpool_layout = 8;
+  repeated int64 kpool_tail_shape = 9;
+  reserved 10;  // never assigned; kpool_cache_shape was field 8 on an unmerged branch
 }
 
 message AllocateKVCacheRequest {
   KVCacheShape kv_cache_shape = 1;
+}
+
+message SpeculativeValidateTimePredictor {
+  double intercept_ms = 1;
+  reserved 2;  // was: double batch_ms (dropped, dead field)
+  double query_token_ms = 3;
+  double query_prefix_ms = 4;
 }
 
 message SleepRequest {
@@ -53,7 +81,7 @@ message WakeupRequest {
   repeated WakeupWeightSegmentList src_weight_segments = 3;
 }
 
-// A single weight segment for D2D transfer
+// A single weight segment for P2P transfer
 message WakeupWeightSegment {
   uint64 offset = 1;  // Byte offset from source GlobalXTensor base
   uint64 size = 2;    // Segment size in bytes
@@ -64,29 +92,57 @@ message WakeupWeightSegmentList {
   repeated WakeupWeightSegment segments = 1;
 }
 
-message D2DLinkWorkerRequest {
+// RL deep-sleep weight update: reload weights in place from disk.
+message UpdateWeightsRequest {
+  // Checkpoint path to reload from. Empty means reuse the original model path.
+  string weights_path = 1;
+}
+
+message P2PLinkWorkerRequest {
   string remote_addr = 1; 
 }
 
 message PullKVCacheRequest {
+  reserved 4, 5, 7 to 11;
+
   uint64 cluster_id = 1;
   string addr = 6;
-  int64 k_cache_id = 2;
-  int64 v_cache_id = 3;
-  repeated uint64 src_blocks = 4;
-  repeated uint64 dst_blocks = 5;
+  repeated KVTransferMapping mappings = 12;
 }
 
 enum TransferType {
   G2H = 0;
   H2D = 1;
   D2G = 2;
+  G2D = 3;
+  D2H2G = 4;
+}
+
+// Mirrors xllm::BlockType (framework/block/block.h) in declaration order so
+// numeric values round-trip losslessly across RPC (serialized by number, not
+// name). Every enumerator here must match its C++ value exactly.
+//
+// APPEND-ONLY: never renumber or remove an existing enumerator. proto3 encodes
+// by number with no version handshake, so a renumber would be silently misread
+// by a rolling/mixed-version peer. C1 and C2 are appended values; both names
+// are new and carry no historical wire meaning.
+enum BlockType {
+  KV = 0;
+  SWA = 1;
+  C4 = 2;
+  C128 = 3;
+  EMBEDDING = 4;
+  LINEAR = 5;
+  C1 = 6;
+  C2 = 7;
 }
 
 message BlockTransferInfo {
   int32 src_block_id = 1;
   int32 dst_block_id = 2;
   bytes hash_key = 3;
+  BlockType block_type = 4;
+  uint64 checkpoint_row = 5;
 }
 
 message BlockTransferInfos {
@@ -95,25 +151,32 @@ message BlockTransferInfos {
   repeated BlockTransferInfo transfer_infos = 3;
 }
 
+message PrefetchUnit {
+  repeated BlockTransferInfo gated_blocks = 1;
+  repeated BlockTransferInfo non_gated_blocks = 2;
+  bool has_non_gated = 3;
+}
+
+message PrefetchRequest {
+  // A request is a sequence of complete semantic units. The worker expands
+  // one batch of units into a flat transfer vector locally.
+  repeated PrefetchUnit units = 1;
+  // Owning request id, used only to correlate prefetch logs.
+  string request_id = 2;
+}
+
 message TransferStatus {
  uint32 success_cnt = 1;
 }
 
-message DeviceInfo {
-  string device_ip = 1;
-  uint32 listen_port = 2;
-}
-
 message CacheInfo {
   uint64 cluster_id = 1;
+  uint32 listen_port = 2;
   string addr = 4;
-  int64 k_cache_id = 2;
-  int64 v_cache_id = 3;
 }
 
 message ClusterInfo {
   repeated uint64 cluster_ids = 1;
-  repeated string device_ips = 2;
   repeated uint32 ports = 3;
   repeated string addrs = 4;
 }
@@ -124,26 +187,34 @@ message InstanceInfo {
   string type = 3;
   repeated uint64 cluster_ids = 4;
   repeated string addrs = 8;
-  repeated int64 k_cache_ids = 5;
-  repeated int64 v_cache_ids = 6;
   int32 dp_size = 7;
 }
 
 message TransferKVInfo {
+  reserved 2, 3, 7, 8;
+
   string request_id = 1;
-  repeated uint64 local_blocks_ids = 2;
-  repeated uint64 remote_blocks_ids = 3;
   int32 dp_rank = 4;
   InstanceInfo remote_instance_info = 5;
   // XTensor mode: destination offsets from D-node (per-layer)
   // Each XTensorLayerOffsets contains K/V offsets for all blocks at one layer
   repeated XTensorLayerOffsets dst_xtensor_layer_offsets = 6;
+  repeated KVTransferMapping mappings = 22;
+}
+
+message KVTransferMapping {
+  int32 group_id = 1;
+  reserved 2;
+  repeated uint64 local_ids = 3;
+  repeated uint64 remote_ids = 4;
+  reserved 5;  // was: repeated uint32 block_valid_token_counts
 }
 
 message EplbInfo {
   int32 prepare_layer_id = 1;
   repeated int32 expert_ids = 2;
   int32 update_layer_id = 3;
+  int64 prepare_token = 4;
 };
 
 message RequestSamplingParam {
@@ -158,6 +229,7 @@ message RequestSamplingParam {
   bool do_sample = 9;
   bool is_embeddings = 10;
   int32 beam_width = 11;
+  int32 num_return_sequences = 12;
 }
 
 message UniqueTokenIds {
@@ -188,59 +260,129 @@ message MMValue {
   }
 }
 
+message MMItemState {
+  uint32 token_pos_offset = 1;
+  uint32 token_pos_length = 2;
+  Tensor mm_token_mask = 3;
+  bytes schedule_data_key = 4;
+  int32 schedule_data_start_pos = 5;
+  int32 schedule_data_end_pos = 6;
+}
+
+message MMDataItem {
+  uint32 type = 1;
+  map<string, MMValue> dict = 2;
+  MMItemState state = 3;
+  int32 seq_index = 4;
+}
+
+// Preserve the original per-request MMData item vector over brpc/proto.
+message MMDataEntry {
+  uint32 type = 1;
+  bool is_item_vec = 2;
+  repeated MMDataItem items = 3;
+  map<string, MMValue> dict = 4;
+}
+
 message MMData {
   uint32 type = 1;
   map<string, MMValue> dict = 2;
+  repeated MMDataEntry entries = 3;
+}
+
+message NamedTensor {
+  string name = 1;
+  Tensor tensor = 2;
+}
+
+message MediaNamedTensor {
+  string name = 1;
+  string modality = 2;
+  Tensor tensor = 3;
+}
+
+message DiTForwardInput {
+  int32 batch_size = 1;
+  
+  // Primary input text description for image generation
+  repeated string prompts = 2;
+  
+  // Secondary prompt for additional details (e.g., color, lighting)
+  repeated string prompts_2 = 3;
+  
+  // Negative prompt to exclude low-quality features
+  repeated string negative_prompts = 4;
+  
+  // Secondary negative prompt to exclude additional unwanted features
+  repeated string negative_prompts_2 = 5;
+  
+  reserved 6, 7, 8, 9, 10, 11, 12, 13, 14, 15;
+  // generation params
+  DiTGenerationParams generation_params = 16;
+
+  reserved 17;
+
+  reserved 18, 19;
+  optional string audio_prompt_text = 20;
+
+  repeated MediaNamedTensor media_sources = 21;
+  repeated NamedTensor tensor_sources = 22;
+}
+
+message DiTForwardOutput {
+  TensorList tensors = 1;
+  repeated string text_output = 2;
+  TensorList audio_tensors = 3;
+}
+
+message DiTGenerationParams {
+  int32 width = 1;
+  int32 height = 2;
+  int32 num_inference_steps = 3;
+  float true_cfg_scale = 4;
+  float guidance_scale = 5;
+  uint32 num_images_per_prompt = 6;
+  // Use optional so has_seed() can distinguish "not set" (stochastic for Cola-DLM)
+  // from "seed=0" (deterministic with base_seed=0).
+  optional int64 seed = 7;
+  int32 max_sequence_length = 8;
+  float strength = 9;
+  bool enable_cfg_renorm = 10;
+  float cfg_renorm_min = 11;
+  int32 num_frames = 12;
+  reserved 13;
+  double video_fps = 14;
+  float guidance_scale_2 = 15;
+  int32 seconds = 16;
+  float boundary_ratio = 17;
+  float flow_shift = 18;
+  uint32 num_videos_per_prompt = 19;
+  // Text diffusion parameters (Cola-DLM)
+  optional int32 max_new_tokens = 20;
+  optional int32 diffusion_steps = 21;
+  optional float temperature = 22;
+  optional int32 top_k = 23;
+  optional float top_p = 24;
+  optional float repetition_penalty = 25;
+  // Explicit flag: true when the client set seed (including seed=0).
+  bool seed_is_set = 26;
+  // Audio generation parameters (LongCat-AudioDiT).
+  optional int32 audio_duration_frames = 27;
+  optional int32 audio_steps = 28;
+  optional string audio_guidance_method = 29;
+  optional int32 audio_sampling_rate = 30;
+}
+
+message PackedForwardInput {
+  // Raw input payload encoded as:
+  // [RawInputLayoutHeader][descriptor bytes][tensor arena bytes].
+  // The descriptor records metadata/non-tensor fields; tensor arena stores all
+  // tensor payloads in one contiguous host buffer.
+  bytes payload = 1;
 }
 
 message ForwardInput {
-  // flatten the token ids and positions
-  repeated int32 flatten_tokens_vec = 1;
-  repeated int32 flatten_positions_vec = 2;
-  // sleceted tokens to return logits, including generated tokens and last
-  // prompt token
-  repeated RequestSamplingParam sampling_params = 3;
-  repeated int32 selected_token_idxes = 4;
-  // track the last token of selected tokens for sampling
-  repeated int32 sample_idxes = 5;
-  // track the unique token ids and counts in the batch
-  repeated UniqueTokenIds unique_token_ids_vec = 6;
-  repeated UniqueTokenCounts unique_token_counts_vec = 7;
-  repeated int32 unique_token_lens_vec = 8;
-  // bool empty_kv_cache = 9;
-  uint32 max_seq_len = 10;
-  uint32 q_max_seq_len = 11;
-  repeated int32  seq_lens = 12;
-  repeated int32  q_seq_lens = 13;
-  repeated int32 paged_kv_indptr = 14;
-  repeated int32 paged_kv_indices = 15;
-  repeated int32 paged_kv_last_page_len = 16;
-  // slot ids for new token
-  repeated int32 new_token_slot_ids = 17;
-  repeated BlockTables block_tables_vec = 18;
-  int32 num_sequences = 19;
-  repeated int32 dp_global_token_nums = 20;
-  // bool global_empty_kv_cache = 21;
-  repeated TransferKVInfo transfer_kv_infos = 22;
-  repeated Embeddings embeds = 23;
-  // uint32 prefill_seq_len = 24;
-  repeated int32 embedding_ids = 25;
-  repeated int32 extra_token_ids = 26;
-  EplbInfo eplb_info =27;
-  repeated BlockTransferInfo swap_blocks = 28;
-  // block copy kernel
-  repeated int32 src_block_indices = 32;
-  repeated int32 dst_block_indices = 33;
-  repeated int32 cum_sum = 34;
-  // beam search kernel
-  repeated float acc_logprob_vec = 37;
-  uint64 batch_id = 38;
-  int32 batch_forward_type = 39;
-  MMData mm_data = 40;
-  repeated int32 q_cu_seq_lens = 41;
-  repeated int32 dp_is_decode = 42;
-  repeated int32 kv_cache_tokens_nums = 43;
-  repeated string request_ids = 44;
+  PackedForwardInput packed_input = 100;
 }
 
  message BatchedForwardInputs {
@@ -262,17 +404,32 @@ message Token {
   Embeddings embeddings = 6;
 };
 
+message SpeculativeTokenStats {
+  int64 accepted_tokens = 1;
+  int64 proposed_tokens = 2;
+}
+
 message SquenceOutput {
   repeated Token tokens = 1;
+  TensorList mm_embeddings = 2;
+  SpeculativeTokenStats speculative_token_stats = 3;
+}
+
+message JsonObjectOutputError {
+  string sample_sequence_id = 1;
+  string message = 2;
 }
 
 message ForwardOutput {
   repeated SquenceOutput outputs = 2;
   repeated int64 expert_load_data = 3;
-  int32 prepared_layer_id = 4;
+  int64 prepared_token = 4;
   repeated int32 src_seq_idxes = 5;
   repeated int32 out_tokens = 6;
   repeated float out_logprobs = 7;
+  DiTForwardOutput dit_forward_output = 8;
+  repeated JsonObjectOutputError json_object_errors = 9;
+  repeated string failed_request_ids = 10;
 }
 
 // master create Collective service
@@ -288,19 +445,23 @@ service DistributeWorker {
   rpc ProcessGroupTest (Empty) returns (Status);
   rpc ProfileDeviceMemory (Empty) returns (DeviceMemory);
   rpc AllocateKVCache (AllocateKVCacheRequest) returns (Status);
+  rpc SetSpeculativeValidateTimePredictor(SpeculativeValidateTimePredictor)
+      returns (Status) {}
   rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (Status) {}
   rpc PullKVCache(PullKVCacheRequest) returns (Status) {}
-  rpc GetDeviceInfo(Empty) returns (DeviceInfo) {}
   rpc GetCacheInfo(Empty) returns (CacheInfo) {}
   rpc LinkCluster(ClusterInfo) returns (Status) {}
   rpc UnlinkCluster(ClusterInfo) returns (Status) {}
-  rpc LinkD2D(D2DLinkWorkerRequest) returns (Status) {}
-  rpc UnlinkD2D(D2DLinkWorkerRequest) returns (Status) {}
+  rpc LinkP2P(P2PLinkWorkerRequest) returns (Status) {}
+  rpc UnlinkP2P(P2PLinkWorkerRequest) returns (Status) {}
   rpc ExecuteModel (ForwardInput) returns (ForwardOutput);
   rpc GetLastStepResult (Empty) returns (ForwardOutput);
   rpc GetActiveActivationMemory (Empty) returns (ActivationMemory);
   rpc TransferBlocks(BlockTransferInfos) returns (TransferStatus) {}
-  rpc PrefetchFromStorage(BlockTransferInfos) returns (Status) {}
+  rpc PrefetchFromStorage(PrefetchRequest) returns (Status) {}
   rpc Sleep (SleepRequest)  returns (Status);
   rpc Wakeup (WakeupRequest) returns (Status);
+  rpc UpdateWeights (UpdateWeightsRequest) returns (Status);
+  rpc StartProfile (Empty) returns (Status);
+  rpc StopProfile (Empty) returns (Status);
 }

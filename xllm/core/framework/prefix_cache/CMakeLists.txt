@@ -1,22 +1,37 @@
 include(cc_binary)
 include(cc_library)
-include(cc_test)
 
 cc_library(
-  NAME 
+  NAME
+    block_hasher
+  HDRS
+    block_hasher.h
+  SRCS
+    block_hasher.cpp
+  DEPS
+    :config
+    :multimodal
+    glog::glog
+    torch
+    xxHash
+)
+
+cc_library(
+  NAME
     prefix_cache
   HDRS
     prefix_cache.h
-    prefix_cache_with_upload.h
+    linear_state_prefix_cache.h
     prefix_cache_factory.h
-  SRCS 
+  SRCS
     prefix_cache.cpp
-    prefix_cache_with_upload.cpp
+    linear_state_prefix_cache.cpp
     prefix_cache_factory.cpp
   DEPS
     $<$<BOOL:${USE_NPU}>:torch_npu>
     $<$<BOOL:${USE_NPU}>:graph>
     :request
+    :block_hasher
     :common
     glog::glog
     Boost::serialization
@@ -25,24 +40,7 @@ cc_library(
 )
 
 
-cc_test(
-  NAME
-    prefix_test
-  SRCS
-    prefix_cache_test.cpp
-  DEPS
-    :flags
-    :kv_cache
-    :prefix_cache
-    :block
-    absl::random_random
-    Boost::serialization
-    GTest::gtest_main
-    # nnopbase
-)
 
-target_link_libraries(prefix_test PRIVATE brpc OpenSSL::SSL OpenSSL::Crypto Folly::folly :xllm_server)
-add_dependencies(prefix_test brpc-static)
 
 cc_binary(
   NAME

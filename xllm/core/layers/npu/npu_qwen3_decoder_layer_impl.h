@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -32,7 +32,6 @@ limitations under the License.
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
 #include "loader/qwen3_decoder_loader.h"
-#include "loader/qwen3_decoder_manual_loader.h"
 #include "nlohmann/json.hpp"
 #include "npu_base_layer.h"
 #include "pytorch/adapter/utils/utils.h"
@@ -50,7 +49,7 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
 
   ~NpuQwen3DecoderLayerImpl() override = default;
 
-  virtual int64_t init_layer() override;
+  int64_t init_layer() override;
 
   torch::Tensor forward(torch::Tensor& x,
                         torch::Tensor& cos_pos,
@@ -61,6 +60,13 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
                         aclrtEvent* event = nullptr,
                         std::atomic<bool>* event_flag = nullptr,
                         int node_id = 0);
+
+  void set_layer_id(int32_t layer_id) override {
+    prefill_param_.layerId = layer_id;
+    decode_graph_param_.layerId = layer_id;
+    decode_optimized_graph_param_.layerId = layer_id;
+    decode_eager_param_.layerId = layer_id;
+  }
 
  private:
   void param_from_args(atb_speed::qwen::QwenLayerParam& param,
@@ -76,7 +82,8 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
                                KVCache& kv_cache,
                                ModelInputParams& input_params,
                                bool is_prefill,
-                               int node_id);
+                               int node_id,
+                               bool use_graph_decode_input);
 
   void initialize_parallel_parameters(atb_speed::qwen::QwenLayerParam& param,
                                       const ParallelArgs& parallel_args);
@@ -90,11 +97,17 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
   int64_t init_attn_mask();
 
   atb_speed::Model::Node prefill_node_;
-  atb_speed::Model::Node decode_node_;
+  atb_speed::Model::Node decode_graph_node_;
+  atb_speed::Model::Node decode_optimized_graph_node_;
+  atb_speed::Model::Node decode_eager_node_;
   std::string model_name_;
   atb_speed::qwen::QwenLayerParam prefill_param_;
-  atb_speed::qwen::QwenLayerParam decode_param_;
+  atb_speed::qwen::QwenLayerParam decode_graph_param_;
+  atb_speed::qwen::QwenLayerParam decode_optimized_graph_param_;
+  atb_speed::qwen::QwenLayerParam decode_eager_param_;
+  bool enable_optimized_decode_graph_ = false;
   atb::Tensor internal_tensors_;
+  atb::Tensor residual_tensors_;
   atb::Tensor placeholder_;
 
   at::Tensor decode_attn_mask_;
@@ -104,6 +117,7 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
   int device_id_;
   int32_t layer_id_;
   int rank_id_;
+  int32_t num_hidden_layers_;
   std::vector<std::shared_ptr<at::Tensor>> prefill_tensor_storage_;
   std::vector<std::shared_ptr<at::Tensor>> decode_tensor_storage_;
   std::vector<std::shared_ptr<std::vector<int>>> prefill_vector_storage_;

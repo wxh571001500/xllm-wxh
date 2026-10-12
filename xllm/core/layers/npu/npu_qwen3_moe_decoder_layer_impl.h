@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,7 +23,7 @@ limitations under the License.
 
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
-#include "framework/model/npu_dp_ep_padding.h"
+#include "framework/parallel_state/npu_dp_ep_padding.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
 #include "loader/qwen3_moe_decoder_loader.h"
@@ -44,9 +44,9 @@ class NpuQwen3MoeDecoderLayerImpl : public BaseLayer {
 
   ~NpuQwen3MoeDecoderLayerImpl() override = default;
 
-  virtual void merge_loaded_weights();
+  void merge_loaded_weights() override;
 
-  virtual int64_t init_layer() override;
+  int64_t init_layer() override;
 
   torch::Tensor forward(torch::Tensor& x,
                         std::optional<torch::Tensor>& residual,
@@ -105,7 +105,8 @@ class NpuQwen3MoeDecoderLayerImpl : public BaseLayer {
                                torch::Tensor& attn_mask,
                                KVCache& kv_cache,
                                const ModelInputParams& input_params,
-                               bool is_prefill);
+                               bool is_prefill,
+                               bool use_graph_decode_input);
 
   torch::Tensor block_tables_placeholder_;
   std::string model_name_;
@@ -129,10 +130,12 @@ class NpuQwen3MoeDecoderLayerImpl : public BaseLayer {
 
   int32_t num_speculative_tokens_ = 0;
   atb_speed::qwen::MoeDecoderLayerParam prefill_param_;
-  atb_speed::qwen::MoeDecoderLayerParam decode_param_;
+  atb_speed::qwen::MoeDecoderLayerParam decode_graph_param_;
+  atb_speed::qwen::MoeDecoderLayerParam decode_eager_param_;
 
   atb_speed::Model::Node prefill_node_;
-  atb_speed::Model::Node decode_node_;
+  atb_speed::Model::Node decode_graph_node_;
+  atb_speed::Model::Node decode_eager_node_;
 
   atb::Tensor internal_tensor_;
 

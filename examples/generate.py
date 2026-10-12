@@ -1,7 +1,7 @@
-# python examples/generate.py --model='/path/models/Qwen2-7B-Instruct' --devices='npu:0'
-# python generate.py --model='/path/models/Qwen2-7B-Instruct' --devices='npu:0,npu:1'
+# ASCEND_RT_VISIBLE_DEVICES=0 python examples/generate.py --model='/path/models/Qwen2-7B-Instruct'
+# ASCEND_RT_VISIBLE_DEVICES=0,1 python generate.py --model='/path/models/Qwen2-7B-Instruct'
 
-from xllm import ArgumentParser, LLM, SamplingParams
+from xllm import LLM, ArgumentParser, SamplingParams
 
 # Create an LLM.
 parser = ArgumentParser()

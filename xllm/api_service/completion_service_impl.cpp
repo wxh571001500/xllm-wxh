@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,6 +24,7 @@ limitations under the License.
 #include <cstdint>
 #include <string>
 
+#include "api_service/request_admission.h"
 #include "common/instance_name.h"
 #include "completion.pb.h"
 #include "core/distributed_runtime/llm_master.h"
@@ -188,40 +189,16 @@ void CompletionServiceImpl::process_async_rpc_impl(
   const auto& target_xservice_addr = request->source_xservice_addr();
   auto callback = [master = master_](const RequestOutput& req_output) -> bool {
     req_output.log_request_status();
-    if (req_output.status.has_value()) {
-      const auto& status = req_output.status.value();
-      if (!status.ok()) {
-        // Reduce the number of concurrent requests when a request is
-        // finished with error.
-        master->get_rate_limiter()->decrease_one_request();
-        return master->handle_rpc_response(req_output);
-      }
-    }
-    // Reduce the number of concurrent requests when a request is finished
-    // or canceled.
-    if (req_output.finished || req_output.cancelled ||
-        req_output.finished_on_prefill_instance) {
-      master->get_rate_limiter()->decrease_one_request();
-    }
     return master->handle_rpc_response(req_output);
   };
 
-  // Check if the request is being rate-limited.
-  if (unlikely(master_->get_rate_limiter()->is_limited())) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.",
-        service_request_id,
-        target_xservice_addr);
-    return;
-  }
-
-  // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  if (unlikely(!models_.contains(model))) {
-    CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
-                        "Model not supported",
+  const Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (unlikely(!admission_status.ok())) {
+    CALLBACK_WITH_ERROR(admission_status.code(),
+                        admission_status.message(),
                         service_request_id,
                         target_xservice_addr);
     return;
@@ -230,13 +207,11 @@ void CompletionServiceImpl::process_async_rpc_impl(
   RequestParams request_params(rpc_request, "", "");
 
   std::optional<std::vector<int>> prompt_tokens = std::nullopt;
+  if (rpc_request.token_ids_size() > 0) {
+    prompt_tokens = std::vector<int>(rpc_request.token_ids().begin(),
+                                     rpc_request.token_ids().end());
+  }
   if (rpc_request.has_routing()) {
-    prompt_tokens = std::vector<int>{};
-    prompt_tokens->reserve(rpc_request.token_ids_size());
-    for (int i = 0; i < rpc_request.token_ids_size(); i++) {
-      prompt_tokens->emplace_back(rpc_request.token_ids(i));
-    }
-
     request_params.decode_address = rpc_request.routing().decode_name();
   }
 
@@ -281,13 +256,11 @@ void CompletionServiceImpl::process_async_impl(
   }
 
   std::optional<std::vector<int>> prompt_tokens = std::nullopt;
+  if (rpc_request.token_ids_size() > 0) {
+    prompt_tokens = std::vector<int>(rpc_request.token_ids().begin(),
+                                     rpc_request.token_ids().end());
+  }
   if (rpc_request.has_routing()) {
-    prompt_tokens = std::vector<int>{};
-    prompt_tokens->reserve(rpc_request.token_ids_size());
-    for (int i = 0; i < rpc_request.token_ids_size(); i++) {
-      prompt_tokens->emplace_back(rpc_request.token_ids(i));
-    }
-
     request_params.decode_address = rpc_request.routing().decode_name();
   }
 
@@ -311,19 +284,8 @@ void CompletionServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            // Reduce the number of concurrent requests when a request is
-            // finished with error.
-            master->get_rate_limiter()->decrease_one_request();
-
             return call->finish_with_error(status.code(), status.message());
           }
-        }
-
-        // Reduce the number of concurrent requests when a request is finished
-        // or canceled.
-        if (req_output.finished || req_output.cancelled ||
-            req_output.finished_on_prefill_instance) {
-          master->get_rate_limiter()->decrease_one_request();
         }
 
         if (stream) {

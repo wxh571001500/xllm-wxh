@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -158,6 +158,30 @@ std::vector<Block> XTensorBlockManagerImpl::allocate(size_t num_blocks) {
   return blocks;
 }
 
+std::optional<std::vector<Block>>
+XTensorBlockManagerImpl::allocate_for_sequence(Sequence* seq,
+                                               KVCacheState& kv_state,
+                                               size_t num_tokens) {
+  if (seq == nullptr) {
+    return std::nullopt;
+  }
+  const size_t block_size = options_.block_size();
+  if (block_size == 0) {
+    return std::vector<Block>{};
+  }
+  const size_t held = kv_state.num_blocks(block_type());
+  const size_t num_blocks_needed = (num_tokens + block_size - 1) / block_size;
+  if (num_blocks_needed <= held) {
+    return std::vector<Block>{};
+  }
+  const size_t num_additional = num_blocks_needed - held;
+  std::vector<Block> blocks = allocate(num_additional);  // VMM page alloc
+  if (blocks.size() != num_additional) {
+    return std::nullopt;
+  }
+  return blocks;
+}
+
 Block XTensorBlockManagerImpl::allocate() {
   auto blocks = allocate(1);
   if (blocks.empty()) {
@@ -243,33 +267,29 @@ void XTensorBlockManagerImpl::free(int32_t block_id) {
 }
 
 std::vector<Block> XTensorBlockManagerImpl::allocate_shared(
-    const Slice<int32_t>& tokens_ids,
-    const Slice<Block>& existed_shared_blocks) {
+    const Slice<int32_t>& /*token_ids*/,
+    const Slice<Block>& /*existed_shared_blocks*/,
+    const MMData& /*mm_data*/,
+    const Slice<XXH3Key>& /*block_hashes*/) {
   // Prefix cache not supported
   VLOG(1) << "allocate_shared called but prefix cache is not supported";
   return {};
 }
 
-void XTensorBlockManagerImpl::cache(const Slice<int32_t>& token_ids,
-                                    std::vector<Block>& blocks,
-                                    size_t existed_shared_blocks_num) {
+void XTensorBlockManagerImpl::cache(const Slice<int32_t>& /*token_ids*/,
+                                    std::vector<Block>& /*blocks*/,
+                                    size_t /*existed_shared_blocks_num*/,
+                                    const MMData& /*mm_data*/,
+                                    const Slice<XXH3Key>& /*block_hashes*/) {
   // Prefix cache not supported
   VLOG(1) << "cache called but prefix cache is not supported";
   return;
 }
 
-void XTensorBlockManagerImpl::cache(const std::vector<Block>& blocks) {
+void XTensorBlockManagerImpl::cache(const std::vector<Block>& /*blocks*/) {
   // Prefix cache not supported
   VLOG(1) << "cache called but prefix cache is not supported";
   return;
-}
-
-void XTensorBlockManagerImpl::get_merged_kvcache_event(
-    KvCacheEvent* event) const {
-  // Not implemented for XTensor
-  if (event != nullptr) {
-    event->clear();
-  }
 }
 
 size_t XTensorBlockManagerImpl::num_free_blocks() const {

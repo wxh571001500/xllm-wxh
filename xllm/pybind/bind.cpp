@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,10 +24,12 @@ limitations under the License.
 #include "core/common/types.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/vlm_master.h"
-#include "core/framework/request/mm_data.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/multimodal/mm_data.h"
 #include "core/framework/request/request_output.h"
 #include "core/framework/request/request_params.h"
 #include "core/framework/request/sample_slot.h"
+#include "core/util/pybind_helper.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -39,21 +41,26 @@ PYBIND11_MODULE(xllm_export, m) {
   py::class_<Options>(m, "Options")
       .def(py::init())
       .def_readwrite("model_path", &Options::model_path_)
-      .def_readwrite("devices", &Options::devices_)
       .def_readwrite("draft_model_path", &Options::draft_model_path_)
-      .def_readwrite("draft_devices", &Options::draft_devices_)
       .def_readwrite("backend", &Options::backend_)
+      .def_readwrite("limit_image_per_prompt",
+                     &Options::limit_image_per_prompt_)
       .def_readwrite("block_size", &Options::block_size_)
       .def_readwrite("max_cache_size", &Options::max_cache_size_)
       .def_readwrite("max_memory_utilization",
                      &Options::max_memory_utilization_)
       .def_readwrite("enable_prefix_cache", &Options::enable_prefix_cache_)
+      .def_readwrite("max_encoder_cache_size",
+                     &Options::max_encoder_cache_size_)
+      .def_readwrite("max_processor_cache_items",
+                     &Options::max_processor_cache_items_)
       .def_readwrite("max_tokens_per_batch", &Options::max_tokens_per_batch_)
       .def_readwrite("max_seqs_per_batch", &Options::max_seqs_per_batch_)
       .def_readwrite("max_tokens_per_chunk_for_prefill",
                      &Options::max_tokens_per_chunk_for_prefill_)
       .def_readwrite("num_speculative_tokens",
                      &Options::num_speculative_tokens_)
+      .def_readwrite("speculative_algorithm", &Options::speculative_algorithm_)
       .def_readwrite("num_request_handling_threads",
                      &Options::num_request_handling_threads_)
       .def_readwrite("communication_backend", &Options::communication_backend_)
@@ -63,11 +70,16 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("task_type", &Options::task_type_)
       .def_readwrite("enable_chunked_prefill",
                      &Options::enable_chunked_prefill_)
-      .def_readwrite("enable_prefill_sp", &Options::enable_prefill_sp_)
+      .def_readwrite("enable_flashcomm1", &Options::enable_flashcomm1_)
+      .def_readwrite("flashcomm1_min_prefill_tokens",
+                     &Options::flashcomm1_min_prefill_tokens_)
+      .def_readwrite("enable_mmrs_fusion", &Options::enable_mmrs_fusion_)
+      .def_readwrite("mmrs_comm_mode", &Options::mmrs_comm_mode_)
       .def_readwrite("master_node_addr", &Options::master_node_addr_)
       .def_readwrite("nnodes", &Options::nnodes_)
       .def_readwrite("node_rank", &Options::node_rank_)
       .def_readwrite("dp_size", &Options::dp_size_)
+      .def_readwrite("cp_size", &Options::cp_size_)
       .def_readwrite("ep_size", &Options::ep_size_)
       .def_readwrite("instance_name", &Options::instance_name_)
       .def_readwrite("enable_disagg_pd", &Options::enable_disagg_pd_)
@@ -77,19 +89,27 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("instance_role", &Options::instance_role_)
       .def_readwrite("kv_cache_transfer_mode",
                      &Options::kv_cache_transfer_mode_)
-      .def_readwrite("device_ip", &Options::device_ip_)
       .def_readwrite("transfer_listen_port", &Options::transfer_listen_port_)
       .def_readwrite("disable_ttft_profiling",
                      &Options::disable_ttft_profiling_)
       .def_readwrite("enable_forward_interruption",
                      &Options::enable_forward_interruption_)
+      .def_readwrite("enable_graph", &Options::enable_graph_)
+      .def_readwrite("enable_graph_mode_decode_no_padding",
+                     &Options::enable_graph_mode_decode_no_padding_)
+      .def_readwrite("enable_prefill_piecewise_graph",
+                     &Options::enable_prefill_piecewise_graph_)
+      .def_readwrite("max_tokens_for_graph_mode",
+                     &Options::max_tokens_for_graph_mode_)
       .def_readwrite("enable_offline_inference",
                      &Options::enable_offline_inference_)
+      .def_readwrite("disable_log_stats", &Options::disable_log_stats_)
       .def_readwrite("spawn_worker_path", &Options::spawn_worker_path_)
       .def_readwrite("enable_shm", &Options::enable_shm_)
       .def_readwrite("input_shm_size", &Options::input_shm_size_)
       .def_readwrite("output_shm_size", &Options::output_shm_size_)
       .def_readwrite("is_local", &Options::is_local_)
+      .def_readwrite("enable_sleep_mode", &Options::enable_sleep_mode_)
       .def_readwrite("kv_cache_dtype", &Options::kv_cache_dtype_);
 
   // 2. export LLMMaster
@@ -148,6 +168,35 @@ PYBIND11_MODULE(xllm_export, m) {
       .def("get_rate_limiter",
            &LLMMaster::get_rate_limiter,
            py::call_guard<py::gil_scoped_release>())
+      // RL offline deep sleep/wakeup (SleepableAllocator path). Distinct from
+      // the xtensor-based online sleep/wakeup exposed via the brpc API service.
+      .def(
+          "sleep",
+          [](LLMMaster& self) {
+            self.set_master_status(MasterStatus::DEEP_SLEEP);
+            return self.sleep();
+          },
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "wake_up",
+          [](LLMMaster& self) {
+            bool ok = self.wakeup();
+            if (ok) {
+              self.set_master_status(MasterStatus::WAKEUP);
+            }
+            return ok;
+          },
+          py::call_guard<py::gil_scoped_release>())
+      .def("is_sleeping",
+           &LLMMaster::is_sleeping,
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "update_weights",
+          [](LLMMaster& self, const std::string& weights_path) {
+            return self.update_weights(weights_path);
+          },
+          py::arg("weights_path") = "",
+          py::call_guard<py::gil_scoped_release>())
       .def("__repr__", [](const LLMMaster& self) {
         return "LLMMaster({})"_s.format(self.options());
       });
@@ -190,11 +239,15 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("logprobs", &RequestParams::logprobs)
       .def_readwrite("top_logprobs", &RequestParams::top_logprobs)
       .def_readwrite("skip_special_tokens", &RequestParams::skip_special_tokens)
+      .def_readwrite("include_stop_str_in_output",
+                     &RequestParams::include_stop_str_in_output)
       .def_readwrite("ignore_eos", &RequestParams::ignore_eos)
       .def_readwrite("is_embeddings", &RequestParams::is_embeddings)
       .def_readwrite("stop", &RequestParams::stop)
       .def_readwrite("stop_token_ids", &RequestParams::stop_token_ids)
       .def_readwrite("beam_width", &RequestParams::beam_width)
+      .def_readwrite("num_return_sequences",
+                     &RequestParams::num_return_sequences)
       .def_readwrite("add_special_tokens", &RequestParams::add_special_tokens)
       .def_readwrite("is_sample_request", &RequestParams::is_sample_request)
       .def_readwrite("sample_slots", &RequestParams::sample_slots);
@@ -205,14 +258,18 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("num_prompt_tokens", &Usage::num_prompt_tokens)
       .def_readwrite("num_generated_tokens", &Usage::num_generated_tokens)
       .def_readwrite("num_total_tokens", &Usage::num_total_tokens)
+      .def_readwrite("num_cached_tokens", &Usage::num_cached_tokens)
       .def_property_readonly(
           "prompt_tokens",
           [](const Usage& self) { return self.num_prompt_tokens; })
       .def_property_readonly(
           "completion_tokens",
           [](const Usage& self) { return self.num_generated_tokens; })
-      .def_property_readonly("total_tokens", [](const Usage& self) {
-        return self.num_total_tokens;
+      .def_property_readonly(
+          "total_tokens",
+          [](const Usage& self) { return self.num_total_tokens; })
+      .def_property_readonly("cached_tokens", [](const Usage& self) {
+        return self.num_cached_tokens;
       });
   // 5. export RequestOutput
   py::class_<RequestOutput>(m, "RequestOutput")
@@ -300,11 +357,7 @@ PYBIND11_MODULE(xllm_export, m) {
       .def(py::init<int, const MMDict&>(), py::arg("ty"), py::arg("data"))
       .def("get",
            [](const MMData& self, const MMKey& key) -> py::object {
-             auto value = self.get<torch::Tensor>(key);
-             if (value.has_value()) {
-               return py::cast(value.value());
-             }
-             return py::none();
+             return optional_tensor(self.get<torch::Tensor>(key));
            })
       .def("get_list",
            [](const MMData& self, const MMKey& key) -> py::object {
@@ -332,6 +385,9 @@ PYBIND11_MODULE(xllm_export, m) {
                              BatchOutputCallback>(
                &VLMMaster::handle_batch_request),
            py::call_guard<py::gil_scoped_release>())
+      // Offline-only entry aligned with vllm-ascend: prompts are used as-is
+      // without re-applying the chat template. The online serving path keeps
+      // applying the chat template via the messages-based request path.
       .def("handle_batch_request_with_image_urls",
            py::overload_cast<std::vector<std::string>,
                              std::vector<std::vector<std::string>>,
@@ -350,6 +406,15 @@ PYBIND11_MODULE(xllm_export, m) {
   m.def("get_model_backend",
         &ModelRegistry::get_model_backend,
         py::arg("model_type"));
+  m.def(
+      "configure_cpp_chat_template",
+      [](bool use_cpp_chat_template, const std::string& model_type) {
+        ModelConfig::get_instance().use_cpp_chat_template(
+            use_cpp_chat_template);
+        ModelConfig::get_instance().normalize_cpp_chat_template(model_type);
+      },
+      py::arg("use_cpp_chat_template"),
+      py::arg("model_type"));
 }
 
 }  // namespace xllm

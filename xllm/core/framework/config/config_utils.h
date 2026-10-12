@@ -1,0 +1,76 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+#include "core/util/json_reader.h"
+
+namespace xllm::config {
+
+JsonReader load_json_file(const std::string& config_path);
+
+JsonReader parse_json_string(std::string_view config_json);
+
+const std::optional<JsonReader>& get_parsed_json_config();
+
+bool is_flag_specified(const char* flag_name);
+
+void dump_startup_config();
+
+}  // namespace xllm::config
+
+#define APPEND_JSON_VALUE_IF_NOT_DEFAULT(       \
+    config_json, key, value, default_value)     \
+  do {                                          \
+    const auto& config_json_value = (value);    \
+    if (config_json_value != (default_value)) { \
+      (config_json)[key] = config_json_value;   \
+    }                                           \
+  } while (false)
+
+#define APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT( \
+    config_json, default_config, property)       \
+  APPEND_JSON_VALUE_IF_NOT_DEFAULT(              \
+      config_json, #property, property(), (default_config).property())
+
+#define XLLM_CONFIG_ASSIGN_FROM_FLAG(property) \
+  do {                                         \
+    property(FLAGS_##property);                \
+  } while (false)
+
+// Assign a config property from JSON, then write the resolved value back to
+// the corresponding FLAGS_ global so that code reading FLAGS_##property
+// directly observes the JSON-provided value instead of the gflags default.
+//
+// Precedence is CLI > Config(JSON) > Defaults: a JSON value is applied only
+// when the matching gflag was NOT explicitly set on the command line. When the
+// flag is specified on the CLI, its value (already assigned by from_flags via
+// XLLM_CONFIG_ASSIGN_FROM_FLAG) is preserved and the JSON entry is ignored.
+// is_flag_specified() reads gflags' is_default bit, which the FLAGS_ writeback
+// below (a direct assignment) never flips, so the signal stays accurate.
+#define XLLM_CONFIG_ASSIGN_FROM_JSON(property)                                 \
+  do {                                                                         \
+    if (!::xllm::config::is_flag_specified(#property)) {                       \
+      property(json.value_or<std::decay_t<decltype(property())>>(#property,    \
+                                                                 property())); \
+      FLAGS_##property = property();                                           \
+    }                                                                          \
+  } while (false)

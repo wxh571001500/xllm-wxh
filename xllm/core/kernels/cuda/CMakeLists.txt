@@ -1,5 +1,4 @@
 include(cc_library)
-include(cc_test)
 
 # CUTLASS headers are provided by root CMakeLists.txt via submodule (third_party/cutlass)
 include_directories(${CMAKE_CURRENT_LIST_DIR})
@@ -7,15 +6,6 @@ include_directories(${CMAKE_CURRENT_LIST_DIR})
 #
 # CUDA feature detection
 #
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
-  # SM90+ (Hopper/Blackwell) scaled matmul support
-  add_compile_definitions(
-    ENABLE_SCALED_MM_SM90=1
-    ENABLE_SCALED_MM_SM100=1
-    ENABLE_SCALED_MM_SM120=1
-  )
-endif()
-
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
   add_compile_definitions(ENABLE_FP8)
 endif()
@@ -33,10 +23,12 @@ set(CUDA_HEADER_FILES
   cutlass_w8a8/c3x/scaled_mm_sm90_fp8_dispatch.cuh
   fp8_quant_utils.cuh
   global_capture_instance.h
+  llm_decode_metadata_update.h
   piecewise_graphs.h
   topk_last_dim.cuh
   type_convert.cuh
   utils.h
+  cuda_ops_library.h
   device_utils.cuh
   xattention/xattention_ops_api.h
   moe/moe_topk.cuh
@@ -44,7 +36,86 @@ set(CUDA_HEADER_FILES
   moe/moe_topk_softmax_kernels.cuh
 )
 
+#
+# Per-SM-architecture CUTLASS libraries.
+#
+# CUTLASS template instantiations are extremely expensive to compile. Splitting each SM generation
+# into its own static library improves incremental build times — changing one SM's CUTLASS code
+# only recompiles that library, not all CUTLASS files.
+
+set(_CUTLASS_SM_LIBS "")
+
+# Only build architecture-specific CUTLASS kernels requested by the caller.
+set(_BUILD_CUTLASS_SM90 OFF)
+set(_BUILD_CUTLASS_SM100 OFF)
+set(_BUILD_CUTLASS_SM120 OFF)
+set(_REQUESTED_CUDA_ARCHS "${TORCH_CUDA_ARCH_LIST}")
+string(REGEX REPLACE "[ \t]+" ";" _REQUESTED_CUDA_ARCHS
+                     "${_REQUESTED_CUDA_ARCHS}")
+foreach(_CUDA_ARCH IN LISTS _REQUESTED_CUDA_ARCHS)
+  string(REGEX REPLACE "\\+PTX$" "" _CUDA_ARCH "${_CUDA_ARCH}")
+  string(REGEX REPLACE "a$" "" _CUDA_ARCH "${_CUDA_ARCH}")
+  if(_CUDA_ARCH STREQUAL "9.0")
+    set(_BUILD_CUTLASS_SM90 ON)
+  elseif(_CUDA_ARCH STREQUAL "10.0")
+    set(_BUILD_CUTLASS_SM100 ON)
+  elseif(_CUDA_ARCH STREQUAL "12.0")
+    set(_BUILD_CUTLASS_SM120 ON)
+  endif()
+endforeach()
+
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+  if(_BUILD_CUTLASS_SM90)
+    cc_library(
+      NAME cutlass_sm90
+      SRCS
+        cutlass_w8a8/c3x/scaled_mm_sm90_fp8.cu
+        cutlass_w8a8/scaled_mm_c3x_sm90.cu
+      DEPS
+        torch
+        tvm_ffi
+      DEFINES
+        ENABLE_SCALED_MM_SM90=1
+    )
+    set_target_properties(cutlass_sm90 PROPERTIES CUDA_ARCHITECTURES 90a)
+    list(APPEND _CUTLASS_SM_LIBS :cutlass_sm90)
+  endif()
+
+  if(_BUILD_CUTLASS_SM100)
+    cc_library(
+      NAME cutlass_sm100
+      SRCS
+        cutlass_w8a8/c3x/scaled_mm_sm100_fp8.cu
+        cutlass_w8a8/scaled_mm_c3x_sm100.cu
+      DEPS
+        torch
+        tvm_ffi
+      DEFINES
+        ENABLE_SCALED_MM_SM100=1
+    )
+    set_target_properties(cutlass_sm100 PROPERTIES CUDA_ARCHITECTURES 100a)
+    list(APPEND _CUTLASS_SM_LIBS :cutlass_sm100)
+  endif()
+
+  if(_BUILD_CUTLASS_SM120)
+    cc_library(
+      NAME cutlass_sm120
+      SRCS
+        cutlass_w8a8/c3x/scaled_mm_sm120_fp8.cu
+        cutlass_w8a8/scaled_mm_c3x_sm120.cu
+      DEPS
+        torch
+        tvm_ffi
+      DEFINES
+        ENABLE_SCALED_MM_SM120=1
+    )
+    set_target_properties(cutlass_sm120 PROPERTIES CUDA_ARCHITECTURES 120a)
+    list(APPEND _CUTLASS_SM_LIBS :cutlass_sm120)
+  endif()
+endif()
+
 # Keep source list explicit to avoid accidentally compiling test files into cuda_kernels.
+# NOTE: SM-specific CUTLASS sources are compiled via the per-arch libraries above.
 set(CUDA_SOURCE_FILES
   activation.cu
   air_log_softmax_last_dim.cu
@@ -52,32 +123,31 @@ set(CUDA_SOURCE_FILES
   batch_decode.cpp
   batch_prefill.cpp
   batch_chunked_prefill.cpp
+  block_copy.cu
   cutlass_extensions/common.cpp
-  cutlass_w8a8/c3x/scaled_mm_sm100_fp8.cu
-  cutlass_w8a8/c3x/scaled_mm_sm120_fp8.cu
-  cutlass_w8a8/c3x/scaled_mm_sm90_fp8.cu
-  cutlass_w8a8/scaled_mm_c3x_sm100.cu
-  cutlass_w8a8/scaled_mm_c3x_sm120.cu
-  cutlass_w8a8/scaled_mm_c3x_sm90.cu
   cutlass_w8a8/scaled_mm_entry.cu
   fp8_quant.cu
   fp8_scaled_matmul.cpp
   fp8_scaled_quantize.cpp
   fused_qknorm_rope.cu
   global_capture_instance.cpp
+  llm_decode_metadata_update.cu
   matmul.cpp
   norm.cu
   piecewise_graphs.cpp
   rec_beam_search.cu
   reshape_paged_cache.cu
   rope.cu
+  random_sample.cpp
   utils.cpp
+  cuda_ops_library.cpp
   xattention/beam_search.cpp
   xattention/cache_select.cu
   xattention/decoder_reshape_and_cache.cu
   xattention/lse_combine.cu
   xattention/prefill_reshape_and_cache.cu
   moe/moe_fused_topk.cu
+  moe/fused_moe.cpp
 )
 
 cc_library(
@@ -92,105 +162,8 @@ cc_library(
     torch
     :util
     :platform
+    ${_CUTLASS_SM_LIBS}
 )
-
-cc_test(
-  NAME
-    activation_test
-  SRCS
-    activation_test.cpp
-  DEPS
-    :cuda_kernels
-    torch
-    GTest::gtest_main
-    glog::glog
-)
-
-cc_test(
-  NAME
-    decoder_reshape_and_cache_test
-  SRCS
-    xattention/decoder_reshape_and_cache_test.cpp
-  DEPS
-    :cuda_kernels
-    torch
-    GTest::gtest_main
-    glog::glog
-)
-target_link_libraries(decoder_reshape_and_cache_test PRIVATE brpc)
-
-cc_test(
-  NAME
-    prefill_reshape_and_cache_test
-  SRCS
-    xattention/prefill_reshape_and_cache_test.cpp
-  DEPS
-    :cuda_kernels
-    torch
-    GTest::gtest_main
-    glog::glog
-)
-target_link_libraries(prefill_reshape_and_cache_test PRIVATE brpc)
-
-cc_test(
-  NAME
-    cache_select_test
-  SRCS
-    xattention/cache_select_test.cpp
-  DEPS
-    :cuda_kernels
-    torch
-    GTest::gtest_main
-    glog::glog
-)
-target_link_libraries(cache_select_test PRIVATE brpc)
-
-cc_test(
-  NAME
-    moe_fused_topk_test
-  SRCS
-    moe/moe_topk_test.cu
-  DEPS
-    :cuda_kernels
-    GTest::gtest_main
-)
-
-cc_test(
-  NAME
-    fused_qknorm_rope_test
-  SRCS
-    fused_qknorm_rope_test.cpp
-  DEPS
-    :cuda_kernels
-    torch
-    GTest::gtest_main
-)
-
-cc_test(
-  NAME
-    cutlass_scaled_mm_test
-  SRCS
-    cutlass_scaled_mm_test.cpp
-  DEPS
-    :cuda_kernels
-    torch
-    GTest::gtest_main
-    glog::glog
-)
-target_link_libraries(cutlass_scaled_mm_test PRIVATE brpc)
-
-cc_test(
-  NAME
-    fp8_quant_test
-  SRCS
-    fp8_quant_test.cpp
-  DEPS
-    :cuda_kernels
-    torch
-    GTest::gtest_main
-    glog::glog
-)
-target_link_libraries(fp8_quant_test PRIVATE brpc)
 
 # Keep CUDA benchmarks behind a plain CMake cache option instead of adding
 # another dedicated argument in `setup.py`.

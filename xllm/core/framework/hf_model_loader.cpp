@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -31,11 +31,14 @@ limitations under the License.
 #include <filesystem>
 #include <limits>
 #include <optional>
+#include <regex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "core/common/rec_model_utils.h"
 #include "core/common/version_singleton.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/rec_config.h"
 #include "core/framework/state_dict/rec_vocab_dict.h"
 #include "core/framework/state_dict/safetensors/safetensors.h"
 #include "core/framework/tokenizer/fast_tokenizer.h"
@@ -44,15 +47,55 @@ limitations under the License.
 #include "core/framework/tokenizer/tiktoken_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer_factory.h"
 #include "core/platform/device.h"
+#include "core/platform/platform.h"
 #include "core/util/blocking_counter.h"
 #include "core/util/json_reader.h"
+#include "core/util/model_config_utils.h"
+#include "core/util/rec_model_utils.h"
 #include "core/util/scope_guard.h"
 #include "core/util/tensor_helper.h"
+#include "core/util/utils.h"
 #include "models/model_registry.h"
 
 namespace xllm {
 
 namespace {
+
+// Speculators-format draft configs (e.g. GLM-5.2 DSpark) nest the backbone
+// under transformer_layer_config; lift it (and flatten rope_parameters) so the
+// flat qwen3 loader sees the backbone fields at the top level.
+void lift_speculators_config(nlohmann::json& config) {
+  if (!config.contains("speculators_model_type") ||
+      !config.contains("transformer_layer_config")) {
+    return;
+  }
+  const auto& tlc = config["transformer_layer_config"];
+  if (tlc.is_object()) {
+    for (const auto& [k, v] : tlc.items()) {
+      if (!v.is_null() && !config.contains(k)) {
+        config[k] = v;
+      }
+    }
+  }
+  if (config.contains("rope_parameters") &&
+      config["rope_parameters"].is_object()) {
+    const auto& rope = config["rope_parameters"];
+    if (rope.contains("rope_theta") && !config.contains("rope_theta")) {
+      config["rope_theta"] = rope["rope_theta"];
+    }
+    if (rope.contains("factor") && !config.contains("rope_scaling")) {
+      config["rope_scaling"] = rope;
+    }
+  }
+}
+
+void normalize_config_torch_dtype(JsonReader& reader) {
+  nlohmann::json& config = reader.mutable_data();
+  if (!config.contains("torch_dtype") && config.contains("dtype")) {
+    config["torch_dtype"] = config["dtype"];
+  }
+  lift_speculators_config(config);
+}
 
 bool is_compressed_tensors_fp8_scheme(const nlohmann::json& config) {
   auto type_it = config.find("type");
@@ -63,29 +106,133 @@ bool is_compressed_tensors_fp8_scheme(const nlohmann::json& config) {
          num_bits_it->get<int64_t>() == 8;
 }
 
-bool try_load_compressed_tensors_quant_cfg(const JsonReader& reader,
-                                           QuantArgs& quant_args) {
+const nlohmann::json* get_compressed_tensors_config(
+    const nlohmann::json& data,
+    const JsonReader& reader,
+    const std::string& config_key) {
   const auto quant_method =
-      reader.value<std::string>("quantization_config.quant_method");
+      reader.value<std::string>(config_key + ".quant_method");
   if (!quant_method.has_value() ||
       !boost::iequals(*quant_method, "compressed-tensors")) {
-    return false;
+    return nullptr;
   }
 
-  const auto& data = reader.data();
-  auto quant_config_it = data.find("quantization_config");
+  auto quant_config_it = data.find(config_key);
   if (quant_config_it == data.end() || !quant_config_it->is_object()) {
-    LOG(ERROR) << "quantization_config must be an object for "
-                  "compressed-tensors quantization.";
+    LOG(ERROR) << config_key << " must be an object for "
+               << "compressed-tensors quantization.";
+    return nullptr;
+  }
+  return &(*quant_config_it);
+}
+
+bool is_compressed_int_scheme(const nlohmann::json& scheme,
+                              int64_t expected_bits,
+                              bool expected_dynamic) {
+  const auto type_it = scheme.find("type");
+  const auto bits_it = scheme.find("num_bits");
+  const auto dynamic_it = scheme.find("dynamic");
+  const bool dynamic = dynamic_it != scheme.end() && !dynamic_it->is_null() &&
+                       dynamic_it->get<bool>();
+  return type_it != scheme.end() && type_it->is_string() &&
+         boost::iequals(type_it->get<std::string>(), "int") &&
+         bits_it != scheme.end() && bits_it->get<int64_t>() == expected_bits &&
+         dynamic == expected_dynamic;
+}
+
+bool load_ct_int_config(const nlohmann::json& config, QuantArgs& args) {
+  if ((config.contains("kv_cache_scheme") &&
+       !config.at("kv_cache_scheme").is_null()) ||
+      (config.contains("transform_config") &&
+       !config.at("transform_config").is_null() &&
+       !config.at("transform_config").empty())) {
+    LOG(ERROR) << "Unsupported compressed-tensors KV-cache or transform scheme";
+    return false;
+  }
+  std::vector<CompressedQuantGroup> groups;
+  groups.reserve(config.at("config_groups").size());
+  for (const auto& [name, group] : config.at("config_groups").items()) {
+    if (!group.is_object() || !group.contains("weights") ||
+        !group.at("weights").is_object() ||
+        !group.contains("input_activations") ||
+        !group.at("input_activations").is_object()) {
+      LOG(ERROR) << "Invalid compressed-tensors group: " << name;
+      return false;
+    }
+    const auto& weights = group.at("weights");
+    const auto& activations = group.at("input_activations");
+    CompressedQuantGroup scheme;
+    scheme.bits = weights.value("num_bits", 0);
+    scheme.preserve_smooth = weights.value("preserve_smooth", false);
+    const bool w4 = scheme.bits == 4;
+    const std::string format =
+        group.value("format", config.value("format", "int-quantized"));
+    if ((scheme.bits != 4 && scheme.bits != 8) ||
+        !is_compressed_int_scheme(weights, scheme.bits, false) ||
+        !is_compressed_int_scheme(activations, 8, true) ||
+        format != (w4 ? "int4-le-pack-quantized" : "int-quantized") ||
+        !weights.value("symmetric", true) ||
+        !activations.value("symmetric", true) ||
+        weights.value("strategy", "channel") != (w4 ? "group" : "channel") ||
+        activations.value("strategy", "token") != "token" ||
+        activations.value("preserve_smooth", false) ||
+        (group.contains("output_activations") &&
+         !group.at("output_activations").is_null())) {
+      LOG(ERROR) << "Unsupported compressed-tensors integer scheme: " << name;
+      return false;
+    }
+    if (w4) {
+      if (!weights.contains("group_size") || weights.at("group_size") != 128) {
+        LOG(ERROR) << "Compressed-tensors W4A8 requires group_size=128: "
+                   << name;
+        return false;
+      }
+      scheme.group_size = 128;
+    }
+    scheme.targets = group.value("targets", std::vector<std::string>{"Linear"});
+    if (scheme.targets.empty()) {
+      LOG(ERROR) << "Empty compressed-tensors targets: " << name;
+      return false;
+    }
+    for (const auto& target : scheme.targets) {
+      if (target.rfind("re:", 0) != 0) {
+        continue;
+      }
+      try {
+        const std::regex pattern(target.substr(3));
+      } catch (const std::regex_error& error) {
+        LOG(ERROR) << "Invalid compressed-tensors target: " << target << ": "
+                   << error.what();
+        return false;
+      }
+    }
+    groups.emplace_back(std::move(scheme));
+  }
+  if (groups.empty()) {
+    LOG(ERROR) << "Compressed-tensors config_groups is empty";
+    return false;
+  }
+  args.compressed_groups() = std::move(groups);
+  args.bits() = 8;
+  args.is_sym() = true;
+  args.activation_dynamic() = true;
+  args.is_compressed_tensors_w8a8_dynamic() = true;
+  return true;
+}
+
+bool load_ct_quant_config(const nlohmann::json& config, QuantArgs& quant_args) {
+  quant_args.quant_method() = "compressed-tensors";
+  quant_args.ignored_modules() =
+      config.value("ignore", std::vector<std::string>{});
+  auto config_groups_it = config.find("config_groups");
+  if (config_groups_it == config.end() || !config_groups_it->is_object()) {
+    LOG(ERROR) << "config_groups must be an object for "
+               << "compressed-tensors quantization.";
     return false;
   }
 
-  auto config_groups_it = quant_config_it->find("config_groups");
-  if (config_groups_it == quant_config_it->end() ||
-      !config_groups_it->is_object()) {
-    LOG(ERROR) << "quantization_config.config_groups must be an object for "
-                  "compressed-tensors quantization.";
-    return false;
+  if (config.value("format", "int-quantized") == "mixed-precision") {
+    return load_ct_int_config(config, quant_args);
   }
 
   for (const auto& [group_name, group] : config_groups_it->items()) {
@@ -102,6 +249,11 @@ bool try_load_compressed_tensors_quant_cfg(const JsonReader& reader,
 
     if (!is_compressed_tensors_fp8_scheme(*weights_it) ||
         !is_compressed_tensors_fp8_scheme(*input_activations_it)) {
+      if ((is_compressed_int_scheme(*weights_it, 8, false) ||
+           is_compressed_int_scheme(*weights_it, 4, false)) &&
+          is_compressed_int_scheme(*input_activations_it, 8, true)) {
+        return load_ct_int_config(config, quant_args);
+      }
       continue;
     }
 
@@ -116,9 +268,8 @@ bool try_load_compressed_tensors_quant_cfg(const JsonReader& reader,
     return true;
   }
 
-  LOG(ERROR) << "Failed to find an FP8 config_group in "
-                "quantization_config.config_groups for compressed-tensors "
-                "quantization.";
+  LOG(ERROR) << "Failed to find a supported FP8 or dynamic INT8 scheme in "
+                "compressed-tensors config_groups";
   return false;
 }
 
@@ -229,6 +380,17 @@ bool try_parse_layer_id(const std::string& tensor_name, int64_t* layer_id) {
   return false;
 }
 
+std::string infer_quantize_type_from_desc(bool has_w4a8_dynamic,
+                                          bool has_w8a8_dynamic) {
+  if (has_w4a8_dynamic) {
+    return "w4a8_dynamic";
+  }
+  if (has_w8a8_dynamic) {
+    return "w8a8_dynamic";
+  }
+  return "";
+}
+
 class ScopedMmap {
  public:
   ~ScopedMmap() {
@@ -329,20 +491,54 @@ void check_safetensors_cleanup(::Status status,
 
 }  // namespace
 
+// Rewrites a speculators-format Eagle3 draft config toward qwen3_eagle3: sets
+// model_type and resolves use_qk_norm (explicit value wins, else inferred from
+// the layer type). The backbone lift is left to normalize_config_torch_dtype.
+void normalize_speculators_config(nlohmann::json* config) {
+  // JsonReader treats null like a missing key; match that contract here so a
+  // config that explicitly writes "speculators_model_type": null parses
+  // instead of throwing nlohmann type_error.302 from json::value().
+  const auto spec_type_it = config->find("speculators_model_type");
+  if (spec_type_it == config->end() || !spec_type_it->is_string() ||
+      spec_type_it->get<std::string>() != "eagle3") {
+    return;
+  }
+  const auto layer_it = config->find("transformer_layer_config");
+  CHECK(layer_it != config->end() && layer_it->is_object())
+      << "speculators eagle3 draft config requires a "
+         "transformer_layer_config object";
+  const std::string layer_model_type = layer_it->value("model_type", "");
+  const bool layer_use_qk_norm =
+      layer_it->value("use_qk_norm", layer_model_type == "qwen3");
+  (*config)["model_type"] = "qwen3_eagle3";
+  if (!config->contains("use_qk_norm")) {
+    (*config)["use_qk_norm"] = layer_use_qk_norm;
+  }
+}
+
 bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
-  if (!reader.contains("quantization_config")) {
+  if (!reader.contains("quantization_config") &&
+      !reader.contains("compression_config")) {
     return true;
   }
+
+  const bool only_expert_per_group =
+      reader.value_or<bool>("quantization_config.only_expert_per_group", false);
+  quant_args.only_expert_per_group() = only_expert_per_group;
 
   if (auto v = reader.value<std::string>("quantization_config.quant_method")) {
     quant_args.quant_method() = v.value();
   }
-  // Only CUDA currently adapts this compressed-tensors JSON layout.
-  // For other backends, skip this special parsing path and continue with the
-  // generic quantization config parsing path.
-  if (Device::type_str() == "cuda" &&
-      try_load_compressed_tensors_quant_cfg(reader, quant_args)) {
-    return true;
+  // Checkpoint format parsing is independent of backend execution support.
+  const nlohmann::json data = reader.data();
+  const nlohmann::json* ct_config =
+      get_compressed_tensors_config(data, reader, "quantization_config");
+  if (ct_config == nullptr) {
+    ct_config =
+        get_compressed_tensors_config(data, reader, "compression_config");
+  }
+  if (ct_config != nullptr) {
+    return load_ct_quant_config(*ct_config, quant_args);
   }
   if (auto v = reader.value<int64_t>("quantization_config.bits")) {
     quant_args.bits() = v.value();
@@ -381,12 +577,6 @@ bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
             .get<std::vector<int64_t>>();
   }
 
-  bool only_expert_per_group = false;
-  if (auto v =
-          reader.value<bool>("quantization_config.only_expert_per_group")) {
-    only_expert_per_group = v.value();
-  }
-
   return validate_smoothquant_mixed_w4a8(
       reader, quant_args, only_expert_per_group);
 }
@@ -408,8 +598,12 @@ HFModelLoader::HFModelLoader(const std::string& model_weights_path)
   // sort the model weights files by name
   std::sort(model_weights_files_.begin(), model_weights_files_.end());
 
-  threadpool_ = std::make_unique<ThreadPool>(32);
-  if (FLAGS_backend == "rec" && is_onerec_model_type(args_.model_type())) {
+  threadpool_ = std::make_unique<ThreadPool>(
+      /*num_threads=*/32,
+      /*cpu_binding=*/false,
+      /*pool_name=*/"HFModelLoader.load_weights");
+  if (::xllm::ModelConfig::get_instance().backend() == "rec" &&
+      is_onerec_model_type(args_.model_type())) {
     CHECK(load_rec_vocab(model_weights_path))
         << "Failed to load rec content from " << model_weights_path;
   }
@@ -657,7 +851,19 @@ bool HFModelLoader::load_rec_vocab(const std::string& model_weights_path) {
               ->initialize(vocab_full_path))
         << "Failed to initialize vocab dict from " << vocab_full_path;
   } else {
-    LOG(ERROR) << "Vocab file is not set";
+    if (::xllm::RecConfig::get_instance().enable_constrained_decoding()) {
+      LOG(ERROR) << "Vocab file is not set for OneRec REC tokenizer under "
+                 << model_weights_path
+                 << ". Constrained decoding requires `vocab_file` in "
+                    "tokenizer_config.json.";
+      return false;
+    }
+
+    LOG(WARNING) << "Vocab file is not set for OneRec REC tokenizer under "
+                 << model_weights_path
+                 << ". Skip vocab dict initialization because constrained "
+                    "decoding is disabled.";
+    return true;
   }
 
   return true;
@@ -691,6 +897,12 @@ bool HFModelLoader::load_args(const std::string& model_weights_path) {
     return false;
   }
 
+  if (!load_audio_preprocessor_args(model_weights_path)) {
+    LOG(ERROR) << "Failed to load audio preprocess args from "
+               << model_weights_path;
+    return false;
+  }
+
   // Some hacky logics to support loading of old models
   // always use float16 for quantization
   // TODO: support quantization for other data types
@@ -711,13 +923,12 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
     return false;
   }
 
-  std::string model_type;
-  if (auto data = reader.value<std::string>("model_type")) {
-    model_type = data.value();
-  } else {
-    LOG(ERROR) << "Failed to find model_type in " << args_file_path;
-    return false;
-  }
+  normalize_speculators_config(&reader.mutable_data());
+
+  const std::string model_type =
+      util::get_model_type(reader,
+                           std::filesystem::path(model_weights_path),
+                           ModelConfig::get_instance().backend());
 
   std::string resolved_model_type;
   std::string error_message;
@@ -734,7 +945,11 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
                << resolved_model_type;
     return false;
   }
+  normalize_config_torch_dtype(reader);
   model_args_loader(reader, &args_);
+  args_.enable_mla(
+      util::should_enable_mla(std::filesystem::path(model_weights_path),
+                              ModelConfig::get_instance().backend()));
 
   return true;
 }
@@ -747,16 +962,155 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
     return false;
   }
 
+  normalize_config_torch_dtype(reader);
+
   if (!load_quant_cfg(reader, quant_args_)) {
     return false;
   }
 
   // load quantization args for npu if exists
-  if (reader.contains("quantize")) {
+  const bool has_config_quantize = reader.contains("quantize");
+  if (has_config_quantize) {
     quant_args_.quantize_type() = reader.value_or<std::string>("quantize", "");
   }
   if (reader.contains("torch_dtype")) {
     quant_args_.torch_dtype() = reader.value_or<std::string>("torch_dtype", "");
+  }
+  if (auto v = reader.value<std::string>("quantization_config.version")) {
+    quant_args_.quant_version() = v.value();
+  }
+  if (quant_args_.quantize_type().empty() &&
+      boost::iequals(quant_args_.quant_method(), "w4a8_dynamic")) {
+    quant_args_.quantize_type() = "w4a8_dynamic";
+  }
+  bool model_is_w4a8_dynamic =
+      boost::iequals(quant_args_.quantize_type(), "w4a8_dynamic");
+  if (boost::iequals(quant_args_.quantize_type(), "w4a8_dynamic")) {
+    quant_args_.bits() = 8;
+    quant_args_.moe_weight_bits() = 4;
+    quant_args_.activation_dynamic() = true;
+  }
+
+  bool explicit_quant_group_size =
+      reader.contains("quantization_config.group_size");
+
+  // Ascend-style quant description file.
+  // This file provides per-weight quant types, e.g.
+  // "layers.0.attn.wq_a.weight": "W8A8_DYNAMIC".
+  JsonReader quant_desc_reader;
+  const std::string quant_desc_file_path =
+      model_weights_path + "/quant_model_description.json";
+  if (quant_desc_reader.parse(quant_desc_file_path)) {
+    std::unordered_map<std::string, std::string> quant_descs;
+    const auto quant_desc_data = quant_desc_reader.data();
+    bool desc_model_quant_is_w4a8_dynamic = false;
+    bool desc_has_w4a8 = false;
+    bool desc_has_w8a8 = false;
+    bool desc_has_w4a8_dynamic = false;
+    bool desc_has_w8a8_dynamic = false;
+    if (!quant_desc_data.is_object()) {
+      LOG(WARNING) << "quant_model_description is not a JSON object: "
+                   << quant_desc_file_path;
+    } else {
+      quant_descs.reserve(quant_desc_data.size());
+      for (auto it = quant_desc_data.begin(); it != quant_desc_data.end();
+           ++it) {
+        if (!it.value().is_string()) {
+          continue;
+        }
+        // Keep only tensor-like keys (contains '.'); skip metadata fields such
+        // as model_quant_type/version.
+        if (it.key().find('.') == std::string::npos) {
+          continue;
+        }
+        const std::string quant_type = it.value().get<std::string>();
+        std::string quant_type_lower = quant_type;
+        boost::algorithm::to_lower(quant_type_lower);
+        if (boost::algorithm::starts_with(quant_type_lower, "w4a8")) {
+          desc_has_w4a8 = true;
+        } else if (boost::algorithm::starts_with(quant_type_lower, "w8a8")) {
+          desc_has_w8a8 = true;
+        }
+        if (boost::iequals(quant_type, "w4a8_dynamic")) {
+          desc_has_w4a8_dynamic = true;
+        } else if (boost::iequals(quant_type, "w8a8_dynamic")) {
+          desc_has_w8a8_dynamic = true;
+        }
+        quant_descs.emplace(it.key(), quant_type);
+        std::string mapped_key = it.key();
+        const std::string packed_weight = "weight_packed";
+        if (const auto pos = mapped_key.find(packed_weight);
+            pos != std::string::npos) {
+          mapped_key.replace(pos, packed_weight.size(), "weight");
+          quant_descs.emplace(std::move(mapped_key), quant_type);
+        }
+      }
+    }
+    quant_args_.quant_descs() = std::move(quant_descs);
+    if (desc_has_w4a8) {
+      quant_args_.quant_method() = kQuantMethodAscendInt4;
+    } else if (desc_has_w8a8) {
+      quant_args_.quant_method() = kQuantMethodAscendInt8;
+    }
+    LOG(INFO) << "Loaded quant_model_description from " << quant_desc_file_path
+              << ", quant_desc_count=" << quant_args_.quant_descs().size()
+              << ", quant_method="
+              << (quant_args_.quant_method().empty()
+                      ? "<empty>"
+                      : quant_args_.quant_method());
+
+    const std::string desc_inferred_quantize_type =
+        infer_quantize_type_from_desc(desc_has_w4a8_dynamic,
+                                      desc_has_w8a8_dynamic);
+    if (!has_config_quantize && !desc_inferred_quantize_type.empty()) {
+      quant_args_.quantize_type() = desc_inferred_quantize_type;
+    }
+    if (quant_args_.quantize_type().empty()) {
+      if (auto v = quant_desc_reader.value<std::string>("model_quant_type")) {
+        auto quantize_type = v.value();
+        boost::algorithm::to_lower(quantize_type);
+        quant_args_.quantize_type() = quantize_type;
+        LOG(INFO) << "Fallback quantize_type from quant_model_description: "
+                  << quant_args_.quantize_type();
+      }
+    }
+    desc_model_quant_is_w4a8_dynamic =
+        boost::iequals(quant_args_.quantize_type(), "w4a8_dynamic") ||
+        desc_has_w4a8_dynamic;
+    model_is_w4a8_dynamic =
+        model_is_w4a8_dynamic || desc_model_quant_is_w4a8_dynamic;
+    if (desc_model_quant_is_w4a8_dynamic) {
+      if (quant_args_.quantize_type().empty()) {
+        quant_args_.quantize_type() = "w4a8_dynamic";
+      }
+      quant_args_.bits() = 8;
+      quant_args_.moe_weight_bits() = 4;
+      quant_args_.activation_dynamic() = true;
+    }
+    if (auto v = quant_desc_reader.value<int64_t>("group_size")) {
+      quant_args_.group_size() = v.value();
+      explicit_quant_group_size = true;
+    } else if (desc_model_quant_is_w4a8_dynamic && !explicit_quant_group_size) {
+      // Match vllm-ascend W4A8_DYNAMIC's default. A config value of 0 is still
+      // respected as the per-channel mode.
+      quant_args_.group_size() = 256;
+      explicit_quant_group_size = true;
+    }
+    if (auto v = quant_desc_reader.value<std::string>("version")) {
+      quant_args_.quant_version() = v.value();
+    }
+  }
+  if (model_is_w4a8_dynamic && !explicit_quant_group_size) {
+    quant_args_.group_size() = 256;
+  }
+  if (model_is_w4a8_dynamic && quant_args_.quant_version() != "1.0.0") {
+    LOG(ERROR) << "W4A8_DYNAMIC only supports quant_version 1.0.0, got "
+               << (quant_args_.quant_version().empty()
+                       ? "<empty>"
+                       : quant_args_.quant_version())
+               << ". Please provide quant_model_description.json version "
+                  "\"1.0.0\".";
+    return false;
   }
 
   // awq quantization args
@@ -891,86 +1245,114 @@ bool HFModelLoader::load_image_preprocessor_args(
     const std::string& model_weights_path) {
   // image preprocessor args
   JsonReader image_preprocess_reader;
-  const std::string image_preprocess_file_path =
+  const std::string flat_file_path =
       model_weights_path + "/preprocessor_config.json";
-  if (image_preprocess_reader.parse(image_preprocess_file_path)) {
+  const std::string nested_file_path =
+      model_weights_path + "/processor_config.json";
+  bool parsed = false;
+  std::string used_file_path;
+  if (image_preprocess_reader.parse(flat_file_path)) {
+    parsed = true;
+    used_file_path = flat_file_path;
+  } else if (image_preprocess_reader.parse(nested_file_path)) {
+    // GLM-5.3-Flash ships a single ``processor_config.json`` whose image
+    // fields live under the ``image_processor`` sub-object. Resolve every key
+    // as ``image_processor.<key>`` first, then the flat top-level form, so
+    // legacy flat ``preprocessor_config.json`` files keep working.
+    parsed = true;
+    used_file_path = nested_file_path;
+  }
+  if (parsed) {
     LOG(INFO) << "Success to parse image preprocess args file: "
-              << image_preprocess_file_path;
-    args_.mm_image_do_center_crop() =
-        image_preprocess_reader.value_or<bool>("do_center_crop", false);
-    args_.mm_image_crop_height_size() =
-        image_preprocess_reader.value_or<int>("crop_size.height", 335);
-    args_.mm_image_crop_width_size() =
-        image_preprocess_reader.value_or<int>("crop_size.width", 335);
+              << used_file_path;
+    const nlohmann::json root = image_preprocess_reader.data();
+    // Resolve a key against the nested ``image_processor`` sub-object first,
+    // then the flat top-level layout; returns nullptr if neither exists.
+    auto resolve_field = [&](const std::string& key) -> const nlohmann::json* {
+      if (auto* ptr =
+              JsonReader::resolve_path(root, "image_processor." + key)) {
+        return ptr;
+      }
+      return JsonReader::resolve_path(root, key);
+    };
+    auto field_int = [&](const std::string& key, int default_value) -> int {
+      const auto* ptr = resolve_field(key);
+      if (ptr != nullptr && !ptr->is_null() && !ptr->is_object()) {
+        return ptr->get<int>();
+      }
+      return default_value;
+    };
+    auto field_bool = [&](const std::string& key, bool default_value) -> bool {
+      const auto* ptr = resolve_field(key);
+      if (ptr != nullptr && !ptr->is_null() && !ptr->is_object()) {
+        return ptr->get<bool>();
+      }
+      return default_value;
+    };
+    auto field_double = [&](const std::string& key,
+                            double default_value) -> double {
+      const auto* ptr = resolve_field(key);
+      if (ptr != nullptr && !ptr->is_null() && !ptr->is_object()) {
+        return ptr->get<double>();
+      }
+      return default_value;
+    };
+    auto field_double_vec =
+        [&](const std::string& key) -> std::optional<std::vector<double>> {
+      const auto* ptr = resolve_field(key);
+      if (ptr != nullptr && ptr->is_array()) {
+        return ptr->get<std::vector<double>>();
+      }
+      return std::nullopt;
+    };
 
-    args_.mm_image_do_resize() =
-        image_preprocess_reader.value_or<bool>("do_resize", false);
+    args_.mm_image_do_center_crop() = field_bool("do_center_crop", false);
+    args_.mm_image_crop_height_size() = field_int("crop_size.height", 335);
+    args_.mm_image_crop_width_size() = field_int("crop_size.width", 335);
+
+    args_.mm_image_do_resize() = field_bool("do_resize", false);
     args_.mm_image_resize_shortest_edge() =
-        image_preprocess_reader.value_or<int>("size.shortest_edge", 335);
-    args_.mm_image_resample() =
-        image_preprocess_reader.value_or<int>("resample", 335);
+        field_int("size.shortest_edge", 335);
+    args_.mm_image_resample() = field_int("resample", 335);
 
-    args_.mm_image_do_rescale() =
-        image_preprocess_reader.value_or<bool>("do_rescale", false);
-    args_.mm_image_rescale_factor() =
-        image_preprocess_reader.value_or<double>("rescale_factor", 0);
+    args_.mm_image_do_rescale() = field_bool("do_rescale", false);
+    args_.mm_image_rescale_factor() = field_double("rescale_factor", 0);
 
-    args_.mm_image_do_normalize() =
-        image_preprocess_reader.value_or<bool>("do_normalize", false);
+    args_.mm_image_do_normalize() = field_bool("do_normalize", false);
 
-    const auto& image_prerocess_data = image_preprocess_reader.data();
-    if (image_preprocess_reader.contains("image_mean")) {
-      args_.mm_image_normalize_mean() =
-          image_prerocess_data["image_mean"].get<std::vector<double>>();
+    if (auto v = field_double_vec("image_mean")) {
+      args_.mm_image_normalize_mean() = std::move(*v);
+    }
+    if (auto v = field_double_vec("image_std")) {
+      args_.mm_image_normalize_std() = std::move(*v);
+    }
+    if (auto v = field_double_vec("norm_mean")) {
+      args_.mm_image_normalize_mean() = std::move(*v);
+    }
+    if (auto v = field_double_vec("norm_std")) {
+      args_.mm_image_normalize_std() = std::move(*v);
     }
 
-    if (image_preprocess_reader.contains("image_std")) {
-      args_.mm_image_normalize_std() =
-          image_prerocess_data["image_std"].get<std::vector<double>>();
-    }
+    args_.mm_image_shortest_edge() = field_int("size.shortest_edge", 0);
+    args_.mm_image_longest_edge() = field_int("size.longest_edge", 0);
 
-    if (image_preprocess_reader.contains("norm_mean")) {
-      args_.mm_image_normalize_mean() =
-          image_prerocess_data["norm_mean"].get<std::vector<double>>();
-    }
+    args_.mm_image_min_pixels() = field_int("min_pixels", 0);
+    args_.mm_image_max_pixels() = field_int("max_pixels", 0);
 
-    if (image_preprocess_reader.contains("norm_std")) {
-      args_.mm_image_normalize_std() =
-          image_prerocess_data["norm_std"].get<std::vector<double>>();
-    }
+    // per-token resize budget (token units; multiplied by pixels_per_token
+    // inside the image processor). When both are > 0 the token-budget
+    // smart_resize is used, matching HF Glm5NextImageProcessor.
+    args_.mm_image_min_tokens() = field_int("min_image_tokens", 0);
+    args_.mm_image_max_tokens() = field_int("max_image_tokens", 0);
 
-    args_.mm_image_shortest_edge() =
-        image_preprocess_reader.value_or<int>("size.shortest_edge", 0);
+    args_.mm_image_patch_size() = field_int("patch_size", 0);
+    args_.mm_image_temporal_patch_size() = field_int("temporal_patch_size", 0);
+    args_.mm_image_merge_size() = field_int("merge_size", 0);
 
-    args_.mm_image_longest_edge() =
-        image_preprocess_reader.value_or<int>("size.longest_edge", 0);
-
-    args_.mm_image_min_pixels() =
-        image_preprocess_reader.value_or<int>("min_pixels", 0);
-
-    args_.mm_image_max_pixels() =
-        image_preprocess_reader.value_or<int>("max_pixels", 0);
-
-    args_.mm_image_patch_size() =
-        image_preprocess_reader.value_or<int>("patch_size", 0);
-
-    args_.mm_image_temporal_patch_size() =
-        image_preprocess_reader.value_or<int>("temporal_patch_size", 0);
-
-    args_.mm_image_merge_size() =
-        image_preprocess_reader.value_or<int>("merge_size", 0);
-
-    args_.mm_image_feature_size() =
-        image_preprocess_reader.value_or<int>("image_feature_size", 0);
-
-    args_.mm_scale_resolution() =
-        image_preprocess_reader.value_or<int>("scale_resolution", 0);
-
-    args_.mm_slice_mode() =
-        image_preprocess_reader.value_or<bool>("slice_mode", false);
-
-    args_.mm_use_image_id() =
-        image_preprocess_reader.value_or<bool>("use_image_id", false);
+    args_.mm_image_feature_size() = field_int("image_feature_size", 0);
+    args_.mm_scale_resolution() = field_int("scale_resolution", 0);
+    args_.mm_slice_mode() = field_bool("slice_mode", false);
+    args_.mm_use_image_id() = field_bool("use_image_id", false);
   }
 
   return true;
@@ -980,40 +1362,183 @@ bool HFModelLoader::load_video_preprocessor_args(
     const std::string& model_weights_path) {
   // video preprocessor args
   JsonReader video_preprocess_reader;
-  const std::string video_preprocess_file_path =
+  const std::string flat_file_path =
       model_weights_path + "/video_preprocessor_config.json";
-  if (video_preprocess_reader.parse(video_preprocess_file_path)) {
-    LOG(INFO) << "Success to parse video preprocess args file: "
-              << video_preprocess_file_path;
-
-    args_.mm_video_shortest_edge() =
-        video_preprocess_reader.value_or<int>("size.shortest_edge", 0);
-
-    args_.mm_video_longest_edge() =
-        video_preprocess_reader.value_or<int>("size.longest_edge", 0);
-
-    const auto& video_prerocess_data = video_preprocess_reader.data();
-    if (video_preprocess_reader.contains("image_mean")) {
-      args_.mm_video_normalize_mean() =
-          video_prerocess_data["image_mean"].get<std::vector<double>>();
-    }
-
-    if (video_preprocess_reader.contains("image_std")) {
-      args_.mm_video_normalize_std() =
-          video_prerocess_data["image_std"].get<std::vector<double>>();
-    }
-    args_.mm_video_patch_size() =
-        video_preprocess_reader.value_or<int>("patch_size", 0);
-
-    args_.mm_video_temporal_patch_size() =
-        video_preprocess_reader.value_or<int>("temporal_patch_size", 0);
-
-    args_.mm_video_merge_size() =
-        video_preprocess_reader.value_or<int>("merge_size", 0);
-
-    args_.mm_video_do_rescale() =
-        video_preprocess_reader.value_or<bool>("do_rescale", false);
+  const std::string nested_file_path =
+      model_weights_path + "/processor_config.json";
+  // Qwen3-Omni keeps video fields (video_max_pixels, ...) in the flat
+  // preprocessor_config.json instead of a dedicated video preprocessor file.
+  const std::string omni_file_path =
+      model_weights_path + "/preprocessor_config.json";
+  bool parsed = false;
+  std::string used_file_path;
+  if (video_preprocess_reader.parse(flat_file_path)) {
+    parsed = true;
+    used_file_path = flat_file_path;
+  } else if (video_preprocess_reader.parse(nested_file_path)) {
+    // GLM-5.3-Flash nests video fields under ``video_processor``.
+    parsed = true;
+    used_file_path = nested_file_path;
+  } else if (video_preprocess_reader.parse(omni_file_path)) {
+    parsed = true;
+    used_file_path = omni_file_path;
   }
+  if (parsed) {
+    LOG(INFO) << "Success to parse video preprocess args file: "
+              << used_file_path;
+    const nlohmann::json root = video_preprocess_reader.data();
+    auto resolve_field = [&](const std::string& key) -> const nlohmann::json* {
+      if (auto* ptr =
+              JsonReader::resolve_path(root, "video_processor." + key)) {
+        return ptr;
+      }
+      return JsonReader::resolve_path(root, key);
+    };
+    auto field_int = [&](const std::string& key, int default_value) -> int {
+      const auto* ptr = resolve_field(key);
+      if (ptr != nullptr && !ptr->is_null() && !ptr->is_object()) {
+        return ptr->get<int>();
+      }
+      return default_value;
+    };
+    auto field_bool = [&](const std::string& key, bool default_value) -> bool {
+      const auto* ptr = resolve_field(key);
+      if (ptr != nullptr && !ptr->is_null() && !ptr->is_object()) {
+        return ptr->get<bool>();
+      }
+      return default_value;
+    };
+    auto field_double_vec =
+        [&](const std::string& key) -> std::optional<std::vector<double>> {
+      const auto* ptr = resolve_field(key);
+      if (ptr != nullptr && ptr->is_array()) {
+        return ptr->get<std::vector<double>>();
+      }
+      return std::nullopt;
+    };
+
+    args_.mm_video_shortest_edge() = field_int("size.shortest_edge", 0);
+    args_.mm_video_longest_edge() = field_int("size.longest_edge", 0);
+
+    if (auto v = field_double_vec("image_mean")) {
+      args_.mm_video_normalize_mean() = std::move(*v);
+    }
+    if (auto v = field_double_vec("image_std")) {
+      args_.mm_video_normalize_std() = std::move(*v);
+    }
+
+    args_.mm_video_patch_size() = field_int("patch_size", 0);
+    args_.mm_video_temporal_patch_size() = field_int("temporal_patch_size", 0);
+    args_.mm_video_merge_size() = field_int("merge_size", 0);
+    args_.mm_video_do_rescale() = field_bool("do_rescale", false);
+
+    // per-token resize budget for video (token units). When both are > 0
+    // the token-budget smart_resize is used.
+    args_.mm_video_min_tokens() = field_int("min_image_tokens", 0);
+    args_.mm_video_max_tokens() = field_int("max_image_tokens", 0);
+
+    // Qwen3-Omni per-frame pixel budget for video (pixel units).
+    args_.mm_video_max_pixels() = field_int("video_max_pixels", 0);
+  }
+
+  return true;
+}
+
+bool HFModelLoader::load_audio_preprocessor_args(
+    const std::string& model_weights_path) {
+  // audio preprocessor args
+  JsonReader audio_preprocess_reader;
+  const std::string flat_file_path =
+      model_weights_path + "/audio_preprocessor_config.json";
+  const std::string shared_file_path =
+      model_weights_path + "/preprocessor_config.json";
+  bool parsed = false;
+  std::string used_file_path;
+  if (audio_preprocess_reader.parse(flat_file_path)) {
+    parsed = true;
+    used_file_path = flat_file_path;
+  } else if (audio_preprocess_reader.parse(shared_file_path)) {
+    // The shared preprocessor_config.json usually belongs to the image /
+    // video frontend: accept it as an audio config only when it carries
+    // sampling_rate (mandatory in every audio feature-extractor config,
+    // never present in image/video processor configs).
+    if (audio_preprocess_reader.contains("sampling_rate")) {
+      parsed = true;
+      used_file_path = shared_file_path;
+    }
+  }
+  if (!parsed) {
+    return true;  // no audio config — text-only and image/video models
+                  // keep the defaults
+  }
+  LOG(INFO) << "Success to parse audio preprocess args file: "
+            << used_file_path;
+  args_.mm_audio_num_mel_bins() = audio_preprocess_reader.value_or<int>(
+      std::vector<std::string>{"num_mel_bins", "feature_size"}, 80);
+  args_.mm_audio_max_frames() =
+      audio_preprocess_reader.value_or<int>("max_length", 3000);
+  // The model-args registration runs first; an absent key must not clobber it.
+  args_.mm_audio_downsample_rate() = audio_preprocess_reader.value_or<int>(
+      "downsample_rate", static_cast<int>(args_.mm_audio_downsample_rate()));
+  // The frontend enforces its 16k contract at construction.
+  args_.mm_audio_sampling_rate() =
+      audio_preprocess_reader.value_or<int>("sampling_rate", 16000);
+
+  const int64_t sampling_rate = args_.mm_audio_sampling_rate();
+  const double frame_length =
+      audio_preprocess_reader.value_or<double>("frame_length", 25.0);
+  const double frame_shift =
+      audio_preprocess_reader.value_or<double>("frame_shift", 10.0);
+  const bool in_samples = frame_length > 100 || frame_shift > 100;
+  args_.mm_audio_frame_length() =
+      in_samples ? static_cast<int64_t>(frame_length)
+                 : static_cast<int64_t>(frame_length * sampling_rate / 1000);
+  args_.mm_audio_frame_shift() =
+      in_samples ? static_cast<int64_t>(frame_shift)
+                 : static_cast<int64_t>(frame_shift * sampling_rate / 1000);
+
+  // CMVN vectors: an array-only optional, which value_or cannot express. The
+  // named copy keeps the resolve_path pointers alive (data() returns by value).
+  const nlohmann::json root = audio_preprocess_reader.data();
+  auto field_double_vec =
+      [&](const std::string& key) -> std::optional<std::vector<double>> {
+    const auto* ptr = JsonReader::resolve_path(root, key);
+    if (ptr != nullptr && ptr->is_array()) {
+      return ptr->get<std::vector<double>>();
+    }
+    return std::nullopt;
+  };
+
+  if (auto v = field_double_vec("means")) {
+    args_.mm_audio_cmvn_means() = std::move(*v);
+  }
+  if (auto v = field_double_vec("inverse_std_variences")) {
+    args_.mm_audio_cmvn_inverse_std() = std::move(*v);
+  }
+  // Qwen3-Omni whisper feature-extraction params (same
+  // preprocessor_config.json family).
+  args_.mm_audio_feature_size() =
+      audio_preprocess_reader.value_or<int64_t>("feature_size", 80);
+
+  args_.mm_audio_hop_length() =
+      audio_preprocess_reader.value_or<int64_t>("hop_length", 160);
+
+  args_.mm_audio_chunk_length() =
+      audio_preprocess_reader.value_or<int64_t>("chunk_length", 300);
+
+  args_.mm_audio_n_fft() =
+      audio_preprocess_reader.value_or<int64_t>("n_fft", 400);
+
+  args_.mm_audio_padding_value() =
+      audio_preprocess_reader.value_or<double>("padding_value", 0.0);
+
+  args_.mm_audio_dither() =
+      audio_preprocess_reader.value_or<double>("dither", 0.0);
+
+  args_.mm_audio_return_attention_mask() =
+      audio_preprocess_reader.value_or<bool>(
+          "return_attention_mask",
+          static_cast<bool>(args_.mm_audio_return_attention_mask()));
 
   return true;
 }

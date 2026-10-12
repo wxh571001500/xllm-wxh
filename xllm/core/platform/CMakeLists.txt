@@ -1,5 +1,4 @@
 include(cc_library)
-include(cc_test)
 
 if(USE_NPU)
   add_subdirectory(npu)
@@ -10,20 +9,52 @@ cc_library(
     platform
   HDRS
     stream.h
+    model_stream_registry.h
     device.h
+    platform.h
+    device_name_utils.h
     vmm_api.h
     shared_vmm_allocator.h
     vmm_torch_allocator.h
+    sleepable_allocator.h
+    batch_memcpy.h
+    layer_synchronizer.h
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_batch_memcpy.h>
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_host_memory.h>
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.h>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_layer_synchronizer.h>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_tensor_alloc.h>
     $<$<BOOL:${USE_CUDA}>:cuda/cuda_utils.h>
-    $<$<BOOL:${USE_CUDA}>:numa_utils.h>
+    $<$<BOOL:${USE_MUSA}>:musa/musa_csrc_guards.h>
+    $<$<BOOL:${USE_MUSA}>:musa/musa_utils.h>
+    $<$<BOOL:${USE_CUDA}>:cuda_profiler.h>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_DCU}>,$<BOOL:${USE_MUSA}>>:torch_profiler.h>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MUSA}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:numa_utils.h>
   SRCS
     stream.cpp
+    model_stream_registry.cpp
     device.cpp
+    platform.cpp
+    device_name_utils.cpp
     vmm_api.cpp
     shared_vmm_allocator.cpp
-    $<$<BOOL:${USE_CUDA}>:numa_utils.cpp>
+    sleepable_allocator.cpp
+    batch_memcpy.cpp
+    layer_synchronizer.cpp
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_batch_memcpy.cpp>
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_host_memory.cpp>
+    $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.cpp>
+    $<$<BOOL:${USE_CUDA}>:cuda_profiler.cpp>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_DCU}>,$<BOOL:${USE_MUSA}>>:torch_profiler.cpp>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_layer_synchronizer.cpp>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_tensor_alloc.cpp>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MUSA}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:numa_utils.cpp>
   DEPS
+    :config
+    absl::strings
     torch
+    glog::glog
+    :util
     $<$<BOOL:${USE_NPU}>:torch_npu>
     $<$<BOOL:${USE_NPU}>:ascendcl>
     $<$<BOOL:${USE_MLU}>:torch_mlu>
@@ -31,24 +62,9 @@ cc_library(
     $<$<BOOL:${USE_MLU}>:cndrv>
     $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_ILU}>>:cuda>
     $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_ILU}>>:cudart>
-    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_ILU}>>:numa>
+    $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MUSA}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_ILU}>,$<BOOL:${USE_DCU}>>:numa>
     $<$<BOOL:${USE_MUSA}>:musa>
     $<$<BOOL:${USE_MUSA}>:musart>
     $<$<BOOL:${USE_NPU}>:platform_npu>
+    $<$<BOOL:${USE_DCU}>:hip::host>
 )
-
-# TODO: test on multi device
-if(USE_NPU OR USE_CUDA OR USE_ILU)
-cc_test(
-  NAME
-    multi_platform_vmm_test
-  SRCS
-    shared_vmm_allocator_test.cpp
-  DEPS
-    :platform
-    :flags
-    GTest::gtest_main
-    glog::glog
-)
-endif()
-

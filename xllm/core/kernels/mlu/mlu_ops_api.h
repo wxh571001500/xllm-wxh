@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,12 +19,32 @@ limitations under the License.
 
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "ATen/Tensor.h"
 #include "torch_mlu_ops.h"
 
 namespace xllm::kernel::mlu {
+
+// Scale [B,H,V] in place using gathered [N,B,H] LSEs and int32 slots.
+void dcp_correct_attn_out(torch::Tensor& output,
+                          const torch::Tensor& lse,
+                          const torch::Tensor& slots,
+                          int64_t rank,
+                          bool base_e = true);
+
+// Write an independent contiguous [H,B,V] destination; inputs stay unchanged.
+void dcp_correct_attn_transpose(const torch::Tensor& output,
+                                const torch::Tensor& lse,
+                                const torch::Tensor& slots,
+                                int64_t rank,
+                                torch::Tensor& dst,
+                                bool base_e = true);
+
+void pack_cache_blocks(const std::vector<torch::Tensor>& sources,
+                       const torch::Tensor& block_ids,
+                       const std::vector<torch::Tensor>& destinations);
 
 void apply_rotary(torch::Tensor& q,
                   torch::Tensor& k,
@@ -142,7 +162,19 @@ void batch_decode(const torch::Tensor& query,
                   int64_t window_size_right,
                   float scale,
                   bool return_lse,
-                  int64_t kv_cache_quant_bit_size);
+                  int64_t kv_cache_quant_bit_size,
+                  const std::optional<torch::Tensor>& cu_seq_q = std::nullopt,
+                  int64_t max_seq_q = -1,
+                  const std::optional<torch::Tensor>& sink = std::nullopt);
+
+void update_out_and_lse(
+    torch::Tensor& out,
+    torch::Tensor& lse,
+    const torch::Tensor& block_out,
+    const torch::Tensor& block_lse,
+    const std::optional<torch::Tensor>& seq_offsets = std::nullopt,
+    const std::optional<torch::Tensor>& cu_seqs = std::nullopt,
+    const std::optional<torch::Tensor>& block_cu_seqs = std::nullopt);
 
 void masked_indexer_select_paged_kv(
     const torch::Tensor& query,
@@ -160,12 +192,16 @@ void masked_indexer_select_paged_kv(
     const std::optional<torch::Tensor>& q_scale,
     const std::optional<torch::Tensor>& k_scale_cache,
     const torch::Tensor& sparse_block_table,
-    const torch::Tensor& sparse_context_lens);
+    const torch::Tensor& sparse_context_lens,
+    bool is_score_float = false,
+    int64_t compress_ratio = 1,
+    const std::optional<torch::Tensor>& kv_cache_block_table_offset =
+        std::nullopt);
 
 void fused_layernorm(const torch::Tensor& input,
                      torch::Tensor& output,
                      const std::optional<torch::Tensor>& residual,
-                     const torch::Tensor& weight,
+                     const std::optional<torch::Tensor>& weight,
                      const std::optional<torch::Tensor>& beta,
                      const std::optional<torch::Tensor>& bias,
                      const std::optional<torch::Tensor>& quant_scale,
@@ -325,6 +361,38 @@ void gather_split(const torch::Tensor& input,
                   const torch::Tensor& output_head,
                   const torch::Tensor& output_tail);
 
+torch::Tensor fused_mul_reduce_sum(const torch::Tensor& x,
+                                   const torch::Tensor& w);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_split_sinkhorn(
+    const torch::Tensor& mixes,
+    const torch::Tensor& hc_scale,
+    const torch::Tensor& hc_base,
+    const std::optional<torch::Tensor>& pre_scale,
+    int64_t hc_mult,
+    int64_t sinkhorn_iter,
+    double eps);
+
+std::tuple<torch::Tensor, torch::Tensor> fused_mhc_post(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const torch::Tensor& post,
+    const torch::Tensor& comb,
+    bool compute_rms,
+    double eps);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fused_mhc(const torch::Tensor& x,
+          const torch::Tensor& residual_in,
+          const torch::Tensor& hc_fn,
+          const torch::Tensor& gamma,
+          const torch::Tensor& post_in,
+          const torch::Tensor& comb_in,
+          const torch::Tensor& hc_scale,
+          const torch::Tensor& hc_base,
+          int64_t sinkhorn_iter,
+          double eps);
+
 void fused_mla_q(const torch::Tensor& input,
                  torch::Tensor& output,
                  torch::Tensor& output_scale,
@@ -340,6 +408,24 @@ void fused_mla_q(const torch::Tensor& input,
                  const std::string& quant_mode,
                  double eps,
                  bool interleaved);
+
+void fused_mla_q_v2(const torch::Tensor& input,
+                    torch::Tensor& output,
+                    const std::optional<torch::Tensor>& output_norm,
+                    const torch::Tensor& gamma,
+                    const std::optional<torch::Tensor>& smooth_quant_scale,
+                    const torch::Tensor& weight_b,
+                    const std::optional<torch::Tensor>& weight_b_scale,
+                    const torch::Tensor& sin,
+                    const torch::Tensor& cos,
+                    const torch::Tensor& position_id,
+                    double eps,
+                    bool interleaved);
+
+torch::Tensor batch_matmul(const torch::Tensor& a,
+                           const torch::Tensor& b,
+                           bool trans_a,
+                           bool trans_b);
 
 void fused_mla_kv(const torch::Tensor& input_kv,
                   const torch::Tensor& sin,
@@ -384,5 +470,183 @@ void fused_indexer_k(const torch::Tensor& x,
                      const std::optional<torch::Tensor>& gamma,
                      const std::optional<torch::Tensor>& beta,
                      double eps);
+
+torch::Tensor gated_layer_norm(torch::Tensor& x,
+                               const torch::Tensor& weight,
+                               const torch::Tensor& bias,
+                               double eps,
+                               const std::optional<torch::Tensor>& gate,
+                               int64_t group_size,
+                               bool norm_before_gate);
+
+torch::Tensor gemma_rms_norm(const torch::Tensor& x,
+                             const torch::Tensor& gamma,
+                             double eps,
+                             torch::Tensor& norm_out,
+                             const std::optional<torch::Tensor>& residual,
+                             std::optional<torch::Tensor>& residual_out);
+
+std::tuple<torch::Tensor, torch::Tensor> moe_softplus_topk(
+    const torch::Tensor& input,
+    int64_t topk,
+    const std::optional<torch::Tensor>& input_ids = std::nullopt,
+    const std::optional<torch::Tensor>& tid2eid = std::nullopt,
+    const std::optional<torch::Tensor>& bias = std::nullopt,
+    float route_scale = 1.0);
+
+void fused_compress_single_kv(
+    const torch::Tensor& kv,
+    const torch::Tensor& score,
+    const torch::Tensor& position,
+    const torch::Tensor& ape,
+    const torch::Tensor& gamma,
+    const torch::Tensor& sin,
+    const torch::Tensor& cos,
+    const std::optional<torch::Tensor>& hadamard_matrix,
+    const torch::Tensor& slot_mapping,
+    torch::Tensor& kv_cache,
+    const std::optional<torch::Tensor>& kv_cache_scale,
+    double eps,
+    bool overlap,
+    torch::Tensor& state_cache,
+    const torch::Tensor& state_bt,
+    int64_t state_width,
+    int64_t state_block_size,
+    const torch::Tensor& cu_query_len,
+    int64_t K = 0);
+
+void fused_compress_multi_kv(const torch::Tensor& kv,
+                             const torch::Tensor& score,
+                             torch::Tensor& state_cache,
+                             const torch::Tensor& state_block_table,
+                             const torch::Tensor& cu_seqlens,
+                             const torch::Tensor& positions,
+                             const torch::Tensor& ape,
+                             int64_t max_seqlen,
+                             bool overlap,
+                             torch::Tensor& compressed_kv);
+
+// Clamp gate/up halves while preserving the layout expected by scaled_quantize.
+torch::Tensor fused_moe_clamp(const torch::Tensor& input, float limit);
+
+torch::Tensor causal_conv1d_fn(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& batch,
+    const torch::Tensor& token_block_offset,
+    int32_t nt,
+    const std::optional<torch::Tensor>& bias_opt = std::nullopt,
+    const std::optional<torch::Tensor>& cache_indices_opt = std::nullopt,
+    const std::optional<torch::Tensor>& has_initial_state_opt = std::nullopt,
+    const std::optional<torch::Tensor>& initial_state_idx_opt = std::nullopt,
+    const std::optional<torch::Tensor>& num_accepted_tokens_opt = std::nullopt,
+    bool inplace_final_state = true);
+
+std::pair<torch::Tensor, torch::Tensor> fused_recurrent_gated_delta_rule(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& g,
+    const std::optional<torch::Tensor>& beta_opt = std::nullopt,
+    const std::optional<torch::Tensor>& initial_state_opt = std::nullopt,
+    bool inplace_final_state = true,
+    const std::optional<torch::Tensor>& cu_seqlens_opt = std::nullopt,
+    const std::optional<torch::Tensor>& ssm_state_indices_opt = std::nullopt,
+    const std::optional<torch::Tensor>& num_accepted_tokens_opt = std::nullopt,
+    bool use_qk_l2norm_in_kernel = true);
+
+std::pair<torch::Tensor, torch::Tensor>
+fused_recurrent_gated_delta_rule_packed_decode(
+    const torch::Tensor& mixed_qkv,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    double scale,
+    torch::Tensor& ssm_cache,
+    const torch::Tensor& ssm_state_indices,
+    bool use_qk_l2norm_in_kernel = true);
+
+std::tuple<torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor>
+fused_post_conv_prep(const torch::Tensor& conv_output,
+                     const torch::Tensor& a,
+                     const torch::Tensor& b,
+                     const torch::Tensor& A_log,
+                     const torch::Tensor& dt_bias,
+                     int64_t num_k_heads,
+                     int64_t head_k_dim,
+                     int64_t head_v_dim,
+                     bool apply_l2norm = true,
+                     bool output_g_exp = false);
+
+std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
+    const torch::Tensor& A_log,
+    torch::Tensor& a,
+    torch::Tensor& b,
+    const torch::Tensor& dt_bias,
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& v,
+    torch::Tensor& initial_state,
+    torch::Tensor& ssm_state_indices,
+    torch::Tensor& cu_seqlens,
+    double scale,
+    bool use_qk_l2norm_in_kernel = true,
+    float softplus_beta = 1.0f,
+    float softplus_threshold = 20.0f,
+    const std::optional<torch::Tensor>& num_accepted_tokens_opt = std::nullopt,
+    bool inplace_final_state = true,
+    bool is_kda = false,
+    bool kda_use_safe_gate = false,
+    float kda_gate_lower_bound = -5.0f);
+
+torch::Tensor causal_conv1d_update_decode(
+    const torch::Tensor& x,
+    torch::Tensor& conv_state,
+    const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias_opt,
+    const std::optional<torch::Tensor>& conv_state_indices_opt,
+    bool activation = true,
+    int32_t pad_slot_id = -1,
+    const std::optional<torch::Tensor>& query_start_loc_opt = std::nullopt,
+    int32_t max_query_len = -1,
+    const std::optional<torch::Tensor>& num_accepted_tokens_opt = std::nullopt,
+    const std::optional<torch::Tensor>& block_idx_last_scheduled_token_opt =
+        std::nullopt,
+    const std::optional<torch::Tensor>& initial_state_idx_opt = std::nullopt);
+
+std::pair<torch::Tensor, torch::Tensor> fused_gdn_gating(
+    const torch::Tensor& A_log,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& dt_bias,
+    float beta = 1.0f,
+    float threshold = 20.0f);
+// Global TopK: score descending; tied candidates follow torch::topk ordering.
+// Invalid slots/NaNs are excluded. Valid slots occupy the output prefix;
+// unused output slots are -1, including all slots of padding queries.
+void dcp_merge_topk(const torch::Tensor& scores,
+                    const torch::Tensor& slots,
+                    const torch::Tensor& mapping,
+                    int64_t topk,
+                    torch::Tensor& output,
+                    torch::Tensor& lengths);
+
+// Stable ownership projection. Lengths must be contiguous and in [0, width].
+// Both outputs are fully written, including zero padding; no input/output
+// alias.
+void dcp_localize_topk(const torch::Tensor& slots,
+                       const torch::Tensor& lengths,
+                       int32_t rank,
+                       int32_t size,
+                       int32_t interleave,
+                       torch::Tensor& output,
+                       torch::Tensor& output_lengths);
 
 }  // namespace xllm::kernel::mlu

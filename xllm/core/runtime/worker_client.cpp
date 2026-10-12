@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -38,60 +38,51 @@ bool WorkerClient::init_model(const std::string& model_weights_path,
   return worker_->init_model(model_weights_path, random_seed, master_status);
 }
 
-bool WorkerClient::allocate_kv_cache(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+bool WorkerClient::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return worker_->allocate_kv_cache(kv_cache_shape);
 }
 
-void WorkerClient::get_device_info(std::string& device_ip, uint16_t& port) {
-  worker_->get_device_info(device_ip, port);
+bool WorkerClient::set_speculative_validate_time_predictor(
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+  return worker_->set_speculative_validate_time_predictor(predictor);
 }
 
 void WorkerClient::get_cache_info(uint64_t& cluster_id,
                                   std::string& addr,
-                                  int64_t& k_cache_id,
-                                  int64_t& v_cache_id) {
-  worker_->get_cache_info(cluster_id, addr, k_cache_id, v_cache_id);
+                                  uint16_t& port) {
+  worker_->get_cache_info(cluster_id, addr, port);
 }
 
 bool WorkerClient::link_cluster(const std::vector<uint64_t>& cluster_ids,
                                 const std::vector<std::string>& addrs,
-                                const std::vector<std::string>& device_ips,
                                 const std::vector<uint16_t>& ports) {
-  return worker_->link_cluster(cluster_ids, addrs, device_ips, ports);
+  return worker_->link_cluster(cluster_ids, addrs, ports);
 }
 
 bool WorkerClient::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                                   const std::vector<std::string>& addrs,
-                                  const std::vector<std::string>& device_ips,
                                   const std::vector<uint16_t>& ports) {
-  return worker_->unlink_cluster(cluster_ids, addrs, device_ips, ports);
+  return worker_->unlink_cluster(cluster_ids, addrs, ports);
 }
 
-bool WorkerClient::link_d2d(const std::string& remote_addr) {
-  return worker_->link_d2d(remote_addr);
+bool WorkerClient::link_p2p(const std::string& remote_addr) {
+  return worker_->link_p2p(remote_addr);
 }
 
-bool WorkerClient::unlink_d2d(const std::string& remote_addr) {
-  return worker_->unlink_d2d(remote_addr);
+bool WorkerClient::unlink_p2p(const std::string& remote_addr) {
+  return worker_->unlink_p2p(remote_addr);
 }
 
 std::tuple<int64_t, int64_t> WorkerClient::estimate_kv_cache_capacity() {
   return worker_->estimate_kv_cache_capacity();
 }
 
-bool WorkerClient::pull_kv_blocks(const uint64_t src_cluster_id,
-                                  const std::string& src_addr,
-                                  const int64_t src_k_cache_id,
-                                  const int64_t src_v_cache_id,
-                                  const std::vector<uint64_t>& src_blocks,
-                                  const std::vector<uint64_t>& dst_blocks) {
-  auto future = worker_->pull_kv_blocks_async(src_cluster_id,
-                                              src_addr,
-                                              src_k_cache_id,
-                                              src_v_cache_id,
-                                              src_blocks,
-                                              dst_blocks);
+bool WorkerClient::pull_kv_blocks(
+    const uint64_t src_cluster_id,
+    const std::string& src_addr,
+    const std::vector<KVTransferMapping>& mappings) {
+  auto future =
+      worker_->pull_kv_blocks_async(src_cluster_id, src_addr, mappings);
   return std::move(future).get();
 }
 
@@ -113,10 +104,10 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerClient::step_async(
   return worker_->step_async(input);
 }
 
-folly::SemiFuture<std::optional<RawForwardOutput>> WorkerClient::step_async(
-    const RawForwardInput& inputs) {
-  LOG(FATAL) << "Worker Method step_async with RawForwardInput param is "
-                "UnImplemented.";
+folly::SemiFuture<std::optional<RawForwardOutput>>
+WorkerClient::step_remote_async(const ForwardInput& input) {
+  LOG(FATAL) << "WorkerClient Method step_remote_async with ForwardInput "
+                "param is UnImplemented.";
   return folly::makeSemiFuture(std::optional<RawForwardOutput>(std::nullopt));
 }
 
@@ -134,28 +125,20 @@ folly::SemiFuture<bool> WorkerClient::init_model_async(
 }
 
 folly::SemiFuture<bool> WorkerClient::allocate_kv_cache_async(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+    const KVCacheShape& kv_cache_shape) {
   return worker_->allocate_kv_cache_async(kv_cache_shape);
 }
 
 folly::SemiFuture<bool> WorkerClient::allocate_kv_cache_with_transfer_async(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+    const KVCacheShape& kv_cache_shape) {
   return worker_->allocate_kv_cache_with_transfer_async(kv_cache_shape);
 }
 
 folly::SemiFuture<bool> WorkerClient::pull_kv_blocks_async(
     const uint64_t src_cluster_id,
     const std::string& src_addr,
-    const int64_t src_k_cache_id,
-    const int64_t src_v_cache_id,
-    const std::vector<uint64_t>& src_blocks,
-    const std::vector<uint64_t>& dst_blocks) {
-  return worker_->pull_kv_blocks_async(src_cluster_id,
-                                       src_addr,
-                                       src_k_cache_id,
-                                       src_v_cache_id,
-                                       src_blocks,
-                                       dst_blocks);
+    const std::vector<KVTransferMapping>& mappings) {
+  return worker_->pull_kv_blocks_async(src_cluster_id, src_addr, mappings);
 }
 
 folly::SemiFuture<uint32_t> WorkerClient::transfer_kv_blocks(
@@ -167,9 +150,9 @@ folly::SemiFuture<uint32_t> WorkerClient::transfer_kv_blocks(
 }
 
 void WorkerClient::prefetch_from_storage(
-    const std::vector<BlockTransferInfo>& block_transfer_info,
-    std::shared_ptr<std::atomic<int32_t>> flag,
-    std::shared_ptr<std::atomic<uint32_t>> success_cnt) {
+    const std::shared_ptr<const StoragePrefetchRequest>& request,
+    std::shared_ptr<PrefetchResult> result,
+    size_t worker_index) {
   NOT_IMPLEMENTED();
 }
 
@@ -186,6 +169,19 @@ folly::SemiFuture<bool> WorkerClient::sleep_async(MasterStatus master_status) {
 folly::SemiFuture<bool> WorkerClient::wakeup_async(
     const WakeupOptions& options) {
   return worker_->wakeup_async(options);
+}
+
+folly::SemiFuture<bool> WorkerClient::update_weights_async(
+    const std::string& /*weights_path*/) {
+  LOG(FATAL) << "WorkerClient Method update_weights is UnImplemented.";
+}
+
+folly::SemiFuture<bool> WorkerClient::start_profile_async() {
+  return worker_->start_profile_async();
+}
+
+folly::SemiFuture<bool> WorkerClient::stop_profile_async() {
+  return worker_->stop_profile_async();
 }
 
 const torch::Device& WorkerClient::device() const { return worker_->device(); }

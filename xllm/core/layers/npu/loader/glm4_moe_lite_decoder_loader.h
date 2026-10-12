@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,6 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+
+#pragma once
 
 #include "base_loader.h"
 
@@ -25,13 +27,15 @@ class Glm4MoeDecoderLiteLoader : public BaseLoader {
   Glm4MoeDecoderLiteLoader(uint64_t weight_count,
                            const ModelContext& context,
                            int32_t layer_id,
-                           int32_t prefill_param_firstKDenseReplace);
+                           int32_t prefill_param_firstKDenseReplace,
+                           LoadMode mode = LoadMode::kEager);
   void load_state_dict(const StateDict& state_dict) override;
   void verify_loaded_weights() const override;
-  void merge_loaded_weights() override;
   void resize_experts_weights(int num_of_device_experts) override;
 
  protected:
+  void merge_host_at_weights() override;
+
   int32_t layer_id_;
   int32_t qk_nope_head_dim_;
   int32_t qk_rope_head_dim_;
@@ -113,8 +117,6 @@ class Glm4MoeDecoderLiteLoader : public BaseLoader {
   torch::Tensor merge_experts_weights(std::vector<torch::Tensor>& experts_up,
                                       std::vector<torch::Tensor>& experts_gate,
                                       bool transpose = false);
-
-  //   int64_t init_layer();
 
   int get_mapped_index(const std::string& name,
                        const std::unordered_map<std::string, int>& mapping);

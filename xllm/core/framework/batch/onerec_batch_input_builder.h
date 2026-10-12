@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,9 +20,9 @@ limitations under the License.
 #include <future>
 #include <vector>
 
+#include "core/framework/multimodal/mm_data.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
-#include "framework/request/mm_data.h"
 #include "framework/request/sequence.h"
 #include "framework/request/sequences_group.h"
 #include "rec_batch_input_builder.h"
@@ -42,7 +42,7 @@ class OneRecBatchInputBuilder : public RecBatchInputBuilder {
       const uint64_t batch_id,
       const ModelArgs* args,
       BatchForwardType batch_forward_type,
-      ThreadPool* thread_pool = nullptr);
+      MPMCThreadPool* thread_pool = nullptr);
 
  public:
   ForwardInput build_rec_forward_input(
@@ -57,7 +57,7 @@ class OneRecBatchInputBuilder : public RecBatchInputBuilder {
   std::vector<BlockTransferInfo>* swap_block_transfer_infos_ = nullptr;
   const uint64_t batch_id_;
   const ModelArgs* args_ = nullptr;
-  ThreadPool* thread_pool_ = nullptr;
+  MPMCThreadPool* thread_pool_ = nullptr;
   BatchForwardType batch_forward_type_;
   // High performance cache system
   struct HighPerformanceCache {

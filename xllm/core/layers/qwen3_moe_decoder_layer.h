@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,8 +20,14 @@ limitations under the License.
 #include "common/dense_mlp.h"
 #if defined(USE_MLU)
 #include "layers/mlu/fused_moe.h"
+#elif defined(USE_NPU)
+#include "npu_torch/fused_moe.h"
 #elif defined(USE_ILU)
 #include "layers/ilu/fused_moe.h"
+#elif defined(USE_CUDA)
+#include "layers/cuda/fused_moe.h"
+#elif defined(USE_DCU)
+#include "layers/dcu/fused_moe.h"
 #else
 #include "layers/common/fused_moe.h"
 #endif

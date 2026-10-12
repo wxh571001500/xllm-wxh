@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,8 +37,8 @@ struct XLLM_CAPI_EXPORT XLLM_ChatMessage {
 struct XLLM_CAPI_EXPORT XLLM_InitLLMOptions {
   bool enable_chunked_prefill = false;
 
-  // Whether to enable prefill-only sequence parallel
-  bool enable_prefill_sp = false;
+  // Context parallel size. Backend and model support is required.
+  int32_t cp_size = 1;
 
   bool enable_prefix_cache = false;
 
@@ -87,7 +87,7 @@ struct XLLM_CAPI_EXPORT XLLM_InitLLMOptions {
   int block_size = 128;
 
   // Max gpu memory size for kv cache. Default is 0, which means cache size is
-  // caculated by available memory
+  // calculated by available memory
   int max_cache_size = 0;
 
   // Max number of tokens per batch
@@ -124,8 +124,6 @@ struct XLLM_CAPI_EXPORT XLLM_InitLLMOptions {
   // The role of instance(e.g. DEFAULT, PREFILL, DECODE, MIX)
   std::string instance_role = "DEFAULT";
 
-  std::string device_ip = "";
-
   // The master address for multi-node distributed serving(e.g. 10.18.1.1:9999)
   std::string master_node_addr = "127.0.0.1:18899";
 
@@ -138,9 +136,6 @@ struct XLLM_CAPI_EXPORT XLLM_InitLLMOptions {
 
   // draft hf model path to the model file
   std::optional<std::string> draft_model = std::nullopt;
-
-  // Devices to run the draft model on, e.g. npu:0, npu:0,npu:1
-  std::optional<std::string> draft_devices = std::nullopt;
 
   // Index ID for internal server ID, which must be set different values
   // if the model supports multiple version or there are multiple models.
@@ -163,6 +158,10 @@ struct XLLM_CAPI_EXPORT XLLM_RequestParams {
   // Whether to skip special tokens in the output text. default = true.
   bool skip_special_tokens = true;
 
+  // Whether to include stop strings or stop tokens in the output text.
+  // default = false.
+  bool include_stop_str_in_output = false;
+
   // Number of completions to return for each prompt. default = 1
   uint32_t n = 1;
 
@@ -181,6 +180,8 @@ struct XLLM_CAPI_EXPORT XLLM_RequestParams {
   int32_t tpot_slo_ms;
 
   int32_t beam_width = 0;
+
+  int32_t num_return_sequences = 0;
 
   // Number of top log probabilities to return. default = 0.
   int64_t top_logprobs = 0;
@@ -202,17 +203,16 @@ struct XLLM_CAPI_EXPORT XLLM_RequestParams {
   // based on their existing in the prompt. default = 0.0
   float presence_penalty = 0.0;
 
-  // Repetition penalty to penalize new tokens based on their occurence in the
+  // Repetition penalty to penalize new tokens based on their occurrence in the
   // text. values > 1.0 encourage the model to use new tokens, while values
   // < 1.0 encourage the model to repeat tokens. default = 1.0
   float repetition_penalty = 1.0;
 
   // Temperature of the sampling, between [0, 2]. default = 0.0
-  // higher value will make the ouput more random.
+  // higher value will make the output more random.
   float temperature = 0.0;
 
   // The list of strings to stop generating further tokens.
-  // the output will contain the stop string.
   std::optional<std::vector<std::string>> stop;
 
   // The list of token ids to stop generating further tokens.
@@ -237,6 +237,9 @@ struct XLLM_CAPI_EXPORT XLLM_Usage {
 
   // The total number of tokens used in the request (prompt + completion).
   int32_t total_tokens;
+
+  // The number of prompt tokens served from prefix cache.
+  int32_t cached_tokens;
 };
 
 struct XLLM_CAPI_EXPORT XLLM_LogProbData {
@@ -280,7 +283,7 @@ struct XLLM_CAPI_EXPORT XLLM_Choice {
   // The log probabilities of output tokens.
   std::optional<std::vector<XLLM_LogProb>> logprobs;
 
-  // The reason of the model stoped generating tokens.
+  // The reason of the model stopped generating tokens.
   // "stop" - the model hit a natural stop point or a provided stop sequence.
   // "length" - the maximum number of tokens specified in the request was
   // reached. "function_call" - the model called a function.

@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -40,11 +40,8 @@ class XTensorManagerPool final : public KVCacheManager {
 
   // unimplemented functions
   void cache(Sequence* sequence) override { NOT_IMPLEMENTED(); }
-
-  bool allocate(Sequence* sequence,
-                size_t num_tokens,
-                size_t needed_copy_in_blocks_num) override {
-    LOG(FATAL) << "allocate is not implemented for page manager pool";
+  void cache(Sequence* sequence, size_t num_tokens) override {
+    NOT_IMPLEMENTED();
   }
 
   std::vector<Block> allocate(size_t num_tokens, int32_t& dp_rank) override {
@@ -60,11 +57,6 @@ class XTensorManagerPool final : public KVCacheManager {
       override {
     NOT_IMPLEMENTED();
     return nullptr;
-  }
-
-  void reset_transfer_infos() override {
-    LOG(FATAL)
-        << "reset_transfer_infos is not implemented for page manager pool";
   }
 
   uint32_t num_blocks() const override {

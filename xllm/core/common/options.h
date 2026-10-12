@@ -1,11 +1,11 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -39,29 +39,34 @@ class Options {
 
   PROPERTY(std::string, model_id);
 
-  PROPERTY(std::optional<std::string>, devices);
-
   PROPERTY(std::optional<std::string>, draft_model_path);
-
-  PROPERTY(std::optional<std::string>, draft_devices);
 
   // model backend
   PROPERTY(std::string, backend);
 
-  // max image num per prompt, default 4
-  PROPERTY(int32_t, limit_image_per_prompt) = 4;
+  // max image num per prompt, default 8
+  PROPERTY(int32_t, limit_image_per_prompt) = 8;
 
   // block size, default 128
   PROPERTY(int32_t, block_size) = 128;
 
   // the maximum cache size in bytes, default is 0 which means cache size is
-  // caculated by available memory * max_memory_utilization
+  // calculated by available memory * max_memory_utilization
   PROPERTY(int64_t, max_cache_size) = 0;
 
   // maximum memory utilization allowed, default 0.9
   PROPERTY(double, max_memory_utilization) = 0.9;
 
   PROPERTY(bool, enable_prefix_cache) = true;
+
+  // maximum encoder cache size in MB (0 disables encoder cache)
+  PROPERTY(int64_t, max_encoder_cache_size) = 0;
+
+  // maximum processor cache item count (default 256; 0 disables)
+  PROPERTY(int64_t, max_processor_cache_items) = 256;
+
+  // active linear-state slots. 0 derives capacity from the KV cache budget.
+  PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
 
   // max tokens num per batch
   PROPERTY(int32_t, max_tokens_per_batch) = 20480;
@@ -77,6 +82,8 @@ class Options {
 
   PROPERTY(std::string, speculative_algorithm) = "MTP";
 
+  PROPERTY(std::string, draft_sampling_mode) = "greedy";
+
   PROPERTY(int32_t, speculative_suffix_cache_max_depth) = 64;
 
   PROPERTY(double, speculative_suffix_max_spec_factor) = 1.0;
@@ -89,6 +96,11 @@ class Options {
 
   PROPERTY(bool, speculative_suffix_use_tree_spec) = false;
 
+  PROPERTY(bool, enable_mtp_draft_body_tp1) = false;
+  PROPERTY(bool, enable_adaptive_speculative_decode) = false;
+
+  PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
+
   // thread num to handle requests
   PROPERTY(size_t, num_request_handling_threads) = 4;
 
@@ -98,7 +110,7 @@ class Options {
 
   PROPERTY(std::optional<int64_t>, eplb_update_interval);
 
-  PROPERTY(std::optional<double>, eplb_update_threshold);
+  PROPERTY(std::optional<double>, eplb_min_peak_load_improvement);
 
   PROPERTY(std::optional<std::string>, communication_backend);
 
@@ -114,7 +126,14 @@ class Options {
 
   PROPERTY(bool, enable_chunked_prefill) = true;
 
-  PROPERTY(bool, enable_prefill_sp) = false;
+  // Flash Communication 1 (FC1) sequence-parallel optimization.
+  PROPERTY(bool, enable_flashcomm1) = false;
+
+  PROPERTY(int32_t, flashcomm1_min_prefill_tokens) = 8192;
+
+  PROPERTY(bool, enable_mmrs_fusion) = false;
+
+  PROPERTY(std::string, mmrs_comm_mode) = "aiv";
 
   PROPERTY(std::optional<std::string>, master_node_addr);
 
@@ -128,6 +147,16 @@ class Options {
 
   PROPERTY(int32_t, ep_size) = 1;
 
+  PROPERTY(int32_t, tp_size) = 1;
+
+  PROPERTY(int32_t, sp_size) = 1;
+
+  PROPERTY(int32_t, cfg_size) = 1;
+
+  PROPERTY(int32_t, vae_size) = 1;
+
+  PROPERTY(int32_t, text_encoder_tp_size) = 1;
+
   PROPERTY(std::optional<std::string>, instance_name);
 
   PROPERTY(bool, enable_disagg_pd) = false;
@@ -140,11 +169,11 @@ class Options {
 
   PROPERTY(std::string, kv_cache_transfer_mode) = "PUSH";
 
-  PROPERTY(std::optional<std::string>, device_ip);
-
   PROPERTY(uint16_t, transfer_listen_port) = 26000;
 
   PROPERTY(std::optional<std::string>, etcd_addr);
+
+  PROPERTY(std::optional<std::string>, etcd_namespace);
 
   PROPERTY(bool, enable_service_routing) = false;
 
@@ -160,9 +189,9 @@ class Options {
 
   PROPERTY(bool, enable_kvcache_store) = false;
 
-  PROPERTY(bool, enable_cache_upload) = false;
-
   PROPERTY(std::string, store_protocol) = "tcp";
+
+  PROPERTY(std::string, store_rdma_devices) = "";
 
   PROPERTY(std::string, store_master_server_address) = "";
 
@@ -187,6 +216,12 @@ class Options {
   PROPERTY(bool, enable_forward_interruption) = false;
   // enable CUDA graph/ACL graph for performance optimization
   PROPERTY(bool, enable_graph) = false;
+  // enable graph-mode decode without padding
+  PROPERTY(bool, enable_graph_mode_decode_no_padding) = false;
+  // enable piecewise graph for prefill
+  PROPERTY(bool, enable_prefill_piecewise_graph) = false;
+  // maximum number of tokens for graph execution
+  PROPERTY(int32_t, max_tokens_for_graph_mode) = 2048;
   // all requests use single global ttft
   PROPERTY(int32_t, max_global_ttft_ms) = std::numeric_limits<int32_t>::max();
   // all requests use single global tpot
@@ -198,6 +233,15 @@ class Options {
 
   // for offline inference: start with offline inference, default is false
   PROPERTY(bool, enable_offline_inference) = false;
+
+  // Enable the RL sleep/wakeup memory mode (SleepableAllocator). When set, the
+  // offline Python sleep()/wake_up() interface releases / re-acquires physical
+  // HBM via the VMM-backed allocator (vllm-ascend style), independent of the
+  // xtensor-based online sleep/wakeup path.
+  PROPERTY(bool, enable_sleep_mode) = false;
+
+  // disable per-request statistic logs.
+  PROPERTY(bool, disable_log_stats) = false;
   // for offline inference: the path to spawn worker binary
   PROPERTY(std::string, spawn_worker_path) = "";
 
@@ -217,12 +261,12 @@ class Options {
   PROPERTY(int64_t, server_idx) = 0;
 
   // Prefetch timeout for prefetch from kv cache store
-  PROPERTY(uint32_t, prefetch_timeout) = 0;
+  PROPERTY(uint32_t, prefetch_timeout) = 120000;
 
   // Prefetch from kvcache store copy batch size
-  PROPERTY(uint32_t, prefetch_bacth_size) = 2;
+  PROPERTY(uint32_t, prefetch_batch_size) = 2;
 
-  // Layer wise H2D copy batchs
+  // Host KV layer-wise copy batches.
   PROPERTY(uint32_t, layers_wise_copy_batchs) = 4;
 
   // beam width for beam search

@@ -1,0 +1,266 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/speculative/embedding_cache.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
+#include "framework/model/model_args.h"
+#include "framework/sampling/draft_proposal.h"
+#include "runtime/draft_model_spec_worker_impl.h"
+#include "runtime/llm_worker_impl.h"
+#include "util/utils.h"
+
+namespace xllm {
+
+namespace dflash_detail {
+
+inline int32_t decode_draft_width(int32_t num_speculative_tokens,
+                                  bool sample_from_anchor) {
+  return sample_from_anchor ? num_speculative_tokens
+                            : num_speculative_tokens + 1;
+}
+
+inline void invalidate_draft_model_geometry(ModelInputParams& input_params) {
+  // Attention metadata is model-owned: DeepSeek-V4 bakes DSA group layout and
+  // sparse tiling values such as ori_win_left into opaque tensors. A draft
+  // input copied from the target must rebuild those tensors for draft geometry.
+  input_params.attn_metadata.reset();
+}
+
+enum class DSparkSasMode : uint8_t {
+  NOT_DSPARK,
+  COMPATIBILITY,
+  NATIVE,
+};
+
+inline DSparkSasMode classify_dspark_sas_mode(const ModelArgs& draft_args,
+                                              bool sample_from_anchor) {
+  if (!sample_from_anchor ||
+      !util::is_deepseek_v4_dspark_model_type(draft_args.model_type())) {
+    return DSparkSasMode::NOT_DSPARK;
+  }
+  return draft_args.dspark_use_native_sas() ? DSparkSasMode::NATIVE
+                                            : DSparkSasMode::COMPATIBILITY;
+}
+
+}  // namespace dflash_detail
+
+// DFlash2 proposal attention follows the prelaunch gate: A3, Python, CP 1,
+// schedule overlap, and the same PD role and adaptive-decode limits.
+bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
+                                 const torch::Device& device,
+                                 const runtime::Options& options);
+
+class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
+ public:
+  DFlashWorkerImpl(const ParallelArgs& parallel_args,
+                   const torch::Device& device,
+                   const runtime::Options& options);
+
+  ~DFlashWorkerImpl() override = default;
+
+  bool init_model(const std::string& model_weights_path,
+                  int32_t random_seed,
+                  MasterStatus master_status) override;
+
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
+
+ protected:
+  std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
+
+  std::optional<ForwardOutput> step_decode(const ForwardInput& input) override;
+
+  std::optional<ForwardOutput> step_empty(const ForwardInput& input) override;
+
+  // Draft produces all speculative tokens of a block in one forward, so its
+  // output is a single [batch, num_speculative_tokens] block rather than the
+  // per-step outputs an autoregressive drafter (e.g. MTP) yields.
+  struct DraftBlock {
+    DraftProposal proposal;
+    // DSpark ConfidenceHead output for adaptive pruning; empty otherwise.
+    torch::Tensor confidence_probs;
+    std::vector<torch::Tensor> retained_tensors;
+    // No-sync draft inputs must outlive validation's stream sync.
+    std::vector<std::shared_ptr<ForwardInput>> retained_inputs;
+  };
+
+  // virtual: DSpark overrides the draft sampling (parallel block sample ->
+  // one forward + sequential Markov-head sampling loop).
+  virtual DraftBlock run_decode_draft(const ForwardInput& input,
+                                      ForwardInput& validate_input);
+
+  virtual bool prepare_draft_prelaunch(const ForwardInput& /*input*/) {
+    return false;
+  }
+  virtual void launch_draft_prelaunch(const ForwardInput& /*input*/,
+                                      const SampleOutput& /*output*/,
+                                      const torch::Tensor& /*accepted_host*/) {
+    LOG(FATAL) << "Draft prelaunch was not implemented";
+  }
+  virtual void discard_draft_prelaunch() {}
+  // Finish host preparation, then retire writes to scheduler-owned KV blocks
+  // before publishing tokens that may terminate a request.
+  virtual void finish_draft_prelaunch(const ForwardInput& /*input*/) {}
+
+  // Block layout hook: false (DFlash) -> query_width N+1, slot 0 is the
+  // un-selected anchor; true (DSpark) -> query_width N, every position predicts
+  // and slot 0 predicts the first draft token. prepare_query_inputs and the
+  // query row builder read this so the whole (helper-heavy) query-build logic
+  // stays here and a subclass flips one bit.
+  virtual bool sample_from_anchor() const { return false; }
+
+  // DFlash/DFlash2 drafts are standalone full-attention models, so they cannot
+  // follow the target's kv_split sharding: every rank keeps a full replica of
+  // the context and one logical block owns kv_split physical pages. Drafters
+  // that share the target's architecture (MTP, DSpark) keep the default 1.
+  int64_t draft_replicated_block_pages() const override {
+    return SpeculativeConfig::draft_replicated_block_pages(
+        options_.speculative_algorithm(),
+        parallel_args_.kv_split_size_effective());
+  }
+
+  // Shared with subclasses (DSpark): build the N/N+1-wide draft query block and
+  // the target validate input. A DSpark override of run_decode_draft calls both
+  // before its draft forward.
+  void prepare_query_inputs(const ForwardInput& input,
+                            ForwardInput& query_input);
+  void prepare_validate_inputs(const ForwardInput& input,
+                               ForwardInput& validate_input);
+
+  // A replicated draft pool stores kv_split physical pages per logical block,
+  // so the draft's own block table has to be expanded to address them. The
+  // logical slot arithmetic in specBuilder is unchanged: run against the
+  // expanded table with the physical block size it still resolves to the
+  // draft's flat cache index (logical_block * kv_split + page_in_block).
+  // No-op when the draft follows the target's kv_split sharding.
+  void expand_draft_block_tables(ModelInputParams& input_params) const;
+
+ private:
+  bool draft_use_block_parallel_rows() const {
+    return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
+  }
+  BatchForwardType draft_batch_forward_type() const {
+    return draft_sas_mode_ == dflash_detail::DSparkSasMode::NATIVE
+               ? BatchForwardType::DECODE
+               : BatchForwardType::CHUNKED_PREFILL;
+  }
+
+  void fill_validate_input_from_draft_outputs(const DraftBlock& draft_block,
+                                              ForwardInput& validate_input,
+                                              Stream& compute_stream,
+                                              int32_t effective_val_tokens);
+
+  // Per-seq varlen variant. Handles the case where validate_input.token_ids
+  // is a flat [Σ per_seq_val_tokens] layout (i.e. the base per_seq builder
+  // produced it), copying draft tokens into the varlen slots per seq.
+  void fill_validate_input_from_draft_outputs_varlen(
+      const DraftBlock& draft_block,
+      ForwardInput& validate_input,
+      Stream& compute_stream,
+      const std::vector<int32_t>& per_seq_val_tokens);
+
+  std::optional<ForwardOutput> run_validate(const ForwardInput& input,
+                                            const DraftBlock& draft_block,
+                                            ForwardInput& validate_input);
+
+  // `per_seq_val_tokens` (optional): when non-empty, the target output was
+  // scattered from a per-seq varlen batch and each seq's bonus lives at
+  // dense col (per_seq_val_tokens[i] - 1), not the fixed last column. Passing
+  // it lets validate() gather the bonus token per-seq. Empty = uniform
+  // batch-max width (bonus at col effective_val_tokens - 1 for every seq).
+  SampleOutput validate(const SamplingParameters& sampling_params,
+                        const DraftBlock& draft_block,
+                        const ForwardOutput& target_output,
+                        int32_t effective_val_tokens,
+                        const std::vector<int32_t>& per_seq_val_tokens);
+
+  SampleOutput validate(const SamplingParameters& sampling_params,
+                        const DraftProposal& draft_proposal,
+                        const ForwardOutput& target_output,
+                        int32_t effective_val_tokens,
+                        const std::vector<int32_t>& per_seq_val_tokens);
+
+  // Adaptive-speculative helper: run controller on draft acceptance
+  // probabilities (ConfidenceHead output if available, sampler-gathered probs
+  // otherwise) and return per-seq prefix_len vector (each entry in
+  // [0, num_speculative_tokens]). Returns empty vector when adaptive is off,
+  // in which case the caller keeps the full draft block.
+  std::vector<int32_t> compute_adaptive_prefix_lengths(
+      const DraftBlock& draft_block,
+      const ForwardInput& input);
+
+  // Zero out draft probs beyond each sequence's prefix_len so the rejection
+  // Per-seq varlen prune: rebuild validate_input as a true varlen
+  // [Σ per_seq_val_tokens[i], ...] batch so target forward only spends
+  // compute on tokens each seq's prefix_len actually needs. Reuses the base
+  // SpeculativeWorkerImpl per-seq builder.
+  void apply_per_seq_varlen_prune(
+      const ForwardInput& input,
+      ForwardInput& validate_input,
+      const std::vector<int32_t>& per_seq_val_tokens);
+
+  // Record precise (draft, accepted) counters. Padded -1 slots at positions
+  // past per_seq_val_tokens[i]-1 are excluded — the count only walks each
+  // row up to its per-seq width. Passing an empty vector treats every row
+  // as full width (static). Caller must ensure val_output.next_tokens is on
+  // CPU (avoids a blocking device sync on the hot path).
+  void record_validate_metrics(
+      SampleOutput& val_output,
+      const std::vector<int32_t>& per_seq_val_tokens) const;
+
+  void process_draft_sample_output(SampleOutput& sample_output);
+
+  // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
+  // commits the same prefix. No-op for a single rank.
+  void maybe_broadcast_spec_tokens(torch::Tensor& tokens);
+
+  void update_decode_step_input(
+      ForwardInput& input,
+      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
+
+  std::vector<std::string> write_context_kv(
+      const ForwardInput& input,
+      const torch::Tensor& context_hidden,
+      const torch::Tensor& positions_device,
+      const torch::Tensor& new_cache_slots_device);
+
+  std::vector<std::string> write_target_context_to_cache(
+      const ForwardInput& input,
+      const SampleOutput& validate_output);
+
+ protected:
+  int32_t mask_token_id_ = -1;
+  int64_t expected_context_hidden_size_ = 0;
+  // Whether the target model owns recurrent (linear attention) layers.
+  // Fixed once the target finishes loading; the hybrid spec-verify gates and
+  // the adaptive-pruning guard read this instead of re-scanning layer_types.
+  bool target_is_hybrid_recurrent_ = false;
+  // Preformatted labels keep per-position acceptance telemetry allocation-free
+  // on the decode hot path.
+  std::vector<std::string> speculative_position_labels_;
+  dflash_detail::DSparkSasMode draft_sas_mode_ =
+      dflash_detail::DSparkSasMode::NOT_DSPARK;
+};
+
+}  // namespace xllm

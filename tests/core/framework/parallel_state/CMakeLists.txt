@@ -1,0 +1,152 @@
+include(cc_test)
+
+cc_test(
+  NAME
+    context_parallel_topology_test
+  CPU_ONLY
+  SRCS
+    context_parallel_topology_test.cpp
+  DEPS
+    :parallel_state
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    collective_communicator_policy_test
+  CPU_ONLY
+  SRCS
+    collective_communicator_policy_test.cpp
+  DEPS
+    parallel_state
+    $<$<BOOL:${USE_NPU}>:atb>
+    $<$<BOOL:${USE_NPU}>:c_sec>
+    GTest::gtest_main
+)
+
+if(USE_NPU)
+  cc_test(
+    NAME
+      mapping_npu_test
+    CPU_ONLY
+    SRCS
+      mapping_npu_test.cpp
+    DEPS
+      parallel_state
+      absl::synchronization
+      absl::time
+      GTest::gtest_main
+      xllm_atb_layers
+      nnopbase
+      ascendcl
+      atb
+      c_sec
+      spdlog::spdlog
+  )
+
+  cc_test(
+    NAME
+      npu_dp_ep_padding_test
+    CPU_ONLY
+    SRCS
+      npu_dp_ep_padding_test.cpp
+    DEPS
+      parallel_state
+      torch
+      absl::synchronization
+      absl::time
+      GTest::gtest_main
+  )
+  target_link_libraries(npu_dp_ep_padding_test
+                        PUBLIC Python::Python
+                               ascendcl
+                               hccl
+                               c_sec
+                               nnopbase)
+
+  cc_test(
+    NAME
+      npu_cp_capability_test
+    CPU_ONLY
+    SRCS
+      npu_cp_capability_test.cpp
+    DEPS
+      master
+      models
+      parallel_state
+      GTest::gtest_main
+  )
+  target_link_libraries(npu_cp_capability_test
+                        PUBLIC Python::Python
+                               ascendcl
+                               hccl
+                               c_sec
+                               nnopbase)
+
+  cc_test(
+    NAME
+      npu_cp_plan_test
+    CPU_ONLY
+    SRCS
+      npu_cp_plan_test.cpp
+    DEPS
+      parallel_state
+      torch
+      absl::synchronization
+      absl::time
+      GTest::gtest_main
+  )
+
+  cc_test(
+    NAME
+      process_group_batch_test
+    SRCS
+      process_group_batch_test.cpp
+    DEPS
+      parallel_state
+      torch
+      GTest::gtest_main
+  )
+endif()
+
+if(USE_NPU OR USE_MLU)
+  cc_test(
+    NAME
+      cp_group_ranks_test
+    CPU_ONLY
+    SRCS
+      cp_group_ranks_test.cpp
+    DEPS
+      parallel_state
+      GTest::gtest_main
+      glog::glog
+  )
+endif()
+
+if(USE_MLU)
+  cc_test(
+    NAME
+      mlu_cp_capability_test
+    SRCS
+      mlu_cp_capability_test.cpp
+    DEPS
+      models
+      parallel_state
+      GTest::gtest_main
+  )
+
+  # Add test for reduce_scatter
+  # This test must exist individually, because it contains forked processes
+  # which does not allow any device init on main process
+  cc_test(
+    NAME
+      parallel_state_test
+    SRCS
+      parallel_state_test.cpp
+    DEPS
+      :parallel_state
+      GTest::gtest_main
+      torch
+      glog::glog
+  )
+endif()

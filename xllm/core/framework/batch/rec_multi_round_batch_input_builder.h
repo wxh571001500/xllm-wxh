@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,7 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "batch_input_builder.h"
-#include "framework/request/mm_data.h"
+#include "core/framework/multimodal/mm_data.h"
 #include "framework/request/sequence.h"
 #include "framework/request/sequences_group.h"
 #include "rec_batch_input_builder.h"
@@ -46,7 +46,7 @@ class RecMultiRoundBatchInputBuilder : public RecBatchInputBuilder {
       const uint64_t batch_id,
       const ModelArgs* args,
       BatchForwardType batch_forward_type,
-      ThreadPool* thread_pool = nullptr);
+      MPMCThreadPool* thread_pool = nullptr);
 
   ~RecMultiRoundBatchInputBuilder() override = default;
 
@@ -85,7 +85,7 @@ class RecMultiRoundBatchInputBuilder : public RecBatchInputBuilder {
     std::vector<int32_t> seq_lens;
     std::vector<int32_t> q_seq_lens;
 #elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU) || \
-    defined(USE_MUSA)
+    defined(USE_MUSA) || defined(USE_DCU)
     std::vector<int32_t> seq_lens = {0};    // cu_seq_lens
     std::vector<int32_t> q_seq_lens = {0};  // q_cu_seq_len
 #endif
@@ -99,6 +99,7 @@ class RecMultiRoundBatchInputBuilder : public RecBatchInputBuilder {
 
     // Additional data
     std::vector<int32_t> embedding_ids;
+    std::vector<int32_t> linear_state_ids;
     std::vector<int32_t> extra_token_ids;
     uint32_t prefill_seq_len = 0;
     std::vector<TransferKVInfo> transfer_kv_infos;
@@ -183,7 +184,7 @@ class RecMultiRoundBatchInputBuilder : public RecBatchInputBuilder {
   std::vector<BlockTransferInfo>* swap_block_transfer_infos_ = nullptr;
 
   // thread pool for potential future multithreaded processing, not owned
-  ThreadPool* thread_pool_ = nullptr;
+  MPMCThreadPool* thread_pool_ = nullptr;
   uint64_t batch_id_ = 0;
 
   // whether prepare draft input for MTP(EAGLE) at Decode phase.

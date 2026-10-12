@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "function_call_parser.h"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
@@ -38,9 +39,12 @@ const std::unordered_map<std::string, std::vector<std::string>> auto_paser_map =
     {
         {"qwen25", {"qwen2", "qwen3"}},
         {"qwen3_coder", {"qwen3_coder", "qwen35"}},
-        {"kimi_k2", {"kimi_k2"}},
+        {"kimi_k2", {"kimi_k2", "kimi_k25"}},
         {"deepseekv3", {"deepseek_v3"}},
         {"deepseekv32", {"deepseek_v32"}},
+        {"deepseekv4", {"deepseek_v4", "deepseek_v4_mtp"}},
+        {"deepseekv41", {"deepseek_v41"}},
+        {"glm5", {"glm_moe_dsa", "glm_moe_dsa_mtp"}},
         // GLM-4.5 and GLM-4.7 are not supported for tool call parser
         // auto-selection
         // {"glm45", {"glm4_moe"}},
@@ -66,6 +70,9 @@ const std::unordered_map<std::string,
         {"kimi_k2", [] { return std::make_unique<KimiK2Detector>(); }},
         {"deepseekv3", [] { return std::make_unique<DeepSeekV3Detector>(); }},
         {"deepseekv32", [] { return std::make_unique<DeepSeekV32Detector>(); }},
+        {"deepseekv4", [] { return std::make_unique<DeepSeekV4Detector>(); }},
+        // deepseek_v41 uses the same tool-call format as deepseek_v4
+        {"deepseekv41", [] { return std::make_unique<DeepSeekV4Detector>(); }},
         {"glm45", [] { return std::make_unique<Glm45Detector>(); }},
         {"glm47", [] { return std::make_unique<Glm47Detector>(); }},
         // glm5 use glm47 detector

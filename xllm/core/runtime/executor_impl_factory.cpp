@@ -1,10 +1,10 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "platform/device.h"
 #include "runtime/base_executor_impl.h"
+#include "runtime/py_executor_impl.h"
 #include "runtime/vlm_executor_impl.h"
 #if defined(USE_NPU)
 #include "runtime/acl_graph_executor_impl.h"
@@ -24,6 +25,8 @@ limitations under the License.
 #include "runtime/mlu_graph_executor_impl.h"
 #elif defined(USE_CUDA)
 #include "runtime/cuda_graph_executor_impl.h"
+#elif defined(USE_DCU)
+#include "runtime/dcu_graph_executor_impl.h"
 #endif
 
 namespace xllm {

@@ -1,10 +1,10 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,16 +23,7 @@ class JoyAILLMFlashForCausalLMImpl
     : public LlmForCausalLMImplBase<DeepseekV2Model> {
  public:
   JoyAILLMFlashForCausalLMImpl(const ModelContext& context)
-      : LlmForCausalLMImplBase<DeepseekV2Model>(context) {
-    // Check if prefix cache or chunked prefill is enabled for unsupported
-    // models
-    CHECK(!FLAGS_enable_prefix_cache)
-        << "JoyAILLMFlash have not supported "
-           "enable_prefix_cache yet. Please disable it.";
-    CHECK(!FLAGS_enable_chunked_prefill)
-        << "JoyAILLMFlash have not supported "
-           "enable_chunked_prefill yet. Please disable it.";
-  }
+      : LlmForCausalLMImplBase<DeepseekV2Model>(context) {}
 };
 TORCH_MODULE(JoyAILLMFlashForCausalLM);
 
@@ -62,7 +53,7 @@ REGISTER_MODEL_ARGS(joyai_llm_flash, [&] {
   LOAD_ARG_OR(first_k_dense_replace, "first_k_dense_replace", 1);
   LOAD_ARG_OR(hidden_act, "hidden_act", "silu");
   LOAD_ARG_OR(moe_layer_freq, "moe_layer_freq", 1);
-  // LOAD_ARG_OR(topk_method, "topk_method", "noaux_tc");
+  LOAD_ARG_OR(topk_method, "topk_method", "noaux_tc");
   LOAD_ARG_OR(n_routed_experts, "n_routed_experts", 256);
   LOAD_ARG_OR(n_shared_experts, "n_shared_experts", 1);
   LOAD_ARG_OR(num_experts_per_tok, "num_experts_per_tok", 8);
@@ -78,6 +69,7 @@ REGISTER_MODEL_ARGS(joyai_llm_flash, [&] {
   LOAD_ARG_OR(q_lora_rank, "q_lora_rank", 1536);
   LOAD_ARG_OR(kv_lora_rank, "kv_lora_rank", 512);
   LOAD_ARG_OR(num_nextn_predict_layers, "num_nextn_predict_layers", 1);
+  SET_ARG(mtp_mlp_type, "dense");
 
   LOAD_ARG_OR_FUNC(head_dim, "head_dim", [&] {
     return 256;  // args->qk_nope_head_dim() + args->qk_rope_head_dim();
