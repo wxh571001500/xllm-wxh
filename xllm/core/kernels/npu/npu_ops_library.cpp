@@ -271,6 +271,31 @@ torch::Tensor causal_conv1d_spec_verify_npu(
       kRunModeUpdate);
 }
 
+torch::Tensor recurrent_gated_delta_rule_npu(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    torch::Tensor& state,
+    const std::optional<torch::Tensor>& beta,
+    const std::optional<double> scale,
+    const std::optional<torch::Tensor>& actual_seq_lengths,
+    const std::optional<torch::Tensor>& ssm_state_indices,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const std::optional<torch::Tensor>& g,
+    const std::optional<torch::Tensor>& gk) {
+  return xllm::kernel::npu::npu_recurrent_gated_delta_rule(query,
+                                                           key,
+                                                           value,
+                                                           state,
+                                                           beta,
+                                                           scale,
+                                                           actual_seq_lengths,
+                                                           ssm_state_indices,
+                                                           num_accepted_tokens,
+                                                           g,
+                                                           gk);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_npu(
     torch::Tensor q,
     torch::Tensor k,
@@ -607,8 +632,8 @@ torch::Tensor update_decode_graph_metadata_npu(
 // shard/restore indices plus the packed query/KV gather indices that one FIA
 // call consumes. This is the C++ lowering of the host scalar loops previously
 // in xllm/python/model_executor/cp_utils.py; both passes below mirror that
-// reference exactly. Each sequence is padded up to a multiple of 2*cp_size and
-// cut into 2*cp_size chunks; rank r owns chunk r paired with chunk
+// reference exactly. Each sequence is padded up to a multiple of 2*cp_size
+// and cut into 2*cp_size chunks; rank r owns chunk r paired with chunk
 // 2*cp_size-1-r (head-tail balanced). See cp_utils.CpContext for field docs.
 std::tuple<torch::Tensor,
            torch::Tensor,
@@ -667,9 +692,9 @@ build_cp_context_npu(const std::vector<int64_t>& q_seq_lens,
     chunk_lens.push_back(chunk_len);
     local_seg_offsets.push_back(local_offset);
 
-    // Emit the two owned segments in local order: first half then second half.
-    // For each, the real rows sit at the front (small j) because real position
-    // grows with j, so query_index stays front-packed per segment.
+    // Emit the two owned segments in local order: first half then second
+    // half. For each, the real rows sit at the front (small j) because real
+    // position grows with j, so query_index stays front-packed per segment.
     const int64_t halves[2][2] = {{0, first_chunk}, {1, second_chunk}};
     for (const auto& half_chunk : halves) {
       const int64_t half = half_chunk[0];
@@ -710,8 +735,8 @@ build_cp_context_npu(const std::vector<int64_t>& q_seq_lens,
   const int64_t total_local = local_offset;
 
   // restore_index: for every global (real) row, where it lands in the
-  // rank-major all-gather output [cp_size * total_local]. Its final size is the
-  // total real-token count, which the first pass accumulated into
+  // rank-major all-gather output [cp_size * total_local]. Its final size is
+  // the total real-token count, which the first pass accumulated into
   // global_offset.
   std::vector<int64_t> restore_index;
   restore_index.reserve(global_offset);
@@ -846,6 +871,11 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor(a!) conv_state, int[] state_indices, int[] query_start_loc, "
       "int[] num_accepted_tokens) -> Tensor");
   m.def(
+      "recurrent_gated_delta_rule(Tensor query, Tensor key, Tensor value, "
+      "Tensor(a!) state, Tensor? beta, float? scale, "
+      "Tensor? actual_seq_lengths, Tensor? ssm_state_indices, "
+      "Tensor? num_accepted_tokens, Tensor? g, Tensor? gk) -> Tensor");
+  m.def(
       "fused_sigmoid_gating_delta_rule_decode(Tensor a_log, Tensor a, "
       "Tensor dt_bias, Tensor q, Tensor k, Tensor v, Tensor b, "
       "Tensor(a!) ssm_state, Tensor state_indices, Tensor cu_seqlens, "
@@ -860,15 +890,17 @@ TORCH_LIBRARY(xllm_ops, m) {
       "weight, "
       "float eps) -> (Tensor, Tensor)");
   // Fused RMSNorm + dynamic per-token int8 quant (W8A8 query preprocess).
-  // Returns (qr_int8, qr_pertoken_scale) matching C++ rms_norm_dynamic_quant
-  // (npu_ops_api.h:122), used by the DSV4 indexer build_query path.
+  // Returns (qr_int8, qr_pertoken_scale) matching C++
+  // rms_norm_dynamic_quant (npu_ops_api.h:122), used by the DSV4 indexer
+  // build_query path.
   m.def(
       "rms_norm_dynamic_quant(Tensor input, Tensor weight, float eps) -> "
       "(Tensor, Tensor)");
-  // In-place partial rotary embedding (interleaved). x is 4D [B,N,S,D], r1/r2
-  // are cos/sin [B,1,1,rope_head_dim]; partial_slice=[rope_start,
+  // In-place partial rotary embedding (interleaved). x is 4D [B,N,S,D],
+  // r1/r2 are cos/sin [B,1,1,rope_head_dim]; partial_slice=[rope_start,
   // rope_head_dim]. Mirrors C++ apply_partial_rope
-  // (deepseek_sparse_attention.cpp:151) used by the DSV4 indexer build_query.
+  // (deepseek_sparse_attention.cpp:151) used by the DSV4 indexer
+  // build_query.
   m.def(
       "npu_inplace_partial_rotary_mul(Tensor(a!) x, Tensor r1, Tensor r2, "
       "str rotary_mode, int[] partial_slice) -> ()");
@@ -883,21 +915,28 @@ TORCH_LIBRARY(xllm_ops, m) {
       "inplace_partial_rotary_mul(Tensor(a!) input, Tensor cosine, Tensor "
       "sine, str rotary_mode, int[] partial_slice) -> ()");
   m.def(
-      "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, "
+      "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int "
+      "num_heads_k, "
       "int "
-      "num_heads_v, int head_dim, float eps, Tensor q_weight, Tensor k_weight, "
-      "Tensor cos_sin_cache, bool interleaved, Tensor position_ids) -> Tensor");
+      "num_heads_v, int head_dim, float eps, Tensor q_weight, Tensor "
+      "k_weight, "
+      "Tensor cos_sin_cache, bool interleaved, Tensor position_ids) -> "
+      "Tensor");
   m.def(
-      "reshape_paged_cache(Tensor slot_mapping, Tensor(c!) keys, Tensor(d!) "
+      "reshape_paged_cache(Tensor slot_mapping, Tensor(c!) keys, "
+      "Tensor(d!) "
       "values, "
       "Tensor(a!) key_cache, Tensor(b!) value_cache) -> Tensor");
   m.def(
-      "apply_rotary_embedding(Tensor(a!) q, Tensor(b!) k, Tensor cos_sin_cache,"
+      "apply_rotary_embedding(Tensor(a!) q, Tensor(b!) k, Tensor "
+      "cos_sin_cache,"
       " Tensor positions) -> ()");
   m.def(
-      "update_decode_graph_metadata(Tensor tokens, Tensor positions, Tensor "
+      "update_decode_graph_metadata(Tensor tokens, Tensor positions, "
+      "Tensor "
       "slot_mapping, Tensor kv_seq_lens, Tensor paged_kv_indptr, Tensor "
-      "paged_kv_indices, Tensor paged_kv_last_page_len, Tensor(a!) dst_tokens, "
+      "paged_kv_indices, Tensor paged_kv_last_page_len, Tensor(a!) "
+      "dst_tokens, "
       "Tensor(b!) dst_positions, Tensor(c!) dst_slot_mapping, Tensor(d!) "
       "dst_kv_seq_lens, Tensor(e!) dst_kv_seq_lens_delta, Tensor(f!) "
       "dst_paged_kv_indptr, Tensor(g!) dst_paged_kv_indices, Tensor(h!) "
@@ -910,14 +949,16 @@ TORCH_LIBRARY(xllm_ops, m) {
       "quantize_per_tensor(Tensor self, Tensor scales, Tensor zero_points, "
       "ScalarType dtype, int axis) -> Tensor");
   m.def(
-      "dynamic_quant(Tensor input, Tensor? smooth_scales, Tensor? group_index, "
+      "dynamic_quant(Tensor input, Tensor? smooth_scales, Tensor? "
+      "group_index, "
       "ScalarType? dst_type) -> (Tensor, Tensor?)");
   m.def(
       "quant_lightning_indexer(Tensor query, Tensor key, Tensor weights, "
       "Tensor query_dequant_scale, Tensor key_dequant_scale, int "
       "query_quant_mode, int key_quant_mode, Tensor? "
       "actual_seq_lengths_query, Tensor? actual_seq_lengths_key, Tensor? "
-      "block_table, Tensor? metadata, str layout_query, str layout_key, int "
+      "block_table, Tensor? metadata, str layout_query, str layout_key, "
+      "int "
       "sparse_count, int sparse_mode, int pre_tokens, int next_tokens, int "
       "cmp_ratio, bool return_value) -> (Tensor, Tensor)");
   m.def(
@@ -930,28 +971,35 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "lightning_indexer(Tensor query, Tensor key, Tensor weights, "
       "Tensor? query_seq_lengths, Tensor? key_seq_lengths, Tensor? "
-      "block_table, str layout_query, str layout_key, int selected_count, int "
+      "block_table, str layout_query, str layout_key, int selected_count, "
+      "int "
       "sparse_mode, int pre_tokens, int next_tokens, bool return_value) -> "
       "Tensor");
   m.def(
       "lightning_indexer_out(Tensor query, Tensor key, Tensor weights, "
       "Tensor? query_seq_lengths, Tensor? key_seq_lengths, Tensor? "
       "block_table, str layout_query, str layout_key, int selected_count, "
-      "int sparse_mode, int pre_tokens, int next_tokens, bool return_value, "
+      "int sparse_mode, int pre_tokens, int next_tokens, bool "
+      "return_value, "
       "Tensor(a!) sparse_indices_out, Tensor(b!) sparse_values_out) -> "
       "Tensor(a!)");
   m.def(
-      "scatter_nd_update(Tensor(a!) var, Tensor indices, Tensor updates) -> "
+      "scatter_nd_update(Tensor(a!) var, Tensor indices, Tensor updates) "
+      "-> "
       "()");
   m.def(
-      "x_flash_attention_decode_out(Tensor query, Tensor key, Tensor value, "
+      "x_flash_attention_decode_out(Tensor query, Tensor key, Tensor "
+      "value, "
       "Tensor block_table, Tensor query_ends, Tensor kv_lengths, Tensor "
       "kv_starts, "
       "float scale, Tensor(a!) output) -> Tensor(a!)");
   m.def(
-      "sparse_flash_attention(Tensor query, Tensor key, Tensor value, Tensor "
-      "sparse_indices, Tensor? block_table, Tensor? actual_seq_lengths_query, "
-      "Tensor? actual_seq_lengths_kv, Tensor? query_rope, Tensor? key_rope, "
+      "sparse_flash_attention(Tensor query, Tensor key, Tensor value, "
+      "Tensor "
+      "sparse_indices, Tensor? block_table, Tensor? "
+      "actual_seq_lengths_query, "
+      "Tensor? actual_seq_lengths_kv, Tensor? query_rope, Tensor? "
+      "key_rope, "
       "float scale_value, int sparse_block_size, str layout_query, str "
       "layout_kv, int sparse_mode) -> Tensor");
   m.def(
@@ -959,15 +1007,18 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor sparse_indices, Tensor? block_table, Tensor? "
       "actual_seq_lengths_query, Tensor? actual_seq_lengths_kv, Tensor? "
       "query_rope, Tensor? key_rope, float scale_value, int "
-      "sparse_block_size, str layout_query, str layout_kv, int sparse_mode, "
+      "sparse_block_size, str layout_query, str layout_kv, int "
+      "sparse_mode, "
       "Tensor(a!) output) -> Tensor(a!)");
   m.def(
       "sparse_flash_attention_lse(Tensor query, Tensor key, Tensor value, "
       "Tensor sparse_indices, Tensor? block_table, Tensor? "
       "actual_seq_lengths_query, Tensor? actual_seq_lengths_kv, Tensor? "
-      "query_rope, Tensor? key_rope, float scale_value, int sparse_block_size, "
+      "query_rope, Tensor? key_rope, float scale_value, int "
+      "sparse_block_size, "
       "str layout_query, str layout_kv, int sparse_mode, int "
-      "pre_tokens=9223372036854775807, int next_tokens=9223372036854775807, "
+      "pre_tokens=9223372036854775807, int "
+      "next_tokens=9223372036854775807, "
       "int attention_mode=2, bool return_softmax_lse=False) -> (Tensor, "
       "Tensor, Tensor)");
   m.def(
@@ -980,7 +1031,8 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "mla_preprocess_v2(Tensor input, Tensor gamma0, Tensor beta0, Tensor "
       "quant_scale0, Tensor quant_offset0, Tensor wdqkv, Tensor descale0, "
-      "Tensor bias0, Tensor gamma1, Tensor beta1, Tensor quant_scale1, Tensor "
+      "Tensor bias0, Tensor gamma1, Tensor beta1, Tensor quant_scale1, "
+      "Tensor "
       "quant_offset1, Tensor wuq, Tensor descale1, Tensor bias1, Tensor "
       "gamma2, Tensor cos, Tensor sin, Tensor wuk, Tensor(a!) kv_cache, "
       "Tensor(b!) kv_cache_rope, Tensor slot_mapping, Tensor ctkv_scale, "
@@ -991,9 +1043,11 @@ TORCH_LIBRARY(xllm_ops, m) {
       "wdkv_split_count, bool q_down_out_flag) -> (Tensor, Tensor(a!), "
       "Tensor, Tensor(b!), Tensor)");
   // ---- DeepSeek-V4 DSA kernels ----
-  // MoE hash routing gate (returns routed output, expert_idx, token_unpermute).
+  // MoE hash routing gate (returns routed output, expert_idx,
+  // token_unpermute).
   m.def(
-      "moe_gating_top_k_hash(Tensor x, int k, Tensor? bias, Tensor? input_ids, "
+      "moe_gating_top_k_hash(Tensor x, int k, Tensor? bias, Tensor? "
+      "input_ids, "
       "Tensor? tid2eid, int k_group, int group_count, float "
       "routed_scaling_factor, "
       "float eps, int group_select_mode, int renorm, int norm_type, bool "
@@ -1002,9 +1056,16 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "dequant_swiglu_quant(Tensor x, Tensor? weight_scale, Tensor? "
       "activation_scale, Tensor? bias, Tensor? quant_scale, Tensor? "
-      "quant_offset, Tensor? group_index, bool activate_left, int quant_mode, "
-      "int swiglu_mode, float clamp_limit, float glu_alpha, float glu_bias) "
+      "quant_offset, Tensor? group_index, bool activate_left, int "
+      "quant_mode, "
+      "int swiglu_mode, float clamp_limit, float glu_alpha, float "
+      "glu_bias) "
       "-> (Tensor, Tensor)");
+  m.def(
+      "dequant_situ_quant(Tensor x, Tensor? weight_scale, Tensor? "
+      "activation_scale, Tensor? bias, Tensor? quant_scale, Tensor? "
+      "quant_offset, Tensor? group_index, float beta, float linear_beta, "
+      "bool activate_left, str quant_mode) -> (Tensor, Tensor)");
   // HyperConnection pre/post (hc_pre returns attn_input, post, comb).
   m.def(
       "hc_pre(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
@@ -1014,11 +1075,12 @@ TORCH_LIBRARY(xllm_ops, m) {
       "hc_post(Tensor x, Tensor residual, Tensor post, Tensor comb) -> "
       "Tensor");
   m.def(
-      "hc_pre_fused(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "hc_pre_fused(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor "
+      "hc_base, "
       "int hc_mult, int hc_sinkhorn_iters, float norm_eps, float hc_eps) "
       "-> (Tensor, Tensor, Tensor)");
-  // Compressor: NSA-style KV pooling. kv_state/score_state are in-place (Ref).
-  // Returns (cmp_kv, wkv_proj, softmax_res, norm_x, norm_rstd).
+  // Compressor: NSA-style KV pooling. kv_state/score_state are in-place
+  // (Ref). Returns (cmp_kv, wkv_proj, softmax_res, norm_x, norm_rstd).
   m.def(
       "compressor(Tensor x, Tensor wkv, Tensor wgate, Tensor(a!) kv_state, "
       "Tensor(b!) score_state, Tensor ape, Tensor norm_weight, Tensor "
@@ -1039,7 +1101,8 @@ TORCH_LIBRARY(xllm_ops, m) {
       "str layout_kv, bool return_softmax_lse) -> (Tensor, Tensor)");
   // AICPU tiling metadata builder for sparse_attn_sharedkv.
   m.def(
-      "sparse_attn_sharedkv_metadata(int num_heads_q, int num_heads_kv, int "
+      "sparse_attn_sharedkv_metadata(int num_heads_q, int num_heads_kv, "
+      "int "
       "head_dim, Tensor? cu_seqlens_q, Tensor? cu_seqlens_ori_kv, Tensor? "
       "cu_seqlens_cmp_kv, Tensor? seqused_q, Tensor? seqused_kv, int "
       "batch_size, int max_seqlen_q, int max_seqlen_kv, int ori_topk, int "
@@ -1048,7 +1111,8 @@ TORCH_LIBRARY(xllm_ops, m) {
       "has_ori_kv, bool has_cmp_kv) -> Tensor");
   m.def(
       "sfa_dcp_remap_out(Tensor topk_indices, int physical_block_size, int "
-      "shard_size, int shard_rank, Tensor(a!) out, Tensor(b!) idx_scratch) -> "
+      "shard_size, int shard_rank, Tensor(a!) out, Tensor(b!) idx_scratch) "
+      "-> "
       "Tensor(a!)");
 }
 
@@ -1073,6 +1137,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::causal_conv1d_qkv_prefill_npu));
   m.impl("causal_conv1d_spec_verify",
          TORCH_FN(xllm::causal_conv1d_spec_verify_npu));
+  m.impl("recurrent_gated_delta_rule",
+         TORCH_FN(xllm::recurrent_gated_delta_rule_npu));
   m.impl("fused_sigmoid_gating_delta_rule_decode",
          TORCH_FN(xllm::fused_sigmoid_gating_delta_rule_decode_npu));
   m.impl("fused_recurrent_gated_delta_rule_spec_verify",
@@ -1113,6 +1179,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::kernel::npu::moe_gating_top_k_hash));
   m.impl("dequant_swiglu_quant",
          TORCH_FN(xllm::kernel::npu::dequant_swiglu_quant));
+  m.impl("dequant_situ_quant", TORCH_FN(xllm::kernel::npu::dequant_situ_quant));
   m.impl("hc_pre", TORCH_FN(xllm::kernel::npu::hc_pre));
   m.impl("hc_pre_fused", TORCH_FN(xllm::kernel::npu::hc_pre_fused));
   m.impl("hc_post", TORCH_FN(xllm::kernel::npu::hc_post));

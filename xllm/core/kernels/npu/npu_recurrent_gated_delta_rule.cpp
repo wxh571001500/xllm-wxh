@@ -64,7 +64,7 @@ torch::Tensor npu_recurrent_gated_delta_rule(
   float scale_value = static_cast<float>(scale.value());
   torch::Tensor output = torch::empty_like(value);
 
-  EXEC_NPU_CMD(aclnnRecurrentGatedDeltaRule,
+  EXEC_NPU_CMD(aclnnXllmRecurrentGatedDeltaRule,
                query,
                key,
                value,

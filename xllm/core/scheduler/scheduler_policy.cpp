@@ -504,8 +504,30 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
   }
 
   const size_t kv_cache_tokens_num = seq->kv_cache_tokens_num();
-  const size_t max_handle_num_tokens =
+  size_t max_handle_num_tokens =
       std::min(kv_cache_tokens_num + token_budget, seq->num_tokens());
+
+  // Linear-state block alignment: for models with linear attention layers +
+  // prefix cache, boundaries must align to the KV block_size so linear-state
+  // checkpoints land at recoverable positions (matching vLLM
+  // mamba_cache_mode="all", which caches state at every i * block_size).
+  if (has_linear_attention_layers(state.model_args) &&
+      state.enable_prefix_cache && seq->is_prefill_stage()) {
+    const size_t chunk_stride =
+        static_cast<size_t>(::xllm::KVCacheConfig::get_instance().block_size());
+    const size_t aligned =
+        (max_handle_num_tokens / chunk_stride) * chunk_stride;
+    if (aligned <= kv_cache_tokens_num) {
+      if (max_handle_num_tokens == seq->num_tokens()) {
+        // Final chunk: allow unaligned to complete the sequence.
+      } else {
+        *actual_tokens = 0;
+        return false;
+      }
+    } else {
+      max_handle_num_tokens = aligned;
+    }
+  }
 
   CHECK_GT(max_handle_num_tokens, kv_cache_tokens_num);
   *actual_tokens = max_handle_num_tokens - kv_cache_tokens_num;

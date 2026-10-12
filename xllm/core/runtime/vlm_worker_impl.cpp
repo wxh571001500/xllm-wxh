@@ -29,7 +29,9 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/kv_cache/linear_state_restore.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/llm/py_causal_lm.h"
@@ -45,6 +47,11 @@ namespace {
 void wait_input_ready_events(const ForwardInput& input, const Stream& stream) {
   CHECK(stream.wait_event(input.metadata_ready_event))
       << "failed to wait ForwardInput metadata ready event";
+}
+
+// Legacy singular alias kept for call sites that predate the rename.
+void wait_input_ready_event(const ForwardInput& input, const Stream& stream) {
+  wait_input_ready_events(input, stream);
 }
 
 StreamEventPtr record_current_stream_event(const Device& device) {
@@ -82,6 +89,7 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
 
   // initialize model
   context.set_encoder_embedding_mode(false);
+  context.set_model_impl(ModelConfig::get_instance().model_impl());
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(
@@ -178,11 +186,12 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   const bool empty_shard =
       input.input_params.meta.num_sequences == 0 &&
       (!input.token_ids.defined() || input.token_ids.numel() == 0);
-  if (empty_shard) {
+  const bool needs_collective_participation =
+      parallel_args_.ep_size() > 1 || !parallel_args_.mapping_data().empty();
+  if (empty_shard && !needs_collective_participation) {
     return ForwardOutput{};
   }
 
-  // TODO guojinrong, to adapt multi stream parallel later
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);

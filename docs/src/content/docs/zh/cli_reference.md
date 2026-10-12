@@ -41,8 +41,8 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `task` | `string` | `"generate"` | 模型任务类型，例如 `generate`、`embed`、`mm_embed`。 |
 | `limit_image_per_prompt` | `int32` | `8` | 每个 prompt 允许的最大图片数量，仅用于多模态模型。 |
 | `max_encoder_cache_size` | `int64` | `0` | 每个 worker 的 encoder cache 最大显存大小，单位 MB；`0` 表示禁用 encoder cache。 |
-| `reasoning_parser` | `string` | `""` | reasoning 交互解析器，例如 `auto`、`glm45`、`glm47`、`glm5`、`qwen3`、`qwen35`、`deepseek-r1`。 |
-| `tool_call_parser` | `string` | `""` | tool-call 交互解析器，例如 `auto`、`qwen25`、`qwen3`、`qwen35`、`qwen3_coder`、`kimi_k2`、`deepseekv3`、`deepseekv32`、`deepseekv4`、`glm45`、`glm47`、`glm5`。 |
+| `reasoning_parser` | `string` | `""` | reasoning 交互解析器，例如 `auto`、`glm45`、`glm47`、`glm5`、`qwen3`、`qwen35`、`deepseek-r1`、`kimi_k3`。 |
+| `tool_call_parser` | `string` | `""` | tool-call 交互解析器，例如 `auto`、`qwen25`、`qwen3`、`qwen35`、`qwen3_coder`、`kimi_k2`、`kimi_k3`、`deepseekv3`、`deepseekv32`、`deepseekv4`、`glm45`、`glm47`、`glm5`。 |
 | `enable_qwen3_reranker` | `bool` | `false` | 是否启用 Qwen3 reranker。 |
 | `flashinfer_workspace_buffer_size` | `int32` | `134217728` | FlashInfer split-k attention 中用于保存中间 attention 结果的预留 workspace 大小，默认 128 MiB。 |
 | `enable_return_mm_full_embeddings` | `bool` | `false` | VLM 模型是否返回 ViT embedding 与序列 embedding。 |

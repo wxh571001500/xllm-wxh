@@ -28,6 +28,8 @@ import importlib
 import warnings
 
 import pytest
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from xllm.python.kernels_npu import _custom_op
 
@@ -70,3 +72,36 @@ def test_custom_op_module_imports_without_native_ops() -> None:
 
     module = importlib.import_module("xllm.python.kernels_npu._custom_op")
     assert hasattr(module, "register_fake")
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.bfloat16])
+@pytest.mark.parametrize("rows", [0, 7])
+def test_dequant_situ_quant_fake_output_contract(dtype: torch.dtype, rows: int) -> None:
+    with FakeTensorMode():
+        x = torch.empty((rows, 768), dtype=dtype)
+        y, scale = _custom_op._dequant_situ_quant_fake(x, None, None, None, None, None, None, 1.0, 1.0, True, "dynamic")
+        assert y.shape == (rows, 384)
+        assert y.dtype == torch.int8
+        assert scale.shape == (rows,)
+        assert scale.dtype == torch.float32
+        assert y.device == scale.device == x.device
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype", "message"),
+    [
+        ((), torch.bfloat16, "2D"),
+        ((768,), torch.bfloat16, "2D"),
+        ((1, 2, 768), torch.bfloat16, "2D"),
+        ((2, 0), torch.bfloat16, "positive"),
+        ((2, 770), torch.bfloat16, "multiple of 16"),
+        ((2, 768), torch.float32, "int32 or bfloat16"),
+    ],
+)
+def test_dequant_situ_quant_fake_rejects_invalid_inputs(
+    shape: tuple[int, ...], dtype: torch.dtype, message: str
+) -> None:
+    with FakeTensorMode(), pytest.raises(RuntimeError, match=message):
+        _custom_op._dequant_situ_quant_fake(
+            torch.empty(shape, dtype=dtype), None, None, None, None, None, None, 1.0, 1.0, True, "dynamic"
+        )

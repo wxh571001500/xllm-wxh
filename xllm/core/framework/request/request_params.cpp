@@ -16,6 +16,7 @@ limitations under the License.
 
 #include "request_params.h"
 
+#include <algorithm>
 #include <type_traits>
 
 #include "core/common/global_flags.h"
@@ -327,6 +328,9 @@ std::vector<xllm::JsonTool> parse_tools_from_proto(
 template <typename ChatRequest>
 void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
   if constexpr (std::is_same_v<ChatRequest, proto::ChatRequest>) {
+    if (request.has_reasoning_effort()) {
+      params.reasoning_effort = request.reasoning_effort();
+    }
     if (request.has_response_format()) {
       const std::string& type = request.response_format().type();
       if (type == "json_object") {
@@ -722,6 +726,40 @@ bool RequestParams::verify_params(OutputCallback callback) const {
     return false;
   }
   return true;
+}
+
+void RequestParams::prepare_kimi_k3_chat_params() {
+  skip_special_tokens = false;
+  if (!chat_template_kwargs.contains("tool_choice")) {
+    std::string prompt_tool_choice = tools.empty() ? "none" : tool_choice;
+    if (!tool_choice.empty() && tool_choice.front() == '{') {
+      const nlohmann::json named_choice =
+          nlohmann::json::parse(tool_choice, nullptr, false);
+      if (named_choice.is_object() && named_choice.contains("function") &&
+          named_choice["function"].is_object() &&
+          named_choice["function"].contains("name") &&
+          named_choice["function"]["name"].is_string()) {
+        const std::string name =
+            named_choice["function"]["name"].get<std::string>();
+        std::erase_if(tools, [&name](const JsonTool& tool) {
+          return tool.function.name != name;
+        });
+        prompt_tool_choice = "required";
+      }
+    }
+    chat_template_kwargs["tool_choice"] = prompt_tool_choice;
+  }
+  if (!reasoning_effort.has_value()) {
+    return;
+  }
+
+  const std::string& effort = *reasoning_effort;
+  if (!chat_template_kwargs.contains("thinking")) {
+    chat_template_kwargs["thinking"] = effort != "none";
+  }
+  if (!chat_template_kwargs.contains("thinking_effort")) {
+    chat_template_kwargs["thinking_effort"] = effort;
+  }
 }
 
 RequestSamplingParam RequestParams::to_sampling_param(size_t best_of) const {

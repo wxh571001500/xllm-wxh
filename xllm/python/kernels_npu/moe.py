@@ -56,7 +56,7 @@ def _grouped_matmul_swiglu_quant_v2(
     *,
     group_list_type: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the W8A8 GMM v2 path with vllm-ascend-compatible arguments."""
+    """Run the W8A8 GMM v2 path with the torch_npu argument contract."""
     return torch_npu.npu_grouped_matmul_swiglu_quant_v2(
         x=x,
         weight=[weight],

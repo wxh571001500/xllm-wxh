@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,9 +14,12 @@
 
 """Reusable and backend-owned layers for Python model execution.
 
-Simple layers use the active :mod:`python.kernels` package directly. Complex
-models whose native fusion boundaries differ by device keep their lowering in
-``layers/<device>/`` and select it once when the model is constructed.
+Layers depend only on the op dispatch layer (:mod:`python.ops`); they never
+touch the kernel backends directly. The dependency direction is
+``models -> layers -> ops -> kernels``. Simple layers use the active
+:mod:`python.kernels` package directly. Complex models whose native fusion
+boundaries differ by device keep their lowering in ``layers/<device>/`` and
+select it once when the model is constructed.
 """
 
 from xllm.python.layers.attention import Attention
@@ -24,7 +27,7 @@ from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.fused_moe import FusedMoE
 from xllm.python.layers.gated_mlp import GatedMLP
 from xllm.python.layers.layernorm import GemmaRMSNorm, RMSNorm
-from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
+from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear, LinearMethod, W8A8DynamicLinearMethod
 from xllm.python.layers.rotary_embedding import (
     RotaryEmbedding,
     apply_rotary_half,
@@ -33,12 +36,11 @@ from xllm.python.layers.rotary_embedding import (
 
 __all__ = [
     "Attention",
-    "FusedMoE",
-    "GatedMLP",
     "RMSNorm",
-    "GemmaRMSNorm",
     "RotaryEmbedding",
     "ColumnParallelLinear",
+    "LinearMethod",
     "RowParallelLinear",
+    "W8A8DynamicLinearMethod",
     "HiddenParallelEmbedding",
 ]

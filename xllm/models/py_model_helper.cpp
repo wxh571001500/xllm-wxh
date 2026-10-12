@@ -24,6 +24,7 @@ limitations under the License.
 #include <c10/util/Exception.h>
 #include <glog/logging.h>
 #include <pybind11/embed.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <cstdlib>
@@ -31,6 +32,7 @@ limitations under the License.
 #include <string>
 
 #include "core/framework/config/model_config.h"
+#include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/kernels/xllm_torch_ops.h"
 
@@ -73,6 +75,42 @@ std::string dtype_to_string(const torch::TensorOptions& options) {
     default:
       return "bfloat16";
   }
+}
+
+void init_python_process_groups(const ParallelArgs& parallel_args,
+                                const torch::Device& device) {
+  CHECK(!parallel_args.python_rendezvous_host_.empty());
+  CHECK_GT(parallel_args.python_rendezvous_port_, 0);
+  py::object init_process_group =
+      py::module_::import("xllm.python.distributed").attr("init_process_group");
+  const int32_t global_rank = parallel_args.rank();
+  const int32_t world_size = parallel_args.world_size();
+  const int32_t tp_size = parallel_args.tp_size();
+  const int32_t dp_size = parallel_args.dp_size();
+  const int32_t moe_tp_size = parallel_args.moe_tp_group_ != nullptr
+                                  ? parallel_args.moe_tp_group_->world_size()
+                                  : 1;
+  const auto init_group =
+      [&](const char* name, ProcessGroup* group, int32_t index) {
+        if (group == nullptr || group->world_size() <= 1) {
+          return;
+        }
+        init_process_group(name,
+                           parallel_args.python_rendezvous_host_,
+                           parallel_args.python_rendezvous_port_,
+                           group->rank(),
+                           group->world_size(),
+                           c10::str(device),
+                           global_rank,
+                           world_size,
+                           index);
+      };
+  init_group("tp", parallel_args.tp_group_, global_rank / tp_size);
+  init_group("dp",
+             parallel_args.dp_local_process_group_,
+             global_rank % (world_size / dp_size));
+  init_group("moe_tp", parallel_args.moe_tp_group_, global_rank / moe_tp_size);
+  init_group("moe_ep", parallel_args.moe_ep_group_, global_rank % moe_tp_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +171,14 @@ torch::Tensor PyStateDict::get_tensor(const std::string& name) const {
   return sd_->get_tensor(name);
 }
 
+torch::Tensor PyStateDict::get_sharded_tensor(const std::string& name,
+                                              int64_t dim,
+                                              int32_t rank,
+                                              int32_t world_size) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return sd_->get_sharded_tensor(name, dim, rank, world_size);
+}
+
 bool PyStateDict::has(const std::string& name) const {
   CHECK(sd_ != nullptr) << "PyStateDict: access after release";
   return sd_->has(name);
@@ -145,6 +191,24 @@ py::list PyStateDict::keys() const {
     result.append(py::str(key));
   }
   return result;
+}
+
+PyStateDict PyStateDict::get_dict_with_prefix(const std::string& prefix) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return PyStateDict(
+      std::make_unique<StateDict>(sd_->get_dict_with_prefix(prefix)));
+}
+
+PyStateDict PyStateDict::get_dict_with_prefixes(
+    const std::vector<std::string>& prefixes) const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return PyStateDict(
+      std::make_unique<StateDict>(sd_->get_dict_with_prefix(prefixes)));
+}
+
+size_t PyStateDict::size() const {
+  CHECK(sd_ != nullptr) << "PyStateDict: access after release";
+  return sd_->size();
 }
 
 void ensure_xllm_weight_loader_module() {
@@ -160,8 +224,21 @@ void ensure_xllm_weight_loader_module() {
   py::module_ module = py::reinterpret_borrow<py::module_>(module_object);
   py::class_<PyStateDict>(module, "StateDict")
       .def("get_tensor", &PyStateDict::get_tensor, py::arg("name"))
+      .def("get_sharded_tensor",
+           &PyStateDict::get_sharded_tensor,
+           py::arg("name"),
+           py::arg("dim"),
+           py::arg("rank"),
+           py::arg("world_size"))
       .def("has", &PyStateDict::has, py::arg("name"))
-      .def("keys", &PyStateDict::keys);
+      .def("keys", &PyStateDict::keys)
+      .def("get_dict_with_prefix",
+           &PyStateDict::get_dict_with_prefix,
+           py::arg("prefix"))
+      .def("get_dict_with_prefixes",
+           &PyStateDict::get_dict_with_prefixes,
+           py::arg("prefixes"))
+      .def("size", &PyStateDict::size);
   modules[module_name] = module;
 }
 

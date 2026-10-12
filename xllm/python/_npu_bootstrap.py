@@ -64,31 +64,6 @@ _torch_library.Library = _OrigLibrary
 del _OrigLibrary, _SafeLibrary
 
 # ---------------------------------------------------------------------------
-# Secondary OPP registration: ensure fla_npu's embedded OPP
-# (ASCEND_CUSTOM_OPP_PATH) is on the path before torch_npu use. The primary
-# registration happens in xllm.cpp init_npu_python_runtime() before aclInit
-# (which caches the OPP scan); this is a best-effort guard for any process that
-# reaches this bootstrap without having run that path, e.g. an already-initialized
-# interpreter re-importing the package. load_ascendc_opapi_libraries() is
-# idempotent (returns cached libraries once the primary registration ran), so a
-# re-call here is a no-op for normal serving; a real OPP-load failure must be
-# logged (§7/§12) rather than silently swallowed into a 561103 at the first
-# KDA op call. A missing fla_npu is harmless for models that never touch the
-# fused KDA path.
-# ---------------------------------------------------------------------------
-try:
-    import fla_npu
-except ImportError:
-    pass  # fla_npu optional; non-KDA models never touch the fused KDA path
-else:
-    try:
-        fla_npu.load_ascendc_opapi_libraries()
-    except Exception as e:  # noqa: BLE001 - secondary guard, see comment above
-        from scripts.logger import logger
-
-        logger.warning(f"fla_npu OPP registration skipped: {e}")
-
-# ---------------------------------------------------------------------------
 # Import torch_npu with accelerator masked to prevent re-initialization.
 # ---------------------------------------------------------------------------
 try:

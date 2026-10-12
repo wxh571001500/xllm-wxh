@@ -44,6 +44,7 @@ const std::unordered_map<std::string, std::string> auto_paser_map = {
     {"deepseek_v32", "deepseekv32"},
     {"kimi_k2", "kimi"},
     {"kimi_k25", "kimi_k25"},
+    {"kimi_k3", "kimi_k3"},
     {"step3", "step3"},
 };
 
@@ -65,6 +66,14 @@ const std::unordered_map<std::string, DetectorFactory> paser_factories = {
     REGISTER_DETECTOR("deepseek-v4", "<think>", "</think>"),
     REGISTER_DETECTOR_DEFAULT_FORCE("kimi", "◁think▷", "◁/think▷", false),
     REGISTER_DETECTOR("kimi_k25", "<think>", "</think>"),
+    {"kimi_k3",
+     [](bool stream, bool force) {
+       return std::make_unique<ReasoningDetector>("<|open|>think<|sep|>",
+                                                  "<|close|>think<|sep|>",
+                                                  force,
+                                                  stream,
+                                                  false);
+     }},
     REGISTER_DETECTOR("qwen3", "<think>", "</think>"),
     REGISTER_DETECTOR("qwen35", "<think>", "</think>"),
     REGISTER_DETECTOR_DEFAULT_FORCE("qwen3-thinking",

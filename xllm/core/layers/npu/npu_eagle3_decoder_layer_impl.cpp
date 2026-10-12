@@ -55,16 +55,6 @@ void NpuEagle3DecoderLayerImpl::param_from_args(
   param.loraEnableGMM = false;
   param.qkvHasBias = false;
   param.selfAttnHasBias = false;
-  // Eagle3.1 draft variants: per-head QK RMSNorm and the hidden_norm residual
-  // base. Both flags come from the draft checkpoint config.
-  param.useQKNorm = args.use_qk_norm();
-  param.normBeforeResidual = args.norm_before_residual();
-  // QK-norm drafts: decode through the fused split+qk-rmsnorm+rope kernel
-  // (same policy as the Qwen3 target layer — prefill keeps the split path).
-  if (param.useQKNorm && !isPrefill &&
-      ::xllm::KernelConfig::get_instance().enable_split_rmsnorm_rope()) {
-    param.enableSplitRmsNormRope = true;
-  }
 
   param.packQuantType = {1, 1};
   param.linearQuantType = {0, -1, -1, 0, 0, -1, 0};

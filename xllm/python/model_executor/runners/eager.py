@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -50,7 +50,7 @@ def _per_seq_lens_from_metadata(
 
 class EagerRunner(BaseRunner):
     # Context-Parallel config, set by ModelExecutor when cp_size > 1. CP shards
-    # the prefill sequence across these ranks; decode is left on the non-CP path.
+    # the packed prefill batch across ranks.
     cp_size: int = 1
     cp_rank: int = 0
 
@@ -88,7 +88,9 @@ class EagerRunner(BaseRunner):
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
         layer_load_context: LayerLoadContext | None = None,
+        kda_metadata: object | None = None,
     ) -> ModelExecutionOutput:
+        del kda_metadata
         cp_context = None
         is_mla = self.attention_backend.is_mla
         is_empty_rank = bool(getattr(metadata, "is_dummy", False))

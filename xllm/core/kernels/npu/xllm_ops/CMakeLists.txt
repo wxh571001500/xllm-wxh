@@ -15,6 +15,7 @@ cc_library(
     quantize.cpp
     quant_dynamic.cpp
     dequant_swiglu_quant.cpp
+    dequant_situ_quant.cpp
     compressor.cpp
     hc_post.cpp
     quant_lightning_indexer.cpp

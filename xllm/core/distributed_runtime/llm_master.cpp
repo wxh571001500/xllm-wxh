@@ -257,7 +257,6 @@ void LLMMaster::handle_request(std::vector<Message> messages,
                          callback = std::move(callback),
                          call]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_chat);
-
     // remove the pending request after scheduling
     SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
 

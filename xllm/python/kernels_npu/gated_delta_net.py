@@ -268,6 +268,35 @@ def chunk_gated_delta_rule(
     return output.squeeze(0), final_state
 
 
+def recurrent_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    state: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    actual_seq_lengths: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the A3 recurrent gated-delta rule and update ``state`` in place."""
+    return torch.ops.xllm_ops.recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        state,
+        beta,
+        scale,
+        actual_seq_lengths,
+        state_indices,
+        None,
+        g,
+        gk,
+    )
+
+
 __all__ = [
     "mega_gdn_decode",
     "mega_gdn_mtp_decode",
@@ -275,4 +304,5 @@ __all__ = [
     "fused_gdn_gating",
     "fused_sigmoid_gating_delta_rule_decode",
     "chunk_gated_delta_rule",
+    "recurrent_gated_delta_rule",
 ]

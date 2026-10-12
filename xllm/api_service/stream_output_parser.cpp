@@ -39,7 +39,8 @@ StreamOutputParser::StreamOutputParser(
 }
 
 bool StreamOutputParser::is_tool_call() {
-  return !tools_.empty() && !tool_call_parser_format_.empty();
+  return !tool_call_parser_format_.empty() &&
+         (!tools_.empty() || tool_call_parser_format_ == "kimi_k3");
 }
 
 bool StreamOutputParser::is_reasoning() {

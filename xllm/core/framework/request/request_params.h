@@ -153,6 +153,10 @@ struct RequestParams {
   // whether to skip special tokens in the output text. default = true.
   bool skip_special_tokens = true;
 
+  void prepare_kimi_k3_chat_params();
+
+  std::optional<std::string> reasoning_effort;
+
   // whether to include stop strings or stop tokens in the output text.
   // default = false.
   bool include_stop_str_in_output = false;
